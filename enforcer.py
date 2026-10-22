@@ -114,6 +114,7 @@ has_reset_at_open = False
 is_locked_down = False
 force_reanchor = False
 current_is_flat = True
+first_poll_of_launch = True
 
 alarm_active = False
 cooldown_active = False
@@ -210,7 +211,6 @@ def load_config():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                # Deep merge brokers dictionary so existing users upgrade cleanly
                 saved_brokers = saved.pop("brokers", {})
                 config.update(saved)
                 for b_name in ("SCHWAB", "WEBULL"):
@@ -221,14 +221,16 @@ def load_config():
 
     active_b = config.get("active_broker", "SCHWAB")
     sel_acct = config["brokers"].get(active_b, {}).get("selected_account_id", "")
+    saved_start = config.get("saved_start_equity")
 
     if (
         config.get("session_date") == get_today_str()
-        and config.get("saved_start_equity") is not None
+        and saved_start is not None
+        and float(saved_start) > 0.0
         and config.get("saved_account_id") in ("", sel_acct)
         and start_equity is None
     ):
-        start_equity = float(config["saved_start_equity"])
+        start_equity = float(saved_start)
         max_equity = float(config.get("saved_max_equity") or start_equity)
         daily_max_equity = float(
             config.get("saved_daily_max_equity") or max_equity
@@ -692,6 +694,7 @@ class WebullAdapter:
         self.data_client = None
         self.account_id = None
         self.accounts = []
+        self._logged_balance_keys = False
 
     def authenticate(self):
         from webull.core.client import ApiClient
@@ -722,6 +725,7 @@ class WebullAdapter:
                 )
                 atype = (
                     item.get("account_type")
+                    or item.get("account_class")
                     or item.get("type")
                     or "TRADING"
                 )
@@ -802,7 +806,7 @@ class WebullAdapter:
                             )
                         log_event(
                             "FLATTEN",
-                            f"Cancel response {cid}: HTTP {c_res.status_code}"
+                            f"Cancel response {cid}: HTTP {c_resp_code(c_res)}"
                         )
                         cancelled_any = True
                 if cancelled_any:
@@ -922,6 +926,84 @@ class WebullAdapter:
             except Exception as e:
                 log_event("ERROR", f"Webull place_order exception: {e}")
 
+    @staticmethod
+    def _extract_webull_equity_and_cash(b_data):
+        """Extracts Total Account Value (Net Liquidation) and Cash Balance
+        from Webull's balance payload without ever mistaking Market Value
+        of positions for Total Account Value."""
+        def to_f(val):
+            try:
+                return float(val) if val is not None and val != "" else None
+            except Exception:
+                return None
+
+        # 1. Check direct top-level net liquidation fields
+        for k in (
+            "total_net_liquidation_value",
+            "net_liquidation_value",
+            "total_net_liquidation",
+            "net_liquidation",
+            "total_asset",
+            "total_value",
+            "account_value"
+        ):
+            v = to_f(b_data.get(k))
+            if v is not None and v > 0:
+                cash = to_f(
+                    b_data.get("total_cash_balance")
+                    or b_data.get("cash_balance")
+                    or b_data.get("total_cash")
+                )
+                return v, cash
+
+        # 2. Check inside account_currency_assets (USD)
+        assets = b_data.get("account_currency_assets")
+        if isinstance(assets, list) and assets:
+            for item in assets:
+                for k in (
+                    "net_liquidation_value",
+                    "total_net_liquidation_value",
+                    "net_liquidation",
+                    "total_asset"
+                ):
+                    v = to_f(item.get(k))
+                    if v is not None and v > 0:
+                        cash = to_f(
+                            item.get("cash_balance")
+                            or item.get("total_cash_balance")
+                            or item.get("total_cash")
+                        )
+                        return v, cash
+
+        # 3. Fallback: Sum Cash Balance + Market Value
+        cash = to_f(
+            b_data.get("total_cash_balance")
+            or b_data.get("cash_balance")
+            or b_data.get("total_cash")
+        )
+        mkt = to_f(
+            b_data.get("total_market_value")
+            or b_data.get("market_value")
+        ) or 0.0
+        if cash is not None:
+            return cash + mkt, cash
+
+        if isinstance(assets, list) and assets:
+            for item in assets:
+                c_sub = to_f(
+                    item.get("cash_balance")
+                    or item.get("total_cash_balance")
+                    or item.get("settled_cash")
+                )
+                m_sub = to_f(
+                    item.get("market_value")
+                    or item.get("total_market_value")
+                ) or 0.0
+                if c_sub is not None:
+                    return c_sub + m_sub, c_sub
+
+        return 0.0, None
+
     def fetch_account_data(self):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         for Webull accounts."""
@@ -939,20 +1021,15 @@ class WebullAdapter:
                 b_json.get("data", b_json)
                 if isinstance(b_json, dict) else {}
             )
-            raw_eq = float(
-                b_data.get("total_net_liquidation")
-                or b_data.get("net_liquidation")
-                or b_data.get("total_market_value")
-                or b_data.get("total_asset")
-                or 0.0
-            )
-            if raw_eq == 0.0 and "account_currency_assets" in b_data:
-                for asset in b_data["account_currency_assets"]:
-                    raw_eq += float(
-                        asset.get("net_liquidation")
-                        or asset.get("total_asset")
-                        or 0.0
-                    )
+
+            raw_eq, cash_bal = self._extract_webull_equity_and_cash(b_data)
+            if not self._logged_balance_keys:
+                self._logged_balance_keys = True
+                log_event(
+                    "SESSION",
+                    f"Webull Balance Parsed -> TotalAccountValue=${raw_eq:,.2f} "
+                    f"(Cash=${cash_bal if cash_bal is not None else 0.0:,.2f})"
+                )
 
             p_res = self._call_get_positions()
             if p_res.status_code != 200:
@@ -965,6 +1042,7 @@ class WebullAdapter:
             )
 
             total_open_pnl = 0.0
+            total_pos_mkt_val = 0.0
             pos_details = {}
             has_options = False
 
@@ -999,6 +1077,11 @@ class WebullAdapter:
                     or avg_price
                 )
 
+                pos_mkt_val = float(
+                    p.get("market_value") or (qty * lp * mult)
+                )
+                total_pos_mkt_val += pos_mkt_val
+
                 if "unrealized_profit_loss" in p and p.get(
                     "unrealized_profit_loss"
                 ) is not None:
@@ -1020,8 +1103,16 @@ class WebullAdapter:
                 }
 
             is_flat = (len(pos_details) == 0)
+
+            # Reconcile total equity with live positions so 1-poll lag
+            # between balance & position endpoints never spikes Realized PnL
+            if cash_bal is not None and cash_bal > 0:
+                adj_eq = round(cash_bal + total_pos_mkt_val, 2)
+            else:
+                adj_eq = round(raw_eq, 2)
+
             return (
-                raw_eq,
+                adj_eq,
                 is_flat,
                 round(total_open_pnl, 2),
                 pos_details,
@@ -1030,6 +1121,10 @@ class WebullAdapter:
         except Exception as e:
             log_event("ERROR", f"Webull account fetch exception: {e}")
             return None, True, 0.0, {}, False
+
+
+def c_resp_code(res):
+    return getattr(res, "status_code", "OK")
 
 
 # ==========================================
@@ -1181,10 +1276,11 @@ def show_broker_setup_wizard(broker_name, parent=None):
         guide_txt = (
             "HOW TO GET YOUR WEBULL OPENAPI KEYS (One-Time Setup):\n"
             "1. Go to https://developer.webull.com (or Webull Web -> Account Management -> OpenAPI).\n"
-            "2. Apply for a Retail Trading API Key (usually approved in 1–2 business days).\n"
-            "3. Once approved, generate your App Key and App Secret in the Webull portal.\n"
-            "4. Paste your Webull App Key and App Secret below and click Save & Connect.\n"
-            "   (Your keys are stored strictly on your PC inside C:\\Users\\<You>\\enforcer_config.json)."
+            "2. Apply for a Retail Trading API Key (often approved within minutes).\n"
+            "3. Generate your App Key and App Secret in the Webull portal and paste them below.\n"
+            "4. ⚠️ IMPORTANT MOBILE 2FA STEP: On your first connection attempt, check your\n"
+            "   Webull Mobile App / SMS! Webull will push a notification asking you to enter\n"
+            "   a texted 2FA verification code to authorize OpenAPI access for your keys."
         )
         portal_url = "https://developer.webull.com"
 
@@ -1344,9 +1440,17 @@ def connect_broker_adapter(broker_name, parent=None, force_wizard=False):
         return adapter
     except Exception as e:
         log_event("ERROR", f"{broker_name} connection error: {e}")
+        extra_hint = (
+            "\n\n⚠️ NOTE FOR WEBULL USERS:\n"
+            "1. Check your Webull mobile app / SMS! Webull sends a 2FA code prompt "
+            "the first time your API keys are used.\n"
+            "2. Once you approve the 2FA code in your Webull app, click 'No' below "
+            "and relaunch, or click 'Yes' to verify your keys."
+            if broker_name == "WEBULL" else ""
+        )
         retry = messagebox.askyesno(
             f"{broker_name} Connection Error",
-            f"Could not authenticate with {broker_name}:\n\n{e}\n\n"
+            f"Could not authenticate with {broker_name}:\n\n{e}{extra_hint}\n\n"
             f"Would you like to re-enter your {broker_name} API keys?",
             parent=parent
         )
@@ -1580,8 +1684,6 @@ def flatten_equities(adapter, force_flatten=False):
 def trigger_open_pnl_flatten(
     adapter, reason, ui_button, has_options=False, context_str=""
 ):
-    """Flattens open equities on Open PnL breach. If options are open,
-    sounds alarm and waits until options are manually closed before OS lock."""
     global alarm_active
     cd_on = config.get("enable_open_cooldown", False)
 
@@ -1760,7 +1862,8 @@ def log_position_transitions(
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global start_equity, max_equity, daily_max_equity, last_flat_equity
     global has_reset_at_open, is_locked_down, force_reanchor
-    global triggered_alarms, prev_pos_snapshot, current_is_flat, active_adapter
+    global triggered_alarms, prev_pos_snapshot, current_is_flat
+    global active_adapter, first_poll_of_launch
 
     while True:
         poll_sec = max(1, int(config.get("poll_interval", 2)))
@@ -1773,10 +1876,14 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 active_adapter.fetch_account_data()
             )
 
-            if current_eq is not None:
+            if current_eq is not None and current_eq > 0:
                 current_is_flat = is_flat
 
-                if start_equity is None or force_reanchor:
+                if (
+                    start_equity is None
+                    or start_equity <= 0.0
+                    or force_reanchor
+                ):
                     start_equity = current_eq
                     max_equity = current_eq
                     daily_max_equity = current_eq
@@ -1863,6 +1970,24 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 t3_max = config["t3_max_loss"]
                 t4_trig = config["t4_trigger"]
                 t4_trail = config["t4_trail"]
+
+                # Prevent immediate siren blast on startup when resuming a
+                # session while flat and already sitting below a warning level
+                if first_poll_of_launch and is_flat:
+                    first_poll_of_launch = False
+                    if net_pnl <= -pm_w1:
+                        triggered_alarms[f"Pre-market -${pm_w1:,.0f} Warn 1"] = time.time()
+                    if net_pnl <= -pm_w2:
+                        triggered_alarms[f"Pre-market -${pm_w2:,.0f} Warn 2"] = time.time()
+                    if current_eq <= start_equity:
+                        triggered_alarms["Hit $0 (Tier 2)"] = time.time()
+                        triggered_alarms["Hit $0 (Tier 3)"] = time.time()
+                    if current_eq <= (start_equity - t1_w1):
+                        triggered_alarms[f"Hit -${t1_w1:,.0f} (Tier 1)"] = time.time()
+                    if current_eq <= (start_equity - t1_w2):
+                        triggered_alarms[f"Hit -${t1_w2:,.0f} (Tier 1)"] = time.time()
+                else:
+                    first_poll_of_launch = False
 
                 ctx = (
                     f"Realized={format_dollar(realized_pnl)}, "
@@ -2635,7 +2760,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     lbl_daily_lock_mins.pack(side="right", padx=(16, 8))
 
     # --- CARD 3: SESSION & SYSTEM SETTINGS ---
-    if start_equity is not None:
+    if start_equity is not None and start_equity > 0:
         base_sub = f"Active Baseline: ${start_equity:,.2f} (Preserved across restarts)"
     else:
         base_sub = "Baseline will anchor automatically on first API poll."
