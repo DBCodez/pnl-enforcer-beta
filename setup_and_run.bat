@@ -25,7 +25,7 @@ if %errorlevel% neq 0 (
 python -c "import webull" >nul 2>&1
 if %errorlevel% neq 0 (
     echo Installing webull-openapi-python-sdk...
-    pip install --upgrade webull-openapi-python-sdk
+    pip install --upgrade --ignore-requires-python webull-openapi-python-sdk
 )
 
 echo Launching PnL Enforcer...
