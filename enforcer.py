@@ -697,11 +697,15 @@ class WebullAdapter:
         self._logged_balance_keys = False
 
     def authenticate(self):
+        logging.getLogger("webull").setLevel(logging.ERROR)
         from webull.core.client import ApiClient
         from webull.trade.trade_client import TradeClient
         self.api_client = ApiClient(self.app_key, self.app_secret, "us")
         self.api_client.add_endpoint("us", "api.webull.com")
-        self.trade_client = TradeClient(self.api_client)
+        wb_token_dir = os.path.join(USER_HOME, ".webull_enforcer_token")
+        self.trade_client = TradeClient(
+            self.api_client, token_dir=wb_token_dir
+        )
         try:
             from webull.data.data_client import DataClient
             self.data_client = DataClient(self.api_client)
