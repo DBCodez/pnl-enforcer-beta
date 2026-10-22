@@ -3187,9 +3187,18 @@ if __name__ == "__main__":
 
         load_config()
         initial_broker = config.get("active_broker", "SCHWAB")
+        
+        # Try connecting to the active broker; if it fails, fallback to SCHWAB safely
         active_adapter = connect_broker_adapter(initial_broker)
+        if active_adapter is None and initial_broker != "SCHWAB":
+            print("\n[WARNING] Active broker failed to connect. Falling back to SCHWAB...")
+            log_event("SESSION", f"Broker {initial_broker} failed startup. Reverting active broker to SCHWAB.")
+            config["active_broker"] = "SCHWAB"
+            save_config(config)
+            active_adapter = connect_broker_adapter("SCHWAB")
+
         if active_adapter is None:
-            log_event("SESSION", "Broker setup canceled. Exiting.")
+            log_event("SESSION", "Broker setup canceled or failed. Exiting.")
             sys.exit(0)
 
         if show_preflight_window():
