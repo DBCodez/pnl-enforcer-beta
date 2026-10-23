@@ -1654,6 +1654,17 @@ def mute_alarm(ui_button):
         )
 
 
+def play_unlock_chimes():
+    """Plays 3 pleasant ascending musical chimes (C5 -> E5 -> G5)
+    when the OS Cool-Down Lock timer expires."""
+    try:
+        for freq, dur in ((523, 180), (659, 180), (784, 320)):
+            winsound.Beep(freq, dur)
+            time.sleep(0.06)
+    except Exception:
+        pass
+
+
 def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK"):
     global cooldown_active, alarm_active
     if cooldown_active:
@@ -1702,6 +1713,7 @@ def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK")
                 state="disabled"
             )
         )
+        play_unlock_chimes()
 
     threading.Thread(target=cooldown_worker, daemon=True).start()
 
