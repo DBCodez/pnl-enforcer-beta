@@ -58,6 +58,7 @@ DEFAULT_CONFIG = {
         }
     },
     "account_sessions": {},
+    "user_defaults": {},
     "enable_auto_flatten": False,
     "enable_kill_tos": False,
     "enable_kill_webull": False,
@@ -302,12 +303,15 @@ def load_config(log_restore=False):
                 saved = json.load(f)
                 saved_brokers = saved.pop("brokers", {})
                 saved_sessions = saved.pop("account_sessions", {})
+                saved_user_defs = saved.pop("user_defaults", {})
                 config.update(saved)
                 for b_name in ("SCHWAB", "WEBULL"):
                     if b_name in saved_brokers:
                         config["brokers"][b_name].update(saved_brokers[b_name])
                 if isinstance(saved_sessions, dict):
                     config["account_sessions"].update(saved_sessions)
+                if isinstance(saved_user_defs, dict):
+                    config["user_defaults"] = saved_user_defs
         except Exception as e:
             print(f"Could not load saved config: {e}")
 
@@ -2021,6 +2025,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     has_reset_at_open = True
                     is_locked_down = False
                     triggered_alarms.clear()
+                    first_poll_of_launch = True
                     save_session_state()
                     log_event(
                         "SESSION",
@@ -2081,8 +2086,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 t4_trig = config["t4_trigger"]
                 t4_trail = config["t4_trail"]
 
-                # Prevent immediate siren blast on startup when resuming a
-                # session while flat and already sitting below a warning level
+                # Prevent immediate siren blast or flat re-lock on startup,
+                # at the 9:25 AM transition, or right after saving Settings
                 if first_poll_of_launch and is_flat:
                     first_poll_of_launch = False
                     if net_pnl <= -pm_w1:
@@ -2096,6 +2101,16 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         triggered_alarms[f"Hit -${t1_w1:,.0f} (Tier 1)"] = time.time()
                     if current_eq <= (start_equity - t1_w2):
                         triggered_alarms[f"Hit -${t1_w2:,.0f} (Tier 1)"] = time.time()
+                    active_floor = (
+                        (max_equity - pm_trail if max_realized_profit >= pm_trig else start_equity - pm_max)
+                        if not is_rth() else
+                        (max_equity - t4_trail if max_realized_profit >= t4_trig else
+                         start_equity - t3_max if max_realized_profit >= t3_trig else
+                         start_equity - t2_max if max_realized_profit >= t2_trig else
+                         start_equity - t1_max)
+                    )
+                    if current_eq <= active_floor:
+                        is_locked_down = True
                 else:
                     first_poll_of_launch = False
 
@@ -2596,23 +2611,43 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     def restore_factory_defaults():
         src = config.get("user_defaults") or DEFAULT_CONFIG
-        var_open_flat.set(src.get("enable_open_flatten", DEFAULT_CONFIG["enable_open_flatten"]))
-        var_open_cd.set(src.get("enable_open_cooldown", DEFAULT_CONFIG["enable_open_cooldown"]))
-        var_cd_mins.set(f"{src.get('open_cooldown_mins', DEFAULT_CONFIG['open_cooldown_mins']):g}")
-        var_flatten.set(src.get("enable_auto_flatten", DEFAULT_CONFIG["enable_auto_flatten"]))
-        var_kill_tos.set(src.get("enable_kill_tos", DEFAULT_CONFIG["enable_kill_tos"]))
-        var_kill_wb.set(src.get("enable_kill_webull", DEFAULT_CONFIG["enable_kill_webull"]))
-        var_lock_os.set(src.get("enable_lock_os", DEFAULT_CONFIG["enable_lock_os"]))
-        var_daily_lock_mins.set(f"{src.get('daily_lock_mins', DEFAULT_CONFIG['daily_lock_mins']):g}")
-        var_reset925.set(src.get("reset_at_925", DEFAULT_CONFIG["reset_at_925"]))
+        var_open_flat.set(
+            src.get("enable_open_flatten", DEFAULT_CONFIG["enable_open_flatten"])
+        )
+        var_open_cd.set(
+            src.get("enable_open_cooldown", DEFAULT_CONFIG["enable_open_cooldown"])
+        )
+        var_cd_mins.set(
+            f"{src.get('open_cooldown_mins', DEFAULT_CONFIG['open_cooldown_mins']):g}"
+        )
+        var_flatten.set(
+            src.get("enable_auto_flatten", DEFAULT_CONFIG["enable_auto_flatten"])
+        )
+        var_kill_tos.set(
+            src.get("enable_kill_tos", DEFAULT_CONFIG["enable_kill_tos"])
+        )
+        var_kill_wb.set(
+            src.get("enable_kill_webull", DEFAULT_CONFIG["enable_kill_webull"])
+        )
+        var_lock_os.set(
+            src.get("enable_lock_os", DEFAULT_CONFIG["enable_lock_os"])
+        )
+        var_daily_lock_mins.set(
+            f"{src.get('daily_lock_mins', DEFAULT_CONFIG['daily_lock_mins']):g}"
+        )
+        var_reset925.set(
+            src.get("reset_at_925", DEFAULT_CONFIG["reset_at_925"])
+        )
         var_reanchor.set(False)
-        var_poll.set(str(int(src.get("poll_interval", DEFAULT_CONFIG["poll_interval"]))))
+        var_poll.set(
+            str(int(src.get("poll_interval", DEFAULT_CONFIG["poll_interval"])))
+        )
         apply_dollar_preset(src)
         refresh_smart_dimming()
         if default_status_lbl is not None:
             msg = (
                 "↺ Restored your saved defaults."
-                if "user_defaults" in config
+                if config.get("user_defaults")
                 else "↺ Restored factory defaults."
             )
             default_status_lbl.config(text=msg, fg="#5dade2")
@@ -2650,7 +2685,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             )
 
     def save_and_launch():
-        global settings_win_open, triggered_alarms
+        global settings_win_open, triggered_alarms, first_poll_of_launch
         global force_reanchor, is_locked_down, current_is_flat, active_adapter
 
         if parent is not None and not current_is_flat:
@@ -2712,6 +2747,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 new_cfg[k] = abs(float(dollar_vars[k].get()))
 
             is_locked_down = False
+            first_poll_of_launch = True
 
             if var_reanchor.get():
                 force_reanchor = True
@@ -3232,7 +3268,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     init_def_txt = (
         "Custom defaults saved ✓"
-        if "user_defaults" in config
+        if config.get("user_defaults")
         else "No custom default saved yet"
     )
     default_status_lbl = tk.Label(
