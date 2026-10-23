@@ -20,16 +20,24 @@ import logging
 import subprocess
 from datetime import datetime, time as dt_time
 
-logging.basicConfig(level=logging.INFO)
-
 # ==========================================
 # 1. DYNAMIC USER PATHS (NO HARDCODED KEYS)
 # ==========================================
 USER_HOME = os.path.expanduser("~")
+# Keep working directory in USER_HOME so Webull SDK stores conf/token.txt
+# safely in C:\Users\<Username>\conf\ instead of inside the repo folder.
+try:
+    os.chdir(USER_HOME)
+except Exception:
+    pass
+
 SCHWAB_TOKEN_PATH = os.path.join(USER_HOME, "schwab_token.json")
 CONFIG_PATH = os.path.join(USER_HOME, "enforcer_config.json")
 LOG_PATH = os.path.join(USER_HOME, "enforcer_log.txt")
 CALLBACK_URL = "https://127.0.0.1"
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("webull").setLevel(logging.ERROR)
 
 # ==========================================
 # 2. DEFAULT CONFIGURATION
@@ -49,6 +57,7 @@ DEFAULT_CONFIG = {
             "selected_account_id": ""
         }
     },
+    "account_sessions": {},
     "enable_auto_flatten": False,
     "enable_kill_tos": False,
     "enable_kill_webull": False,
@@ -132,6 +141,12 @@ def get_today_str():
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def get_session_key(broker_name, account_id):
+    if not broker_name or not account_id:
+        return ""
+    return f"{broker_name}_{account_id}"
+
+
 def format_dollar(val):
     rounded = round(val, 2)
     if rounded > 0:
@@ -204,31 +219,53 @@ def format_config_summary(cfg):
     )
 
 
-def load_config():
-    global config, start_equity, max_equity
-    global daily_max_equity, last_flat_equity, has_reset_at_open
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-                saved_brokers = saved.pop("brokers", {})
-                config.update(saved)
-                for b_name in ("SCHWAB", "WEBULL"):
-                    if b_name in saved_brokers:
-                        config["brokers"][b_name].update(saved_brokers[b_name])
-        except Exception as e:
-            print(f"Could not load saved config: {e}")
+def restore_account_session(broker_name, account_id, log_restore=False):
+    """Restores today's saved baseline for a specific broker + account_id.
+    Returns True if a valid baseline for today was found, False otherwise."""
+    global start_equity, max_equity, daily_max_equity
+    global last_flat_equity, has_reset_at_open
 
-    active_b = config.get("active_broker", "SCHWAB")
-    sel_acct = config["brokers"].get(active_b, {}).get("selected_account_id", "")
+    today_str = get_today_str()
+    s_key = get_session_key(broker_name, account_id)
+    acct_sessions = config.get("account_sessions", {})
+
+    if s_key and s_key in acct_sessions:
+        s_data = acct_sessions[s_key]
+        s_start = s_data.get("start_equity")
+        if (
+            s_data.get("session_date") == today_str
+            and s_start is not None
+            and float(s_start) > 0.0
+        ):
+            start_equity = float(s_start)
+            max_equity = float(s_data.get("max_equity") or start_equity)
+            daily_max_equity = float(
+                s_data.get("daily_max_equity") or max_equity
+            )
+            last_flat_equity = float(
+                s_data.get("last_flat_equity") or start_equity
+            )
+            has_reset_at_open = bool(
+                s_data.get("has_reset_at_open", False)
+            )
+            if log_restore:
+                log_event(
+                    "SESSION",
+                    f"Restored {broker_name} baseline from memory: "
+                    f"Start=${start_equity:,.2f} | "
+                    f"LastFlat=${last_flat_equity:,.2f} | "
+                    f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)}"
+                )
+            return True
+
+    # Backward-compatible check for legacy top-level saved session fields
     saved_start = config.get("saved_start_equity")
-
     if (
-        config.get("session_date") == get_today_str()
+        config.get("session_date") == today_str
         and saved_start is not None
         and float(saved_start) > 0.0
-        and config.get("saved_account_id") in ("", sel_acct)
-        and start_equity is None
+        and config.get("saved_account_id") == account_id
+        and account_id != ""
     ):
         start_equity = float(saved_start)
         max_equity = float(config.get("saved_max_equity") or start_equity)
@@ -239,13 +276,47 @@ def load_config():
             config.get("saved_last_flat_equity") or start_equity
         )
         has_reset_at_open = bool(config.get("saved_has_reset_at_open", False))
-        log_event(
-            "SESSION",
-            f"Restored today's baseline from memory: "
-            f"Start=${start_equity:,.2f} | "
-            f"LastFlat=${last_flat_equity:,.2f} | "
-            f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)}"
-        )
+        if log_restore:
+            log_event(
+                "SESSION",
+                f"Restored {broker_name} baseline from memory: "
+                f"Start=${start_equity:,.2f} | "
+                f"LastFlat=${last_flat_equity:,.2f} | "
+                f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)}"
+            )
+        return True
+
+    start_equity = None
+    max_equity = None
+    daily_max_equity = None
+    last_flat_equity = None
+    has_reset_at_open = False
+    return False
+
+
+def load_config(log_restore=False):
+    global config
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                saved_brokers = saved.pop("brokers", {})
+                saved_sessions = saved.pop("account_sessions", {})
+                config.update(saved)
+                for b_name in ("SCHWAB", "WEBULL"):
+                    if b_name in saved_brokers:
+                        config["brokers"][b_name].update(saved_brokers[b_name])
+                if isinstance(saved_sessions, dict):
+                    config["account_sessions"].update(saved_sessions)
+        except Exception as e:
+            print(f"Could not load saved config: {e}")
+
+    active_b = config.get("active_broker", "SCHWAB")
+    sel_acct = (
+        config["brokers"].get(active_b, {}).get("selected_account_id", "")
+    )
+    if start_equity is None and sel_acct:
+        restore_account_session(active_b, sel_acct, log_restore=log_restore)
 
 
 def save_config(new_cfg):
@@ -260,10 +331,36 @@ def save_config(new_cfg):
 
 def save_session_state():
     today_str = get_today_str()
-    active_b = config.get("active_broker", "SCHWAB")
-    sel_acct = config["brokers"].get(active_b, {}).get("selected_account_id", "")
+    active_b = (
+        active_adapter.name
+        if active_adapter is not None
+        else config.get("active_broker", "SCHWAB")
+    )
+    sel_acct = (
+        active_adapter.account_id
+        if active_adapter is not None and active_adapter.account_id
+        else config["brokers"].get(active_b, {}).get("selected_account_id", "")
+    )
+    s_key = get_session_key(active_b, sel_acct)
+
+    if "account_sessions" not in config or not isinstance(
+        config["account_sessions"], dict
+    ):
+        config["account_sessions"] = {}
+
+    new_entry = {
+        "session_date": today_str,
+        "start_equity": start_equity,
+        "max_equity": max_equity,
+        "daily_max_equity": daily_max_equity,
+        "last_flat_equity": last_flat_equity,
+        "has_reset_at_open": has_reset_at_open
+    }
+
+    old_entry = config["account_sessions"].get(s_key)
     changed = (
-        config.get("session_date") != today_str
+        old_entry != new_entry
+        or config.get("session_date") != today_str
         or config.get("saved_start_equity") != start_equity
         or config.get("saved_max_equity") != max_equity
         or config.get("saved_daily_max_equity") != daily_max_equity
@@ -272,6 +369,8 @@ def save_session_state():
         or config.get("saved_account_id") != sel_acct
     )
     if changed:
+        if s_key:
+            config["account_sessions"][s_key] = new_entry
         config["session_date"] = today_str
         config["saved_start_equity"] = start_equity
         config["saved_max_equity"] = max_equity
@@ -694,7 +793,7 @@ class WebullAdapter:
         self.data_client = None
         self.account_id = None
         self.accounts = []
-        self._logged_balance_keys = False
+        self._logged_accounts = set()
 
     def authenticate(self):
         logging.getLogger("webull").setLevel(logging.ERROR)
@@ -1024,8 +1123,8 @@ class WebullAdapter:
             )
 
             raw_eq, cash_bal = self._extract_webull_equity_and_cash(b_data)
-            if not self._logged_balance_keys:
-                self._logged_balance_keys = True
+            if self.account_id not in self._logged_accounts:
+                self._logged_accounts.add(self.account_id)
                 log_event(
                     "SESSION",
                     f"Webull Balance Parsed -> TotalAccountValue=${raw_eq:,.2f} "
@@ -1105,8 +1204,6 @@ class WebullAdapter:
 
             is_flat = (len(pos_details) == 0)
 
-            # Reconcile total equity with live positions so 1-poll lag
-            # between balance & position endpoints never spikes Realized PnL
             if cash_bal is not None and cash_bal > 0:
                 adj_eq = round(cash_bal + total_pos_mkt_val, 2)
             else:
@@ -1280,8 +1377,8 @@ def show_broker_setup_wizard(broker_name, parent=None):
             "2. Apply for a Retail Trading API Key (often approved within minutes).\n"
             "3. Generate your App Key and App Secret in the Webull portal and paste them below.\n"
             "4. ⚠️ IMPORTANT MOBILE 2FA STEP: On your first connection attempt, check your\n"
-            "   Webull Mobile App / SMS! Webull will push a notification asking you to enter\n"
-            "   a texted 2FA verification code to authorize OpenAPI access for your keys."
+            "   Webull Mobile App / SMS! Webull may push a notification asking you to enter\n"
+            "   a texted 2FA verification code (unless 2FA is disabled in your OpenAPI portal)."
         )
         portal_url = "https://developer.webull.com"
 
@@ -1443,10 +1540,10 @@ def connect_broker_adapter(broker_name, parent=None, force_wizard=False):
         log_event("ERROR", f"{broker_name} connection error: {e}")
         extra_hint = (
             "\n\n⚠️ NOTE FOR WEBULL USERS:\n"
-            "1. Check your Webull mobile app / SMS! Webull sends a 2FA code prompt "
+            "1. Check your Webull mobile app / SMS! Webull may send a 2FA code prompt "
             "the first time your API keys are used.\n"
-            "2. Once you approve the 2FA code in your Webull app, click 'No' below "
-            "and relaunch, or click 'Yes' to verify your keys."
+            "2. Once you approve the 2FA code (or disable API 2FA in Webull portal), "
+            "click 'No' to open Pre-Flight settings or 'Yes' to re-enter keys."
             if broker_name == "WEBULL" else ""
         )
         retry = messagebox.askyesno(
@@ -1488,8 +1585,8 @@ def get_idle_button_text():
         )
 
     if len(active_modes) == 1:
-        return f"[{b_name}] ALARMS CLEAR  |  MODE: ALARM ONLY (OBSERVATION)"
-    return "ALARMS CLEAR  |  ARMED: " + " + ".join(active_modes)
+        return f"[{b_name}] MODE: ALARM ONLY (OBSERVATION)"
+    return "ARMED: " + " + ".join(active_modes)
 
 
 def sound_alarm_loop():
@@ -2213,7 +2310,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 # ==========================================
 def show_preflight_window(parent=None, mute_btn=None):
     global settings_win_open, triggered_alarms
-    global force_reanchor, is_locked_down, current_is_flat, active_adapter
+    global force_reanchor, is_locked_down, current_is_flat
+    global active_adapter, start_equity
 
     if parent is not None:
         if settings_win_open:
@@ -2251,6 +2349,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     var_broker = tk.StringVar(value=config.get("active_broker", "SCHWAB"))
     var_account_label = tk.StringVar(value="")
     account_label_to_id = {}
+    base_sub_lbl = None
 
     var_open_flat = tk.BooleanVar(
         value=config.get("enable_open_flatten", False)
@@ -2287,6 +2386,40 @@ def show_preflight_window(parent=None, mute_btn=None):
         k: tk.StringVar(value=f"{config.get(k, DEFAULT_CONFIG[k]):.0f}")
         for k in dollar_keys
     }
+
+    def refresh_baseline_preview():
+        """Updates the Active Baseline label in Card 3 to match the
+        currently selected Broker + Account."""
+        global start_equity, force_reanchor
+        if base_sub_lbl is None:
+            return
+        if active_adapter is None or not active_adapter.account_id:
+            base_sub_lbl.config(
+                text="No broker connected — click API Keys or select broker above."
+            )
+            return
+
+        b_name = active_adapter.name
+        acct_id = active_adapter.account_id
+        had_saved = restore_account_session(b_name, acct_id, log_restore=False)
+
+        if had_saved and start_equity is not None and start_equity > 0:
+            force_reanchor = False
+            base_sub_lbl.config(
+                text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Preserved across restarts)"
+            )
+        else:
+            eq, _, _, _, _ = active_adapter.fetch_account_data()
+            if eq is not None and eq > 0:
+                start_equity = eq
+                force_reanchor = True
+                base_sub_lbl.config(
+                    text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Live account equity)"
+                )
+            else:
+                base_sub_lbl.config(
+                    text=f"Active Baseline ({b_name}): Will anchor on first API poll."
+                )
 
     # --- TOP BAR: BROKER & ACCOUNT SELECTOR + PRESETS ---
     top_bar = tk.Frame(
@@ -2343,6 +2476,15 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     acct_menu.pack(side="left", padx=(0, 8))
 
+    def on_account_select(chosen_lbl):
+        var_account_label.set(chosen_lbl)
+        if active_adapter is not None:
+            chosen_id = account_label_to_id.get(chosen_lbl)
+            if chosen_id and chosen_id != active_adapter.account_id:
+                active_adapter.account_id = chosen_id
+                config["brokers"][active_adapter.name]["selected_account_id"] = chosen_id
+                refresh_baseline_preview()
+
     def populate_account_dropdown():
         account_label_to_id.clear()
         menu = acct_menu["menu"]
@@ -2355,7 +2497,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 account_label_to_id[lbl] = aid
                 menu.add_command(
                     label=lbl,
-                    command=lambda v=lbl: var_account_label.set(v)
+                    command=lambda v=lbl: on_account_select(v)
                 )
                 if aid == active_adapter.account_id:
                     selected_lbl = lbl
@@ -2364,15 +2506,15 @@ def show_preflight_window(parent=None, mute_btn=None):
             var_account_label.set("No Account Connected")
 
     def on_broker_change(*_):
-        global active_adapter, force_reanchor
+        global active_adapter
         chosen = var_broker.get()
         if active_adapter is None or active_adapter.name != chosen:
             new_ad = connect_broker_adapter(chosen, parent=pf, force_wizard=False)
             if new_ad is not None:
                 active_adapter = new_ad
                 config["active_broker"] = chosen
-                force_reanchor = True
                 populate_account_dropdown()
+                refresh_baseline_preview()
             else:
                 if active_adapter is not None:
                     var_broker.set(active_adapter.name)
@@ -2383,7 +2525,9 @@ def show_preflight_window(parent=None, mute_btn=None):
         new_ad = connect_broker_adapter(chosen, parent=pf, force_wizard=True)
         if new_ad is not None:
             active_adapter = new_ad
+            config["active_broker"] = chosen
             populate_account_dropdown()
+            refresh_baseline_preview()
 
     tk.Button(
         top_bar,
@@ -2423,7 +2567,9 @@ def show_preflight_window(parent=None, mute_btn=None):
         fg="white",
         padx=10,
         pady=3,
-        command=lambda: apply_dollar_preset(DEFAULT_CONFIG)
+        command=lambda: apply_dollar_preset(
+            config.get("user_defaults") or DEFAULT_CONFIG
+        )
     ).pack(side="right", padx=4)
 
     tk.Label(
@@ -2434,20 +2580,62 @@ def show_preflight_window(parent=None, mute_btn=None):
         bg="#1c1c1c"
     ).pack(side="right", padx=(8, 4))
 
+    default_status_lbl = None
+
     def restore_factory_defaults():
-        var_open_flat.set(DEFAULT_CONFIG["enable_open_flatten"])
-        var_open_cd.set(DEFAULT_CONFIG["enable_open_cooldown"])
-        var_cd_mins.set(f"{DEFAULT_CONFIG['open_cooldown_mins']:g}")
-        var_flatten.set(DEFAULT_CONFIG["enable_auto_flatten"])
-        var_kill_tos.set(DEFAULT_CONFIG["enable_kill_tos"])
-        var_kill_wb.set(DEFAULT_CONFIG["enable_kill_webull"])
-        var_lock_os.set(DEFAULT_CONFIG["enable_lock_os"])
-        var_daily_lock_mins.set(f"{DEFAULT_CONFIG['daily_lock_mins']:g}")
-        var_reset925.set(DEFAULT_CONFIG["reset_at_925"])
+        src = config.get("user_defaults") or DEFAULT_CONFIG
+        var_open_flat.set(src.get("enable_open_flatten", DEFAULT_CONFIG["enable_open_flatten"]))
+        var_open_cd.set(src.get("enable_open_cooldown", DEFAULT_CONFIG["enable_open_cooldown"]))
+        var_cd_mins.set(f"{src.get('open_cooldown_mins', DEFAULT_CONFIG['open_cooldown_mins']):g}")
+        var_flatten.set(src.get("enable_auto_flatten", DEFAULT_CONFIG["enable_auto_flatten"]))
+        var_kill_tos.set(src.get("enable_kill_tos", DEFAULT_CONFIG["enable_kill_tos"]))
+        var_kill_wb.set(src.get("enable_kill_webull", DEFAULT_CONFIG["enable_kill_webull"]))
+        var_lock_os.set(src.get("enable_lock_os", DEFAULT_CONFIG["enable_lock_os"]))
+        var_daily_lock_mins.set(f"{src.get('daily_lock_mins', DEFAULT_CONFIG['daily_lock_mins']):g}")
+        var_reset925.set(src.get("reset_at_925", DEFAULT_CONFIG["reset_at_925"]))
         var_reanchor.set(False)
-        var_poll.set(str(int(DEFAULT_CONFIG["poll_interval"])))
-        apply_dollar_preset(DEFAULT_CONFIG)
+        var_poll.set(str(int(src.get("poll_interval", DEFAULT_CONFIG["poll_interval"]))))
+        apply_dollar_preset(src)
         refresh_smart_dimming()
+        if default_status_lbl is not None:
+            msg = (
+                "↺ Restored your saved defaults."
+                if "user_defaults" in config
+                else "↺ Restored factory defaults."
+            )
+            default_status_lbl.config(text=msg, fg="#5dade2")
+
+    def save_as_user_defaults():
+        try:
+            custom_def = {
+                "enable_open_flatten": bool(var_open_flat.get()),
+                "enable_open_cooldown": bool(var_open_cd.get()),
+                "open_cooldown_mins": max(0.1, abs(float(var_cd_mins.get()))),
+                "enable_auto_flatten": bool(var_flatten.get()),
+                "enable_kill_tos": bool(var_kill_tos.get()),
+                "enable_kill_webull": bool(var_kill_wb.get()),
+                "enable_lock_os": bool(var_lock_os.get()),
+                "daily_lock_mins": max(0.0, abs(float(var_daily_lock_mins.get()))),
+                "reset_at_925": bool(var_reset925.get()),
+                "poll_interval": max(1, int(float(var_poll.get())))
+            }
+            for k in dollar_keys:
+                custom_def[k] = abs(float(dollar_vars[k].get()))
+
+            config["user_defaults"] = custom_def
+            save_config(config)
+            log_event("CONFIG", "Saved current Pre-Flight settings as User Defaults.")
+            if default_status_lbl is not None:
+                default_status_lbl.config(
+                    text="✓ Saved as your Default! ('Restore Defaults' will return to these values)",
+                    fg="#58d68d"
+                )
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Input",
+                "Please ensure all fields contain valid numbers before saving defaults.",
+                parent=pf
+            )
 
     def save_and_launch():
         global settings_win_open, triggered_alarms
@@ -2483,12 +2671,14 @@ def show_preflight_window(parent=None, mute_btn=None):
             chosen_id = account_label_to_id.get(
                 chosen_lbl, active_adapter.account_id
             )
-            prev_id = new_cfg["brokers"][chosen_b].get(
-                "selected_account_id", ""
-            )
-            if chosen_id and chosen_id != prev_id:
+            if chosen_id:
                 active_adapter.account_id = chosen_id
                 new_cfg["brokers"][chosen_b]["selected_account_id"] = chosen_id
+
+            had_saved = restore_account_session(
+                chosen_b, active_adapter.account_id, log_restore=False
+            )
+            if not had_saved:
                 force_reanchor = True
 
             new_cfg["enable_open_flatten"] = bool(var_open_flat.get())
@@ -2514,6 +2704,9 @@ def show_preflight_window(parent=None, mute_btn=None):
             if var_reanchor.get():
                 force_reanchor = True
                 triggered_alarms.clear()
+                s_key = get_session_key(chosen_b, active_adapter.account_id)
+                if s_key and s_key in new_cfg.get("account_sessions", {}):
+                    del new_cfg["account_sessions"][s_key]
                 new_cfg["saved_start_equity"] = None
                 new_cfg["saved_daily_max_equity"] = None
                 log_event("CONFIG", "User checked Force Re-Anchor Baseline.")
@@ -2760,19 +2953,30 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     lbl_daily_lock_mins.pack(side="right", padx=(16, 8))
 
-    # --- CARD 3: SESSION & SYSTEM SETTINGS ---
-    if start_equity is not None and start_equity > 0:
-        base_sub = f"Active Baseline: ${start_equity:,.2f} (Preserved across restarts)"
-    else:
-        base_sub = "Baseline will anchor automatically on first API poll."
-
-    c3 = make_card(
-        left_col,
-        "3. SESSION & SYSTEM SETTINGS",
-        base_sub,
-        accent="#58d68d",
-        expand=True
+    # --- CARD 3: SESSION & SYSTEM SETTINGS (WITH EXPLICIT BASELINE LABEL) ---
+    c3 = tk.Frame(
+        left_col, bg="#1b1b1b", bd=1, relief="solid", padx=18, pady=12
     )
+    c3.pack(fill="both", expand=True, pady=6)
+    tk.Label(
+        c3,
+        text="3. SESSION & SYSTEM SETTINGS",
+        font=("Arial", 11, "bold"),
+        fg="#58d68d",
+        bg="#1b1b1b",
+        anchor="w"
+    ).pack(fill="x")
+
+    base_sub_lbl = tk.Label(
+        c3,
+        text="Checking active broker baseline...",
+        font=("Arial", 9),
+        fg="#aaaaaa",
+        bg="#1b1b1b",
+        anchor="w"
+    )
+    base_sub_lbl.pack(fill="x", pady=(2, 8))
+    refresh_baseline_preview()
 
     tk.Checkbutton(
         c3,
@@ -3003,6 +3207,32 @@ def show_preflight_window(parent=None, mute_btn=None):
         command=restore_factory_defaults
     ).pack(side="left")
 
+    tk.Button(
+        btn_frame,
+        text="Save as Default",
+        font=("Arial", 10, "bold"),
+        bg="#2c3e50",
+        fg="#aed6f1",
+        padx=16,
+        pady=7,
+        command=save_as_user_defaults
+    ).pack(side="left", padx=(10, 14))
+
+    init_def_txt = (
+        "Custom defaults saved ✓"
+        if "user_defaults" in config
+        else "No custom default saved yet"
+    )
+    default_status_lbl = tk.Label(
+        btn_frame,
+        text=init_def_txt,
+        font=("Arial", 9, "bold"),
+        fg="#888888",
+        bg="#121212",
+        anchor="w"
+    )
+    default_status_lbl.pack(side="left")
+
     launch_txt = (
         "SAVE & LAUNCH ENFORCER >>"
         if parent is None else "SAVE & APPLY CHANGES >>"
@@ -3027,9 +3257,44 @@ def show_preflight_window(parent=None, mute_btn=None):
 # ==========================================
 # 9. 5-COLUMN HUD SETUP
 # ==========================================
+show_baseline_on_badge = False
+acct_badge_lbl = None
+
+
+def refresh_acct_badge():
+    """Updates the muted left account badge (FLAT vs BASE).
+    Uses last_flat_equity so it never ticks while in an open trade."""
+    if acct_badge_lbl is None:
+        return
+
+    if show_baseline_on_badge:
+        val = start_equity
+        prefix = "BASE"
+        fg_col = "#85929e"
+    else:
+        val = last_flat_equity if last_flat_equity is not None else start_equity
+        prefix = "FLAT"
+        fg_col = "#a6acaf"
+
+    if val is not None and val > 0:
+        txt = f"{prefix}: ${val:,.2f}"
+    else:
+        txt = f"{prefix}: ---"
+
+    acct_badge_lbl.config(text=txt, fg=fg_col)
+
+
+def toggle_acct_badge(event=None):
+    global show_baseline_on_badge
+    show_baseline_on_badge = not show_baseline_on_badge
+    refresh_acct_badge()
+
+
 def update_gui(ui_labels, col_data, is_flat, settings_btn, close_btn):
     for i, (text_val, bg_col) in enumerate(col_data):
         ui_labels[i].config(text=text_val, bg=bg_col)
+
+    refresh_acct_badge()
 
     if is_flat:
         settings_btn.config(
@@ -3053,6 +3318,7 @@ def update_gui(ui_labels, col_data, is_flat, settings_btn, close_btn):
 
 
 def start_gui():
+    global acct_badge_lbl
     root = tk.Tk()
     root.title("PnL Enforcer")
     root.overrideredirect(True)
@@ -3131,6 +3397,22 @@ def start_gui():
     bottom_bar = tk.Frame(root, bg="#1a1a1a")
     bottom_bar.pack(fill="x", side="bottom")
 
+    # Muted clickable Left Badge (Toggles between FLAT and BASE)
+    acct_badge_lbl = tk.Label(
+        bottom_bar,
+        text="FLAT: ---",
+        font=("Arial", 8, "bold"),
+        bg="#262626",
+        fg="#a6acaf",
+        padx=10,
+        bd=1,
+        relief="solid",
+        cursor="hand2"
+    )
+    acct_badge_lbl.pack(side="left", fill="y", padx=(1, 1))
+    acct_badge_lbl.bind("<Button-1>", toggle_acct_badge)
+    refresh_acct_badge()
+
     mute_btn = tk.Button(
         bottom_bar,
         text=get_idle_button_text(),
@@ -3173,7 +3455,7 @@ def start_gui():
 
 
 # ==========================================
-# 10. ENTRY POINT
+# 10. ENTRY POINT & SAFE FALLBACK
 # ==========================================
 if __name__ == "__main__":
     init_daily_log()
@@ -3185,22 +3467,29 @@ if __name__ == "__main__":
             log_event("SESSION", "Liability waiver declined. Exiting.")
             sys.exit(0)
 
-        load_config()
+        load_config(log_restore=True)
         initial_broker = config.get("active_broker", "SCHWAB")
-        
-        # Try connecting to the active broker; if it fails, fallback to SCHWAB safely
         active_adapter = connect_broker_adapter(initial_broker)
-        if active_adapter is None and initial_broker != "SCHWAB":
-            print("\n[WARNING] Active broker failed to connect. Falling back to SCHWAB...")
-            log_event("SESSION", f"Broker {initial_broker} failed startup. Reverting active broker to SCHWAB.")
-            config["active_broker"] = "SCHWAB"
-            save_config(config)
-            active_adapter = connect_broker_adapter("SCHWAB")
 
+        # Safe fallback: if the active broker failed to connect and the other
+        # broker already has saved credentials, switch to it automatically.
         if active_adapter is None:
-            log_event("SESSION", "Broker setup canceled or failed. Exiting.")
-            sys.exit(0)
+            fallback_broker = (
+                "SCHWAB" if initial_broker == "WEBULL" else "WEBULL"
+            )
+            fb_cfg = config.get("brokers", {}).get(fallback_broker, {})
+            if fb_cfg.get("app_key") and fb_cfg.get("app_secret"):
+                log_event(
+                    "SESSION",
+                    f"{initial_broker} connection failed. "
+                    f"Falling back to configured broker {fallback_broker}..."
+                )
+                config["active_broker"] = fallback_broker
+                save_config(config)
+                active_adapter = connect_broker_adapter(fallback_broker)
 
+        # Always open Pre-Flight even if active_adapter is None so the user
+        # is never locked out of the Broker dropdown or API Keys button.
         if show_preflight_window():
             log_event("SESSION", "Launching 5-Column HUD.")
             start_gui()
