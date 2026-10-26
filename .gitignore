@@ -1,0 +1,17 @@
+# Credentials & Local Configs (NEVER COMMIT)
+conf/
+*token*.json
+*token*.txt
+enforcer_config.json
+enforcer_log.txt
+*.log
+.env
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.spec
+build/
+dist/
+
