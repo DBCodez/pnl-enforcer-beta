@@ -39,4 +39,9 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
    * If Python is not already installed on your PC, `Launch_Enforcer.bat` will automatically install **Python 3.12** via Windows `winget` and configure your system `PATH` (click **Yes** if a Windows permission prompt appears).
    * It will then automatically install all required broker libraries (`schwab-py`, `webull-openapi-python-sdk`, and dependencies) and launch the Pre-Flight Setup Wizard.
 3. Accept the **Beta Liability Waiver**, select your broker (**Schwab** or **Webull**), and paste your **App Key** and **App Secret** into the first-time setup prompt.
-4. Choose which account you want to monitor from the **Account Dropdown** at the top of the Pre-Flight screen.
+4. **Schwab Browser Login Step (First Time & Every 7 Days):**
+   * If using **Schwab**, your web browser will open to the official Charles Schwab login page. Log in and approve account access.
+   * After you click approve, your browser will redirect to a blank **"This site can't be reached (`127.0.0.1`)"** page. **This is 100% normal!**
+   * Copy the **entire URL** from the top of your browser's address bar (starting with `https://127.0.0.1/?code=...`), paste it into the black terminal window, and press **Enter**.
+   * *(Note: Schwab security tokens last 7 days, so you will only need to repeat this quick copy-paste login once a week when your token expires.)*
+5. Choose which account you want to monitor from the **Account Dropdown** at the top of the Pre-Flight screen.
