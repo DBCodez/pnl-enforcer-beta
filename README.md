@@ -42,7 +42,7 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
 ---
 
 ## Step 3: Launch the App
-1. Double-click **`setup_and_run.bat`**.
+1. Double-click **`Launch_Enforcer.bat`**.
 2. The script will automatically install the required libraries (`schwab-py` and `webull-openapi-python-sdk`) and launch the Pre-Flight Setup Wizard.
 3. Accept the **Beta Liability Waiver**, select your broker (**Schwab** or **Webull**), and paste your **App Key** and **App Secret** into the first-time setup prompt.
 4. Choose which account you want to monitor from the **Account Dropdown** at the top of the Pre-Flight screen.
