@@ -128,6 +128,8 @@ first_poll_of_launch = True
 
 alarm_active = False
 cooldown_active = False
+cooldown_end_time = 0.0
+cooldown_label = "COOL-DOWN LOCK"
 triggered_alarms = {}
 ALARM_COOLDOWN_SEC = 180
 RECOVERY_BUFFER_DOLLARS = 150.0
@@ -1670,27 +1672,38 @@ def play_unlock_chimes():
 
 
 def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK"):
-    global cooldown_active, alarm_active
+    global cooldown_active, cooldown_end_time, cooldown_label, alarm_active
+    duration_sec = max(5, int(round(float(duration_mins) * 60)))
+    new_end_time = time.time() + duration_sec
+
     if cooldown_active:
+        if new_end_time > cooldown_end_time:
+            cooldown_end_time = new_end_time
+            cooldown_label = label_prefix
+            log_event(
+                "COOLDOWN",
+                f"Upgraded active lock to {label_prefix} for {duration_sec}s "
+                f"({duration_mins:g} min). Siren muted."
+            )
         return
 
-    duration_sec = max(5, int(round(float(duration_mins) * 60)))
     cooldown_active = True
+    cooldown_end_time = new_end_time
+    cooldown_label = label_prefix
     alarm_active = False
 
     def cooldown_worker():
-        global cooldown_active, alarm_active
-        end_time = time.time() + duration_sec
+        global cooldown_active, cooldown_end_time, cooldown_label, alarm_active
         log_event(
             "COOLDOWN",
-            f"Persistent {label_prefix} started for {duration_sec}s "
+            f"Persistent {cooldown_label} started for {duration_sec}s "
             f"({duration_mins:g} min). Siren muted."
         )
-        while time.time() < end_time:
+        while time.time() < cooldown_end_time:
             alarm_active = False
-            rem = int(round(end_time - time.time()))
+            rem = int(round(cooldown_end_time - time.time()))
             txt = (
-                f"{label_prefix} ACTIVE: {rem}s REMAINING "
+                f"{cooldown_label} ACTIVE: {rem}s REMAINING "
                 f"(DO NOT REVENGE TRADE)"
             )
             ui_button.after(
@@ -1706,7 +1719,7 @@ def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK")
         alarm_active = False
         log_event(
             "COOLDOWN",
-            f"{label_prefix} timer expired. Workstation unlocked."
+            f"{cooldown_label} timer expired. Workstation unlocked."
         )
         ui_button.after(
             0,
