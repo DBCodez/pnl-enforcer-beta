@@ -12,3 +12,4 @@
    - **Options:** Tracked for HUD PnL and warning sirens ONLY (100x multiplier). NEVER auto-flatten option contracts.
 3. **Per-Account Session Separation:** Daily baselines (`start_equity`, `max_equity`, `daily_max_equity`, `last_flat_equity`) are stored per broker + account ID inside `config["account_sessions"]`. Switching brokers must never cross-contaminate baselines.
 4. **Surgical Edits Only:** Do not delete existing RTH/Pre-Market tier rules, smart dimming callbacks (`refresh_smart_dimming`), or `[FLATTEN]` / `[GUARDRAIL]` audit log statements when making targeted edits.
+5. **Log Reviews — Strictly Technical & Code-Focused:** Do NOT comment on trading performance, PnL swings, or discretionary trading outcomes (e.g., no "great comeback" or commentary on wins/losses). Limit log analysis strictly to software behavior, API execution, guardrail/lockout mechanics, and actionable code improvements for `enforcer.py`.
