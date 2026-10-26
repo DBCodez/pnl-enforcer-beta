@@ -13,15 +13,7 @@ This software is **experimental beta software** provided strictly "AS IS." By in
 
 ---
 
-## Step 1: Install Python (One-Time Setup)
-1. Download and install **Python 3.10 – 3.13** for Windows from [python.org/downloads](https://www.python.org/downloads/).
-2. **CRITICAL:** On the very first installer screen, check the box at the bottom that says:
-   * ✅ **`Add python.exe to PATH`**
-3. Click **Install Now**.
-
----
-
-## Step 2: Get Your Broker API Keys (Schwab OR Webull)
+## Step 1: Get Your Broker API Keys (Schwab OR Webull)
 Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\enforcer_config.json`. Never share your App Key or App Secret with anyone.
 
 ### Option A: If Your Broker is Charles Schwab (Thinkorswim)
@@ -41,8 +33,10 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
 
 ---
 
-## Step 3: Launch the App
+## Step 2: Launch the App (Automatic One-Click Setup)
 1. Double-click **`Launch_Enforcer.bat`**.
-2. The script will automatically install the required libraries (`schwab-py` and `webull-openapi-python-sdk`) and launch the Pre-Flight Setup Wizard.
+2. **Automatic Python & Library Installation:**
+   * If Python is not already installed on your PC, `Launch_Enforcer.bat` will automatically install **Python 3.12** via Windows `winget` and configure your system `PATH` (click **Yes** if a Windows permission prompt appears).
+   * It will then automatically install all required broker libraries (`schwab-py`, `webull-openapi-python-sdk`, and dependencies) and launch the Pre-Flight Setup Wizard.
 3. Accept the **Beta Liability Waiver**, select your broker (**Schwab** or **Webull**), and paste your **App Key** and **App Secret** into the first-time setup prompt.
 4. Choose which account you want to monitor from the **Account Dropdown** at the top of the Pre-Flight screen.
