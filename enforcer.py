@@ -130,6 +130,7 @@ alarm_active = False
 cooldown_active = False
 cooldown_end_time = 0.0
 cooldown_label = "COOL-DOWN LOCK"
+cooldown_30s_announced = False
 triggered_alarms = {}
 ALARM_COOLDOWN_SEC = 180
 RECOVERY_BUFFER_DOLLARS = 150.0
@@ -1671,8 +1672,38 @@ def play_unlock_chimes():
         pass
 
 
+def speak_async(text):
+    """Speaks text asynchronously using Windows built-in SAPI speech synthesizer."""
+    try:
+        safe_text = str(text).replace("'", "")
+        ps_cmd = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$s.Speak('{safe_text}')"
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def _format_lock_voice_msg(duration_mins, label_prefix, upgraded=False):
+    mins_val = float(duration_mins)
+    dur_words = "1 minute" if mins_val == 1.0 else f"{mins_val:g} minutes"
+    is_daily = "DAILY" in str(label_prefix).upper()
+    if upgraded:
+        reason_words = "Upgraded to daily floor breach" if is_daily else "Lockout extended"
+    else:
+        reason_words = "Daily floor breached" if is_daily else "Open P and L stop triggered"
+    return f"{reason_words}. Locked out for {dur_words}."
+
+
 def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK"):
-    global cooldown_active, cooldown_end_time, cooldown_label, alarm_active
+    global cooldown_active, cooldown_end_time, cooldown_label, cooldown_30s_announced, alarm_active
     duration_sec = max(5, int(round(float(duration_mins) * 60)))
     new_end_time = time.time() + duration_sec
 
@@ -1680,28 +1711,35 @@ def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK")
         if new_end_time > cooldown_end_time:
             cooldown_end_time = new_end_time
             cooldown_label = label_prefix
+            cooldown_30s_announced = (duration_sec <= 35)
             log_event(
                 "COOLDOWN",
                 f"Upgraded active lock to {label_prefix} for {duration_sec}s "
                 f"({duration_mins:g} min). Siren muted."
             )
+            speak_async(_format_lock_voice_msg(duration_mins, label_prefix, upgraded=True))
         return
 
     cooldown_active = True
     cooldown_end_time = new_end_time
     cooldown_label = label_prefix
+    cooldown_30s_announced = (duration_sec <= 35)
     alarm_active = False
 
     def cooldown_worker():
-        global cooldown_active, cooldown_end_time, cooldown_label, alarm_active
+        global cooldown_active, cooldown_end_time, cooldown_label, cooldown_30s_announced, alarm_active
         log_event(
             "COOLDOWN",
             f"Persistent {cooldown_label} started for {duration_sec}s "
             f"({duration_mins:g} min). Siren muted."
         )
+        speak_async(_format_lock_voice_msg(duration_mins, cooldown_label, upgraded=False))
         while time.time() < cooldown_end_time:
             alarm_active = False
             rem = int(round(cooldown_end_time - time.time()))
+            if not cooldown_30s_announced and 0 < rem <= 30:
+                cooldown_30s_announced = True
+                speak_async("30 seconds remaining until unlock.")
             txt = (
                 f"{cooldown_label} ACTIVE: {rem}s REMAINING "
                 f"(DO NOT REVENGE TRADE)"
