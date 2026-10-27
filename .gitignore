@@ -1,0 +1,18 @@
+# Credentials & Local Configs (NEVER COMMIT)
+conf/
+*token*
+enforcer_config.json
+enforcer_log.txt
+*.log
+.env
+
+# Python Cache & Build Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.spec
+build/
+dist/
+
+# Local AI Instructions (Kept private on local machine)
+AGENTS.md
