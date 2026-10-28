@@ -68,6 +68,8 @@ DEFAULT_CONFIG = {
     "open_max_loss": 500.0,
     "enable_open_cooldown": False,
     "open_cooldown_mins": 1.0,
+    "enable_voice_cues": True,
+    "enable_upside_chime": True,
     "reset_at_925": True,
     "poll_interval": 2,
     "pm_warn_1": 500.0,
@@ -131,6 +133,8 @@ cooldown_active = False
 cooldown_end_time = 0.0
 cooldown_label = "COOL-DOWN LOCK"
 cooldown_30s_announced = False
+current_upside_tier = 1
+last_rth_mode = None
 triggered_alarms = {}
 ALARM_COOLDOWN_SEC = 180
 RECOVERY_BUFFER_DOLLARS = 150.0
@@ -218,6 +222,8 @@ def format_config_summary(cfg):
         f"KillTOS={'ON' if cfg.get('enable_kill_tos') else 'OFF'} | "
         f"KillWB={'ON' if cfg.get('enable_kill_webull') else 'OFF'} | "
         f"LockOS={dl_str} | "
+        f"Voice={'ON' if cfg.get('enable_voice_cues', True) else 'OFF'} | "
+        f"UpChime={'ON' if cfg.get('enable_upside_chime', True) else 'OFF'} | "
         f"PM_Max=-${cfg.get('pm_max_loss', 0):,.0f} | "
         f"T1_Max=-${cfg.get('t1_max_loss', 0):,.0f}"
     )
@@ -420,6 +426,23 @@ def calc_ext_limit_price(ref_price, is_sell=True):
 # ==========================================
 # 4. DUAL-BROKER ADAPTER ENGINE (SCHWAB & WEBULL)
 # ==========================================
+def get_schwab_token_remaining_hours():
+    """Returns remaining lifetime (in hours) of the 7-day Schwab Refresh Token,
+    or None if the token file does not exist or lacks creation_timestamp."""
+    if not os.path.exists(SCHWAB_TOKEN_PATH):
+        return None
+    try:
+        with open(SCHWAB_TOKEN_PATH, "r", encoding="utf-8") as f:
+            tok_data = json.load(f)
+        created_ts = tok_data.get("creation_timestamp")
+        if created_ts is not None:
+            expires_ts = float(created_ts) + (7 * 86400)
+            return (expires_ts - time.time()) / 3600.0
+    except Exception:
+        pass
+    return None
+
+
 class SchwabAdapter:
     name = "SCHWAB"
 
@@ -429,11 +452,18 @@ class SchwabAdapter:
         self.client = None
         self.account_id = None
         self.accounts = []
+        self.last_error = ""
 
     def authenticate(self):
         from schwab.auth import client_from_manual_flow, client_from_token_file
         try:
             if os.path.exists(SCHWAB_TOKEN_PATH):
+                rem_hrs = get_schwab_token_remaining_hours()
+                if rem_hrs is not None and rem_hrs < 14.0:
+                    raise RuntimeError(
+                        f"Schwab 7-day token has {max(0.0, rem_hrs):.1f}h remaining "
+                        f"(<14h safety buffer) — refreshing proactively before session"
+                    )
                 self.client = client_from_token_file(
                     SCHWAB_TOKEN_PATH, self.app_key, self.app_secret
                 )
@@ -686,6 +716,7 @@ class SchwabAdapter:
                 self.account_id, fields=self.client.Account.Fields.POSITIONS
             )
             if resp.status_code == 200:
+                self.last_error = ""
                 data = resp.json().get("securitiesAccount", {})
                 balances = data.get("currentBalances", {})
                 raw_eq = float(balances.get("liquidationValue", 0))
@@ -781,10 +812,12 @@ class SchwabAdapter:
                     has_options
                 )
             else:
+                self.last_error = f"HTTP {resp.status_code}"
                 log_event(
                     "ERROR", f"Schwab get_account returned HTTP {resp.status_code}"
                 )
         except Exception as e:
+            self.last_error = str(e)
             log_event("ERROR", f"Schwab account fetch exception: {e}")
         return None, True, 0.0, {}, False
 
@@ -801,6 +834,7 @@ class WebullAdapter:
         self.account_id = None
         self.accounts = []
         self._logged_accounts = set()
+        self.last_error = ""
 
     def authenticate(self):
         logging.getLogger("webull").setLevel(logging.ERROR)
@@ -1117,6 +1151,9 @@ class WebullAdapter:
         try:
             b_res = self._call_get_balance()
             if b_res.status_code != 200:
+                self.last_error = (
+                    f"HTTP {b_res.status_code}: {getattr(b_res, 'text', '')[:80]}"
+                )
                 log_event(
                     "ERROR",
                     f"Webull get_account_balance HTTP {b_res.status_code}"
@@ -1140,7 +1177,14 @@ class WebullAdapter:
 
             p_res = self._call_get_positions()
             if p_res.status_code != 200:
-                return raw_eq, True, 0.0, {}, False
+                self.last_error = (
+                    f"HTTP {p_res.status_code}: {getattr(p_res, 'text', '')[:80]}"
+                )
+                log_event(
+                    "ERROR",
+                    f"Webull get_account_position HTTP {p_res.status_code}"
+                )
+                return None, True, 0.0, {}, False
 
             p_json = p_res.json()
             pos_list = (
@@ -1216,6 +1260,7 @@ class WebullAdapter:
             else:
                 adj_eq = round(raw_eq, 2)
 
+            self.last_error = ""
             return (
                 adj_eq,
                 is_flat,
@@ -1224,6 +1269,7 @@ class WebullAdapter:
                 has_options
             )
         except Exception as e:
+            self.last_error = str(e)
             log_event("ERROR", f"Webull account fetch exception: {e}")
             return None, True, 0.0, {}, False
 
@@ -1674,6 +1720,8 @@ def play_unlock_chimes():
 
 def speak_async(text):
     """Speaks text asynchronously using Windows built-in SAPI speech synthesizer."""
+    if not config.get("enable_voice_cues", True):
+        return
     try:
         safe_text = str(text).replace("'", "")
         ps_cmd = (
@@ -1689,6 +1737,75 @@ def speak_async(text):
         )
     except Exception:
         pass
+
+
+def play_upside_tier_chime():
+    """Plays a crisp 4-note ascending D-major arpeggio (D5 -> F#5 -> A5 -> D6)
+    when a higher profit tier is unlocked while 100% flat."""
+    def _chime_worker():
+        try:
+            for freq, dur in ((587, 110), (740, 110), (880, 110), (1175, 240)):
+                winsound.Beep(freq, dur)
+                time.sleep(0.03)
+        except Exception:
+            pass
+
+    threading.Thread(target=_chime_worker, daemon=True).start()
+
+
+def compute_upside_tier(rth_now, max_realized_profit, cfg):
+    """Returns the current upside profit tier (1=Base, 2/3/4=Unlocked Tiers)."""
+    if not rth_now:
+        return 2 if max_realized_profit >= cfg["pm_lock_trigger"] else 1
+    if max_realized_profit >= cfg["t4_trigger"]:
+        return 4
+    if max_realized_profit >= cfg["t3_trigger"]:
+        return 3
+    if max_realized_profit >= cfg["t2_trigger"]:
+        return 2
+    return 1
+
+
+def trigger_upside_tier_glow(ui_button, banner_text, log_msg):
+    """Logs the tier ratchet and, if enabled, plays the upside chime and pulses
+    the bottom HUD status bar with a 3-second emerald glow."""
+    log_event("RATCHET", log_msg)
+    if not config.get("enable_upside_chime", True):
+        return
+    if alarm_active or cooldown_active or ui_button is None:
+        return
+
+    play_upside_tier_chime()
+
+    # 6 steps x 500ms = 3.0 seconds total
+    glow_steps = [
+        ("#00e676", "#000000"),
+        ("#2ecc71", "#000000"),
+        ("#27ae60", "#ffffff"),
+        ("#1e8449", "#ffffff"),
+        ("#196f3d", "#ffffff"),
+        ("#145a32", "#ffffff"),
+    ]
+
+    def _step(idx=0):
+        if alarm_active or cooldown_active:
+            return
+        if idx < len(glow_steps):
+            bg_c, fg_c = glow_steps[idx]
+            ui_button.config(
+                text=banner_text, bg=bg_c, fg=fg_c, state="disabled"
+            )
+            ui_button.after(500, lambda: _step(idx + 1))
+        else:
+            if not alarm_active and not cooldown_active:
+                ui_button.config(
+                    text=get_idle_button_text(),
+                    bg="#333333",
+                    fg="white",
+                    state="disabled"
+                )
+
+    ui_button.after(0, lambda: _step(0))
 
 
 def _format_lock_voice_msg(duration_mins, label_prefix, upgraded=False):
@@ -1992,17 +2109,23 @@ def log_position_transitions(
     pos_details, realized_pnl, open_pnl, net_pnl, session_high_pnl
 ):
     global prev_pos_snapshot
-    curr_qty_map = {s: d["qty"] for s, d in pos_details.items()}
-    prev_qty_map = {s: d["qty"] for s, d in prev_pos_snapshot.items()}
+    curr_sig_map = {
+        s: (d["qty"], round(float(d.get("avg", 0.0)), 4))
+        for s, d in pos_details.items()
+    }
+    prev_sig_map = {
+        s: (d["qty"], round(float(d.get("avg", 0.0)), 4))
+        for s, d in prev_pos_snapshot.items()
+    }
 
-    if curr_qty_map == prev_qty_map:
+    if curr_sig_map == prev_sig_map:
         return
 
-    all_syms = sorted(set(curr_qty_map.keys()) | set(prev_qty_map.keys()))
+    all_syms = sorted(set(curr_sig_map.keys()) | set(prev_sig_map.keys()))
     changes = []
     for sym in all_syms:
-        old_q = prev_qty_map.get(sym, 0)
-        new_q = curr_qty_map.get(sym, 0)
+        old_q, old_avg = prev_sig_map.get(sym, (0, 0.0))
+        new_q, new_avg = curr_sig_map.get(sym, (0, 0.0))
         if old_q != new_q:
             if new_q != 0:
                 info = pos_details[sym]
@@ -2012,6 +2135,16 @@ def log_position_transitions(
                 )
             else:
                 changes.append(f"{sym}: {old_q:+d} -> 0 (CLOSED FLAT)")
+        elif new_q != 0 and abs(new_avg - old_avg) >= 0.0001:
+            info = pos_details[sym]
+            changes.append(
+                f"{sym}: {old_q:+d} -> 0 -> {new_q:+d} "
+                f"(Re-entry Avg: ${old_avg:.4f} -> ${info['avg']:.4f}, "
+                f"Last: ${info['last']:.4f})"
+            )
+
+    if not changes:
+        return
 
     prev_pos_snapshot = pos_details.copy()
     change_str = ", ".join(changes)
@@ -2029,6 +2162,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global has_reset_at_open, is_locked_down, force_reanchor
     global triggered_alarms, prev_pos_snapshot, current_is_flat
     global active_adapter, first_poll_of_launch
+    global current_upside_tier, last_rth_mode
+
+    consecutive_api_failures = 0
+    api_disconnect_alerted = False
 
     while True:
         poll_sec = max(1, int(config.get("poll_interval", 2)))
@@ -2042,6 +2179,21 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
             )
 
             if current_eq is not None and current_eq > 0:
+                if consecutive_api_failures > 0 or api_disconnect_alerted:
+                    consecutive_api_failures = 0
+                    if api_disconnect_alerted:
+                        api_disconnect_alerted = False
+                        log_event("SESSION", "Broker API connection restored.")
+                        if not alarm_active and not cooldown_active:
+                            mute_btn.after(
+                                0,
+                                lambda: mute_btn.config(
+                                    text=get_idle_button_text(),
+                                    bg="#333333",
+                                    fg="white",
+                                    state="disabled"
+                                )
+                            )
                 current_is_flat = is_flat
 
                 if (
@@ -2139,6 +2291,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 # Prevent immediate siren blast or flat re-lock on startup,
                 # at the 9:25 AM transition, or right after saving Settings
+                rth_now = is_rth()
+                if first_poll_of_launch or last_rth_mode != rth_now:
+                    last_rth_mode = rth_now
+                    current_upside_tier = compute_upside_tier(
+                        rth_now, max_realized_profit, config
+                    )
+
                 if first_poll_of_launch and is_flat:
                     first_poll_of_launch = False
                     if net_pnl <= -pm_w1:
@@ -2347,6 +2506,34 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 terminate_pnl_level = round(floor_equity - start_equity, 2)
                 distance_to_terminate = round(current_eq - floor_equity, 2)
 
+                new_upside_tier = compute_upside_tier(
+                    rth_now, max_realized_profit, config
+                )
+                if is_flat and new_upside_tier > current_upside_tier:
+                    current_upside_tier = new_upside_tier
+                    fl_str = format_dollar(terminate_pnl_level)
+                    if not rth_now:
+                        banner_txt = (
+                            f"★ PM PROFIT LOCK UNLOCKED — "
+                            f"FLOOR RAISED TO {fl_str} ★"
+                        )
+                        log_txt = (
+                            f"Pre-Market Profit Lock unlocked at "
+                            f"{format_dollar(max_realized_profit)} — "
+                            f"Floor raised to {fl_str}"
+                        )
+                    else:
+                        banner_txt = (
+                            f"★ TIER {new_upside_tier} UNLOCKED — "
+                            f"DAILY FLOOR RAISED TO {fl_str} ★"
+                        )
+                        log_txt = (
+                            f"RTH Tier {new_upside_tier} unlocked at "
+                            f"{format_dollar(max_realized_profit)} — "
+                            f"Daily Floor raised to {fl_str}"
+                        )
+                    trigger_upside_tier_glow(mute_btn, banner_txt, log_txt)
+
                 c1_bg = (
                     "#1e8449" if realized_pnl > 0
                     else ("#b03a2e" if realized_pnl < 0 else "#2c3e50")
@@ -2376,6 +2563,54 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         ui_labels, d, f, settings_btn, close_btn
                     )
                 )
+            else:
+                consecutive_api_failures += 1
+                err_lower = getattr(active_adapter, "last_error", "").lower()
+                is_tok_exp = any(
+                    k in err_lower
+                    for k in (
+                        "invalid_grant",
+                        "unsupported_token_type",
+                        "expired",
+                        "unauthorized",
+                        "http 401",
+                    )
+                )
+                if is_tok_exp or consecutive_api_failures >= 3:
+                    current_is_flat = True
+                    lbl_1 = "TOKEN" if is_tok_exp else "API"
+                    lbl_2 = "EXPIRED" if is_tok_exp else "LOST"
+                    err_cols = [
+                        (lbl_1, "#7b241c"),
+                        (lbl_2, "#7b241c"),
+                        ("---", "#444444"),
+                        ("---", "#444444"),
+                        ("---", "#444444"),
+                    ]
+                    root.after(
+                        0,
+                        lambda d=err_cols: update_gui(
+                            ui_labels, d, True, settings_btn, close_btn
+                        )
+                    )
+                    if not api_disconnect_alerted:
+                        api_disconnect_alerted = True
+                        r_msg = (
+                            "BROKER TOKEN EXPIRED — RESTART APP TO RE-LOGIN"
+                            if is_tok_exp
+                            else "BROKER API DISCONNECTED — CHECK CONNECTION"
+                        )
+                        v_msg = (
+                            "Warning. Broker token expired. Please restart Enforcer to log in."
+                            if is_tok_exp
+                            else "Warning. Broker A P I connection lost."
+                        )
+                        speak_async(v_msg)
+                        trigger_alarm(
+                            r_msg,
+                            mute_btn,
+                            getattr(active_adapter, "last_error", "")[:80],
+                        )
 
         except Exception as e:
             log_event("ERROR", f"Main data_loop error: {e}")
@@ -2449,6 +2684,12 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     var_reset925 = tk.BooleanVar(value=config["reset_at_925"])
     var_reanchor = tk.BooleanVar(value=False)
+    var_voice_cues = tk.BooleanVar(
+        value=config.get("enable_voice_cues", True)
+    )
+    var_upside_chime = tk.BooleanVar(
+        value=config.get("enable_upside_chime", True)
+    )
     var_poll = tk.StringVar(value=str(int(config["poll_interval"])))
 
     dollar_keys = [
@@ -2480,11 +2721,16 @@ def show_preflight_window(parent=None, mute_btn=None):
         b_name = active_adapter.name
         acct_id = active_adapter.account_id
         had_saved = restore_account_session(b_name, acct_id, log_restore=False)
+        tok_suffix = ""
+        if b_name == "SCHWAB":
+            rem_h = get_schwab_token_remaining_hours()
+            if rem_h is not None and rem_h > 0:
+                tok_suffix = f" | Token: {rem_h / 24.0:.1f}d left"
 
         if had_saved and start_equity is not None and start_equity > 0:
             force_reanchor = False
             base_sub_lbl.config(
-                text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Preserved across restarts)"
+                text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Preserved across restarts){tok_suffix}"
             )
         else:
             eq, _, _, _, _ = active_adapter.fetch_account_data()
@@ -2492,11 +2738,11 @@ def show_preflight_window(parent=None, mute_btn=None):
                 start_equity = eq
                 force_reanchor = True
                 base_sub_lbl.config(
-                    text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Live account equity)"
+                    text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Live account equity){tok_suffix}"
                 )
             else:
                 base_sub_lbl.config(
-                    text=f"Active Baseline ({b_name}): Will anchor on first API poll."
+                    text=f"Active Baseline ({b_name}): Will anchor on first API poll.{tok_suffix}"
                 )
 
     # --- TOP BAR: BROKER & ACCOUNT SELECTOR + PRESETS ---
@@ -2689,6 +2935,12 @@ def show_preflight_window(parent=None, mute_btn=None):
         var_reset925.set(
             src.get("reset_at_925", DEFAULT_CONFIG["reset_at_925"])
         )
+        var_voice_cues.set(
+            src.get("enable_voice_cues", DEFAULT_CONFIG["enable_voice_cues"])
+        )
+        var_upside_chime.set(
+            src.get("enable_upside_chime", DEFAULT_CONFIG["enable_upside_chime"])
+        )
         var_reanchor.set(False)
         var_poll.set(
             str(int(src.get("poll_interval", DEFAULT_CONFIG["poll_interval"])))
@@ -2715,6 +2967,8 @@ def show_preflight_window(parent=None, mute_btn=None):
                 "enable_lock_os": bool(var_lock_os.get()),
                 "daily_lock_mins": max(0.0, abs(float(var_daily_lock_mins.get()))),
                 "reset_at_925": bool(var_reset925.get()),
+                "enable_voice_cues": bool(var_voice_cues.get()),
+                "enable_upside_chime": bool(var_upside_chime.get()),
                 "poll_interval": max(1, int(float(var_poll.get())))
             }
             for k in dollar_keys:
@@ -2792,6 +3046,8 @@ def show_preflight_window(parent=None, mute_btn=None):
                 0.0, abs(float(var_daily_lock_mins.get()))
             )
             new_cfg["reset_at_925"] = bool(var_reset925.get())
+            new_cfg["enable_voice_cues"] = bool(var_voice_cues.get())
+            new_cfg["enable_upside_chime"] = bool(var_upside_chime.get())
             new_cfg["poll_interval"] = max(1, int(float(var_poll.get())))
 
             for k in dollar_keys:
@@ -3102,6 +3358,33 @@ def show_preflight_window(parent=None, mute_btn=None):
         activeforeground="#f5b041",
         anchor="w"
     ).pack(fill="x", pady=3)
+
+    r_audio = tk.Frame(c3, bg="#1b1b1b")
+    r_audio.pack(fill="x", pady=3)
+    tk.Checkbutton(
+        r_audio,
+        text="Verbal Lockout Voice Cues",
+        variable=var_voice_cues,
+        font=("Arial", 10, "bold"),
+        fg="#f2f2f2",
+        bg="#1b1b1b",
+        selectcolor="#2a2a2a",
+        activebackground="#1b1b1b",
+        activeforeground="#ffffff",
+        anchor="w"
+    ).pack(side="left", padx=(0, 18))
+    tk.Checkbutton(
+        r_audio,
+        text="Upside Tier Chime & Glow",
+        variable=var_upside_chime,
+        font=("Arial", 10, "bold"),
+        fg="#58d68d",
+        bg="#1b1b1b",
+        selectcolor="#2a2a2a",
+        activebackground="#1b1b1b",
+        activeforeground="#58d68d",
+        anchor="w"
+    ).pack(side="left")
 
     r_poll = tk.Frame(c3, bg="#1b1b1b")
     r_poll.pack(fill="x", pady=(6, 2))
