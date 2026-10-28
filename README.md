@@ -42,6 +42,6 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
 4. **Schwab Browser Login Step (First Time & Every 7 Days):**
    * If using **Schwab**, your web browser will open to the official Charles Schwab login page. Log in and approve account access.
    * After you click approve, your browser will redirect to a blank **"This site can't be reached (`127.0.0.1`)"** page. **This is 100% normal!**
-   * Copy the **entire URL** from the top of your browser's address bar (starting with `https://127.0.0.1/?code=...`), paste it into the black terminal window, and press **Enter**.
-   * *(Note: Schwab security tokens last 7 days, so you will only need to repeat this quick copy-paste login once a week when your token expires.)*
+   * Copy the **entire URL** from the top of your browser's address bar (starting with `https://127.0.0.1/?code=...`) — the on-screen **Schwab 7-Day Security Login** popup window will automatically detect it from your clipboard (or click **📋 Paste from Clipboard**), then click **Complete Schwab Login >>**.
+   * *(Note: Schwab security tokens last 7 days. You don't need to track this yourself — the app displays your remaining token days in Pre-Flight Settings, **automatically walks you through this renewal early at startup** whenever `< 14 hours` remain so it never expires mid-session, and also lets you renew it manually anytime once a week via **`🔑 API Keys -> 🔄 Renew 7-Day Token Now`** on the Settings screen.)*
 5. Choose which account you want to monitor from the **Account Dropdown** at the top of the Pre-Flight screen.
