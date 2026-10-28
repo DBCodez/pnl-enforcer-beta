@@ -20,6 +20,19 @@ import logging
 import subprocess
 from datetime import datetime, time as dt_time
 
+# Suppress harmless Tkinter Variable.__del__ RuntimeError when Python's
+# cyclic garbage collector runs on the background API polling thread
+# after the Pre-Flight or HUD Columns dialog has been closed.
+_orig_tk_var_del = getattr(tk.Variable, "__del__", None)
+if _orig_tk_var_del is not None:
+    def _safe_tk_var_del(self):
+        try:
+            _orig_tk_var_del(self)
+        except Exception:
+            pass
+
+    tk.Variable.__del__ = _safe_tk_var_del
+
 # ==========================================
 # 1. DYNAMIC USER PATHS (NO HARDCODED KEYS)
 # ==========================================
@@ -70,6 +83,13 @@ DEFAULT_CONFIG = {
     "open_cooldown_mins": 1.0,
     "enable_voice_cues": True,
     "enable_upside_chime": True,
+    "hud_columns": [
+        "realized_pnl",
+        "open_pnl",
+        "terminate_lvl",
+        "dist_to_term",
+        "session_high",
+    ],
     "reset_at_925": True,
     "poll_interval": 2,
     "pm_warn_1": 500.0,
@@ -92,8 +112,29 @@ DEFAULT_CONFIG = {
     "saved_daily_max_equity": None,
     "saved_last_flat_equity": None,
     "saved_has_reset_at_open": False,
+    "saved_win_trades": 0,
+    "saved_loss_trades": 0,
     "saved_account_id": ""
 }
+
+HUD_COLUMN_CATALOG = [
+    ("realized_pnl", "REALIZED PnL", "Closed (flat) PnL for the day"),
+    ("open_pnl", "OPEN PnL", "Live unrealized PnL on open positions"),
+    ("net_pnl", "NET PnL", "Total daily PnL (Realized + Open)"),
+    ("terminate_lvl", "TERMINATE LVL", "Active Pre-Market or RTH lockout floor"),
+    ("dist_to_term", "$ TO TERMINATE", "Remaining dollar cushion above floor"),
+    ("session_high", "SESSION HIGH", "Highest flat realized PnL of the day"),
+    ("from_high", "FROM HIGH", "Current drawdown/giveback from Session High"),
+    ("trades_wl", "TRADES (W/L)", "Completed round-trip Wins & Losses (%)"),
+]
+HUD_COL_HEADERS = {col_id: hdr for col_id, hdr, _ in HUD_COLUMN_CATALOG}
+DEFAULT_HUD_COLUMNS = [
+    "realized_pnl",
+    "open_pnl",
+    "terminate_lvl",
+    "dist_to_term",
+    "session_high",
+]
 
 HALF_RISK_DOLLARS = {
     "open_max_loss": 250.0,
@@ -135,6 +176,9 @@ cooldown_label = "COOL-DOWN LOCK"
 cooldown_30s_announced = False
 current_upside_tier = 1
 last_rth_mode = None
+win_trades = 0
+loss_trades = 0
+prev_flat_realized_pnl = 0.0
 triggered_alarms = {}
 ALARM_COOLDOWN_SEC = 180
 RECOVERY_BUFFER_DOLLARS = 150.0
@@ -162,6 +206,69 @@ def format_dollar(val):
     elif rounded < 0:
         return f"-${abs(rounded):,.2f}"
     return "$0.00"
+
+
+def get_active_hud_columns(cfg=None):
+    raw_cols = (cfg or config).get("hud_columns") or DEFAULT_HUD_COLUMNS
+    valid = [c for c in raw_cols if c in HUD_COL_HEADERS]
+    return valid if valid else list(DEFAULT_HUD_COLUMNS)
+
+
+def format_trades_wl_multiline(wins, losses):
+    total = int(wins) + int(losses)
+    if total <= 0:
+        return "W: 0 (0.0%)\nL: 0 (0.0%)"
+    w_pct = (wins / total) * 100.0
+    l_pct = (losses / total) * 100.0
+    return f"W: {wins} ({w_pct:.1f}%)\nL: {losses} ({l_pct:.1f}%)"
+
+
+def format_trades_wl_inline(wins, losses):
+    total = int(wins) + int(losses)
+    if total <= 0:
+        return "W: 0 (0.0%) | L: 0 (0.0%)"
+    w_pct = (wins / total) * 100.0
+    l_pct = (losses / total) * 100.0
+    return f"W: {wins} ({w_pct:.1f}%) | L: {losses} ({l_pct:.1f}%)"
+
+
+def backfill_trades_from_today_log():
+    """If today's log has completed round-trip trades and win/loss counters
+    are at 0 (e.g. upgrading mid-day), reconstructs W/L from today's log."""
+    if not os.path.exists(LOG_PATH):
+        return 0, 0, 0.0
+    today_str = get_today_str()
+    w_cnt = 0
+    l_cnt = 0
+    prev_real = 0.0
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            first = f.readline()
+            if today_str not in first:
+                return 0, 0, 0.0
+            for line in f:
+                if "Baseline anchored to:" in line:
+                    w_cnt = 0
+                    l_cnt = 0
+                    prev_real = 0.0
+                elif "[POS_CHANGE]" in line and (
+                    "(CLOSED FLAT)" in line or "Re-entry Avg:" in line
+                ):
+                    m = re.search(
+                        r"Realized:\s*([+-]?)\$(\d[\d,]*\.\d{2})", line
+                    )
+                    if m:
+                        sign = -1.0 if m.group(1) == "-" else 1.0
+                        val = sign * float(m.group(2).replace(",", ""))
+                        delta = round(val - prev_real, 2)
+                        if delta > 0.0:
+                            w_cnt += 1
+                        elif delta < 0.0:
+                            l_cnt += 1
+                        prev_real = val
+    except Exception:
+        pass
+    return w_cnt, l_cnt, prev_real
 
 
 # --- ACTION-ONLY DAILY EVENT LOGGER ---
@@ -234,6 +341,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     Returns True if a valid baseline for today was found, False otherwise."""
     global start_equity, max_equity, daily_max_equity
     global last_flat_equity, has_reset_at_open
+    global win_trades, loss_trades, prev_flat_realized_pnl
 
     today_str = get_today_str()
     s_key = get_session_key(broker_name, account_id)
@@ -258,13 +366,21 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             has_reset_at_open = bool(
                 s_data.get("has_reset_at_open", False)
             )
+            win_trades = int(s_data.get("win_trades", 0) or 0)
+            loss_trades = int(s_data.get("loss_trades", 0) or 0)
+            prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
+            if win_trades == 0 and loss_trades == 0:
+                bw, bl, b_real = backfill_trades_from_today_log()
+                if bw > 0 or bl > 0:
+                    win_trades, loss_trades = bw, bl
             if log_restore:
                 log_event(
                     "SESSION",
                     f"Restored {broker_name} baseline from memory: "
                     f"Start=${start_equity:,.2f} | "
                     f"LastFlat=${last_flat_equity:,.2f} | "
-                    f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)}"
+                    f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
+                    f"{format_trades_wl_inline(win_trades, loss_trades)}"
                 )
             return True
 
@@ -286,13 +402,21 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             config.get("saved_last_flat_equity") or start_equity
         )
         has_reset_at_open = bool(config.get("saved_has_reset_at_open", False))
+        win_trades = int(config.get("saved_win_trades", 0) or 0)
+        loss_trades = int(config.get("saved_loss_trades", 0) or 0)
+        prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
+        if win_trades == 0 and loss_trades == 0:
+            bw, bl, _ = backfill_trades_from_today_log()
+            if bw > 0 or bl > 0:
+                win_trades, loss_trades = bw, bl
         if log_restore:
             log_event(
                 "SESSION",
                 f"Restored {broker_name} baseline from memory: "
                 f"Start=${start_equity:,.2f} | "
                 f"LastFlat=${last_flat_equity:,.2f} | "
-                f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)}"
+                f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
+                f"{format_trades_wl_inline(win_trades, loss_trades)}"
             )
         return True
 
@@ -301,6 +425,9 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     daily_max_equity = None
     last_flat_equity = None
     has_reset_at_open = False
+    win_trades = 0
+    loss_trades = 0
+    prev_flat_realized_pnl = 0.0
     return False
 
 
@@ -367,7 +494,9 @@ def save_session_state():
         "max_equity": max_equity,
         "daily_max_equity": daily_max_equity,
         "last_flat_equity": last_flat_equity,
-        "has_reset_at_open": has_reset_at_open
+        "has_reset_at_open": has_reset_at_open,
+        "win_trades": win_trades,
+        "loss_trades": loss_trades,
     }
 
     old_entry = config["account_sessions"].get(s_key)
@@ -379,6 +508,8 @@ def save_session_state():
         or config.get("saved_daily_max_equity") != daily_max_equity
         or config.get("saved_last_flat_equity") != last_flat_equity
         or config.get("saved_has_reset_at_open") != has_reset_at_open
+        or config.get("saved_win_trades") != win_trades
+        or config.get("saved_loss_trades") != loss_trades
         or config.get("saved_account_id") != sel_acct
     )
     if changed:
@@ -390,6 +521,8 @@ def save_session_state():
         config["saved_daily_max_equity"] = daily_max_equity
         config["saved_last_flat_equity"] = last_flat_equity
         config["saved_has_reset_at_open"] = has_reset_at_open
+        config["saved_win_trades"] = win_trades
+        config["saved_loss_trades"] = loss_trades
         config["saved_account_id"] = sel_acct
         save_config(config)
 
@@ -2108,7 +2241,7 @@ def trigger_lockdown(
 def log_position_transitions(
     pos_details, realized_pnl, open_pnl, net_pnl, session_high_pnl
 ):
-    global prev_pos_snapshot
+    global prev_pos_snapshot, win_trades, loss_trades, prev_flat_realized_pnl
     curr_sig_map = {
         s: (d["qty"], round(float(d.get("avg", 0.0)), 4))
         for s, d in pos_details.items()
@@ -2123,6 +2256,7 @@ def log_position_transitions(
 
     all_syms = sorted(set(curr_sig_map.keys()) | set(prev_sig_map.keys()))
     changes = []
+    completed_round_trip = False
     for sym in all_syms:
         old_q, old_avg = prev_sig_map.get(sym, (0, 0.0))
         new_q, new_avg = curr_sig_map.get(sym, (0, 0.0))
@@ -2135,6 +2269,7 @@ def log_position_transitions(
                 )
             else:
                 changes.append(f"{sym}: {old_q:+d} -> 0 (CLOSED FLAT)")
+                completed_round_trip = True
         elif new_q != 0 and abs(new_avg - old_avg) >= 0.0001:
             info = pos_details[sym]
             changes.append(
@@ -2142,9 +2277,19 @@ def log_position_transitions(
                 f"(Re-entry Avg: ${old_avg:.4f} -> ${info['avg']:.4f}, "
                 f"Last: ${info['last']:.4f})"
             )
+            completed_round_trip = True
 
     if not changes:
         return
+
+    if completed_round_trip and (len(pos_details) == 0 or any("Re-entry Avg:" in c for c in changes)):
+        delta = round(realized_pnl - prev_flat_realized_pnl, 2)
+        if delta > 0.0:
+            win_trades += 1
+        elif delta < 0.0:
+            loss_trades += 1
+        prev_flat_realized_pnl = realized_pnl
+        save_session_state()
 
     prev_pos_snapshot = pos_details.copy()
     change_str = ", ".join(changes)
@@ -2163,6 +2308,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global triggered_alarms, prev_pos_snapshot, current_is_flat
     global active_adapter, first_poll_of_launch
     global current_upside_tier, last_rth_mode
+    global win_trades, loss_trades, prev_flat_realized_pnl
 
     consecutive_api_failures = 0
     api_disconnect_alerted = False
@@ -2208,6 +2354,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     has_reset_at_open = is_rth()
                     force_reanchor = False
                     is_locked_down = False
+                    win_trades = 0
+                    loss_trades = 0
+                    prev_flat_realized_pnl = 0.0
                     triggered_alarms.clear()
                     prev_pos_snapshot = {}
                     save_session_state()
@@ -2542,6 +2691,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     "#1e8449" if open_pnl > 0
                     else ("#b03a2e" if open_pnl < 0 else "#2c3e50")
                 )
+                net_bg = (
+                    "#1e8449" if net_pnl > 0
+                    else ("#b03a2e" if net_pnl < 0 else "#2c3e50")
+                )
                 c3_bg = "#1e8449" if terminate_pnl_level > 0 else "#1f538d"
                 c4_bg = (
                     "#b03a2e" if distance_to_terminate <= 0
@@ -2549,12 +2702,36 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 )
                 c5_bg = "#1e8449" if session_high_pnl > 0 else "#2c3e50"
 
+                giveback_val = (
+                    round(net_pnl - session_high_pnl, 2)
+                    if session_high_pnl > 0 else 0.0
+                )
+                fh_bg = (
+                    "#1e8449" if (session_high_pnl > 0 and giveback_val >= 0)
+                    else (
+                        "#b03a2e" if giveback_val <= -500
+                        else ("#d35400" if giveback_val <= -250 else "#2c3e50")
+                    )
+                )
+                wl_bg = "#2c3e50"
+
+                all_col_values = {
+                    "realized_pnl": (format_dollar(realized_pnl), c1_bg),
+                    "open_pnl": (format_dollar(open_pnl), c2_bg),
+                    "net_pnl": (format_dollar(net_pnl), net_bg),
+                    "terminate_lvl": (format_dollar(terminate_pnl_level), c3_bg),
+                    "dist_to_term": (f"${distance_to_terminate:,.2f}", c4_bg),
+                    "session_high": (format_dollar(session_high_pnl), c5_bg),
+                    "from_high": (format_dollar(giveback_val), fh_bg),
+                    "trades_wl": (
+                        format_trades_wl_multiline(win_trades, loss_trades),
+                        wl_bg
+                    ),
+                }
+                active_cols = get_active_hud_columns(config)
                 col_data = [
-                    (format_dollar(realized_pnl), c1_bg),
-                    (format_dollar(open_pnl), c2_bg),
-                    (format_dollar(terminate_pnl_level), c3_bg),
-                    (f"${distance_to_terminate:,.2f}", c4_bg),
-                    (format_dollar(session_high_pnl), c5_bg)
+                    all_col_values.get(cid, ("---", "#2c3e50"))
+                    for cid in active_cols
                 ]
 
                 root.after(
@@ -2580,13 +2757,15 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     current_is_flat = True
                     lbl_1 = "TOKEN" if is_tok_exp else "API"
                     lbl_2 = "EXPIRED" if is_tok_exp else "LOST"
-                    err_cols = [
-                        (lbl_1, "#7b241c"),
-                        (lbl_2, "#7b241c"),
-                        ("---", "#444444"),
-                        ("---", "#444444"),
-                        ("---", "#444444"),
-                    ]
+                    n_cols = max(1, len(get_active_hud_columns(config)))
+                    err_cols = []
+                    for idx in range(n_cols):
+                        if idx == 0:
+                            err_cols.append((lbl_1, "#7b241c"))
+                        elif idx == 1:
+                            err_cols.append((lbl_2, "#7b241c"))
+                        else:
+                            err_cols.append(("---", "#444444"))
                     root.after(
                         0,
                         lambda d=err_cols: update_gui(
@@ -2690,6 +2869,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     var_upside_chime = tk.BooleanVar(
         value=config.get("enable_upside_chime", True)
     )
+    selected_hud_columns = list(get_active_hud_columns(config))
     var_poll = tk.StringVar(value=str(int(config["poll_interval"])))
 
     dollar_keys = [
@@ -2726,11 +2906,12 @@ def show_preflight_window(parent=None, mute_btn=None):
             rem_h = get_schwab_token_remaining_hours()
             if rem_h is not None and rem_h > 0:
                 tok_suffix = f" | Token: {rem_h / 24.0:.1f}d left"
+        wl_suffix = f" | {format_trades_wl_inline(win_trades, loss_trades)}"
 
         if had_saved and start_equity is not None and start_equity > 0:
             force_reanchor = False
             base_sub_lbl.config(
-                text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Preserved across restarts){tok_suffix}"
+                text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Preserved){tok_suffix}{wl_suffix}"
             )
         else:
             eq, _, _, _, _ = active_adapter.fetch_account_data()
@@ -2738,11 +2919,11 @@ def show_preflight_window(parent=None, mute_btn=None):
                 start_equity = eq
                 force_reanchor = True
                 base_sub_lbl.config(
-                    text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Live account equity){tok_suffix}"
+                    text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Live equity){tok_suffix}{wl_suffix}"
                 )
             else:
                 base_sub_lbl.config(
-                    text=f"Active Baseline ({b_name}): Will anchor on first API poll.{tok_suffix}"
+                    text=f"Active Baseline ({b_name}): Will anchor on first API poll.{tok_suffix}{wl_suffix}"
                 )
 
     # --- TOP BAR: BROKER & ACCOUNT SELECTOR + PRESETS ---
@@ -2862,7 +3043,173 @@ def show_preflight_window(parent=None, mute_btn=None):
         padx=10,
         pady=3,
         command=edit_api_keys
-    ).pack(side="left", padx=(0, 18))
+    ).pack(side="left", padx=(0, 8))
+
+    def open_hud_columns_dialog():
+        dlg = tk.Toplevel(pf)
+        dlg.title("Customize HUD Columns & Order")
+        dlg.config(bg="#161616", padx=22, pady=16)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        dlg.grab_set()
+
+        tk.Label(
+            dlg,
+            text="📊 CUSTOMIZE HUD COLUMNS & DISPLAY ORDER",
+            font=("Arial", 11, "bold"),
+            fg="#5dade2",
+            bg="#161616",
+            anchor="w"
+        ).pack(fill="x")
+        tk.Label(
+            dlg,
+            text="Check the columns you want on your HUD and use ▲ / ▼ to arrange their left-to-right order.",
+            font=("Arial", 9),
+            fg="#aaaaaa",
+            bg="#161616",
+            anchor="w"
+        ).pack(fill="x", pady=(2, 10))
+
+        all_ids = [cid for cid, _, _ in HUD_COLUMN_CATALOG]
+        ordered_ids = list(selected_hud_columns) + [
+            cid for cid in all_ids if cid not in selected_hud_columns
+        ]
+        checked_vars = {
+            cid: tk.BooleanVar(value=(cid in selected_hud_columns))
+            for cid in all_ids
+        }
+        desc_map = {cid: (hdr, desc) for cid, hdr, desc in HUD_COLUMN_CATALOG}
+
+        list_frame = tk.Frame(dlg, bg="#1f1f1f", bd=1, relief="solid", padx=12, pady=8)
+        list_frame.pack(fill="both", expand=True)
+
+        def render_rows():
+            for w in list_frame.winfo_children():
+                w.destroy()
+            for idx, cid in enumerate(ordered_ids):
+                hdr, desc = desc_map[cid]
+                row = tk.Frame(list_frame, bg="#1f1f1f", pady=3)
+                row.pack(fill="x")
+
+                tk.Checkbutton(
+                    row,
+                    text=f"{idx + 1}. {hdr}",
+                    variable=checked_vars[cid],
+                    font=("Arial", 10, "bold"),
+                    fg="#ffffff",
+                    bg="#1f1f1f",
+                    selectcolor="#2a2a2a",
+                    activebackground="#1f1f1f",
+                    activeforeground="#ffffff",
+                    width=18,
+                    anchor="w"
+                ).pack(side="left")
+
+                tk.Label(
+                    row,
+                    text=desc,
+                    font=("Arial", 9),
+                    fg="#999999",
+                    bg="#1f1f1f",
+                    anchor="w",
+                    width=42
+                ).pack(side="left", padx=(6, 10))
+
+                def move_up(i=idx):
+                    if i > 0:
+                        ordered_ids[i - 1], ordered_ids[i] = (
+                            ordered_ids[i],
+                            ordered_ids[i - 1],
+                        )
+                        render_rows()
+
+                def move_down(i=idx):
+                    if i < len(ordered_ids) - 1:
+                        ordered_ids[i + 1], ordered_ids[i] = (
+                            ordered_ids[i],
+                            ordered_ids[i + 1],
+                        )
+                        render_rows()
+
+                tk.Button(
+                    row,
+                    text="▼",
+                    font=("Arial", 8, "bold"),
+                    bg="#2e2e2e",
+                    fg="white",
+                    width=3,
+                    command=move_down
+                ).pack(side="right", padx=2)
+                tk.Button(
+                    row,
+                    text="▲",
+                    font=("Arial", 8, "bold"),
+                    bg="#2e2e2e",
+                    fg="white",
+                    width=3,
+                    command=move_up
+                ).pack(side="right", padx=2)
+
+        render_rows()
+
+        def reset_standard_5():
+            ordered_ids.clear()
+            ordered_ids.extend(
+                list(DEFAULT_HUD_COLUMNS)
+                + [c for c in all_ids if c not in DEFAULT_HUD_COLUMNS]
+            )
+            for c in all_ids:
+                checked_vars[c].set(c in DEFAULT_HUD_COLUMNS)
+            render_rows()
+
+        def apply_and_close():
+            chosen = [c for c in ordered_ids if checked_vars[c].get()]
+            if not chosen:
+                messagebox.showwarning(
+                    "No Columns Selected",
+                    "Please keep at least 1 HUD column checked.",
+                    parent=dlg
+                )
+                return
+            selected_hud_columns.clear()
+            selected_hud_columns.extend(chosen)
+            hud_cols_btn.config(text=f"📊 HUD Columns ({len(chosen)})")
+            dlg.destroy()
+
+        b_bar = tk.Frame(dlg, bg="#161616", pady=10)
+        b_bar.pack(fill="x")
+        tk.Button(
+            b_bar,
+            text="Reset Default 5",
+            font=("Arial", 9, "bold"),
+            bg="#333333",
+            fg="white",
+            padx=12,
+            pady=4,
+            command=reset_standard_5
+        ).pack(side="left")
+        tk.Button(
+            b_bar,
+            text="Done ✓",
+            font=("Arial", 9, "bold"),
+            bg="#1e8449",
+            fg="white",
+            padx=18,
+            pady=4,
+            command=apply_and_close
+        ).pack(side="right")
+
+    hud_cols_btn = tk.Button(
+        top_bar,
+        text=f"📊 HUD Columns ({len(selected_hud_columns)})",
+        font=("Arial", 9, "bold"),
+        bg="#2c3e50",
+        fg="#aed6f1",
+        padx=10,
+        pady=3,
+        command=open_hud_columns_dialog
+    )
+    hud_cols_btn.pack(side="left", padx=(0, 14))
 
     populate_account_dropdown()
     var_broker.trace_add("write", on_broker_change)
@@ -2941,6 +3288,11 @@ def show_preflight_window(parent=None, mute_btn=None):
         var_upside_chime.set(
             src.get("enable_upside_chime", DEFAULT_CONFIG["enable_upside_chime"])
         )
+        selected_hud_columns.clear()
+        selected_hud_columns.extend(get_active_hud_columns(src))
+        hud_cols_btn.config(
+            text=f"📊 HUD Columns ({len(selected_hud_columns)})"
+        )
         var_reanchor.set(False)
         var_poll.set(
             str(int(src.get("poll_interval", DEFAULT_CONFIG["poll_interval"])))
@@ -2969,6 +3321,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 "reset_at_925": bool(var_reset925.get()),
                 "enable_voice_cues": bool(var_voice_cues.get()),
                 "enable_upside_chime": bool(var_upside_chime.get()),
+                "hud_columns": list(selected_hud_columns),
                 "poll_interval": max(1, int(float(var_poll.get())))
             }
             for k in dollar_keys:
@@ -3048,6 +3401,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             new_cfg["reset_at_925"] = bool(var_reset925.get())
             new_cfg["enable_voice_cues"] = bool(var_voice_cues.get())
             new_cfg["enable_upside_chime"] = bool(var_upside_chime.get())
+            new_cfg["hud_columns"] = list(selected_hud_columns)
             new_cfg["poll_interval"] = max(1, int(float(var_poll.get())))
 
             for k in dollar_keys:
@@ -3068,6 +3422,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
             save_config(new_cfg)
             log_event("CONFIG", format_config_summary(new_cfg))
+            rebuild_hud_columns()
 
             if not alarm_active and not cooldown_active:
                 if mute_btn is not None:
@@ -3637,44 +3992,114 @@ def show_preflight_window(parent=None, mute_btn=None):
 
 
 # ==========================================
-# 9. 5-COLUMN HUD SETUP
+# 9. DYNAMIC MULTI-COLUMN HUD SETUP
 # ==========================================
-show_baseline_on_badge = False
+acct_badge_mode = 0  # 0 = FLAT, 1 = BASE, 2 = W/L
 acct_badge_lbl = None
+hud_root = None
+hud_grid_frame = None
+hud_ui_labels = []
+hud_start_move_fn = None
+hud_do_move_fn = None
 
 
 def refresh_acct_badge():
-    """Updates the muted left account badge (FLAT vs BASE).
-    Uses last_flat_equity so it never ticks while in an open trade."""
+    """Updates the clickable left account badge (FLAT -> BASE -> W/L)."""
     if acct_badge_lbl is None:
         return
 
-    if show_baseline_on_badge:
+    if acct_badge_mode == 1:
         val = start_equity
-        prefix = "BASE"
+        txt = f"BASE: ${val:,.2f}" if (val is not None and val > 0) else "BASE: ---"
         fg_col = "#85929e"
+    elif acct_badge_mode == 2:
+        txt = format_trades_wl_inline(win_trades, loss_trades)
+        fg_col = "#a6acaf"
     else:
         val = last_flat_equity if last_flat_equity is not None else start_equity
-        prefix = "FLAT"
+        txt = f"FLAT: ${val:,.2f}" if (val is not None and val > 0) else "FLAT: ---"
         fg_col = "#a6acaf"
-
-    if val is not None and val > 0:
-        txt = f"{prefix}: ${val:,.2f}"
-    else:
-        txt = f"{prefix}: ---"
 
     acct_badge_lbl.config(text=txt, fg=fg_col)
 
 
 def toggle_acct_badge(event=None):
-    global show_baseline_on_badge
-    show_baseline_on_badge = not show_baseline_on_badge
+    global acct_badge_mode
+    acct_badge_mode = (acct_badge_mode + 1) % 3
     refresh_acct_badge()
+
+
+def rebuild_hud_columns():
+    """Dynamically builds or rebuilds the HUD columns inside hud_grid_frame
+    and adjusts the HUD window width while preserving screen position."""
+    global hud_ui_labels
+    if hud_grid_frame is None or hud_root is None:
+        return
+
+    for child in hud_grid_frame.winfo_children():
+        child.destroy()
+
+    for c_idx in range(12):
+        hud_grid_frame.columnconfigure(c_idx, weight=0, uniform="")
+
+    active_cols = get_active_hud_columns(config)
+    hud_ui_labels.clear()
+
+    for i, col_id in enumerate(active_cols):
+        title = HUD_COL_HEADERS.get(col_id, col_id.upper())
+        hud_grid_frame.columnconfigure(i, weight=1, uniform="col")
+
+        col_frame = tk.Frame(hud_grid_frame, bg="#222222", bd=1, relief="solid")
+        col_frame.grid(row=0, column=i, sticky="nsew", padx=1, pady=1)
+
+        hdr_lbl = tk.Label(
+            col_frame,
+            text=title,
+            font=("Arial", 8, "bold"),
+            fg="#cccccc",
+            bg="#1a1a1a",
+            pady=3
+        )
+        hdr_lbl.pack(fill="x")
+
+        val_font = (
+            ("Arial", 9, "bold")
+            if col_id == "trades_wl"
+            else ("Arial", 12, "bold")
+        )
+        val_lbl = tk.Label(
+            col_frame,
+            text="---",
+            font=val_font,
+            fg="white",
+            bg="#2c3e50",
+            justify="center"
+        )
+        val_lbl.pack(fill="both", expand=True)
+
+        if hud_start_move_fn and hud_do_move_fn:
+            for widget in (col_frame, hdr_lbl, val_lbl):
+                widget.bind("<Button-1>", hud_start_move_fn)
+                widget.bind("<B1-Motion>", hud_do_move_fn)
+
+        hud_ui_labels.append(val_lbl)
+
+    w_px = max(800, len(active_cols) * 160)
+    try:
+        hud_root.update_idletasks()
+        cur_x = hud_root.winfo_x()
+        cur_y = hud_root.winfo_y()
+        if cur_x <= 0 and cur_y <= 0:
+            cur_x, cur_y = 50, 50
+        hud_root.geometry(f"{w_px}x85+{cur_x}+{cur_y}")
+    except Exception:
+        hud_root.geometry(f"{w_px}x85+50+50")
 
 
 def update_gui(ui_labels, col_data, is_flat, settings_btn, close_btn):
     for i, (text_val, bg_col) in enumerate(col_data):
-        ui_labels[i].config(text=text_val, bg=bg_col)
+        if i < len(ui_labels):
+            ui_labels[i].config(text=text_val, bg=bg_col)
 
     refresh_acct_badge()
 
@@ -3700,12 +4125,15 @@ def update_gui(ui_labels, col_data, is_flat, settings_btn, close_btn):
 
 
 def start_gui():
-    global acct_badge_lbl
+    global acct_badge_lbl, hud_root, hud_grid_frame
+    global hud_ui_labels, hud_start_move_fn, hud_do_move_fn
     root = tk.Tk()
+    hud_root = root
     root.title("PnL Enforcer")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    root.geometry("800x85+50+50")
+    w_init = max(800, len(get_active_hud_columns(config)) * 160)
+    root.geometry(f"{w_init}x85+50+50")
     root.config(bg="#1a1a1a")
 
     def start_move(event):
@@ -3716,6 +4144,9 @@ def start_gui():
         x = event.x_root - root.x
         y = event.y_root - root.y
         root.geometry(f"+{x}+{y}")
+
+    hud_start_move_fn = start_move
+    hud_do_move_fn = do_move
 
     def close_app(event=None):
         global alarm_active, current_is_flat
@@ -3735,46 +4166,10 @@ def start_gui():
 
     grid_frame = tk.Frame(root, bg="#1a1a1a")
     grid_frame.pack(fill="both", expand=True)
+    hud_grid_frame = grid_frame
 
-    headers = [
-        "REALIZED PnL",
-        "OPEN PnL",
-        "TERMINATE LVL",
-        "$ TO TERMINATE",
-        "SESSION HIGH"
-    ]
-
-    ui_labels = []
-    for i, title in enumerate(headers):
-        grid_frame.columnconfigure(i, weight=1, uniform="col")
-
-        col_frame = tk.Frame(grid_frame, bg="#222222", bd=1, relief="solid")
-        col_frame.grid(row=0, column=i, sticky="nsew", padx=1, pady=1)
-
-        hdr_lbl = tk.Label(
-            col_frame,
-            text=title,
-            font=("Arial", 8, "bold"),
-            fg="#cccccc",
-            bg="#1a1a1a",
-            pady=3
-        )
-        hdr_lbl.pack(fill="x")
-
-        val_lbl = tk.Label(
-            col_frame,
-            text="---",
-            font=("Arial", 12, "bold"),
-            fg="white",
-            bg="#2c3e50"
-        )
-        val_lbl.pack(fill="both", expand=True)
-
-        for widget in (col_frame, hdr_lbl, val_lbl):
-            widget.bind("<Button-1>", start_move)
-            widget.bind("<B1-Motion>", do_move)
-
-        ui_labels.append(val_lbl)
+    rebuild_hud_columns()
+    ui_labels = hud_ui_labels
 
     bottom_bar = tk.Frame(root, bg="#1a1a1a")
     bottom_bar.pack(fill="x", side="bottom")
