@@ -9,20 +9,50 @@ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
 
+The above copyright notice, this permission notice, and the Trading & Financial
+Risk Disclaimer below shall be included in all copies or substantial portions
+of the Software.
+
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-TRADING & FINANCIAL RISK DISCLAIMER:
-This Software is an experimental beta tool designed for personal risk-management
-assistance. Automated order cancellation, market/limit order execution, application
-termination, and operating system locks carry inherent technical and financial risks,
-including but not limited to API outages, rate limits, partial fills, illiquid
-spreads, market halts, and software bugs.
+TRADING, FINANCIAL RISK & REGULATORY DISCLAIMER:
+1. NOT INVESTMENT ADVICE OR BROKERAGE SERVICES: This Software is an experimental,
+   self-directed mechanical utility designed for personal risk-management assistance.
+   Nothing in the Software constitutes financial, investment, legal, or tax advice.
+   The authors and contributors are not registered broker-dealers, investment
+   advisors, or fiduciaries. All risk thresholds, parameters, and execution
+   settings are 100% self-directed and configured by the user.
 
-IN NO EVENT SHALL THE AUTHORS, CREATORS, OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DIRECT OR INDIRECT TRADING LOSSES, SLIPPAGE, MISSED EXECUTIONS, DAMAGES,
-OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE. BY USING THIS SOFTWARE, YOU ASSUME 100% SOLE RESPONSIBILITY FOR
-ALL ORDERS AND ACCOUNT ACTIVITY.
+2. NO GUARANTEE OF LOSS PREVENTION: Automated order cancellation, market/limit
+   order execution, application termination, and operating system locks carry
+   inherent technical and market risks, including but not limited to API outages,
+   network disconnects, rate limits, rejected orders, partial fills, wide bid-ask
+   spreads, market gaps, trading halts, and software bugs. The Software DOES NOT
+   and CANNOT guarantee that trading losses will be capped at your configured
+   thresholds. Actual account losses may significantly exceed configured limits.
+
+3. EQUITIES VS. OPTIONS: Equities (stocks) may be configured for automated Market
+   or Extended-Hours Limit liquidation. Option contracts are tracked for display
+   and audio warning sirens ONLY and are NEVER automatically flattened or closed
+   by the Software.
+
+4. NO BROKER AFFILIATION: This Software is an independent third-party tool and is
+   not affiliated with, endorsed by, or sponsored by Charles Schwab Corporation,
+   Thinkorswim, Webull Financial LLC, or the maintainers of third-party SDKs
+   (including schwab-py and webull-openapi-python-sdk). Use of automated API calls
+   is subject to your broker's terms of service and rate limits.
+
+5. LIMITATION OF LIABILITY & INDEMNIFICATION: IN NO EVENT SHALL THE AUTHORS,
+   CREATORS, OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DIRECT, INDIRECT,
+   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES, TRADING LOSSES,
+   SLIPPAGE, MISSED EXECUTIONS, ACCOUNT RESTRICTIONS, OR OTHER LIABILITY, WHETHER
+   IN AN ACTION OF CONTRACT, TORT, STRICT LIABILITY, OR OTHERWISE, ARISING FROM,
+   OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+   BY INSTALLING, CONFIGURING, OR RUNNING THIS SOFTWARE, YOU AGREE TO ASSUME 100%
+   SOLE RESPONSIBILITY FOR ALL ORDERS AND ACCOUNT ACTIVITY, AND TO INDEMNIFY,
+   DEFEND, AND HOLD HARMLESS THE AUTHORS AND CONTRIBUTORS FROM ANY CLAIMS, LOSSES,
+   OR LIABILITIES ARISING FROM YOUR USE OF THE SOFTWARE.

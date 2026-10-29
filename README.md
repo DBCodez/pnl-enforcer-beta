@@ -4,8 +4,10 @@ An external, real-time PnL circuit breaker and discipline enforcer for **Charles
 
 ---
 
-## ⚠️ IMPORTANT BETA DISCLAIMER
-This software is **experimental beta software** provided strictly "AS IS." By installing and running this software, you agree that you are 100% solely responsible for your trading account, order executions, and risk management.
+## ⚠️ IMPORTANT BETA DISCLAIMER & ASSUMPTION OF RISK
+This software is **experimental beta software** provided strictly **"AS IS"** without warranty of any kind (see [`LICENSE.txt`](LICENSE.txt)). By installing, configuring, or running this software, you agree that you assume **100% sole responsibility** for your trading account, order executions, and risk management, and agree to indemnify and hold harmless the authors from any trading losses or claims.
+* **Not Financial Advice & No Guarantee of Loss Prevention:** This tool is a self-directed mechanical utility, not a registered investment advisor or broker-dealer. **It does NOT and CANNOT guarantee that losses will be limited to your configured thresholds.** API outages, network latency, rate limits, rejected orders, illiquid spreads, market gaps, or trading halts can cause actual losses to significantly exceed your configured limits.
+* **No Broker Affiliation:** This project is an independent tool and is **not** affiliated with, endorsed by, or sponsored by Charles Schwab, Thinkorswim, or Webull.
 * **Test First:** Always test in **Alarm-Only Mode** (all enforcement switches unchecked) or with **1 share** before enabling live Auto-Flatten.
 * **Equities vs. Options:**
   * **Equities (Stocks):** Tracked in real-time for HUD display, Alarms, **and** automated Market / Extended-Hours (`GTC_EXT`) Limit liquidation.

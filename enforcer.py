@@ -1,6 +1,8 @@
 """
 PnL Enforcer (Closed Beta) — Dual-Broker Edition (Charles Schwab & Webull)
-MIT License — Provided "AS IS" without warranty of any kind.
+MIT License & Trading Risk Disclaimer — Provided "AS IS" without warranty of any kind.
+Not financial advice; no guarantee of loss prevention; not affiliated with Schwab or Webull.
+See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
 import os
@@ -8,6 +10,7 @@ import sys
 import re
 import uuid
 import json
+import hashlib
 import ctypes
 import time
 import builtins
@@ -57,8 +60,13 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # ==========================================
 # 2. DEFAULT CONFIGURATION
 # ==========================================
+WAIVER_VERSION = "2026.10.29"
+
 DEFAULT_CONFIG = {
     "waiver_accepted": False,
+    "waiver_accepted_version": "",
+    "waiver_accepted_at": "",
+    "waiver_sha256": "",
     "active_broker": "SCHWAB",
     "brokers": {
         "SCHWAB": {
@@ -1664,44 +1672,65 @@ def c_resp_code(res):
 # ==========================================
 def show_liability_waiver():
     load_config()
-    if config.get("waiver_accepted", False):
+    waiver_text = (
+        "1. NO WARRANTY, LIMITATION OF LIABILITY & INDEMNIFICATION:\n"
+        "   This software is an experimental beta tool provided strictly 'AS IS' without warranty of any kind.\n"
+        "   In no event shall the authors or contributors be liable for any direct or indirect trading losses,\n"
+        "   slippage, missed fills, API outages, rate limits, rejected orders, or unexpected software behavior.\n"
+        "   By using this software, you agree to indemnify and hold harmless the authors from any claims or losses.\n\n"
+        "2. NOT FINANCIAL ADVICE & NO GUARANTEE OF LOSS PREVENTION:\n"
+        "   This tool is a self-directed mechanical utility, NOT a registered investment advisor, broker-dealer,\n"
+        "   or fiduciary. It DOES NOT and CANNOT guarantee that losses will be capped at your configured limits.\n"
+        "   Market gaps, illiquid spreads, halts, API latency, or order rejections can cause actual account losses\n"
+        "   to significantly exceed your configured thresholds.\n\n"
+        "3. NO BROKER AFFILIATION & API TERMS RISK:\n"
+        "   This project is an independent third-party tool and is NOT affiliated with, endorsed by, or sponsored\n"
+        "   by Charles Schwab, Thinkorswim, or Webull. Automated API polling and liquidation orders are subject\n"
+        "   to your broker's terms of service and rate limits.\n\n"
+        "4. EQUITIES vs. OPTIONS BEHAVIOR:\n"
+        "   • Equities (Stocks) are tracked for HUD display, Alarms, AND automated Market/Limit flatten orders.\n"
+        "   • Options contracts are tracked for HUD PnL display and Warning Sirens ONLY. Because option\n"
+        "     bid-ask spreads can widen dramatically, this software will NEVER auto-flatten option contracts.\n"
+        "     If a guardrail breaches while holding options, you must manually flatten your options.\n\n"
+        "5. SAFE TESTING RECOMMENDATION:\n"
+        "   Always test first in Observation Mode (all enforcement checkboxes unchecked) or with 1 share\n"
+        "   to verify your API connection and PnL calculations before trading live size."
+    )
+    expected_sha = hashlib.sha256(waiver_text.encode("utf-8")).hexdigest()
+
+    if (
+        config.get("waiver_accepted", False)
+        and config.get("waiver_accepted_version") == WAIVER_VERSION
+        and config.get("waiver_sha256") == expected_sha
+    ):
+        acc_at = config.get("waiver_accepted_at", "Unknown")
+        log_event(
+            "WAIVER",
+            f"Liability Waiver v{WAIVER_VERSION} verified "
+            f"(Accepted at: {acc_at} | SHA256: {expected_sha[:12]}...)"
+        )
         return True
 
     accepted = {"ok": False}
     w = tk.Tk()
-    w.title("PnL Enforcer Beta — Legal Disclaimer & Assumption of Risk")
+    w.title(f"PnL Enforcer Beta — Legal Disclaimer & Assumption of Risk (v{WAIVER_VERSION})")
     w.config(bg="#141414", padx=28, pady=22)
     w.resizable(False, False)
     w.attributes("-topmost", True)
 
     tk.Label(
         w,
-        text="⚠️ EXPERIMENTAL BETA SOFTWARE — ASSUMPTION OF RISK",
+        text=f"⚠️ EXPERIMENTAL BETA SOFTWARE — ASSUMPTION OF RISK (v{WAIVER_VERSION})",
         font=("Arial", 12, "bold"),
         fg="#f5b041",
         bg="#141414",
         anchor="w"
     ).pack(fill="x", pady=(0, 12))
 
-    waiver_text = (
-        "1. NO WARRANTY OR FINANCIAL LIABILITY:\n"
-        "   This software is an experimental beta tool provided 'AS IS' without warranty of any kind.\n"
-        "   The authors and contributors are NOT liable for any trading losses, slippage, missed fills,\n"
-        "   API outages, rate limits, or unexpected software behavior.\n\n"
-        "2. EQUITIES vs. OPTIONS BEHAVIOR:\n"
-        "   • Equities (Stocks) are tracked for HUD display, Alarms, AND automated Market/Limit flatten orders.\n"
-        "   • Options contracts are tracked for HUD PnL display and Warning Sirens ONLY. Because option\n"
-        "     bid-ask spreads can widen dramatically, this software will NEVER auto-flatten option contracts.\n"
-        "     If a guardrail breaches while holding options, you must manually flatten your options.\n\n"
-        "3. SAFE TESTING RECOMMENDATION:\n"
-        "   Always test first in Observation Mode (all enforcement checkboxes unchecked) or with 1 share\n"
-        "   to verify your API connection and PnL calculations before trading live size."
-    )
-
     msg_box = tk.Label(
         w,
         text=waiver_text,
-        font=("Arial", 10),
+        font=("Arial", 9),
         fg="#e0e0e0",
         bg="#1e1e1e",
         justify="left",
@@ -1716,9 +1745,12 @@ def show_liability_waiver():
     var_agree = tk.BooleanVar(value=False)
     tk.Checkbutton(
         w,
-        text="I have read this disclaimer, understand the risks, and assume 100% sole responsibility for my account.",
+        text=(
+            "I have read this disclaimer and LICENSE.txt, understand that losses cannot be guaranteed, "
+            "and assume 100% sole responsibility for my account."
+        ),
         variable=var_agree,
-        font=("Arial", 10, "bold"),
+        font=("Arial", 9, "bold"),
         fg="#58d68d",
         bg="#141414",
         selectcolor="#2a2a2a",
@@ -1737,9 +1769,17 @@ def show_liability_waiver():
                 parent=w
             )
             return
+        accepted_ts = datetime.now().isoformat(timespec="seconds")
         config["waiver_accepted"] = True
+        config["waiver_accepted_version"] = WAIVER_VERSION
+        config["waiver_accepted_at"] = accepted_ts
+        config["waiver_sha256"] = expected_sha
         save_config(config)
-        log_event("SESSION", "User accepted Beta Liability Waiver.")
+        log_event(
+            "WAIVER",
+            f"User accepted Liability Waiver v{WAIVER_VERSION} "
+            f"(Accepted at: {accepted_ts} | SHA256: {expected_sha[:12]}...)"
+        )
         accepted["ok"] = True
         w.destroy()
 
