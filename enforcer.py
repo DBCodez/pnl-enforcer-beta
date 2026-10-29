@@ -20,6 +20,7 @@ import tkinter as tk
 from tkinter import messagebox
 import winsound
 import logging
+import warnings
 import subprocess
 from datetime import datetime, time as dt_time
 
@@ -338,6 +339,38 @@ def log_event(category, message):
             print(f"Log write error: {e}")
 
 
+def _custom_showwarning(message, category, filename, lineno, file=None, line=None):
+    short_file = os.path.basename(str(filename)) if filename else "unknown"
+    cat_name = getattr(category, "__name__", str(category))
+    msg_clean = str(message).strip().replace("\n", " ")
+    log_event("PY_WARN", f"{cat_name} ({short_file}:{lineno}): {msg_clean}")
+
+
+warnings.showwarning = _custom_showwarning
+
+
+class _EnforcerFileLogHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self._in_emit = False
+
+    def emit(self, record):
+        if self._in_emit:
+            return
+        try:
+            self._in_emit = True
+            msg = record.getMessage().strip().replace("\n", " ")
+            if msg:
+                log_event("LIB_WARN", f"{record.name} ({record.levelname}): {msg}")
+        except Exception:
+            pass
+        finally:
+            self._in_emit = False
+
+
+logging.getLogger().addHandler(_EnforcerFileLogHandler())
+
+
 def format_config_summary(cfg):
     broker = cfg.get("active_broker", "SCHWAB")
     cd_str = (
@@ -593,6 +626,58 @@ def calc_ext_limit_price(ref_price, is_sell=True):
     offset = min(offset, ref_price * 0.025)
     raw = (ref_price - offset) if is_sell else (ref_price + offset)
     return round(max(0.01, raw), 2)
+
+
+def format_limit_price_str(price_val):
+    """Formats a limit price float as a clean string (2 decimals for >= $1.00,
+    up to 4 decimals for sub-$1.00 stocks) so schwab-py and Webull SDKs
+    never emit float deprecation warnings or float precision artifacts."""
+    p = float(price_val)
+    if p < 1.0:
+        s = f"{p:.4f}".rstrip("0").rstrip(".")
+        if "." not in s:
+            return f"{p:.2f}"
+        dec_part = s.split(".")[1]
+        if len(dec_part) < 2:
+            return f"{p:.2f}"
+        return s
+    return f"{p:.2f}"
+
+
+def sanitize_equity_live_price(raw_last, bid=None, ask=None, mark=None, net_qty=0):
+    """Protects equity open PnL valuation against off-exchange FINRA TRF / dark-pool
+    sub-penny prints and single-order wicks that fall outside the live NBBO
+    [bid, ask] spread."""
+    def _pos_f(v):
+        try:
+            f = float(v)
+            return f if f > 0.0 else None
+        except Exception:
+            return None
+
+    lp = _pos_f(raw_last)
+    b = _pos_f(bid)
+    a = _pos_f(ask)
+    m = _pos_f(mark)
+
+    if lp is None:
+        lp = m or b or a
+    if lp is None:
+        return None
+
+    if b is not None and a is not None and b <= a:
+        if lp < b:
+            return b
+        if lp > a:
+            return a
+        return lp
+
+    if net_qty > 0 and b is not None and lp < b:
+        return b
+    if net_qty < 0 and a is not None and lp > a:
+        return a
+
+    return lp
 
 
 # ==========================================
@@ -1053,13 +1138,14 @@ class SchwabAdapter:
                         log_event("ERROR", f"No valid bid found for {symbol}!")
                         continue
                     lim_price = calc_ext_limit_price(float(bid), is_sell=True)
+                    lim_price_str = format_limit_price_str(lim_price)
                     log_event(
                         "ORDER_OUT",
                         f"Submitting EXT GTC_EXT Limit Sell: {int(qty)} {symbol} "
-                        f"@ ${lim_price} (Live Bid: ${bid})"
+                        f"@ ${lim_price_str} (Live Bid: ${bid})"
                     )
                     spec = (
-                        equity_sell_limit(symbol, int(qty), lim_price)
+                        equity_sell_limit(symbol, int(qty), lim_price_str)
                         .set_session(Session.SEAMLESS)
                         .set_duration(Duration.GOOD_TILL_CANCEL)
                         .build()
@@ -1080,13 +1166,14 @@ class SchwabAdapter:
                         log_event("ERROR", f"No valid ask found for {symbol}!")
                         continue
                     lim_price = calc_ext_limit_price(float(ask), is_sell=False)
+                    lim_price_str = format_limit_price_str(lim_price)
                     log_event(
                         "ORDER_OUT",
                         f"Submitting EXT GTC_EXT Limit Cover: {abs_q} {symbol} "
-                        f"@ ${lim_price} (Live Ask: ${ask})"
+                        f"@ ${lim_price_str} (Live Ask: ${ask})"
                     )
                     spec = (
-                        equity_buy_to_cover_limit(symbol, abs_q, lim_price)
+                        equity_buy_to_cover_limit(symbol, abs_q, lim_price_str)
                         .set_session(Session.SEAMLESS)
                         .set_duration(Duration.GOOD_TILL_CANCEL)
                         .build()
@@ -1163,10 +1250,12 @@ class SchwabAdapter:
                             or quote_info.get("bidPrice")
                         )
                     else:
-                        live_price = (
-                            quote_info.get("lastPrice")
-                            or quote_info.get("mark")
-                            or quote_info.get("bidPrice")
+                        live_price = sanitize_equity_live_price(
+                            raw_last=quote_info.get("lastPrice"),
+                            bid=quote_info.get("bidPrice"),
+                            ask=quote_info.get("askPrice"),
+                            mark=quote_info.get("mark"),
+                            net_qty=net_q
                         )
 
                     if live_price is not None and float(live_price) > 0:
@@ -1420,10 +1509,11 @@ class WebullAdapter:
                 lim_price = calc_ext_limit_price(
                     float(ref_lp), is_sell=(qty > 0)
                 )
+                lim_price_str = format_limit_price_str(lim_price)
                 log_event(
                     "ORDER_OUT",
                     f"Submitting Webull EXT Limit {side}: {abs_q} {symbol} "
-                    f"@ ${lim_price} (Ref Last: ${ref_lp})"
+                    f"@ ${lim_price_str} (Ref Last: ${ref_lp})"
                 )
                 order_item = {
                     "client_order_id": client_oid,
@@ -1431,7 +1521,7 @@ class WebullAdapter:
                     "instrument_type": "EQUITY",
                     "market": "US",
                     "order_type": "LIMIT",
-                    "limit_price": str(lim_price),
+                    "limit_price": lim_price_str,
                     "side": side,
                     "quantity": str(abs_q),
                     "time_in_force": "DAY",
@@ -1611,26 +1701,43 @@ class WebullAdapter:
                     or p.get("average_price")
                     or 0.0
                 )
-                lp = float(
+                raw_lp = float(
                     p.get("last_price")
                     or p.get("market_price")
                     or avg_price
                 )
-
-                pos_mkt_val = float(
-                    p.get("market_value") or (qty * lp * mult)
-                )
-                total_pos_mkt_val += pos_mkt_val
-
-                if "unrealized_profit_loss" in p and p.get(
-                    "unrealized_profit_loss"
-                ) is not None:
-                    pos_open_pnl = float(p["unrealized_profit_loss"])
+                if not is_opt:
+                    san_lp = sanitize_equity_live_price(
+                        raw_last=raw_lp,
+                        bid=p.get("bid_price") or p.get("bid"),
+                        ask=p.get("ask_price") or p.get("ask"),
+                        mark=p.get("market_price"),
+                        net_qty=qty
+                    )
+                    lp = float(san_lp) if san_lp is not None else raw_lp
                 else:
+                    lp = raw_lp
+
+                if abs(lp - raw_lp) > 0.0001:
+                    pos_mkt_val = qty * lp * mult
                     pos_open_pnl = (
                         (lp - avg_price) * qty * mult
                         if avg_price > 0 else 0.0
                     )
+                else:
+                    pos_mkt_val = float(
+                        p.get("market_value") or (qty * lp * mult)
+                    )
+                    if "unrealized_profit_loss" in p and p.get(
+                        "unrealized_profit_loss"
+                    ) is not None:
+                        pos_open_pnl = float(p["unrealized_profit_loss"])
+                    else:
+                        pos_open_pnl = (
+                            (lp - avg_price) * qty * mult
+                            if avg_price > 0 else 0.0
+                        )
+                total_pos_mkt_val += pos_mkt_val
 
                 total_open_pnl += pos_open_pnl
                 tag = f"{sym} (OPT)" if is_opt else sym
@@ -2752,14 +2859,6 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     daily_max_equity - start_equity, 2
                 )
 
-                log_position_transitions(
-                    pos_details,
-                    realized_pnl,
-                    open_pnl,
-                    net_pnl,
-                    session_high_pnl
-                )
-
                 open_flat_on = config.get("enable_open_flatten", False)
                 open_max = config.get("open_max_loss", 500.0)
 
@@ -2787,9 +2886,117 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 t3_on = config.get("enable_t3", True)
                 t4_on = config.get("enable_t4", True)
 
+                rth_now = is_rth()
+
+                # Anti-Wick Verification: if an open position's live quote
+                # appears to breach either the Daily Floor or Open PnL Stop,
+                # re-poll once after 1.2s before logging or firing enforcement
+                # so transient single-order wicks cannot cause a false flatten.
+                active_floor_now = (
+                    (
+                        max_equity - pm_trail
+                        if (pm_lock_on and max_realized_profit >= pm_trig)
+                        else start_equity - pm_max
+                    )
+                    if not rth_now
+                    else (
+                        max_equity - t4_trail
+                        if (t4_on and max_realized_profit >= t4_trig)
+                        else start_equity - t3_max
+                        if (t3_on and max_realized_profit >= t3_trig)
+                        else start_equity - t2_max
+                        if (t2_on and max_realized_profit >= t2_trig)
+                        else start_equity - t1_max
+                    )
+                )
+                floor_breach_cand = (
+                    not is_locked_down and current_eq <= active_floor_now
+                )
+                open_breach_cand = (
+                    open_flat_on and not is_flat and open_pnl <= -open_max
+                )
+                if (
+                    not first_poll_of_launch
+                    and not is_flat
+                    and (floor_breach_cand or open_breach_cand)
+                ):
+                    spike_ctx = (
+                        f"Realized={format_dollar(realized_pnl)}, "
+                        f"Open={format_dollar(open_pnl)}, "
+                        f"Net={format_dollar(net_pnl)}"
+                    )
+                    time.sleep(1.2)
+                    v_eq, v_flat, v_open, v_pos, v_opt = (
+                        active_adapter.fetch_account_data()
+                    )
+                    if v_eq is not None and v_eq > 0:
+                        current_eq = v_eq
+                        is_flat = v_flat
+                        current_is_flat = v_flat
+                        live_open_pnl = v_open
+                        pos_details = v_pos
+                        has_options = v_opt
+                        if is_flat:
+                            last_flat_equity = current_eq
+                            if current_eq > max_equity:
+                                max_equity = current_eq
+                            if current_eq > daily_max_equity:
+                                daily_max_equity = current_eq
+                            save_session_state()
+                            realized_pnl = round(
+                                last_flat_equity - start_equity, 2
+                            )
+                            open_pnl = 0.0
+                        else:
+                            open_pnl = live_open_pnl
+                            realized_pnl = round(
+                                (current_eq - start_equity) - open_pnl, 2
+                            )
+                        net_pnl = round(current_eq - start_equity, 2)
+                        max_realized_profit = round(
+                            max_equity - start_equity, 2
+                        )
+                        session_high_pnl = round(
+                            daily_max_equity - start_equity, 2
+                        )
+                        v_ctx = (
+                            f"Realized={format_dollar(realized_pnl)}, "
+                            f"Open={format_dollar(open_pnl)}, "
+                            f"Net={format_dollar(net_pnl)}"
+                        )
+                        still_floor = (
+                            not is_locked_down
+                            and current_eq <= active_floor_now
+                        )
+                        still_open = (
+                            open_flat_on
+                            and not is_flat
+                            and open_pnl <= -open_max
+                        )
+                        if not still_floor and not still_open:
+                            log_event(
+                                "GUARDRAIL",
+                                f"Filtered transient single-order wick "
+                                f"(Spike: {spike_ctx} -> Re-verified 1.2s later: "
+                                f"{v_ctx}). No flatten triggered."
+                            )
+                        else:
+                            log_event(
+                                "GUARDRAIL",
+                                f"Breach confirmed after 1.2s anti-wick check "
+                                f"(Initial: {spike_ctx} -> Verified: {v_ctx})."
+                            )
+
+                log_position_transitions(
+                    pos_details,
+                    realized_pnl,
+                    open_pnl,
+                    net_pnl,
+                    session_high_pnl
+                )
+
                 # Prevent immediate siren blast or flat re-lock on startup,
                 # at the 9:25 AM transition, or right after saving Settings
-                rth_now = is_rth()
                 if first_poll_of_launch or last_rth_mode != rth_now:
                     last_rth_mode = rth_now
                     current_upside_tier = compute_upside_tier(
