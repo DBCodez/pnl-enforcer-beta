@@ -193,6 +193,7 @@ cooldown_active = False
 cooldown_end_time = 0.0
 cooldown_label = "COOL-DOWN LOCK"
 cooldown_30s_announced = False
+cooldown_announced_mins = set()
 current_upside_tier = 1
 last_rth_mode = None
 win_trades = 0
@@ -680,6 +681,42 @@ def sanitize_equity_live_price(raw_last, bid=None, ask=None, mark=None, net_qty=
     return lp
 
 
+def compute_book_confirmed_price(
+    lp, bid=None, ask=None, mark=None, acct_lp=None, net_qty=0
+):
+    """Computes the book-confirmed reference price across the live NBBO midpoint
+    (or mark) and the broker's position snapshot price so real market moves fire
+    immediately (0s delay) while single-order wicks or entry-sweep quote lags
+    are caught and verified."""
+    def _pos_f(v):
+        try:
+            f = float(v)
+            return f if f > 0.0 else None
+        except Exception:
+            return None
+
+    b = _pos_f(bid)
+    a = _pos_f(ask)
+    m = _pos_f(mark)
+    ac = _pos_f(acct_lp)
+
+    if b is not None and a is not None and b <= a:
+        mid_p = round((b + a) / 2.0, 4)
+    elif m is not None:
+        mid_p = m
+    else:
+        mid_p = lp
+
+    cands = [lp, mid_p]
+    if ac is not None:
+        cands.append(ac)
+    if net_qty > 0:
+        return max(cands)
+    if net_qty < 0:
+        return min(cands)
+    return lp
+
+
 # ==========================================
 # 4. DUAL-BROKER ADAPTER ENGINE (SCHWAB & WEBULL)
 # ==========================================
@@ -1044,16 +1081,19 @@ class SchwabAdapter:
                         "FLATTEN",
                         f"Cancel response {order_id}: HTTP {c_resp.status_code}"
                     )
-                    cancelled_any = True
+                    if c_resp.status_code in (200, 201, 202, 204):
+                        cancelled_any = True
             if cancelled_any:
-                time.sleep(0.6)
+                time.sleep(0.2)
             else:
                 log_event("FLATTEN", "No working orders found to cancel.")
+            return cancelled_any
         else:
             log_event(
                 "ERROR",
                 f"Failed to query working orders: HTTP {orders_resp.status_code}"
             )
+            return False
 
     def get_open_equity_positions(self):
         """Returns ONLY Equity positions for Auto-Flatten (Never Options)."""
@@ -1258,19 +1298,36 @@ class SchwabAdapter:
                             net_qty=net_q
                         )
 
+                    acct_lp = (
+                        abs(acct_mkt_val / (net_q * mult))
+                        if net_q != 0 else avg_price
+                    )
                     if live_price is not None and float(live_price) > 0:
                         lp = float(live_price)
                         live_mkt_val = net_q * lp * mult
                         adj_eq += (live_mkt_val - acct_mkt_val)
                     else:
-                        lp = (
-                            abs(acct_mkt_val / (net_q * mult))
-                            if net_q != 0 else avg_price
+                        lp = acct_lp
+
+                    if a_type == "OPTION":
+                        conf_lp = lp
+                    else:
+                        conf_lp = compute_book_confirmed_price(
+                            lp=lp,
+                            bid=quote_info.get("bidPrice"),
+                            ask=quote_info.get("askPrice"),
+                            mark=quote_info.get("mark"),
+                            acct_lp=acct_lp,
+                            net_qty=net_q
                         )
 
                     pos_open_pnl = (
                         (lp - avg_price) * net_q * mult
                         if avg_price > 0 else 0.0
+                    )
+                    conf_open_pnl = (
+                        (conf_lp - avg_price) * net_q * mult
+                        if avg_price > 0 else pos_open_pnl
                     )
                     total_open_pnl += pos_open_pnl
                     tag = f"{sym} (OPT)" if a_type == "OPTION" else sym
@@ -1279,6 +1336,7 @@ class SchwabAdapter:
                         "avg": round(avg_price, 4),
                         "last": round(lp, 4),
                         "open_pnl": round(pos_open_pnl, 2),
+                        "confirmed_open_pnl": round(conf_open_pnl, 2),
                         "asset_type": a_type
                     }
 
@@ -1423,17 +1481,21 @@ class WebullAdapter:
                             c_res = self.trade_client.cancel_order(
                                 self.account_id, cid
                             )
+                        code = c_resp_code(c_res)
                         log_event(
                             "FLATTEN",
-                            f"Cancel response {cid}: HTTP {c_resp_code(c_res)}"
+                            f"Cancel response {cid}: HTTP {code}"
                         )
-                        cancelled_any = True
+                        if code in (200, 201, 202, 204, "OK"):
+                            cancelled_any = True
                 if cancelled_any:
-                    time.sleep(0.6)
+                    time.sleep(0.2)
                 else:
                     log_event("FLATTEN", "No working Webull orders to cancel.")
+                return cancelled_any
         except Exception as e:
             log_event("ERROR", f"Webull cancel working orders exception: {e}")
+        return False
 
     def get_open_equity_positions(self):
         """Returns (symbol, qty, last_price) for EQUITIES ONLY."""
@@ -1706,6 +1768,13 @@ class WebullAdapter:
                     or p.get("market_price")
                     or avg_price
                 )
+                raw_mkt_val = float(
+                    p.get("market_value") or (qty * raw_lp * mult)
+                )
+                acct_lp = (
+                    abs(raw_mkt_val / (qty * mult))
+                    if qty != 0 else avg_price
+                )
                 if not is_opt:
                     san_lp = sanitize_equity_live_price(
                         raw_last=raw_lp,
@@ -1715,8 +1784,17 @@ class WebullAdapter:
                         net_qty=qty
                     )
                     lp = float(san_lp) if san_lp is not None else raw_lp
+                    conf_lp = compute_book_confirmed_price(
+                        lp=lp,
+                        bid=p.get("bid_price") or p.get("bid"),
+                        ask=p.get("ask_price") or p.get("ask"),
+                        mark=p.get("market_price"),
+                        acct_lp=acct_lp,
+                        net_qty=qty
+                    )
                 else:
                     lp = raw_lp
+                    conf_lp = lp
 
                 if abs(lp - raw_lp) > 0.0001:
                     pos_mkt_val = qty * lp * mult
@@ -1737,6 +1815,10 @@ class WebullAdapter:
                             (lp - avg_price) * qty * mult
                             if avg_price > 0 else 0.0
                         )
+                conf_open_pnl = (
+                    (conf_lp - avg_price) * qty * mult
+                    if avg_price > 0 else pos_open_pnl
+                )
                 total_pos_mkt_val += pos_mkt_val
 
                 total_open_pnl += pos_open_pnl
@@ -1746,6 +1828,7 @@ class WebullAdapter:
                     "avg": round(avg_price, 4),
                     "last": round(lp, 4),
                     "open_pnl": round(pos_open_pnl, 2),
+                    "confirmed_open_pnl": round(conf_open_pnl, 2),
                     "asset_type": "OPTION" if is_opt else "EQUITY"
                 }
 
@@ -2401,15 +2484,21 @@ def _format_lock_voice_msg(duration_mins, label_prefix, upgraded=False):
 
 
 def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK"):
-    global cooldown_active, cooldown_end_time, cooldown_label, cooldown_30s_announced, alarm_active
+    global cooldown_active, cooldown_end_time, cooldown_label
+    global cooldown_30s_announced, cooldown_announced_mins, alarm_active
     duration_sec = max(5, int(round(float(duration_mins) * 60)))
     new_end_time = time.time() + duration_sec
+    init_announced_mins = {
+        m for m in range(1, (duration_sec // 60) + 3)
+        if (m * 60) >= (duration_sec - 10)
+    }
 
     if cooldown_active:
         if new_end_time > cooldown_end_time:
             cooldown_end_time = new_end_time
             cooldown_label = label_prefix
             cooldown_30s_announced = (duration_sec <= 35)
+            cooldown_announced_mins = set(init_announced_mins)
             log_event(
                 "COOLDOWN",
                 f"Upgraded active lock to {label_prefix} for {duration_sec}s "
@@ -2422,10 +2511,12 @@ def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK")
     cooldown_end_time = new_end_time
     cooldown_label = label_prefix
     cooldown_30s_announced = (duration_sec <= 35)
+    cooldown_announced_mins = set(init_announced_mins)
     alarm_active = False
 
     def cooldown_worker():
-        global cooldown_active, cooldown_end_time, cooldown_label, cooldown_30s_announced, alarm_active
+        global cooldown_active, cooldown_end_time, cooldown_label
+        global cooldown_30s_announced, cooldown_announced_mins, alarm_active
         log_event(
             "COOLDOWN",
             f"Persistent {cooldown_label} started for {duration_sec}s "
@@ -2435,6 +2526,16 @@ def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK")
         while time.time() < cooldown_end_time:
             alarm_active = False
             rem = int(round(cooldown_end_time - time.time()))
+            if rem > 35:
+                m_mark = (rem + 4) // 60
+                if (
+                    m_mark >= 1
+                    and m_mark not in cooldown_announced_mins
+                    and (m_mark * 60) - 5 <= rem <= (m_mark * 60)
+                ):
+                    cooldown_announced_mins.add(m_mark)
+                    m_word = "minute" if m_mark == 1 else "minutes"
+                    speak_async(f"{m_mark} {m_word} remaining until unlock.")
             if not cooldown_30s_announced and 0 < rem <= 30:
                 cooldown_30s_announced = True
                 speak_async("30 seconds remaining until unlock.")
@@ -2501,7 +2602,7 @@ def flatten_equities(adapter, force_flatten=False):
         start_wait = time.time()
         polls = 0
         while time.time() - start_wait < 15:
-            time.sleep(2)
+            time.sleep(0.5 if polls == 0 else 1.5)
             polls += 1
             rem_pos = adapter.get_open_equity_positions()
             elapsed = time.time() - start_wait
@@ -2888,10 +2989,15 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 rth_now = is_rth()
 
-                # Anti-Wick Verification: if an open position's live quote
-                # appears to breach either the Daily Floor or Open PnL Stop,
-                # re-poll once after 1.2s before logging or firing enforcement
-                # so transient single-order wicks cannot cause a false flatten.
+                # Anti-Wick Verification:
+                # 1. If the breach is already confirmed across BOTH the live
+                #    NBBO Midpoint and the broker's Account position snapshot
+                #    (confirmed_open_pnl / confirmed_eq), fire immediately with
+                #    0.0s delay!
+                # 2. If only the raw trade print breached while the NBBO
+                #    Midpoint or Account snapshot did not yet breach (e.g. a
+                #    single-order wick or entry-sweep quote lag), do a fast
+                #    0.2s re-verification poll before firing enforcement.
                 active_floor_now = (
                     (
                         max_equity - pm_trail
@@ -2920,72 +3026,95 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     and not is_flat
                     and (floor_breach_cand or open_breach_cand)
                 ):
+                    conf_open_pnl = round(
+                        sum(
+                            d.get("confirmed_open_pnl", d.get("open_pnl", 0.0))
+                            for d in pos_details.values()
+                        ),
+                        2
+                    )
+                    conf_eq = round(
+                        current_eq + (conf_open_pnl - open_pnl), 2
+                    )
+                    book_confirms_floor = (
+                        floor_breach_cand and conf_eq <= active_floor_now
+                    )
+                    book_confirms_open = (
+                        open_breach_cand and conf_open_pnl <= -open_max
+                    )
                     spike_ctx = (
                         f"Realized={format_dollar(realized_pnl)}, "
                         f"Open={format_dollar(open_pnl)}, "
                         f"Net={format_dollar(net_pnl)}"
                     )
-                    time.sleep(1.2)
-                    v_eq, v_flat, v_open, v_pos, v_opt = (
-                        active_adapter.fetch_account_data()
-                    )
-                    if v_eq is not None and v_eq > 0:
-                        current_eq = v_eq
-                        is_flat = v_flat
-                        current_is_flat = v_flat
-                        live_open_pnl = v_open
-                        pos_details = v_pos
-                        has_options = v_opt
-                        if is_flat:
-                            last_flat_equity = current_eq
-                            if current_eq > max_equity:
-                                max_equity = current_eq
-                            if current_eq > daily_max_equity:
-                                daily_max_equity = current_eq
-                            save_session_state()
-                            realized_pnl = round(
-                                last_flat_equity - start_equity, 2
+                    if book_confirms_floor or book_confirms_open:
+                        log_event(
+                            "GUARDRAIL",
+                            f"Breach confirmed immediately by NBBO book & "
+                            f"account snapshot (0s delay | {spike_ctx})."
+                        )
+                    else:
+                        time.sleep(0.2)
+                        v_eq, v_flat, v_open, v_pos, v_opt = (
+                            active_adapter.fetch_account_data()
+                        )
+                        if v_eq is not None and v_eq > 0:
+                            current_eq = v_eq
+                            is_flat = v_flat
+                            current_is_flat = v_flat
+                            live_open_pnl = v_open
+                            pos_details = v_pos
+                            has_options = v_opt
+                            if is_flat:
+                                last_flat_equity = current_eq
+                                if current_eq > max_equity:
+                                    max_equity = current_eq
+                                if current_eq > daily_max_equity:
+                                    daily_max_equity = current_eq
+                                save_session_state()
+                                realized_pnl = round(
+                                    last_flat_equity - start_equity, 2
+                                )
+                                open_pnl = 0.0
+                            else:
+                                open_pnl = live_open_pnl
+                                realized_pnl = round(
+                                    (current_eq - start_equity) - open_pnl, 2
+                                )
+                            net_pnl = round(current_eq - start_equity, 2)
+                            max_realized_profit = round(
+                                max_equity - start_equity, 2
                             )
-                            open_pnl = 0.0
-                        else:
-                            open_pnl = live_open_pnl
-                            realized_pnl = round(
-                                (current_eq - start_equity) - open_pnl, 2
+                            session_high_pnl = round(
+                                daily_max_equity - start_equity, 2
                             )
-                        net_pnl = round(current_eq - start_equity, 2)
-                        max_realized_profit = round(
-                            max_equity - start_equity, 2
-                        )
-                        session_high_pnl = round(
-                            daily_max_equity - start_equity, 2
-                        )
-                        v_ctx = (
-                            f"Realized={format_dollar(realized_pnl)}, "
-                            f"Open={format_dollar(open_pnl)}, "
-                            f"Net={format_dollar(net_pnl)}"
-                        )
-                        still_floor = (
-                            not is_locked_down
-                            and current_eq <= active_floor_now
-                        )
-                        still_open = (
-                            open_flat_on
-                            and not is_flat
-                            and open_pnl <= -open_max
-                        )
-                        if not still_floor and not still_open:
-                            log_event(
-                                "GUARDRAIL",
-                                f"Filtered transient single-order wick "
-                                f"(Spike: {spike_ctx} -> Re-verified 1.2s later: "
-                                f"{v_ctx}). No flatten triggered."
+                            v_ctx = (
+                                f"Realized={format_dollar(realized_pnl)}, "
+                                f"Open={format_dollar(open_pnl)}, "
+                                f"Net={format_dollar(net_pnl)}"
                             )
-                        else:
-                            log_event(
-                                "GUARDRAIL",
-                                f"Breach confirmed after 1.2s anti-wick check "
-                                f"(Initial: {spike_ctx} -> Verified: {v_ctx})."
+                            still_floor = (
+                                not is_locked_down
+                                and current_eq <= active_floor_now
                             )
+                            still_open = (
+                                open_flat_on
+                                and not is_flat
+                                and open_pnl <= -open_max
+                            )
+                            if not still_floor and not still_open:
+                                log_event(
+                                    "GUARDRAIL",
+                                    f"Filtered transient single-order wick "
+                                    f"(Spike: {spike_ctx} -> Re-verified 0.2s later: "
+                                    f"{v_ctx}). No flatten triggered."
+                                )
+                            else:
+                                log_event(
+                                    "GUARDRAIL",
+                                    f"Breach confirmed after 0.2s anti-wick check "
+                                    f"(Initial: {spike_ctx} -> Verified: {v_ctx})."
+                                )
 
                 log_position_transitions(
                     pos_details,
@@ -4625,7 +4754,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         cb_voice,
         "Uses Windows Speech Synthesis to speak the lockout reason and duration out loud\n"
         "when a Penalty Box or Daily Lockout triggers (e.g. 'Open PnL stop triggered. Locked out\n"
-        "for 2 minutes'), plus a '30 seconds remaining' heads-up before your screen unlocks."
+        "for 2 minutes'), plus an announcement every whole minute remaining and at 30 seconds\n"
+        "remaining before your screen unlocks."
     )
 
     cb_chime = tk.Checkbutton(
@@ -4664,6 +4794,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         "Warning Siren (Short Preview)",
         "Upside Tier Chime",
         "Voice: Lockout Alert",
+        "Voice: 1m Warning",
         "Voice: 30s Warning",
         "Unlock Chime (3-Tone)",
     ]
@@ -4702,6 +4833,8 @@ def show_preflight_window(parent=None, mute_btn=None):
                 "Open P and L stop triggered. Locked out for 2 minutes.",
                 force=True
             )
+        elif choice == "Voice: 1m Warning":
+            speak_async("1 minute remaining until unlock.", force=True)
         elif choice == "Voice: 30s Warning":
             speak_async("30 seconds remaining until unlock.", force=True)
         elif choice == "Unlock Chime (3-Tone)":
