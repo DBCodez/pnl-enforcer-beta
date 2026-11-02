@@ -133,6 +133,7 @@ DEFAULT_CONFIG = {
     "saved_daily_max_equity": None,
     "saved_last_flat_equity": None,
     "saved_has_reset_at_open": False,
+    "saved_has_reset_at_close": False,
     "saved_win_trades": 0,
     "saved_loss_trades": 0,
     "saved_account_id": ""
@@ -142,7 +143,7 @@ HUD_COLUMN_CATALOG = [
     ("realized_pnl", "REALIZED PnL", "Closed (flat) PnL for the day"),
     ("open_pnl", "OPEN PnL", "Live unrealized PnL on open positions"),
     ("net_pnl", "NET PnL", "Total daily PnL (Realized + Open)"),
-    ("terminate_lvl", "TERMINATE LVL", "Active Pre-Market or RTH lockout floor"),
+    ("terminate_lvl", "TERMINATE LVL", "Active Extended-Hours or RTH lockout floor"),
     ("dist_to_term", "$ TO TERMINATE", "Remaining dollar cushion above floor"),
     ("session_high", "SESSION HIGH", "Highest flat realized PnL of the day"),
     ("from_high", "FROM HIGH", "Current drawdown/giveback from Session High"),
@@ -185,6 +186,7 @@ max_equity = None
 daily_max_equity = None
 last_flat_equity = None
 has_reset_at_open = False
+has_reset_at_close = False
 is_locked_down = False
 force_reanchor = False
 current_is_flat = True
@@ -466,7 +468,7 @@ def format_config_summary(cfg):
         f"LockOS={dl_str} | "
         f"Voice={'ON' if cfg.get('enable_voice_cues', True) else 'OFF'} | "
         f"UpChime={'ON' if cfg.get('enable_upside_chime', True) else 'OFF'} | "
-        f"PM_Max=-${cfg.get('pm_max_loss', 0):,.0f} | "
+        f"EH_Max=-${cfg.get('pm_max_loss', 0):,.0f} | "
         f"T1_Max=-${cfg.get('t1_max_loss', 0):,.0f}"
     )
 
@@ -475,7 +477,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     """Restores today's saved baseline for a specific broker + account_id.
     Returns True if a valid baseline for today was found, False otherwise."""
     global start_equity, max_equity, daily_max_equity
-    global last_flat_equity, has_reset_at_open
+    global last_flat_equity, has_reset_at_open, has_reset_at_close
     global win_trades, loss_trades, prev_flat_realized_pnl
     global current_upside_tier, first_poll_of_launch
 
@@ -501,6 +503,9 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             )
             has_reset_at_open = bool(
                 s_data.get("has_reset_at_open", False)
+            )
+            has_reset_at_close = bool(
+                s_data.get("has_reset_at_close", False)
             )
             win_trades = int(s_data.get("win_trades", 0) or 0)
             loss_trades = int(s_data.get("loss_trades", 0) or 0)
@@ -542,6 +547,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             config.get("saved_last_flat_equity") or start_equity
         )
         has_reset_at_open = bool(config.get("saved_has_reset_at_open", False))
+        has_reset_at_close = bool(config.get("saved_has_reset_at_close", False))
         win_trades = int(config.get("saved_win_trades", 0) or 0)
         loss_trades = int(config.get("saved_loss_trades", 0) or 0)
         prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
@@ -569,6 +575,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     daily_max_equity = None
     last_flat_equity = None
     has_reset_at_open = False
+    has_reset_at_close = False
     win_trades = 0
     loss_trades = 0
     prev_flat_realized_pnl = 0.0
@@ -641,6 +648,7 @@ def save_session_state():
         "daily_max_equity": daily_max_equity,
         "last_flat_equity": last_flat_equity,
         "has_reset_at_open": has_reset_at_open,
+        "has_reset_at_close": has_reset_at_close,
         "win_trades": win_trades,
         "loss_trades": loss_trades,
     }
@@ -654,6 +662,7 @@ def save_session_state():
         or config.get("saved_daily_max_equity") != daily_max_equity
         or config.get("saved_last_flat_equity") != last_flat_equity
         or config.get("saved_has_reset_at_open") != has_reset_at_open
+        or config.get("saved_has_reset_at_close") != has_reset_at_close
         or config.get("saved_win_trades") != win_trades
         or config.get("saved_loss_trades") != loss_trades
         or config.get("saved_account_id") != sel_acct
@@ -667,6 +676,7 @@ def save_session_state():
         config["saved_daily_max_equity"] = daily_max_equity
         config["saved_last_flat_equity"] = last_flat_equity
         config["saved_has_reset_at_open"] = has_reset_at_open
+        config["saved_has_reset_at_close"] = has_reset_at_close
         config["saved_win_trades"] = win_trades
         config["saved_loss_trades"] = loss_trades
         config["saved_account_id"] = sel_acct
@@ -675,7 +685,12 @@ def save_session_state():
 
 def is_rth():
     now = datetime.now().time()
-    return dt_time(9, 25) <= now <= dt_time(16, 0)
+    return dt_time(9, 25) <= now < dt_time(16, 0)
+
+
+def is_after_hours():
+    now = datetime.now().time()
+    return now >= dt_time(16, 0)
 
 
 def is_market_hours():
@@ -2926,7 +2941,7 @@ def log_position_transitions(
 
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global start_equity, max_equity, daily_max_equity, last_flat_equity
-    global has_reset_at_open, is_locked_down, force_reanchor
+    global has_reset_at_open, has_reset_at_close, is_locked_down, force_reanchor
     global triggered_alarms, prev_pos_snapshot, current_is_flat
     global active_adapter, first_poll_of_launch
     global current_upside_tier, last_rth_mode
@@ -2973,7 +2988,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     max_equity = current_eq
                     daily_max_equity = current_eq
                     last_flat_equity = current_eq
-                    has_reset_at_open = is_rth()
+                    has_reset_at_open = is_rth() or is_after_hours()
+                    has_reset_at_close = is_after_hours()
                     force_reanchor = False
                     is_locked_down = False
                     win_trades = 0
@@ -2992,22 +3008,56 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     daily_max_equity = max(start_equity, max_equity)
 
                 reset_925 = config.get("reset_at_925", True)
-                if reset_925 and is_rth() and not has_reset_at_open:
-                    old_hwm = max_equity - start_equity
-                    max_equity = max(start_equity, last_flat_equity)
-                    new_hwm = max_equity - start_equity
+                if is_rth() and not has_reset_at_open:
                     has_reset_at_open = True
-                    is_locked_down = False
-                    triggered_alarms.clear()
                     first_poll_of_launch = True
-                    save_session_state()
-                    log_event(
-                        "SESSION",
-                        f"9:25 AM RTH Transition: Rulebook HWM recalibrated "
-                        f"from {format_dollar(old_hwm)} to "
-                        f"{format_dollar(new_hwm)} (Session High preserved at "
-                        f"{format_dollar(daily_max_equity - start_equity)})."
-                    )
+                    if reset_925:
+                        old_hwm = max_equity - start_equity
+                        max_equity = max(start_equity, last_flat_equity)
+                        new_hwm = max_equity - start_equity
+                        is_locked_down = False
+                        triggered_alarms.clear()
+                        save_session_state()
+                        log_event(
+                            "SESSION",
+                            f"9:25 AM RTH Transition: Rulebook HWM recalibrated "
+                            f"from {format_dollar(old_hwm)} to "
+                            f"{format_dollar(new_hwm)} (Session High preserved at "
+                            f"{format_dollar(daily_max_equity - start_equity)})."
+                        )
+                    else:
+                        save_session_state()
+                        log_event(
+                            "SESSION",
+                            "9:25 AM RTH Transition: Switched from Extended-Hours "
+                            "Rulebook to RTH Rulebook."
+                        )
+
+                if is_after_hours() and not has_reset_at_close:
+                    has_reset_at_open = True
+                    has_reset_at_close = True
+                    first_poll_of_launch = True
+                    if reset_925:
+                        old_hwm = max_equity - start_equity
+                        max_equity = max(start_equity, last_flat_equity)
+                        new_hwm = max_equity - start_equity
+                        is_locked_down = False
+                        triggered_alarms.clear()
+                        save_session_state()
+                        log_event(
+                            "SESSION",
+                            f"4:00 PM Extended-Hours Transition: Rulebook HWM "
+                            f"recalibrated from {format_dollar(old_hwm)} to "
+                            f"{format_dollar(new_hwm)} (Session High preserved at "
+                            f"{format_dollar(daily_max_equity - start_equity)})."
+                        )
+                    else:
+                        save_session_state()
+                        log_event(
+                            "SESSION",
+                            "4:00 PM Extended-Hours Transition: Switched from RTH "
+                            "Rulebook to Extended-Hours Rulebook."
+                        )
 
                 if is_flat:
                     last_flat_equity = current_eq
@@ -3198,8 +3248,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 )
 
                 # Prevent immediate siren blast or flat re-lock on startup,
-                # at the 9:25 AM transition, or right after saving Settings
+                # at the 9:25 AM / 4:00 PM transitions, or right after saving Settings
                 if first_poll_of_launch or last_rth_mode != rth_now:
+                    if last_rth_mode is not None and last_rth_mode != rth_now:
+                        first_poll_of_launch = True
                     last_rth_mode = rth_now
                     current_upside_tier = compute_upside_tier(
                         rth_now, max_realized_profit, config
@@ -3208,9 +3260,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 if first_poll_of_launch and is_flat:
                     first_poll_of_launch = False
                     if pm_w1_on and net_pnl <= -pm_w1:
-                        triggered_alarms[f"Pre-market -${pm_w1:,.0f} Warn 1"] = time.time()
+                        triggered_alarms[f"Ext-Hours -${pm_w1:,.0f} Warn 1"] = time.time()
                     if pm_w2_on and net_pnl <= -pm_w2:
-                        triggered_alarms[f"Pre-market -${pm_w2:,.0f} Warn 2"] = time.time()
+                        triggered_alarms[f"Ext-Hours -${pm_w2:,.0f} Warn 2"] = time.time()
                     if (t2_on or t3_on) and current_eq <= start_equity:
                         triggered_alarms["Hit $0 (Tier 2)"] = time.time()
                         triggered_alarms["Hit $0 (Tier 3)"] = time.time()
@@ -3238,10 +3290,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 )
 
                 if not is_rth():
-                    r_pm_max = f"Pre-market -${pm_max:,.0f} Breach"
-                    r_pm_w2 = f"Pre-market -${pm_w2:,.0f} Warn 2"
-                    r_pm_w1 = f"Pre-market -${pm_w1:,.0f} Warn 1"
-                    r_pm_tr = "Pre-market Trailing Floor Breach"
+                    r_pm_max = f"Ext-Hours -${pm_max:,.0f} Breach"
+                    r_pm_w2 = f"Ext-Hours -${pm_w2:,.0f} Warn 2"
+                    r_pm_w1 = f"Ext-Hours -${pm_w1:,.0f} Warn 1"
+                    r_pm_tr = "Ext-Hours Trailing Floor Breach"
 
                     check_alarm_rearm(r_pm_max, net_pnl, -pm_max)
                     if pm_w2_on:
@@ -3426,11 +3478,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     fl_str = format_dollar(terminate_pnl_level)
                     if not rth_now:
                         banner_txt = (
-                            f"★ PM PROFIT LOCK UNLOCKED — "
+                            f"★ EXT-HOURS PROFIT LOCK UNLOCKED — "
                             f"FLOOR RAISED TO {fl_str} ★"
                         )
                         log_txt = (
-                            f"Pre-Market Profit Lock unlocked at "
+                            f"Extended-Hours Profit Lock unlocked at "
                             f"{format_dollar(max_realized_profit)} — "
                             f"Floor raised to {fl_str}"
                         )
@@ -4561,7 +4613,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     c1 = make_card(
         left_col,
         "1. SINGLE-TRADE CIRCUIT BREAKER (Open PnL Stop)",
-        "Flattens open Equities in PM or RTH without ending your day "
+        "Flattens open Equities in Extended Hours or RTH without ending your day "
         "(Options = Siren Only).",
         accent="#5dade2"
     )
@@ -4645,7 +4697,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     c2 = make_card(
         left_col,
         "2. DAILY FLOOR BREACH ACTIONS (End-of-Day)",
-        "Fires ONLY when total Net PnL breaches your Pre-Market "
+        "Fires ONLY when total Net PnL breaches your Extended-Hours "
         "or RTH Termination Floor.",
         accent="#f5b041"
     )
@@ -4782,7 +4834,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     cb_reset925 = tk.Checkbutton(
         c3,
-        text="Start Fresh at RTH Open (9:25 AM) — Don't Carry PM Peak into RTH",
+        text="Start Fresh on Rulebook Switch (9:25 AM & 4:00 PM) — Don't Carry Prior Peak",
         variable=var_reset925,
         font=("Arial", 10, "bold"),
         fg="#f2f2f2",
@@ -4795,9 +4847,9 @@ def show_preflight_window(parent=None, mute_btn=None):
     cb_reset925.pack(fill="x", pady=2)
     attach_tooltip(
         cb_reset925,
-        "If checked, at 9:25 AM ET your RTH Rulebook starts fresh from current flat equity\n"
-        "so a Pre-Market profit peak won't immediately trigger an RTH Tier ratchet/trailing stop\n"
-        "on normal morning volatility. (Your SESSION HIGH column still preserves your full-day peak.)"
+        "If checked, at 9:25 AM ET (RTH Open) and 4:00 PM ET (After-Hours Open) your active Rulebook\n"
+        "starts fresh from current flat equity so an earlier session's profit peak won't immediately\n"
+        "trigger a tier ratchet or trailing stop. (Your SESSION HIGH column still preserves your full-day peak.)"
     )
 
     cb_reanchor = tk.Checkbutton(
@@ -4860,7 +4912,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(
         cb_chime,
         "When you close a winning trade (100% flat) that unlocks a higher profit ratchet tier\n"
-        "(PM Profit Lock or RTH Tier 2 / 3 / 4), plays a pleasant 4-note ascending chime\n"
+        "(Extended-Hours Profit Lock or RTH Tier 2 / 3 / 4), plays a pleasant 4-note ascending chime\n"
         "and glows the HUD status bar emerald green for 3 seconds."
     )
 
@@ -4966,13 +5018,13 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(ent_poll, poll_tip)
 
     # ==========================================================
-    # RIGHT COLUMN: 4. PRE-MARKET RULEBOOK, 5. RTH TIERED RISK
+    # RIGHT COLUMN: 4. EXTENDED HOURS RULEBOOK, 5. RTH TIERED RISK
     # ==========================================================
     c4 = make_card(
         right_col,
-        "4. PRE-MARKET RULEBOOK (Before 9:25 AM)",
-        "Extended-hours warning sirens, max loss floor, "
-        "and trailing profit lock. Uncheck any alarm/lock to disable it.",
+        "4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)",
+        "Active before 9:25 AM and after 4:00 PM ET. Warning sirens, max loss "
+        "floor, and trailing profit lock. Uncheck any alarm/lock to disable it.",
         accent="#5dade2"
     )
     cb_pm_w1, ent_pm_w1, cb_pm_w2, ent_pm_w2 = make_dual_field_row(
@@ -4984,25 +5036,25 @@ def show_preflight_window(parent=None, mute_btn=None):
         cb_var1=var_pm_w1_on,
         cb_var2=var_pm_w2_on,
         tip1=(
-            "Pre-Market Warning Alarm 1:\n"
-            "Sounds a warning siren (no flatten) when Pre-Market Net PnL reaches this loss.\n"
+            "Extended-Hours Warning Alarm 1:\n"
+            "Sounds a warning siren (no flatten) when Extended-Hours Net PnL reaches this loss.\n"
             "Uncheck to disable Warning Alarm 1."
         ),
         tip2=(
-            "Pre-Market Warning Alarm 2:\n"
-            "Sounds a second warning siren when Pre-Market Net PnL reaches this deeper loss.\n"
+            "Extended-Hours Warning Alarm 2:\n"
+            "Sounds a second warning siren when Extended-Hours Net PnL reaches this deeper loss.\n"
             "Uncheck if you only want a single warning alarm before your Max Loss Floor."
         )
     )
     make_dual_field_row(
         c4,
-        "PM Max Loss Floor (-$):",
+        "EH Max Loss Floor (-$):",
         dollar_vars["pm_max_loss"],
         None,
         None,
         tip1=(
-            "Pre-Market Hard Termination Floor:\n"
-            "If Pre-Market Net PnL reaches this loss, triggers your Card 2 Daily Floor Breach Actions\n"
+            "Extended-Hours Hard Termination Floor:\n"
+            "If Extended-Hours Net PnL reaches this loss, triggers your Card 2 Daily Floor Breach Actions\n"
             "(Auto-Flatten Equities via Extended-Hours limit order, OS Lock, etc.)."
         )
     )
@@ -5015,14 +5067,14 @@ def show_preflight_window(parent=None, mute_btn=None):
         dollar_vars["pm_trail_cushion"],
         cb_var1=var_pm_lock_on,
         tip1=(
-            "Pre-Market Trailing Profit Lock:\n"
-            "Once your closed Pre-Market Realized PnL reaches +Profit Lock Trigger ($),\n"
-            "activates a trailing floor behind your highest Pre-Market realized peak.\n"
-            "Uncheck to disable Pre-Market profit trailing."
+            "Extended-Hours Trailing Profit Lock:\n"
+            "Once your closed Extended-Hours Realized PnL reaches +Profit Lock Trigger ($),\n"
+            "activates a trailing floor behind your highest Extended-Hours realized peak.\n"
+            "Uncheck to disable Extended-Hours profit trailing."
         ),
         tip2=(
-            "Pre-Market Trailing Cushion ($):\n"
-            "Once Profit Lock Trigger (+$) is reached, your Pre-Market floor trails behind\n"
+            "Extended-Hours Trailing Cushion ($):\n"
+            "Once Profit Lock Trigger (+$) is reached, your Extended-Hours floor trails behind\n"
             "your highest closed Realized PnL by this dollar amount.\n"
             "(Example: Trigger +$500 with $500 Trail locks your floor at $0.00 breakeven\n"
             "at +$500, and raises it to +$200 if you reach +$700.)"
