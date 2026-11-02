@@ -4,6 +4,15 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.7] — 2026-11-02
+### Changed
+- **Pre-Flight UI & Layout Polish:**
+  - Restyled the sanitized log export button into a compact, dark-slate **`🔒 Safe Log`** utility button in the top bar (removing the oversized Windows multi-codepoint emoji gap and bright green CTA collision).
+  - Enforced uniform grid column alignment across Cards 4 and 5 (`make_dual_field_row`) so single-field rows (`EH Max Loss Floor (-$)` and `Hard Termination (-$)`) align vertically with dual-field input columns above and below them.
+  - Added subtle `1px` horizontal section dividers below every card header subtitle, indented the Card 1 `└─ Penalty Box OS Lock` checkbox widget under its parent toggle, right-aligned the `NEW FLOOR / TRAIL` table header in Card 5, and trimmed verbose parenthetical text on Card 3 checkboxes.
+
+---
+
 ## [v0.9.6] — 2026-11-02
 ### Added
 - **One-Click "🛡️ Export Sanitized Log" Button (Pre-Flight Top Bar):**

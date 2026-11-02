@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.6"
+APP_VERSION = "0.9.7"
 
 import os
 import sys
@@ -4324,7 +4324,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             if default_status_lbl is not None:
                 default_status_lbl.config(
                     text=(
-                        "🛡️ Sanitized log copied to clipboard & saved to "
+                        "✓ Safe log copied to clipboard & saved to "
                         f"{_mask_user_path(SANITIZED_LOG_PATH)} (Account balances redacted)."
                     ),
                     fg="#58d68d",
@@ -4342,10 +4342,10 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     btn_export_sanitized = tk.Button(
         top_bar,
-        text="🛡️ Export Sanitized Log",
+        text="🔒 Safe Log",
         font=("Arial", 9, "bold"),
-        bg="#1e8449",
-        fg="white",
+        bg="#2c3e50",
+        fg="#a3e4d7",
         padx=9,
         pady=3,
         command=export_sanitized_log_action,
@@ -4353,10 +4353,11 @@ def show_preflight_window(parent=None, mute_btn=None):
     btn_export_sanitized.pack(side="left", padx=(0, 10))
     attach_tooltip(
         btn_export_sanitized,
+        "Export Sanitized Log (Safe for Sharing / Bug Reports):\n"
         "Creates a privacy-scrubbed copy of today's log (enforcer_log_sanitized.txt),\n"
         "copies it to your clipboard, and opens it in Notepad.\n"
         "• Redacts total account balances ($[REDACTED]), Windows usernames (~), and full order IDs (...1234)\n"
-        "• Keeps relative PnL (Realized, Open, Net, High) and guardrail events intact for bug reports."
+        "• Keeps relative PnL (Realized, Open, Net, High) and guardrail events intact."
     )
 
     populate_account_dropdown()
@@ -4694,7 +4695,8 @@ def show_preflight_window(parent=None, mute_btn=None):
                 fg="#aaaaaa",
                 bg="#1b1b1b",
                 anchor="w"
-            ).pack(fill="x", pady=(2, 8))
+            ).pack(fill="x", pady=(2, 6))
+        tk.Frame(card, bg="#2c2c2c", height=1).pack(fill="x", pady=(0, 6))
         return card
 
     def make_entry(parent_w, var, width=8):
@@ -4726,8 +4728,10 @@ def show_preflight_window(parent=None, mute_btn=None):
     ):
         row = tk.Frame(parent_w, bg="#1b1b1b")
         row.pack(fill="x", pady=4)
-        row.columnconfigure(0, weight=1)
-        row.columnconfigure(2, weight=1)
+        row.columnconfigure(0, weight=1, uniform="dual_lbl")
+        row.columnconfigure(1, weight=0, minsize=108)
+        row.columnconfigure(2, weight=1, uniform="dual_lbl")
+        row.columnconfigure(3, weight=0, minsize=84)
 
         if cb_var1 is not None:
             w1 = tk.Checkbutton(
@@ -4753,7 +4757,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             )
         w1.grid(row=0, column=0, sticky="w", padx=(0, 8))
         e1 = make_entry(row, var1, width=8)
-        e1.grid(row=0, column=1, padx=(0, 24))
+        e1.grid(row=0, column=1, sticky="e", padx=(0, 24))
         if tip1:
             attach_tooltip(w1, tip1)
             attach_tooltip(e1, tip1)
@@ -4784,7 +4788,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 )
             w2.grid(row=0, column=2, sticky="w", padx=(0, 8))
             e2 = make_entry(row, var2, width=8)
-            e2.grid(row=0, column=3)
+            e2.grid(row=0, column=3, sticky="e")
             if tip2:
                 attach_tooltip(w2, tip2)
                 attach_tooltip(e2, tip2)
@@ -4842,7 +4846,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     r_open2.pack(fill="x", pady=4)
     cb_open_cd = tk.Checkbutton(
         r_open2,
-        text="   └─ Penalty Box OS Lock After Open Stop",
+        text="└─ Penalty Box OS Lock After Open Stop",
         variable=var_open_cd,
         font=("Arial", 10, "bold"),
         fg="#f2f2f2",
@@ -4853,7 +4857,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         activeforeground="#ffffff",
         anchor="w"
     )
-    cb_open_cd.pack(side="left")
+    cb_open_cd.pack(side="left", padx=(18, 0))
     ent_cd_mins = make_entry(r_open2, var_cd_mins, width=8)
     ent_cd_mins.pack(side="right")
     lbl_cd_mins = tk.Label(
@@ -5008,6 +5012,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         anchor="w"
     )
     base_sub_lbl.pack(fill="x", pady=(2, 6))
+    tk.Frame(c3, bg="#2c2c2c", height=1).pack(fill="x", pady=(0, 6))
     refresh_baseline_preview()
     attach_tooltip(
         base_sub_lbl,
@@ -5017,7 +5022,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     cb_reset925 = tk.Checkbutton(
         c3,
-        text="Start Fresh on Rulebook Switch (9:25 AM & 4:00 PM) — Don't Carry Prior Peak",
+        text="Start Fresh on Rulebook Switch (9:25 AM & 4:00 PM)",
         variable=var_reset925,
         font=("Arial", 10, "bold"),
         fg="#f2f2f2",
@@ -5037,7 +5042,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     cb_reanchor = tk.Checkbutton(
         c3,
-        text="Re-Zero Today's Starting Baseline to Current Equity (One-Time Reset)",
+        text="Re-Zero Today's Starting Baseline to Current Equity",
         variable=var_reanchor,
         font=("Arial", 10, "bold"),
         fg="#f5b041",
@@ -5343,7 +5348,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         font=("Arial", 9, "bold"),
         fg="#aaaaaa",
         bg="#1b1b1b"
-    ).grid(row=0, column=2, pady=(0, 6))
+    ).grid(row=0, column=2, sticky="e", pady=(0, 6))
 
     tier_rows = [
         (
