@@ -5646,6 +5646,20 @@ GIST_ENFORCER_RAW_URL = (
     "https://gist.githubusercontent.com/DBCodez/"
     "6442a3ab2767aeb5ba0b13940d012634/raw/enforcer.py"
 )
+GIST_DOC_RAW_URLS = {
+    "CHANGELOG.md": (
+        "https://gist.githubusercontent.com/DBCodez/"
+        "c91f71c6114caf3f2dee17cc8b60a757/raw/CHANGELOG.md"
+    ),
+    "README.md": (
+        "https://gist.githubusercontent.com/DBCodez/"
+        "e0cf8acf24c3f42181ce732411abf4d4/raw/README.md"
+    ),
+    "LICENSE.txt": (
+        "https://gist.githubusercontent.com/DBCodez/"
+        "39620ddc3740dae7ea271ee7c12580e2/raw/LICENSE.txt"
+    ),
+}
 
 
 def _parse_version_tuple(v_str):
@@ -5719,18 +5733,23 @@ def check_for_updates_cli():
             os.replace(tmp_py, target_py)
 
             for doc_name in ("CHANGELOG.md", "README.md", "LICENSE.txt"):
-                try:
-                    d_req = urllib.request.Request(
-                        f"{GITHUB_RAW_BASE}{doc_name}?t={ts}",
-                        headers={"User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}"},
-                    )
-                    with urllib.request.urlopen(d_req, timeout=3) as d_resp:
-                        doc_bytes = d_resp.read()
-                    if doc_bytes:
-                        with open(os.path.join(script_dir, doc_name), "wb") as df:
-                            df.write(doc_bytes)
-                except Exception:
-                    pass
+                doc_urls = [f"{GITHUB_RAW_BASE}{doc_name}?t={ts}"]
+                if doc_name in GIST_DOC_RAW_URLS:
+                    doc_urls.append(f"{GIST_DOC_RAW_URLS[doc_name]}?t={ts}")
+                for d_url in doc_urls:
+                    try:
+                        d_req = urllib.request.Request(
+                            d_url,
+                            headers={"User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}"},
+                        )
+                        with urllib.request.urlopen(d_req, timeout=3) as d_resp:
+                            doc_bytes = d_resp.read()
+                        if doc_bytes:
+                            with open(os.path.join(script_dir, doc_name), "wb") as df:
+                                df.write(doc_bytes)
+                            break
+                    except Exception:
+                        continue
             print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver}.\n")
         else:
             print(f"[SKIPPED] Continuing with local v{APP_VERSION}...\n")
