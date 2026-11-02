@@ -5,6 +5,8 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
+APP_VERSION = "0.9.5"
+
 import os
 import sys
 import re
@@ -363,7 +365,9 @@ def _archive_previous_log_and_prune(today_str):
 
 def init_daily_log():
     today_str = get_today_str()
-    header_line = f"=== ENFORCER SESSION LOG | DATE: {today_str} ===\n"
+    header_line = (
+        f"=== ENFORCER SESSION LOG | v{APP_VERSION} | DATE: {today_str} ===\n"
+    )
     needs_wipe = True
 
     if os.path.exists(LOG_PATH):
@@ -385,7 +389,10 @@ def init_daily_log():
                     f"Archive Folder ({LOG_RETENTION_DAYS}-day retention): "
                     f"{LOG_ARCHIVE_DIR}\n" + "=" * 50 + "\n"
                 )
-            log_event("SESSION", "Initialized fresh daily log file.")
+            log_event(
+                "SESSION",
+                f"Initialized fresh daily log file (v{APP_VERSION})."
+            )
             if archived_path:
                 log_event(
                     "SESSION",
@@ -398,7 +405,10 @@ def init_daily_log():
                     f"{LOG_RETENTION_DAYS} days."
                 )
         else:
-            log_event("SESSION", "--- APPLICATION LAUNCHED / RESUMED ---")
+            log_event(
+                "SESSION",
+                f"--- APPLICATION LAUNCHED / RESUMED (v{APP_VERSION}) ---"
+            )
     except Exception as e:
         print(f"Could not initialize log file: {e}")
 
@@ -3640,7 +3650,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         pf = tk.Toplevel(parent)
         pf.grab_set()
 
-    pf.title("PnL Enforcer — Pre-Flight & Risk Rulebook")
+    pf.title(f"PnL Enforcer Beta v{APP_VERSION} — Pre-Flight & Risk Rulebook")
     pf.config(bg="#121212", padx=26, pady=18)
     pf.resizable(False, False)
     pf.attributes("-topmost", True)
@@ -5524,7 +5534,7 @@ def start_gui():
     global hud_ui_labels, hud_start_move_fn, hud_do_move_fn
     root = tk.Tk()
     hud_root = root
-    root.title("PnL Enforcer")
+    root.title(f"PnL Enforcer v{APP_VERSION}")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     w_init = max(800, len(get_active_hud_columns(config)) * 160)
@@ -5629,10 +5639,112 @@ def start_gui():
 # ==========================================
 # 10. ENTRY POINT & SAFE FALLBACK
 # ==========================================
+GITHUB_RAW_BASE = (
+    "https://raw.githubusercontent.com/DBCodez/pnl-enforcer-beta/main/"
+)
+GIST_ENFORCER_RAW_URL = (
+    "https://gist.githubusercontent.com/DBCodez/"
+    "6442a3ab2767aeb5ba0b13940d012634/raw/enforcer.py"
+)
+
+
+def _parse_version_tuple(v_str):
+    nums = [int(x) for x in re.findall(r"\d+", str(v_str))]
+    return tuple(nums) if nums else (0,)
+
+
+def check_for_updates_cli():
+    """Checks GitHub / Gist for a newer APP_VERSION and prompts (Y/N) in the
+    terminal to download and install the latest files before launching GUI."""
+    try:
+        import urllib.request
+        ts = int(time.time())
+        candidate_urls = [
+            f"{GITHUB_RAW_BASE}enforcer.py?t={ts}",
+            f"{GIST_ENFORCER_RAW_URL}?t={ts}",
+        ]
+        best_ver = None
+        best_bytes = None
+        best_txt = None
+
+        for url in candidate_urls:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}",
+                        "Cache-Control": "no-cache",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    rem_bytes = resp.read()
+                rem_txt = rem_bytes.decode("utf-8", errors="replace")
+                if "def data_loop" not in rem_txt:
+                    continue
+                m_rem = re.search(
+                    r'(?m)^APP_VERSION\s*=\s*["\']([^"\']+)["\']', rem_txt
+                )
+                v_cand = m_rem.group(1).strip() if m_rem else "0.9.4"
+                if (
+                    best_ver is None
+                    or _parse_version_tuple(v_cand) > _parse_version_tuple(best_ver)
+                ):
+                    best_ver = v_cand
+                    best_bytes = rem_bytes
+                    best_txt = rem_txt
+            except Exception:
+                continue
+
+        if best_ver is None:
+            print(f"Version check: v{APP_VERSION} (Offline / skipped)")
+            return
+
+        if _parse_version_tuple(best_ver) <= _parse_version_tuple(APP_VERSION):
+            print(f"Version check: v{APP_VERSION} (Up to date)")
+            return
+
+        print("\n========================================================")
+        print(f"  NEW UPDATE AVAILABLE: v{APP_VERSION} -> v{best_ver}")
+        print("  (Your saved settings & broker API tokens are preserved)")
+        print("========================================================")
+        ans = input(
+            f"Download and install v{best_ver} now? (Y/N): "
+        ).strip().lower()
+        if ans in ("y", "yes"):
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            target_py = os.path.join(script_dir, "enforcer.py")
+            tmp_py = target_py + ".tmp"
+            with open(tmp_py, "wb") as f:
+                f.write(best_bytes)
+            os.replace(tmp_py, target_py)
+
+            for doc_name in ("CHANGELOG.md", "README.md", "LICENSE.txt"):
+                try:
+                    d_req = urllib.request.Request(
+                        f"{GITHUB_RAW_BASE}{doc_name}?t={ts}",
+                        headers={"User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}"},
+                    )
+                    with urllib.request.urlopen(d_req, timeout=3) as d_resp:
+                        doc_bytes = d_resp.read()
+                    if doc_bytes:
+                        with open(os.path.join(script_dir, doc_name), "wb") as df:
+                            df.write(doc_bytes)
+                except Exception:
+                    pass
+            print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver}.\n")
+        else:
+            print(f"[SKIPPED] Continuing with local v{APP_VERSION}...\n")
+    except Exception:
+        print(f"Version check: v{APP_VERSION} (Offline / skipped)")
+
+
 if __name__ == "__main__":
+    if "--check-update" in sys.argv:
+        check_for_updates_cli()
+        sys.exit(0)
     init_daily_log()
     print("\n=========================================")
-    print("      INITIALIZING PnL ENFORCER BETA     ")
+    print(f"  INITIALIZING PnL ENFORCER BETA v{APP_VERSION}  ")
     print("=========================================\n")
     try:
         if not show_liability_waiver():

@@ -68,6 +68,14 @@ if !errorlevel! neq 0 (
     "!PY_CMD!" -m pip install --upgrade --no-deps --ignore-requires-python webull-openapi-core webull-openapi-trade webull-openapi-data webull-openapi-python-sdk
 )
 
+:: 4. Check GitHub / Gist for newer release version and offer 1-keystroke update
+findstr /c:"--check-update" enforcer.py >nul 2>&1
+if !errorlevel! equ 0 (
+    "!PY_CMD!" enforcer.py --check-update
+) else (
+    "!PY_CMD!" -c "import os, re, time, urllib.request; url='https://gist.githubusercontent.com/DBCodez/6442a3ab2767aeb5ba0b13940d012634/raw/enforcer.py?t='+str(int(time.time())); rem=urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent':'PnL-Enforcer-Updater'}), timeout=3).read(); txt=rem.decode('utf-8','replace'); m=re.search(r'(?m)^APP_VERSION\s*=\s*.([0-9.]+).', txt); v=m.group(1) if m else 'latest'; ans=input(f'\nNew version v{v} available. Download and install now? (Y/N): ').strip().lower(); (open('enforcer.py.tmp','wb').write(rem), os.replace('enforcer.py.tmp','enforcer.py'), print(f'[SUCCESS] Updated to v{v}.')) if ans in ('y','yes') and 'def data_loop' in txt else None" 2>nul
+)
+
 echo Launching PnL Enforcer...
 "!PY_CMD!" enforcer.py
 if !errorlevel! neq 0 (
