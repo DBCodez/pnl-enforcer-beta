@@ -4,6 +4,15 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.8] — 2026-11-02
+### Changed
+- **Unified Rulebook & Termination Floor Terminology (Cards 2, 4, & 5):**
+  - Renamed Card 5 from *"5. REGULAR HOURS TIERED RISK"* to **`5. REGULAR HOURS RULEBOOK (9:25 AM – 4:00 PM)`** so it pairs directly with **`4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)`** and Card 3's *"Start Fresh on Rulebook Switch"* toggle.
+  - Standardized the initial loss floor label in both Rulebooks to **`Starting Max Loss (-$):`** (replacing *"EH Max Loss Floor"* in Card 4 and *"Hard Termination"* in Card 5 so Base Tier 1 doesn't appear to be the only hard termination level).
+  - Updated **Card 2 (`2. FLOOR BREACH ACTIONS (Max Loss & Profit Locks)`)** and all hover tooltips across Cards 2, 4, and 5 to make it explicit that unlocking a Profit Ratchet Tier (Tier 2/3) or Trailing Profit Lock (Tier 4 / Extended-Hours Profit Lock) replaces your active Termination Floor, and breaching that ratcheted/trailed floor triggers the exact same Card 2 actions (Auto-Flatten Equities, Kill Apps, and Windows OS Lock for the configured duration).
+
+---
+
 ## [v0.9.7] — 2026-11-02
 ### Changed
 - **Pre-Flight UI & Layout Polish:**

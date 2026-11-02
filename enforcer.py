@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.7"
+APP_VERSION = "0.9.8"
 
 import os
 import sys
@@ -146,8 +146,8 @@ HUD_COLUMN_CATALOG = [
     ("realized_pnl", "REALIZED PnL", "Closed (flat) PnL for the day"),
     ("open_pnl", "OPEN PnL", "Live unrealized PnL on open positions"),
     ("net_pnl", "NET PnL", "Total daily PnL (Realized + Open)"),
-    ("terminate_lvl", "TERMINATE LVL", "Active Extended-Hours or RTH lockout floor"),
-    ("dist_to_term", "$ TO TERMINATE", "Remaining dollar cushion above floor"),
+    ("terminate_lvl", "TERMINATE LVL", "Active Rulebook floor (Max Loss, Ratcheted Tier, or Trailing Lock)"),
+    ("dist_to_term", "$ TO TERMINATE", "Remaining dollar cushion above active Termination Floor"),
     ("session_high", "SESSION HIGH", "Highest flat realized PnL of the day"),
     ("from_high", "FROM HIGH", "Current drawdown/giveback from Session High"),
     ("trades_wl", "TRADES (W/L)", "Completed round-trip Wins & Losses (%)"),
@@ -4880,18 +4880,18 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(lbl_cd_mins, open_cd_tip)
     attach_tooltip(ent_cd_mins, open_cd_tip)
 
-    # --- CARD 2: DAILY FLOOR BREACH ACTIONS (END-OF-DAY) ---
+    # --- CARD 2: FLOOR BREACH ACTIONS (MAX LOSS & PROFIT LOCKS) ---
     c2 = make_card(
         left_col,
-        "2. DAILY FLOOR BREACH ACTIONS (End-of-Day)",
-        "Fires ONLY when total Net PnL breaches your Extended-Hours "
-        "or RTH Termination Floor.",
+        "2. FLOOR BREACH ACTIONS (Max Loss & Profit Locks)",
+        "Fires when Net PnL breaches your active floor in Rulebook 4 or 5 "
+        "(Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock).",
         accent="#f5b041"
     )
 
     cb_day_flat = tk.Checkbutton(
         c2,
-        text="Auto-Flatten Equities on Daily Floor Breach",
+        text="Auto-Flatten Equities on Active Floor Breach",
         variable=var_flatten,
         font=("Arial", 10, "bold"),
         fg="#ffffff",
@@ -4904,8 +4904,9 @@ def show_preflight_window(parent=None, mute_btn=None):
     cb_day_flat.pack(fill="x", pady=3)
     attach_tooltip(
         cb_day_flat,
-        "When your total Net PnL (Realized + Open) touches your active Daily Termination Floor,\n"
-        "cancels all working orders and liquidates open Equity shares immediately.\n"
+        "When your total Net PnL (Realized + Open) touches your active Termination Floor\n"
+        "— whether that floor is your Starting Max Loss, a tightened Tier 2/3 floor, or a\n"
+        "green Trailing Profit Lock — cancels all working orders and liquidates open Equity shares.\n"
         "(Options are never auto-flattened; if options are open, siren blares until you close them.)"
     )
 
@@ -4945,7 +4946,8 @@ def show_preflight_window(parent=None, mute_btn=None):
     cb_kill_wb.pack(side="left")
     kill_tip = (
         "Force-closes your desktop trading platform (thinkorswim.exe and/or Webull Desktop)\n"
-        "ONLY after confirming your account is 100% flat."
+        "when your active floor (Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock)\n"
+        "is breached — ONLY after confirming your account is 100% flat."
     )
     attach_tooltip(lbl_kill, kill_tip)
     attach_tooltip(cb_kill_tos, kill_tip)
@@ -4955,7 +4957,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     r_day_lock.pack(fill="x", pady=3)
     cb_lock_os = tk.Checkbutton(
         r_day_lock,
-        text="Lock Windows OS on Daily Breach",
+        text="Lock Windows OS on Floor Breach",
         variable=var_lock_os,
         font=("Arial", 10, "bold"),
         fg="#f2f2f2",
@@ -4977,7 +4979,8 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     lbl_daily_lock_mins.pack(side="right", padx=(12, 8))
     day_lock_tip = (
-        "Locks your Windows workstation for the set duration after a Daily Floor Breach:\n"
+        "Locks your Windows workstation for this exact duration whenever your active floor\n"
+        "(Starting Max Loss, Tier 2/3 Ratchet, or Trailing Profit Lock) is breached:\n"
         "• 0 = Locks Windows one single time.\n"
         "• > 0 (e.g. 15) = Persistent lockout timer that re-locks Windows every few seconds\n"
         "  if you log back in before the timer finishes.\n"
@@ -5206,13 +5209,13 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(ent_poll, poll_tip)
 
     # ==========================================================
-    # RIGHT COLUMN: 4. EXTENDED HOURS RULEBOOK, 5. RTH TIERED RISK
+    # RIGHT COLUMN: 4. EXTENDED HOURS RULEBOOK, 5. REGULAR HOURS RULEBOOK
     # ==========================================================
     c4 = make_card(
         right_col,
         "4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)",
-        "Active before 9:25 AM and after 4:00 PM ET. Warning sirens, max loss "
-        "floor, and trailing profit lock. Uncheck any alarm/lock to disable it.",
+        "Active before 9:25 AM and after 4:00 PM ET. Breaching your Max Loss "
+        "or Trailing Profit Lock triggers Card 2.",
         accent="#5dade2"
     )
     cb_pm_w1, ent_pm_w1, cb_pm_w2, ent_pm_w2 = make_dual_field_row(
@@ -5231,19 +5234,21 @@ def show_preflight_window(parent=None, mute_btn=None):
         tip2=(
             "Extended-Hours Warning Alarm 2:\n"
             "Sounds a second warning siren when Extended-Hours Net PnL reaches this deeper loss.\n"
-            "Uncheck if you only want a single warning alarm before your Max Loss Floor."
+            "Uncheck if you only want a single warning alarm before your Starting Max Loss floor."
         )
     )
     make_dual_field_row(
         c4,
-        "EH Max Loss Floor (-$):",
+        "Starting Max Loss (-$):",
         dollar_vars["pm_max_loss"],
         None,
         None,
         tip1=(
-            "Extended-Hours Hard Termination Floor:\n"
-            "If Extended-Hours Net PnL reaches this loss, triggers your Card 2 Daily Floor Breach Actions\n"
-            "(Auto-Flatten Equities via Extended-Hours limit order, OS Lock, etc.)."
+            "Extended-Hours Starting Max Loss Floor:\n"
+            "Your initial worst-case Extended-Hours loss floor before Profit Lock is triggered.\n"
+            "If Extended-Hours Net PnL reaches this loss, it immediately triggers your Card 2\n"
+            "Floor Breach Actions (Auto-Flatten Equities via Extended-Hours limit order,\n"
+            "Kill Apps, and Windows OS Lock for the duration set in Card 2)."
         )
     )
     tk.Frame(c4, bg="#2c2c2c", height=1).pack(fill="x", pady=7)
@@ -5257,30 +5262,34 @@ def show_preflight_window(parent=None, mute_btn=None):
         tip1=(
             "Extended-Hours Trailing Profit Lock:\n"
             "Once your closed Extended-Hours Realized PnL reaches +Profit Lock Trigger ($),\n"
-            "activates a trailing floor behind your highest Extended-Hours realized peak.\n"
+            "this trailing floor replaces your Starting Max Loss as your active Termination Floor.\n"
+            "• IMPORTANT: If Net PnL pulls back and touches this trailed floor, it triggers the\n"
+            "  exact same Card 2 Floor Breach Actions (Auto-Flatten, Kill Apps, and OS Lock\n"
+            "  for your Card 2 lock duration).\n"
             "Uncheck to disable Extended-Hours profit trailing."
         ),
         tip2=(
             "Extended-Hours Trailing Cushion ($):\n"
-            "Once Profit Lock Trigger (+$) is reached, your Extended-Hours floor trails behind\n"
+            "Once Profit Lock Trigger (+$) is reached, your active Termination Floor trails behind\n"
             "your highest closed Realized PnL by this dollar amount.\n"
             "(Example: Trigger +$500 with $500 Trail locks your floor at $0.00 breakeven\n"
-            "at +$500, and raises it to +$200 if you reach +$700.)"
+            "at +$500, and raises it to +$200 if you reach +$700.)\n"
+            "• Breaching this trailed floor triggers your Card 2 Floor Breach Actions & OS Lock timer."
         )
     )
 
     c5 = make_card(
         right_col,
-        "5. REGULAR HOURS TIERED RISK (9:25 AM – 4:00 PM)",
+        "5. REGULAR HOURS RULEBOOK (9:25 AM – 4:00 PM)",
         "Starts at Base Tier 1 and ratchets your floor upward "
-        "as realized profit grows. Uncheck any alarm or tier to skip it.",
+        "as realized profit grows. Breaching your active floor triggers Card 2.",
         accent="#5dade2",
         expand=True
     )
 
     tk.Label(
         c5,
-        text="BASE TIER 1 — Starting Daily Leash",
+        text="BASE TIER 1 — Starting Max Loss Floor",
         font=("Arial", 10, "bold"),
         fg="#aed6f1",
         bg="#1b1b1b",
@@ -5303,19 +5312,20 @@ def show_preflight_window(parent=None, mute_btn=None):
         tip2=(
             "RTH Base Tier 1 — Warning Alarm 2:\n"
             "Sounds a second warning siren when Net PnL reaches this deeper loss.\n"
-            "Uncheck if you only want 1 warning alarm before Hard Termination."
+            "Uncheck if you only want 1 warning alarm before your Starting Max Loss floor."
         )
     )
     make_dual_field_row(
         c5,
-        "Hard Termination (-$):",
+        "Starting Max Loss (-$):",
         dollar_vars["t1_max_loss"],
         None,
         None,
         tip1=(
-            "RTH Base Tier 1 — Hard Daily Max Loss:\n"
-            "Your starting worst-case daily loss floor before any profit tiers are unlocked.\n"
-            "Breaching this floor triggers your Card 2 Daily Floor Breach Actions."
+            "RTH Base Tier 1 — Starting Max Loss Floor:\n"
+            "Your initial worst-case RTH loss floor before any profit ratchet tiers are unlocked.\n"
+            "If Net PnL reaches this loss, it triggers your Card 2 Floor Breach Actions\n"
+            "(Auto-Flatten Equities, Kill Apps, and Windows OS Lock for the duration set in Card 2)."
         )
     )
 
@@ -5329,7 +5339,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     tk.Label(
         tbl,
-        text="PROFIT RATCHET TIERS (Optional)",
+        text="PROFIT RATCHET TIERS (Replaces Active Floor)",
         font=("Arial", 10, "bold"),
         fg="#aed6f1",
         bg="#1b1b1b",
@@ -5344,7 +5354,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     ).grid(row=0, column=1, pady=(0, 6))
     tk.Label(
         tbl,
-        text="NEW FLOOR / TRAIL",
+        text="NEW TERMINATION FLOOR",
         font=("Arial", 9, "bold"),
         fg="#aaaaaa",
         bg="#1b1b1b"
@@ -5358,10 +5368,13 @@ def show_preflight_window(parent=None, mute_btn=None):
             "New Max Loss (-$):",
             dollar_vars["t2_max_loss"],
             (
-                "RTH Tier 2 — Reduced Daily Loss Floor:\n"
-                "Once your closed Realized PnL reaches 'Activate At (+$)', your daily max loss\n"
-                "tightens to 'New Max Loss (-$)' (e.g. from -$1,500 up to -$1,000), and a warning\n"
-                "siren sounds if your PnL pulls back to $0.00. Uncheck to skip Tier 2."
+                "RTH Tier 2 — Reduced Max Loss Termination Floor:\n"
+                "Once your closed Realized PnL reaches 'Activate At (+$)', your active Termination Floor\n"
+                "tightens to 'New Max Loss (-$)' (e.g. from -$1,500 up to -$1,000), and a warning siren\n"
+                "sounds if PnL pulls back to $0.00.\n"
+                "• IMPORTANT: Breaching this tightened floor triggers your Card 2 Floor Breach Actions\n"
+                "  (Auto-Flatten, Kill Apps, and Windows OS Lock for your Card 2 lock duration).\n"
+                "Uncheck to skip Tier 2."
             )
         ),
         (
@@ -5371,10 +5384,13 @@ def show_preflight_window(parent=None, mute_btn=None):
             "New Max Loss (-$):",
             dollar_vars["t3_max_loss"],
             (
-                "RTH Tier 3 — Tighter Daily Loss / Breakeven Floor:\n"
-                "Once your closed Realized PnL reaches 'Activate At (+$)', your daily max loss\n"
+                "RTH Tier 3 — Tighter Max Loss / Breakeven Termination Floor:\n"
+                "Once your closed Realized PnL reaches 'Activate At (+$)', your active Termination Floor\n"
                 "tightens further to 'New Max Loss (-$)' (set to 0 for a $0.00 breakeven floor),\n"
-                "with a warning siren at $0.00. Uncheck to skip Tier 3."
+                "with a warning siren at $0.00.\n"
+                "• IMPORTANT: Breaching this tightened floor triggers your Card 2 Floor Breach Actions\n"
+                "  (Auto-Flatten, Kill Apps, and Windows OS Lock for your Card 2 lock duration).\n"
+                "Uncheck to skip Tier 3."
             )
         ),
         (
@@ -5384,11 +5400,15 @@ def show_preflight_window(parent=None, mute_btn=None):
             "Trail Peak By ($):",
             dollar_vars["t4_trail"],
             (
-                "RTH Tier 4 — Dynamic Trailing Profit Lock:\n"
-                "Once your closed Realized PnL reaches 'Activate At (+$)', your termination floor\n"
+                "RTH Tier 4 — Dynamic Trailing Profit Termination Floor:\n"
+                "Once your closed Realized PnL reaches 'Activate At (+$)', your active Termination Floor\n"
                 "locks in green and trails behind your highest realized PnL peak by 'Trail Peak By ($)'.\n"
                 "(Example: Activate at +$1,000 with $500 Trail locks in +$500 minimum, and ratchets\n"
-                "to +$900 if your closed Realized PnL reaches +$1,400.) Uncheck to disable Tier 4."
+                "to +$900 if your closed Realized PnL reaches +$1,400.)\n"
+                "• IMPORTANT: If Net PnL pulls back and touches this trailed floor, it triggers the\n"
+                "  exact same Card 2 Floor Breach Actions (Auto-Flatten, Kill Apps, and OS Lock\n"
+                "  for your Card 2 lock duration).\n"
+                "Uncheck to disable Tier 4."
             )
         )
     ]
