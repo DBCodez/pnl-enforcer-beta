@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.8"
+APP_VERSION = "0.9.9"
 
 import os
 import sys
@@ -3783,9 +3783,36 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     pf.protocol("WM_DELETE_WINDOW", on_close)
 
+    def _normalize_tooltip_paragraphs(raw_text):
+        lines = [
+            ln.strip() for ln in str(raw_text).strip().splitlines() if ln.strip()
+        ]
+        if not lines:
+            return []
+        paragraphs = [lines[0]]
+        new_para_prefixes = (
+            "•",
+            "- ",
+            "* ",
+            "(Example",
+            "(Options",
+            "(Note",
+            "Left-Click:",
+            "Right-Click:",
+            "Uncheck ",
+        )
+        for ln in lines[1:]:
+            prev = paragraphs[-1]
+            if prev.endswith(":") or ln.startswith(new_para_prefixes):
+                paragraphs.append(ln)
+            else:
+                paragraphs[-1] = f"{prev} {ln}"
+        return paragraphs
+
     def attach_tooltip(widget, text):
         """Attaches a clean dark-themed hover tooltip card to any widget."""
         tip_state = {"win": None, "after_id": None}
+        paragraphs = _normalize_tooltip_paragraphs(text)
 
         def show_tip():
             tip_state["after_id"] = None
@@ -3796,18 +3823,28 @@ def show_preflight_window(parent=None, mute_btn=None):
                 tw.wm_overrideredirect(True)
                 tw.attributes("-topmost", True)
                 tw.config(bg="#5dade2", padx=1, pady=1)
-                lbl = tk.Label(
-                    tw,
-                    text=text,
-                    font=("Arial", 9),
-                    fg="#f2f2f2",
-                    bg="#1b2631",
-                    justify="left",
-                    wraplength=360,
-                    padx=10,
-                    pady=7
-                )
-                lbl.pack()
+                inner = tk.Frame(tw, bg="#1b2631", padx=12, pady=8)
+                inner.pack(fill="both", expand=True)
+                for p_idx, para in enumerate(paragraphs):
+                    is_hdr = (p_idx == 0 and para.endswith(":"))
+                    is_bullet = para.startswith("•")
+                    fg_col = (
+                        "#aed6f1" if is_hdr
+                        else ("#f5cba7" if para.startswith("• IMPORTANT:") else "#f2f2f2")
+                    )
+                    fnt = ("Arial", 9, "bold") if is_hdr else ("Arial", 9)
+                    top_pad = 0 if p_idx == 0 else (4 if is_bullet or para.startswith(("Uncheck ", "(Example")) else 2)
+                    bot_pad = 3 if is_hdr else 0
+                    tk.Label(
+                        inner,
+                        text=para,
+                        font=fnt,
+                        fg=fg_col,
+                        bg="#1b2631",
+                        justify="left",
+                        anchor="w",
+                        wraplength=420,
+                    ).pack(fill="x", pady=(top_pad, bot_pad))
                 tw.update_idletasks()
                 tip_w = tw.winfo_reqwidth()
                 tip_h = tw.winfo_reqheight()
@@ -4904,10 +4941,11 @@ def show_preflight_window(parent=None, mute_btn=None):
     cb_day_flat.pack(fill="x", pady=3)
     attach_tooltip(
         cb_day_flat,
-        "When your total Net PnL (Realized + Open) touches your active Termination Floor\n"
-        "— whether that floor is your Starting Max Loss, a tightened Tier 2/3 floor, or a\n"
-        "green Trailing Profit Lock — cancels all working orders and liquidates open Equity shares.\n"
-        "(Options are never auto-flattened; if options are open, siren blares until you close them.)"
+        "Auto-Flatten on Active Floor Breach:\n"
+        "When your total Net PnL (Realized + Open) touches your active Termination Floor "
+        "(whether that floor is your Starting Max Loss, a tightened Tier 2/3 floor, or a "
+        "green Trailing Profit Lock), Enforcer cancels all working orders and liquidates open Equity shares.\n"
+        "• Option contracts are never auto-flattened; if options are open, the siren blares until you close them."
     )
 
     r_kill = tk.Frame(c2, bg="#1b1b1b")
@@ -4945,9 +4983,10 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     cb_kill_wb.pack(side="left")
     kill_tip = (
-        "Force-closes your desktop trading platform (thinkorswim.exe and/or Webull Desktop)\n"
-        "when your active floor (Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock)\n"
-        "is breached — ONLY after confirming your account is 100% flat."
+        "Platform Kill-Switch (When Flat):\n"
+        "Force-closes your desktop trading platform (thinkorswim.exe and/or Webull Desktop) "
+        "when your active floor (Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock) is breached.\n"
+        "• SAFETY GUARANTEE: Only closes the app AFTER confirming your account is 100% flat."
     )
     attach_tooltip(lbl_kill, kill_tip)
     attach_tooltip(cb_kill_tos, kill_tip)
@@ -4979,14 +5018,12 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     lbl_daily_lock_mins.pack(side="right", padx=(12, 8))
     day_lock_tip = (
-        "Locks your Windows workstation for this exact duration whenever your active floor\n"
-        "(Starting Max Loss, Tier 2/3 Ratchet, or Trailing Profit Lock) is breached:\n"
+        "Windows OS Lockout on Active Floor Breach:\n"
+        "Locks your Windows workstation for this exact duration whenever your active floor "
+        "(Starting Max Loss, Tier 2/3 Ratchet, or Trailing Profit Lock) is breached.\n"
         "• 0 = Locks Windows one single time.\n"
-        "• > 0 (e.g. 15) = Persistent lockout timer that re-locks Windows every few seconds\n"
-        "  if you log back in before the timer finishes.\n"
-        "• SAFETY GUARANTEE: The app ALWAYS confirms with the broker API that 100% of open\n"
-        "  positions are closed (flat) before locking your computer — it will never lock you\n"
-        "  out while a position is still open."
+        "• > 0 (e.g. 15) = Persistent lockout timer that re-locks Windows every few seconds if you log back in early.\n"
+        "• SAFETY GUARANTEE: Always confirms with the broker API that 100% of open positions are flat before locking."
     )
     attach_tooltip(cb_lock_os, day_lock_tip)
     attach_tooltip(lbl_daily_lock_mins, day_lock_tip)

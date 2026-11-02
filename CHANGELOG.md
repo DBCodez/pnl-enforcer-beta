@@ -4,6 +4,14 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.9] — 2026-11-02
+### Changed
+- **Structured Multi-Paragraph Hover Tooltips (`attach_tooltip`):**
+  - Added automatic paragraph normalization (`_normalize_tooltip_paragraphs`) so soft mid-sentence `\n` breaks never collide with Tkinter word-wrapping (`wraplength=420`) to create jagged 2-word orphan lines.
+  - Styled tooltip title headers (`...:`) in bold light-blue (`#aed6f1`), highlighted `• IMPORTANT:` callouts in warm amber (`#f5cba7`), and added clean vertical spacing between paragraphs, examples, and bullet points.
+
+---
+
 ## [v0.9.8] — 2026-11-02
 ### Changed
 - **Unified Rulebook & Termination Floor Terminology (Cards 2, 4, & 5):**
