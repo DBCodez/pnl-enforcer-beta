@@ -48,4 +48,4 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
    * *(Note: Schwab security tokens last 7 days. You don't need to track this yourself — the app displays your remaining token days in Pre-Flight Settings, **automatically walks you through this renewal early at startup** whenever `< 14 hours` remain so it never expires mid-session, and also lets you renew it manually anytime once a week via **`🔑 API Keys -> 🔄 Renew 7-Day Token Now`** on the Settings screen.)*
 5. Choose which account you want to monitor from the **Account Dropdown** at the top of the Pre-Flight screen.
 
-If you end up enjoying this feel welcome to buy me a coffee (or beer): buymeacoffee.com/dbcodez
+If you end up enjoying this feel welcome to buy me a coffee (or beer): (https://buymeacoffee.com/dbcodez)
