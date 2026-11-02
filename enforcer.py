@@ -22,7 +22,7 @@ import winsound
 import logging
 import warnings
 import subprocess
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 
 # Suppress harmless Tkinter Variable.__del__ RuntimeError when Python's
 # cyclic garbage collector runs on the background API polling thread
@@ -51,6 +51,8 @@ except Exception:
 SCHWAB_TOKEN_PATH = os.path.join(USER_HOME, "schwab_token.json")
 CONFIG_PATH = os.path.join(USER_HOME, "enforcer_config.json")
 LOG_PATH = os.path.join(USER_HOME, "enforcer_log.txt")
+LOG_ARCHIVE_DIR = os.path.join(USER_HOME, "enforcer_logs")
+LOG_RETENTION_DAYS = 90
 CALLBACK_URL = "https://127.0.0.1"
 
 logging.basicConfig(level=logging.INFO)
@@ -302,6 +304,61 @@ def backfill_trades_from_today_log(target_broker=None):
 
 
 # --- ACTION-ONLY DAILY EVENT LOGGER ---
+def _archive_previous_log_and_prune(today_str):
+    """Archives an older enforcer_log.txt into ~/enforcer_logs/enforcer_log_YYYY-MM-DD.txt
+    and prunes archived log files older than LOG_RETENTION_DAYS (90 days)."""
+    archived_path = None
+    pruned_count = 0
+
+    try:
+        os.makedirs(LOG_ARCHIVE_DIR, exist_ok=True)
+    except Exception:
+        return None, 0
+
+    if os.path.exists(LOG_PATH):
+        try:
+            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            if content.strip():
+                first_line = content.splitlines()[0] if content else ""
+                m = re.search(r"DATE:\s*(\d{4}-\d{2}-\d{2})", first_line)
+                if m:
+                    old_date = m.group(1)
+                else:
+                    mtime = os.path.getmtime(LOG_PATH)
+                    old_date = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+
+                if old_date != today_str:
+                    dest_path = os.path.join(
+                        LOG_ARCHIVE_DIR, f"enforcer_log_{old_date}.txt"
+                    )
+                    if os.path.exists(dest_path):
+                        with open(dest_path, "a", encoding="utf-8") as af:
+                            af.write("\n" + content)
+                    else:
+                        with open(dest_path, "w", encoding="utf-8") as af:
+                            af.write(content)
+                    archived_path = dest_path
+        except Exception as e:
+            print(f"Could not archive previous log file: {e}")
+
+    try:
+        cutoff_dt = datetime.now() - timedelta(days=LOG_RETENTION_DAYS)
+        cutoff_date_str = cutoff_dt.strftime("%Y-%m-%d")
+        for fname in os.listdir(LOG_ARCHIVE_DIR):
+            m = re.match(r"^enforcer_log_(\d{4}-\d{2}-\d{2})\.txt$", fname)
+            if m and m.group(1) < cutoff_date_str:
+                try:
+                    os.remove(os.path.join(LOG_ARCHIVE_DIR, fname))
+                    pruned_count += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return archived_path, pruned_count
+
+
 def init_daily_log():
     today_str = get_today_str()
     header_line = f"=== ENFORCER SESSION LOG | DATE: {today_str} ===\n"
@@ -318,10 +375,26 @@ def init_daily_log():
 
     try:
         if needs_wipe:
+            archived_path, pruned_cnt = _archive_previous_log_and_prune(today_str)
             with open(LOG_PATH, "w", encoding="utf-8") as f:
                 f.write(header_line)
-                f.write(f"Log File Path: {LOG_PATH}\n" + "=" * 50 + "\n")
+                f.write(f"Log File Path: {LOG_PATH}\n")
+                f.write(
+                    f"Archive Folder ({LOG_RETENTION_DAYS}-day retention): "
+                    f"{LOG_ARCHIVE_DIR}\n" + "=" * 50 + "\n"
+                )
             log_event("SESSION", "Initialized fresh daily log file.")
+            if archived_path:
+                log_event(
+                    "SESSION",
+                    f"Archived previous session log to: {archived_path}"
+                )
+            if pruned_cnt > 0:
+                log_event(
+                    "SESSION",
+                    f"Pruned {pruned_cnt} archived log(s) older than "
+                    f"{LOG_RETENTION_DAYS} days."
+                )
         else:
             log_event("SESSION", "--- APPLICATION LAUNCHED / RESUMED ---")
     except Exception as e:
@@ -4022,6 +4095,17 @@ def show_preflight_window(parent=None, mute_btn=None):
                 parent=pf
             )
 
+    def open_log_archive_folder(event=None):
+        try:
+            os.makedirs(LOG_ARCHIVE_DIR, exist_ok=True)
+            os.startfile(LOG_ARCHIVE_DIR)
+        except Exception as e:
+            messagebox.showinfo(
+                "Log Archive Folder",
+                f"Your 90-day log archive folder is located at:\n{LOG_ARCHIVE_DIR}\n\n({e})",
+                parent=pf
+            )
+
     btn_view_log = tk.Button(
         top_bar,
         text="📂 View Log",
@@ -4033,9 +4117,11 @@ def show_preflight_window(parent=None, mute_btn=None):
         command=open_log_file
     )
     btn_view_log.pack(side="left", padx=(0, 10))
+    btn_view_log.bind("<Button-3>", open_log_archive_folder)
     attach_tooltip(
         btn_view_log,
-        f"Open today's audit & trade log in Notepad:\n{LOG_PATH}"
+        f"Left-Click: Open today's audit & trade log in Notepad ({LOG_PATH})\n"
+        f"Right-Click: Open the {LOG_RETENTION_DAYS}-day log archive folder ({LOG_ARCHIVE_DIR})"
     )
 
     populate_account_dropdown()
