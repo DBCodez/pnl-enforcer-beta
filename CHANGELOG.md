@@ -4,6 +4,18 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.6] — 2026-11-02
+### Added
+- **One-Click "🛡️ Export Sanitized Log" Button (Pre-Flight Top Bar):**
+  - Generates a share-safe copy of today's session log (`~/enforcer_log_sanitized.txt`), automatically copies the sanitized text to the Windows clipboard, and opens it in Notepad for inspection.
+  - Redacts all total account equity/balance figures (`Baseline anchored to: $[REDACTED]`, `Start=$[REDACTED]`, `LastFlat=$[REDACTED]`, `TotalAccountValue=$[REDACTED]`, etc.) while keeping 100% of relative PnL (`Realized`, `Open`, `Net`, `High`, `SessionHighPnL`) and guardrail events intact for bug reports.
+- **Automatic Privacy Scrubbing in Local Session Logs (`enforcer_log.txt`):**
+  - Masks the user's Windows home folder path (`C:\Users\<Username>`) as `~` across all log headers and events so real names are never written to disk while preserving full account baseline details in the user's local log.
+  - Masks brokerage order IDs (`orderId` / `client_order_id`) to their last 4 characters (`...1234`) in both `SchwabAdapter` and `WebullAdapter`.
+  - Added central regex sanitization inside `log_event()` to strip any accidental `/accounts/<hash>` URL segments, Bearer tokens, or OAuth query parameters from raw HTTP exception strings.
+
+---
+
 ## [v0.9.5] — 2026-11-02
 ### Added
 - **Extended Hours Rulebook (Pre-Market & After-Hours):** Renamed Pre-Flight Card 4 and all associated HUD tooltips, banners, and audit log entries from "Pre-Market" to **Extended Hours** to reflect that Card 4 governs both Pre-Market (`Before 9:25 AM ET`) and After-Hours (`After 4:00 PM ET`).

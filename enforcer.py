@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.5"
+APP_VERSION = "0.9.6"
 
 import os
 import sys
@@ -53,6 +53,7 @@ except Exception:
 SCHWAB_TOKEN_PATH = os.path.join(USER_HOME, "schwab_token.json")
 CONFIG_PATH = os.path.join(USER_HOME, "enforcer_config.json")
 LOG_PATH = os.path.join(USER_HOME, "enforcer_log.txt")
+SANITIZED_LOG_PATH = os.path.join(USER_HOME, "enforcer_log_sanitized.txt")
 LOG_ARCHIVE_DIR = os.path.join(USER_HOME, "enforcer_logs")
 LOG_RETENTION_DAYS = 90
 CALLBACK_URL = "https://127.0.0.1"
@@ -363,6 +364,122 @@ def _archive_previous_log_and_prune(today_str):
     return archived_path, pruned_count
 
 
+def _mask_last4(val):
+    """Masks an order ID or account identifier to its last 4 characters."""
+    s = str(val or "").strip()
+    if len(s) > 4:
+        return f"...{s[-4:]}"
+    return s
+
+
+def _mask_user_path(text):
+    """Replaces the user's home directory path with '~' so Windows usernames
+    are never exposed in log files."""
+    out = str(text or "")
+    if USER_HOME:
+        for variant in (
+            USER_HOME,
+            USER_HOME.replace("\\", "/"),
+            USER_HOME.replace("/", "\\"),
+        ):
+            if variant:
+                out = re.sub(
+                    re.escape(variant), "~", out, flags=re.IGNORECASE
+                )
+    out = re.sub(r"[A-Za-z]:\\Users\\[^\\/\s]+", "~", out)
+    out = re.sub(r"[A-Za-z]:/Users/[^\\/\s]+", "~", out)
+    return out
+
+
+def _scrub_log_line(message):
+    """Sanitizes a single log message before writing to disk:
+    - Masks USER_HOME paths as '~'
+    - Masks any configured account_id (>4 chars) to '...last4'
+    - Masks URL /accounts/<hash> segments and Bearer/OAuth tokens
+    - Masks any long numeric/alphanumeric order IDs in cancel/order lines"""
+    msg = _mask_user_path(message)
+
+    try:
+        brokers_cfg = config.get("brokers", {})
+        for b_info in brokers_cfg.values():
+            if isinstance(b_info, dict):
+                aid = str(b_info.get("selected_account_id") or "").strip()
+                if len(aid) > 4:
+                    msg = msg.replace(aid, _mask_last4(aid))
+                for secret_k in ("app_key", "app_secret"):
+                    sec_v = str(b_info.get(secret_k) or "").strip()
+                    if len(sec_v) > 4:
+                        msg = msg.replace(sec_v, "[REDACTED]")
+    except Exception:
+        pass
+
+    # Scrub /accounts/<hash> in HTTP exception URLs
+    msg = re.sub(
+        r"(/accounts/)([A-Za-z0-9_-]{5,})",
+        lambda m: f"{m.group(1)}...{m.group(2)[-4:]}",
+        msg,
+    )
+    # Scrub Bearer tokens and OAuth query/body parameters
+    msg = re.sub(
+        r"(Bearer\s+)[A-Za-z0-9._~+/=-]+",
+        r"\1[REDACTED]",
+        msg,
+        flags=re.IGNORECASE,
+    )
+    msg = re.sub(
+        r"((?:access_token|refresh_token|id_token|client_secret|app_secret|code)=)[^&\s'\"]+",
+        r"\1[REDACTED]",
+        msg,
+        flags=re.IGNORECASE,
+    )
+    # Ensure any order ID in cancel/order log lines is masked to last 4
+    msg = re.sub(
+        r"(order ID:\s*)(?!\.\.\.)([A-Za-z0-9_-]{5,})",
+        lambda m: f"{m.group(1)}...{m.group(2)[-4:]}",
+        msg,
+        flags=re.IGNORECASE,
+    )
+    msg = re.sub(
+        r"(Cancel response\s+)(?!\.\.\.)([A-Za-z0-9_-]{5,})(:)",
+        lambda m: f"{m.group(1)}...{m.group(2)[-4:]}{m.group(3)}",
+        msg,
+        flags=re.IGNORECASE,
+    )
+    return msg
+
+
+def sanitize_log_for_export(raw_log_text):
+    """Produces a share-safe version of a session log with all total account
+    balances/equities redacted ($[REDACTED]) while keeping all relative PnL
+    (Realized, Open, Net, High, ratchets, and risk floors) intact."""
+    lines = str(raw_log_text or "").splitlines()
+    out_lines = []
+    inserted_notice = False
+
+    for line in lines:
+        s = _scrub_log_line(line)
+        # Redact total account equity / balance figures while keeping relative PnL
+        s = re.sub(
+            r"(Baseline anchored to:\s*)\$[0-9,]+(?:\.[0-9]{2})?",
+            r"\1$[REDACTED]",
+            s,
+        )
+        s = re.sub(
+            r"((?:Start|LastFlat|TotalAccountValue|NetLiq|Cash|MarketVal)=)\$[0-9,]+(?:\.[0-9]{2})?",
+            r"\1$[REDACTED]",
+            s,
+        )
+        out_lines.append(s)
+        if not inserted_notice and s.startswith("==="):
+            out_lines.append(
+                "[SANITIZED EXPORT: Total account balances, user paths, "
+                "and full order IDs redacted for safe sharing]"
+            )
+            inserted_notice = True
+
+    return "\n".join(out_lines) + "\n"
+
+
 def init_daily_log():
     today_str = get_today_str()
     header_line = (
@@ -384,10 +501,10 @@ def init_daily_log():
             archived_path, pruned_cnt = _archive_previous_log_and_prune(today_str)
             with open(LOG_PATH, "w", encoding="utf-8") as f:
                 f.write(header_line)
-                f.write(f"Log File Path: {LOG_PATH}\n")
+                f.write(f"Log File Path: {_mask_user_path(LOG_PATH)}\n")
                 f.write(
                     f"Archive Folder ({LOG_RETENTION_DAYS}-day retention): "
-                    f"{LOG_ARCHIVE_DIR}\n" + "=" * 50 + "\n"
+                    f"{_mask_user_path(LOG_ARCHIVE_DIR)}\n" + "=" * 50 + "\n"
                 )
             log_event(
                 "SESSION",
@@ -396,7 +513,7 @@ def init_daily_log():
             if archived_path:
                 log_event(
                     "SESSION",
-                    f"Archived previous session log to: {archived_path}"
+                    f"Archived previous session log to: {_mask_user_path(archived_path)}"
                 )
             if pruned_cnt > 0:
                 log_event(
@@ -415,7 +532,8 @@ def init_daily_log():
 
 def log_event(category, message):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    line = f"[{ts}] [{category:<10}] {message}"
+    clean_msg = _scrub_log_line(message)
+    line = f"[{ts}] [{category:<10}] {clean_msg}"
     print(line)
     with log_lock:
         try:
@@ -1170,14 +1288,15 @@ class SchwabAdapter:
                 status = order.get("status")
                 if status in active_statuses:
                     order_id = order.get("orderId")
+                    masked_oid = _mask_last4(order_id)
                     log_event(
                         "FLATTEN",
-                        f"Canceling Schwab order ID: {order_id} ({status})"
+                        f"Canceling Schwab order ID: {masked_oid} ({status})"
                     )
                     c_resp = self.client.cancel_order(self.account_id, order_id)
                     log_event(
                         "FLATTEN",
-                        f"Cancel response {order_id}: HTTP {c_resp.status_code}"
+                        f"Cancel response {masked_oid}: HTTP {c_resp.status_code}"
                     )
                     if c_resp.status_code in (200, 201, 202, 204):
                         cancelled_any = True
@@ -1568,8 +1687,9 @@ class WebullAdapter:
                         or o.get("order_id")
                     )
                     if cid:
+                        masked_cid = _mask_last4(cid)
                         log_event(
-                            "FLATTEN", f"Canceling Webull order ID: {cid}"
+                            "FLATTEN", f"Canceling Webull order ID: {masked_cid}"
                         )
                         if hasattr(self.trade_client, "order_v3"):
                             c_res = self.trade_client.order_v3.cancel_order(
@@ -1582,7 +1702,7 @@ class WebullAdapter:
                         code = c_resp_code(c_res)
                         log_event(
                             "FLATTEN",
-                            f"Cancel response {cid}: HTTP {code}"
+                            f"Cancel response {masked_cid}: HTTP {code}"
                         )
                         if code in (200, 201, 202, 204, "OK"):
                             cancelled_any = True
@@ -4178,12 +4298,65 @@ def show_preflight_window(parent=None, mute_btn=None):
         pady=3,
         command=open_log_file
     )
-    btn_view_log.pack(side="left", padx=(0, 10))
+    btn_view_log.pack(side="left", padx=(0, 6))
     btn_view_log.bind("<Button-3>", open_log_archive_folder)
     attach_tooltip(
         btn_view_log,
-        f"Left-Click: Open today's audit & trade log in Notepad ({LOG_PATH})\n"
+        f"Left-Click: Open today's full audit & trade log in Notepad ({LOG_PATH})\n"
         f"Right-Click: Open the {LOG_RETENTION_DAYS}-day log archive folder ({LOG_ARCHIVE_DIR})"
+    )
+
+    def export_sanitized_log_action():
+        if not os.path.exists(LOG_PATH):
+            init_daily_log()
+        try:
+            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                raw_txt = f.read()
+            sanitized_txt = sanitize_log_for_export(raw_txt)
+            with open(SANITIZED_LOG_PATH, "w", encoding="utf-8") as sf:
+                sf.write(sanitized_txt)
+            try:
+                pf.clipboard_clear()
+                pf.clipboard_append(sanitized_txt)
+                pf.update()
+            except Exception:
+                pass
+            if default_status_lbl is not None:
+                default_status_lbl.config(
+                    text=(
+                        "🛡️ Sanitized log copied to clipboard & saved to "
+                        f"{_mask_user_path(SANITIZED_LOG_PATH)} (Account balances redacted)."
+                    ),
+                    fg="#58d68d",
+                )
+            try:
+                os.startfile(SANITIZED_LOG_PATH)
+            except Exception:
+                pass
+        except Exception as e:
+            messagebox.showerror(
+                "Export Sanitized Log Error",
+                f"Could not export sanitized log:\n{e}",
+                parent=pf,
+            )
+
+    btn_export_sanitized = tk.Button(
+        top_bar,
+        text="🛡️ Export Sanitized Log",
+        font=("Arial", 9, "bold"),
+        bg="#1e8449",
+        fg="white",
+        padx=9,
+        pady=3,
+        command=export_sanitized_log_action,
+    )
+    btn_export_sanitized.pack(side="left", padx=(0, 10))
+    attach_tooltip(
+        btn_export_sanitized,
+        "Creates a privacy-scrubbed copy of today's log (enforcer_log_sanitized.txt),\n"
+        "copies it to your clipboard, and opens it in Notepad.\n"
+        "• Redacts total account balances ($[REDACTED]), Windows usernames (~), and full order IDs (...1234)\n"
+        "• Keeps relative PnL (Realized, Open, Net, High) and guardrail events intact for bug reports."
     )
 
     populate_account_dropdown()
