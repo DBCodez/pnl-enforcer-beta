@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.10"
+APP_VERSION = "0.9.11"
 
 import os
 import sys
@@ -57,6 +57,7 @@ SANITIZED_LOG_PATH = os.path.join(USER_HOME, "enforcer_log_sanitized.txt")
 LOG_ARCHIVE_DIR = os.path.join(USER_HOME, "enforcer_logs")
 LOG_RETENTION_DAYS = 90
 CALLBACK_URL = "https://127.0.0.1"
+BUG_REPORT_FORM_URL = "https://tally.so/r/Z98y4V"
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("webull").setLevel(logging.ERROR)
@@ -4374,37 +4375,76 @@ def show_preflight_window(parent=None, mute_btn=None):
         f"Right-Click: Open the {LOG_RETENTION_DAYS}-day log archive folder ({LOG_ARCHIVE_DIR})"
     )
 
-    def export_sanitized_log_action():
+    def _prepare_sanitized_log():
+        """Generates ~/enforcer_log_sanitized.txt (and a convenience copy in
+        ~/Downloads if present) and copies the sanitized text to the clipboard."""
         if not os.path.exists(LOG_PATH):
             init_daily_log()
+        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            raw_txt = f.read()
+        sanitized_txt = sanitize_log_for_export(raw_txt)
+        with open(SANITIZED_LOG_PATH, "w", encoding="utf-8") as sf:
+            sf.write(sanitized_txt)
         try:
-            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-                raw_txt = f.read()
-            sanitized_txt = sanitize_log_for_export(raw_txt)
-            with open(SANITIZED_LOG_PATH, "w", encoding="utf-8") as sf:
-                sf.write(sanitized_txt)
-            try:
-                pf.clipboard_clear()
-                pf.clipboard_append(sanitized_txt)
-                pf.update()
-            except Exception:
-                pass
+            dl_dir = os.path.join(USER_HOME, "Downloads")
+            if os.path.isdir(dl_dir):
+                dl_copy = os.path.join(dl_dir, "enforcer_log_sanitized.txt")
+                with open(dl_copy, "w", encoding="utf-8") as df:
+                    df.write(sanitized_txt)
+        except Exception:
+            pass
+        try:
+            pf.clipboard_clear()
+            pf.clipboard_append(sanitized_txt)
+            pf.update()
+        except Exception:
+            pass
+        return SANITIZED_LOG_PATH
+
+    def export_sanitized_log_action():
+        try:
+            out_path = _prepare_sanitized_log()
             if default_status_lbl is not None:
                 default_status_lbl.config(
                     text=(
                         "✓ Safe log copied to clipboard & saved to "
-                        f"{_mask_user_path(SANITIZED_LOG_PATH)} (Account balances redacted)."
+                        f"{_mask_user_path(out_path)} (Account balances redacted)."
                     ),
                     fg="#58d68d",
                 )
             try:
-                os.startfile(SANITIZED_LOG_PATH)
+                os.startfile(out_path)
             except Exception:
                 pass
         except Exception as e:
             messagebox.showerror(
                 "Export Sanitized Log Error",
                 f"Could not export sanitized log:\n{e}",
+                parent=pf,
+            )
+
+    def report_bug_action():
+        try:
+            out_path = _prepare_sanitized_log()
+            if default_status_lbl is not None:
+                default_status_lbl.config(
+                    text=(
+                        "✓ Safe log copied to clipboard & highlighted in Explorer "
+                        "— Opening Bug Report form..."
+                    ),
+                    fg="#f5cba7",
+                )
+            try:
+                subprocess.Popen(
+                    ["explorer", f"/select,{os.path.normpath(out_path)}"]
+                )
+            except Exception:
+                pass
+            webbrowser.open(BUG_REPORT_FORM_URL)
+        except Exception as e:
+            messagebox.showerror(
+                "Bug Report Error",
+                f"Could not prepare sanitized log for bug report:\n{e}",
                 parent=pf,
             )
 
@@ -4418,14 +4458,34 @@ def show_preflight_window(parent=None, mute_btn=None):
         pady=3,
         command=export_sanitized_log_action,
     )
-    btn_export_sanitized.pack(side="left", padx=(0, 10))
+    btn_export_sanitized.pack(side="left", padx=(0, 6))
     attach_tooltip(
         btn_export_sanitized,
-        "Export Sanitized Log (Safe for Sharing / Bug Reports):\n"
-        "Creates a privacy-scrubbed copy of today's log (enforcer_log_sanitized.txt),\n"
+        "Export Sanitized Log (Safe for Sharing / Preview):\n"
+        "Creates a privacy-scrubbed copy of today's log (enforcer_log_sanitized.txt), "
         "copies it to your clipboard, and opens it in Notepad.\n"
         "• Redacts total account balances ($[REDACTED]), Windows usernames (~), and full order IDs (...1234)\n"
         "• Keeps relative PnL (Realized, Open, Net, High) and guardrail events intact."
+    )
+
+    btn_report_bug = tk.Button(
+        top_bar,
+        text="🐞 Report Bug",
+        font=("Arial", 9, "bold"),
+        bg="#4a235a",
+        fg="#f5cba7",
+        padx=9,
+        pady=3,
+        command=report_bug_action,
+    )
+    btn_report_bug.pack(side="left", padx=(0, 10))
+    attach_tooltip(
+        btn_report_bug,
+        "One-Click Bug Report & Safe Log Prep:\n"
+        "Automatically prepares your sanitized log and opens the Bug Report portal in your browser.\n"
+        "• Copies your privacy-scrubbed log straight to your clipboard (ready to Ctrl+V)\n"
+        "• Saves enforcer_log_sanitized.txt (in ~ and ~/Downloads) and highlights it in Windows Explorer so you can drag-and-drop it straight into the form\n"
+        "• Redacts all total account balances ($[REDACTED]), Windows usernames (~), and order IDs (...1234)."
     )
 
     populate_account_dropdown()

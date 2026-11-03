@@ -4,6 +4,13 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.11] — 2026-11-03
+### Added
+- **One-Click `🐞 Report Bug` Button (Pre-Flight Top Bar):**
+  - Automatically generates `enforcer_log_sanitized.txt` (in `~` and `~/Downloads`) with all account balances redacted, copies the sanitized text to the Windows clipboard, opens Windows Explorer with `enforcer_log_sanitized.txt` pre-highlighted (`explorer /select,`) for instant drag-and-drop upload, and launches the Tally.so Bug Report portal (`https://tally.so/r/Z98y4V`).
+
+---
+
 ## [v0.9.10] — 2026-11-03
 ### Fixed
 - **Webull OpenAPI SDK Auto-Installer (`Launch_Enforcer.bat` & `enforcer.py`):**
