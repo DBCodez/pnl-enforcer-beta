@@ -4,6 +4,15 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.12] — 2026-11-03
+### Added
+- **GUI "Update Available" Pop-Up Dialog (`show_update_available_dialog`):**
+  - Replaced the terminal-only `Y/N` update prompt with a dark-themed, always-on-top GUI pop-up whenever a newer release is detected on startup.
+  - Displays a live scrollable preview of `CHANGELOG.md` right inside the dialog, a clickable **`Open Full Changelog ↗`** button, and one-click **`Skip for Now`** or **`Install vX.Y.Z & Launch >>`** buttons.
+- **Launcher Banner Cleanup (`Launch_Enforcer.bat`):** Replaced the UTF-8 em-dash (`—`) in `Launch_Enforcer.bat` with ASCII `--` to prevent `ΓÇö` encoding artifacts in Windows `cmd.exe`.
+
+---
+
 ## [v0.9.11] — 2026-11-03
 ### Added
 - **One-Click `🐞 Report Bug` Button (Pre-Flight Top Bar):**

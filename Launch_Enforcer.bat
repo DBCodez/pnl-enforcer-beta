@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableDelayedExpansion
-title PnL Enforcer Beta — Launcher
+title PnL Enforcer Beta -- Launcher
 cd /d "%~dp0"
 
 echo ========================================================
-echo          PnL ENFORCER BETA — STARTUP CHECK
+echo          PnL ENFORCER BETA -- STARTUP CHECK
 echo ========================================================
 
 set "PY_CMD="

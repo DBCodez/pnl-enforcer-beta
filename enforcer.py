@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.11"
+APP_VERSION = "0.9.12"
 
 import os
 import sys
@@ -43,6 +43,7 @@ if _orig_tk_var_del is not None:
 # 1. DYNAMIC USER PATHS (NO HARDCODED KEYS)
 # ==========================================
 USER_HOME = os.path.expanduser("~")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Keep working directory in USER_HOME so Webull SDK stores conf/token.txt
 # safely in C:\Users\<Username>\conf\ instead of inside the repo folder.
 try:
@@ -5972,6 +5973,9 @@ GIST_ENFORCER_RAW_URL = (
     "https://gist.githubusercontent.com/DBCodez/"
     "6442a3ab2767aeb5ba0b13940d012634/raw/enforcer.py"
 )
+CHANGELOG_WEB_URL = (
+    "https://gist.github.com/DBCodez/c91f71c6114caf3f2dee17cc8b60a757"
+)
 GIST_DOC_RAW_URLS = {
     "CHANGELOG.md": (
         "https://gist.githubusercontent.com/DBCodez/"
@@ -5993,9 +5997,179 @@ def _parse_version_tuple(v_str):
     return tuple(nums) if nums else (0,)
 
 
+def _fetch_remote_doc_bytes(doc_name, ts=None):
+    import urllib.request
+    if ts is None:
+        ts = int(time.time())
+    doc_urls = [f"{GITHUB_RAW_BASE}{doc_name}?t={ts}"]
+    if doc_name in GIST_DOC_RAW_URLS:
+        doc_urls.append(f"{GIST_DOC_RAW_URLS[doc_name]}?t={ts}")
+    for d_url in doc_urls:
+        try:
+            d_req = urllib.request.Request(
+                d_url,
+                headers={
+                    "User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}",
+                    "Cache-Control": "no-cache",
+                },
+            )
+            with urllib.request.urlopen(d_req, timeout=3) as d_resp:
+                doc_bytes = d_resp.read()
+            if doc_bytes:
+                return doc_bytes
+        except Exception:
+            continue
+    return None
+
+
+def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
+    """Displays a dark-themed GUI popup when a new version is available,
+    showing release notes and a clickable link to the full Changelog."""
+    decision = {"install": False}
+    try:
+        win = tk.Tk()
+        win.title(f"PnL Enforcer Beta — Update Available (v{new_ver})")
+        win.config(bg="#121212", padx=24, pady=18)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+
+        w, h = 700, 460
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        x = max(20, (sw - w) // 2)
+        y = max(20, (sh - h) // 2)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+        hdr_row = tk.Frame(win, bg="#121212")
+        hdr_row.pack(fill="x")
+
+        tk.Label(
+            hdr_row,
+            text=f"🚀 UPDATE AVAILABLE:  v{curr_ver}  ➔  v{new_ver}",
+            font=("Arial", 13, "bold"),
+            fg="#58d68d",
+            bg="#121212",
+            anchor="w",
+        ).pack(side="left")
+
+        tk.Button(
+            hdr_row,
+            text="Open Full Changelog ↗",
+            font=("Arial", 9, "bold"),
+            bg="#2c3e50",
+            fg="#aed6f1",
+            padx=10,
+            pady=3,
+            command=lambda: webbrowser.open(CHANGELOG_WEB_URL),
+        ).pack(side="right")
+
+        tk.Label(
+            win,
+            text=(
+                "Your saved Pre-Flight settings, daily account baselines, and "
+                "broker API tokens are 100% preserved."
+            ),
+            font=("Arial", 9),
+            fg="#aaaaaa",
+            bg="#121212",
+            anchor="w",
+        ).pack(fill="x", pady=(4, 10))
+
+        # Pack bottom button bar BEFORE the expandable changelog card so
+        # Tkinter always reserves space for the buttons at the bottom.
+        btn_bar = tk.Frame(win, bg="#121212", pady=12)
+        btn_bar.pack(fill="x", side="bottom")
+
+        def on_skip():
+            decision["install"] = False
+            win.destroy()
+
+        def on_install():
+            decision["install"] = True
+            win.destroy()
+
+        tk.Button(
+            btn_bar,
+            text=f"Skip for Now (Keep v{curr_ver})",
+            font=("Arial", 10, "bold"),
+            bg="#333333",
+            fg="#cccccc",
+            padx=16,
+            pady=7,
+            command=on_skip,
+        ).pack(side="left")
+
+        tk.Button(
+            btn_bar,
+            text=f"Install v{new_ver} & Launch >>",
+            font=("Arial", 10, "bold"),
+            bg="#1e8449",
+            fg="white",
+            padx=22,
+            pady=7,
+            command=on_install,
+        ).pack(side="right")
+
+        card = tk.Frame(
+            win, bg="#1b1b1b", bd=1, relief="solid", padx=12, pady=10
+        )
+        card.pack(fill="both", expand=True)
+
+        tk.Label(
+            card,
+            text=f"WHAT'S NEW IN v{new_ver} (CHANGELOG):",
+            font=("Arial", 9, "bold"),
+            fg="#5dade2",
+            bg="#1b1b1b",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 6))
+
+        txt_frame = tk.Frame(card, bg="#141414")
+        txt_frame.pack(fill="both", expand=True)
+
+        sb = tk.Scrollbar(txt_frame)
+        sb.pack(side="right", fill="y")
+
+        txt_box = tk.Text(
+            txt_frame,
+            height=12,
+            bg="#141414",
+            fg="#e5e8e8",
+            font=("Consolas", 9),
+            wrap="word",
+            bd=0,
+            padx=10,
+            pady=8,
+            yscrollcommand=sb.set,
+        )
+        txt_box.pack(side="left", fill="both", expand=True)
+        sb.config(command=txt_box.yview)
+
+        display_notes = (changelog_md or "").strip()
+        if not display_notes:
+            display_notes = (
+                f"PnL Enforcer Beta v{new_ver} is ready to install.\n\n"
+                f"Click 'Open Full Changelog ↗' above to view full release notes."
+            )
+        txt_box.insert("1.0", display_notes)
+        txt_box.see("1.0")
+        txt_box.config(state="disabled")
+
+        win.protocol("WM_DELETE_WINDOW", on_skip)
+        win.lift()
+        win.focus_force()
+        win.mainloop()
+        return decision["install"]
+    except Exception:
+        ans = input(
+            f"Download and install v{new_ver} now? (Y/N): "
+        ).strip().lower()
+        return ans in ("y", "yes")
+
+
 def check_for_updates_cli():
-    """Checks GitHub / Gist for a newer APP_VERSION and prompts (Y/N) in the
-    terminal to download and install the latest files before launching GUI."""
+    """Checks GitHub / Gist for a newer APP_VERSION and pops up a GUI dialog
+    (with Changelog preview + link) to download and install the latest files."""
     try:
         import urllib.request
         ts = int(time.time())
@@ -6043,39 +6217,35 @@ def check_for_updates_cli():
             print(f"Version check: v{APP_VERSION} (Up to date)")
             return
 
-        print("\n========================================================")
-        print(f"  NEW UPDATE AVAILABLE: v{APP_VERSION} -> v{best_ver}")
-        print("  (Your saved settings & broker API tokens are preserved)")
-        print("========================================================")
-        ans = input(
-            f"Download and install v{best_ver} now? (Y/N): "
-        ).strip().lower()
-        if ans in ("y", "yes"):
-            script_dir = os.path.dirname(os.path.abspath(__file__))
+        print(f"New update available: v{APP_VERSION} -> v{best_ver}")
+        cl_bytes = _fetch_remote_doc_bytes("CHANGELOG.md", ts=ts)
+        cl_text = (
+            cl_bytes.decode("utf-8", errors="replace") if cl_bytes else ""
+        )
+
+        if show_update_available_dialog(APP_VERSION, best_ver, cl_text):
+            script_dir = SCRIPT_DIR
             target_py = os.path.join(script_dir, "enforcer.py")
             tmp_py = target_py + ".tmp"
             with open(tmp_py, "wb") as f:
                 f.write(best_bytes)
             os.replace(tmp_py, target_py)
 
-            for doc_name in ("CHANGELOG.md", "README.md", "LICENSE.txt"):
-                doc_urls = [f"{GITHUB_RAW_BASE}{doc_name}?t={ts}"]
-                if doc_name in GIST_DOC_RAW_URLS:
-                    doc_urls.append(f"{GIST_DOC_RAW_URLS[doc_name]}?t={ts}")
-                for d_url in doc_urls:
+            if cl_bytes:
+                try:
+                    with open(os.path.join(script_dir, "CHANGELOG.md"), "wb") as cf:
+                        cf.write(cl_bytes)
+                except Exception:
+                    pass
+
+            for doc_name in ("README.md", "LICENSE.txt"):
+                doc_bytes = _fetch_remote_doc_bytes(doc_name, ts=ts)
+                if doc_bytes:
                     try:
-                        d_req = urllib.request.Request(
-                            d_url,
-                            headers={"User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}"},
-                        )
-                        with urllib.request.urlopen(d_req, timeout=3) as d_resp:
-                            doc_bytes = d_resp.read()
-                        if doc_bytes:
-                            with open(os.path.join(script_dir, doc_name), "wb") as df:
-                                df.write(doc_bytes)
-                            break
+                        with open(os.path.join(script_dir, doc_name), "wb") as df:
+                            df.write(doc_bytes)
                     except Exception:
-                        continue
+                        pass
             print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver}.\n")
         else:
             print(f"[SKIPPED] Continuing with local v{APP_VERSION}...\n")
@@ -6084,6 +6254,14 @@ def check_for_updates_cli():
 
 
 if __name__ == "__main__":
+    if "--preview-update-dialog" in sys.argv:
+        cl_local = ""
+        cl_path = os.path.join(SCRIPT_DIR, "CHANGELOG.md")
+        if os.path.exists(cl_path):
+            with open(cl_path, "r", encoding="utf-8", errors="replace") as f:
+                cl_local = f.read()
+        show_update_available_dialog("0.9.10", APP_VERSION, cl_local)
+        sys.exit(0)
     if "--check-update" in sys.argv:
         check_for_updates_cli()
         sys.exit(0)
