@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.9"
+APP_VERSION = "0.9.10"
 
 import os
 import sys
@@ -1174,7 +1174,15 @@ class SchwabAdapter:
         self.last_error = ""
 
     def authenticate(self):
-        from schwab.auth import client_from_manual_flow, client_from_token_file
+        try:
+            from schwab.auth import client_from_manual_flow, client_from_token_file
+        except ImportError:
+            print("[SETUP] Installing required Schwab SDK (schwab-py)...")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "schwab-py"],
+                check=False
+            )
+            from schwab.auth import client_from_manual_flow, client_from_token_file
         try:
             if os.path.exists(SCHWAB_TOKEN_PATH):
                 rem_hrs = get_schwab_token_remaining_hours()
@@ -1591,8 +1599,31 @@ class WebullAdapter:
 
     def authenticate(self):
         logging.getLogger("webull").setLevel(logging.ERROR)
-        from webull.core.client import ApiClient
-        from webull.trade.trade_client import TradeClient
+        try:
+            import six  # noqa: F401
+            import jmespath  # noqa: F401
+            from webull.core.client import ApiClient
+            from webull.trade.trade_client import TradeClient
+        except ImportError:
+            print("[SETUP] Installing required Webull OpenAPI SDK & dependencies...")
+            subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install", "--upgrade",
+                    "six", "jmespath", "protobuf", "paho-mqtt",
+                    "requests", "urllib3", "certifi", "cryptography", "cachetools"
+                ],
+                check=False
+            )
+            subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install", "--upgrade",
+                    "--no-deps", "--ignore-requires-python",
+                    "webull-openapi-python-sdk"
+                ],
+                check=False
+            )
+            from webull.core.client import ApiClient
+            from webull.trade.trade_client import TradeClient
         self.api_client = ApiClient(self.app_key, self.app_secret, "us")
         self.api_client.add_endpoint("us", "api.webull.com")
         self.trade_client = TradeClient(self.api_client)

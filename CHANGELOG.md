@@ -4,6 +4,15 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.10] — 2026-11-03
+### Fixed
+- **Webull OpenAPI SDK Auto-Installer (`Launch_Enforcer.bat` & `enforcer.py`):**
+  - Fixed a package name list bug in `Launch_Enforcer.bat` where deprecated split package names (`webull-openapi-core`, `webull-openapi-trade`, `webull-openapi-data`) caused `pip install` to abort before installing `webull-openapi-python-sdk`.
+  - Added missing runtime dependencies (`six`, `jmespath`, `protobuf`, `paho-mqtt`) alongside `--no-deps --ignore-requires-python webull-openapi-python-sdk` so the Webull SDK installs cleanly out-of-the-box on all Python versions (including Python 3.13, 3.14, and 3.15).
+  - Added self-healing SDK auto-installation inside both `SchwabAdapter.authenticate()` and `WebullAdapter.authenticate()` in `enforcer.py` so missing broker packages are installed automatically even if launched from an older `.bat` file.
+
+---
+
 ## [v0.9.9] — 2026-11-02
 ### Changed
 - **Structured Multi-Paragraph Hover Tooltips (`attach_tooltip`):**

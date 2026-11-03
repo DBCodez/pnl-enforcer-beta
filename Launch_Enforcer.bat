@@ -61,11 +61,11 @@ if !errorlevel! neq 0 (
     "!PY_CMD!" -m pip install --upgrade schwab-py
 )
 
-"!PY_CMD!" -c "from webull.core.client import ApiClient; from webull.trade.trade_client import TradeClient" >nul 2>&1
+"!PY_CMD!" -c "import six, jmespath, requests, urllib3, certifi, cryptography, cachetools; from webull.core.client import ApiClient; from webull.trade.trade_client import TradeClient" >nul 2>&1
 if !errorlevel! neq 0 (
     echo Installing Webull OpenAPI SDK and dependencies...
-    "!PY_CMD!" -m pip install --upgrade requests urllib3 certifi cryptography cachetools
-    "!PY_CMD!" -m pip install --upgrade --no-deps --ignore-requires-python webull-openapi-core webull-openapi-trade webull-openapi-data webull-openapi-python-sdk
+    "!PY_CMD!" -m pip install --upgrade six jmespath protobuf paho-mqtt requests urllib3 certifi cryptography cachetools
+    "!PY_CMD!" -m pip install --upgrade --no-deps --ignore-requires-python webull-openapi-python-sdk
 )
 
 :: 4. Check GitHub / Gist for newer release version and offer 1-keystroke update
