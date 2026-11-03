@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.12"
+APP_VERSION = "0.9.13"
 
 import os
 import sys
@@ -44,12 +44,36 @@ if _orig_tk_var_del is not None:
 # ==========================================
 USER_HOME = os.path.expanduser("~")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_PATH = os.path.join(SCRIPT_DIR, "enforcer.ico")
 # Keep working directory in USER_HOME so Webull SDK stores conf/token.txt
 # safely in C:\Users\<Username>\conf\ instead of inside the repo folder.
 try:
     os.chdir(USER_HOME)
 except Exception:
     pass
+
+# Set explicit Windows AppUserModelID and default Tkinter icon so the custom
+# .ico displays in all window titlebars and on the Windows Taskbar.
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        "DBCodez.PnLEnforcer.Beta"
+    )
+except Exception:
+    pass
+
+_orig_tk_init = tk.Tk.__init__
+
+
+def _icon_tk_init(self, *args, **kwargs):
+    _orig_tk_init(self, *args, **kwargs)
+    if os.path.exists(ICON_PATH):
+        try:
+            self.iconbitmap(default=ICON_PATH)
+        except Exception:
+            pass
+
+
+tk.Tk.__init__ = _icon_tk_init
 
 SCHWAB_TOKEN_PATH = os.path.join(USER_HOME, "schwab_token.json")
 CONFIG_PATH = os.path.join(USER_HOME, "enforcer_config.json")
@@ -6212,6 +6236,15 @@ def check_for_updates_cli():
             except Exception:
                 continue
 
+        if not os.path.exists(ICON_PATH):
+            ico_bytes = _fetch_remote_doc_bytes("enforcer.ico", ts=ts)
+            if ico_bytes:
+                try:
+                    with open(ICON_PATH, "wb") as icf:
+                        icf.write(ico_bytes)
+                except Exception:
+                    pass
+
         if best_ver is None:
             print(f"Version check: v{APP_VERSION} (Offline / skipped)")
             return
@@ -6241,7 +6274,7 @@ def check_for_updates_cli():
                 except Exception:
                     pass
 
-            for doc_name in ("README.md", "LICENSE.txt"):
+            for doc_name in ("README.md", "LICENSE.txt", "enforcer.ico"):
                 doc_bytes = _fetch_remote_doc_bytes(doc_name, ts=ts)
                 if doc_bytes:
                     try:

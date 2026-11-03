@@ -4,6 +4,14 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.13] — 2026-11-03
+### Added
+- **Custom Application & Taskbar Icon (`enforcer.ico`):**
+  - Added multi-resolution Windows `.ico` badge (`16×16` through `256×256`) for Desktop shortcuts, Pre-Flight/HUD window titlebars, and the Windows Taskbar (`SetCurrentProcessExplicitAppUserModelID`).
+  - Automatic `enforcer.ico` asset sync during startup version checks.
+
+---
+
 ## [v0.9.12] — 2026-11-03
 ### Added
 - **GUI "Update Available" Pop-Up Dialog (`show_update_available_dialog`):**
