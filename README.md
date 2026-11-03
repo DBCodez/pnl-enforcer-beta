@@ -28,7 +28,7 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
 4. Once `Ready for Use`, copy your **App Key** and **Secret**.
 
 ### Option B: If Your Broker is Webull
-1. Go to [developer.webull.com](https://developer.webull.com/) (or log into your Webull web portal -> **Account Management -> OpenAPI Management**).
+1. Go to [https://developer.webull.com/apis/docs/authentication/IndividualApplicationAPI](https://developer.webull.com/apis/docs/authentication/IndividualApplicationAPI) (or log into your Webull web portal -> **Account Management -> OpenAPI Management**).
 2. Apply for a **Retail Trading API Key** (typically approved in 1–2 business days).
 3. Once approved, generate your **App Key** and **App Secret** in the OpenAPI portal.
 4. *(Note for Live Quotes)*: Webull's OpenAPI uses account position snapshots by default; if you subscribe to Webull OpenAPI real-time quotes (`webullapp.com/quote`), it will also poll live bid/ask quotes during extended-hours liquidations.

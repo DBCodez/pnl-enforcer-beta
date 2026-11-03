@@ -2285,17 +2285,20 @@ def show_broker_setup_wizard(broker_name, parent=None):
             "   address bar — our popup window will auto-detect it from your clipboard!"
         )
         portal_url = "https://developer.schwab.com"
+        portal_btn_lbl = "🌐 Open Schwab Developer Portal in Browser"
     else:
         guide_txt = (
             "HOW TO GET YOUR WEBULL OPENAPI KEYS (One-Time Setup):\n"
-            "1. Go to https://developer.webull.com (or Webull Web -> Account Management -> OpenAPI).\n"
+            "1. Go to https://developer.webull.com/apis/docs/authentication/IndividualApplicationAPI\n"
+            "   (or Webull Web -> Account Management -> OpenAPI Management).\n"
             "2. Apply for a Retail Trading API Key (often approved within minutes).\n"
             "3. Generate your App Key and App Secret in the Webull portal and paste them below.\n"
             "4. ⚠️ IMPORTANT MOBILE 2FA STEP: On your first connection attempt, check your\n"
             "   Webull Mobile App / SMS! Webull may push a notification asking you to enter\n"
             "   a texted 2FA verification code (unless 2FA is disabled in your OpenAPI portal)."
         )
-        portal_url = "https://developer.webull.com"
+        portal_url = "https://developer.webull.com/apis/docs/authentication/IndividualApplicationAPI"
+        portal_btn_lbl = "🌐 Open Webull API Setup Guide in Browser"
 
     guide_lbl = tk.Label(
         wiz,
@@ -2316,7 +2319,7 @@ def show_broker_setup_wizard(broker_name, parent=None):
     link_row.pack(fill="x", pady=(0, 12))
     tk.Button(
         link_row,
-        text=f"🌐 Open {portal_url} in Browser",
+        text=portal_btn_lbl,
         font=("Arial", 9, "bold"),
         bg="#1f538d",
         fg="white",
