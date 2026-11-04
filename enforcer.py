@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.14"
+APP_VERSION = "0.9.15"
 
 import os
 import sys
@@ -1368,28 +1368,35 @@ class SchwabAdapter:
             return False
 
     def get_open_equity_positions(self):
-        """Returns ONLY Equity positions for Auto-Flatten (Never Options)."""
-        resp = self.client.get_account(
-            self.account_id, fields=self.client.Account.Fields.POSITIONS
-        )
-        open_eq = []
-        if resp.status_code == 200:
-            sec_acc = resp.json().get("securitiesAccount", {})
-            for pos in sec_acc.get("positions", []):
-                inst = pos.get("instrument", {})
-                if inst.get("assetType") == "EQUITY":
-                    qty = (
-                        pos.get("longQuantity", 0)
-                        - pos.get("shortQuantity", 0)
-                    )
-                    if qty != 0:
-                        open_eq.append((inst["symbol"], qty))
-        else:
+        """Returns ONLY Equity positions for Auto-Flatten (Never Options), or None on API error."""
+        try:
+            resp = self.client.get_account(
+                self.account_id, fields=self.client.Account.Fields.POSITIONS
+            )
+            if resp.status_code == 200:
+                open_eq = []
+                sec_acc = resp.json().get("securitiesAccount", {})
+                for pos in sec_acc.get("positions", []):
+                    inst = pos.get("instrument", {})
+                    if inst.get("assetType") == "EQUITY":
+                        qty = (
+                            pos.get("longQuantity", 0)
+                            - pos.get("shortQuantity", 0)
+                        )
+                        if qty != 0:
+                            open_eq.append((inst["symbol"], qty))
+                return open_eq
             log_event(
                 "ERROR",
                 f"get_open_equity_positions HTTP {resp.status_code}"
             )
-        return open_eq
+            return None
+        except Exception as e:
+            log_event(
+                "ERROR",
+                f"Schwab get_open_equity_positions exception: {e}"
+            )
+            return None
 
     def submit_liquidation_batch(self, open_positions):
         from schwab.orders.common import Session, Duration
@@ -1794,39 +1801,51 @@ class WebullAdapter:
         return False
 
     def get_open_equity_positions(self):
-        """Returns (symbol, qty, last_price) for EQUITIES ONLY."""
-        res = self._call_get_positions()
-        open_eq = []
-        if res.status_code == 200:
-            payload = res.json()
-            pos_list = (
-                payload if isinstance(payload, list)
-                else payload.get("data", payload.get("positions", []))
+        """Returns (symbol, qty, last_price) for EQUITIES ONLY, or None on API error."""
+        try:
+            res = self._call_get_positions()
+            if res.status_code == 200:
+                open_eq = []
+                payload = res.json()
+                pos_list = (
+                    payload if isinstance(payload, list)
+                    else payload.get("data", payload.get("positions", []))
+                )
+                for p in pos_list:
+                    itype = str(
+                        p.get("instrument_type")
+                        or p.get("asset_type")
+                        or "EQUITY"
+                    ).upper()
+                    if "OPT" in itype:
+                        continue
+                    qty = float(p.get("quantity") or p.get("position") or 0)
+                    if qty != 0:
+                        sym = (
+                            p.get("symbol")
+                            or p.get("ticker", {}).get("symbol")
+                            or ""
+                        )
+                        lp = float(
+                            p.get("last_price")
+                            or p.get("market_price")
+                            or p.get("cost_price")
+                            or 0.0
+                        )
+                        if sym:
+                            open_eq.append((sym, qty, lp))
+                return open_eq
+            log_event(
+                "ERROR",
+                f"Webull get_open_equity_positions HTTP {res.status_code}"
             )
-            for p in pos_list:
-                itype = str(
-                    p.get("instrument_type")
-                    or p.get("asset_type")
-                    or "EQUITY"
-                ).upper()
-                if "OPT" in itype:
-                    continue
-                qty = float(p.get("quantity") or p.get("position") or 0)
-                if qty != 0:
-                    sym = (
-                        p.get("symbol")
-                        or p.get("ticker", {}).get("symbol")
-                        or ""
-                    )
-                    lp = float(
-                        p.get("last_price")
-                        or p.get("market_price")
-                        or p.get("cost_price")
-                        or 0.0
-                    )
-                    if sym:
-                        open_eq.append((sym, qty, lp))
-        return open_eq
+            return None
+        except Exception as e:
+            log_event(
+                "ERROR",
+                f"Webull get_open_equity_positions exception: {e}"
+            )
+            return None
 
     def submit_liquidation_batch(self, open_positions):
         if not open_positions:
@@ -2782,7 +2801,72 @@ def _format_lock_voice_msg(duration_mins, label_prefix, upgraded=False):
     return f"{reason_words}. Locked out for {dur_words}."
 
 
-def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK"):
+def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
+    """Waits 2.0s after Windows OS lock engages and performs a final watchdog
+    check to guarantee 0 open equity shares remain on the account."""
+    if adapter is None:
+        return
+
+    def _watchdog():
+        global cooldown_active
+        time.sleep(2.0)
+        try:
+            post_pos = adapter.get_open_equity_positions()
+            if post_pos is not None and len(post_pos) == 0:
+                log_event(
+                    "GUARDRAIL",
+                    f"POST-LOCK WATCHDOG ({lock_context}): Triple-confirmed 0 "
+                    f"open equity shares 2.0s after OS lock."
+                )
+                return
+            if post_pos is None:
+                log_event(
+                    "WARNING",
+                    f"POST-LOCK WATCHDOG ({lock_context}): Position check "
+                    f"returned None; retrying in 1.5s..."
+                )
+                time.sleep(1.5)
+                post_pos = adapter.get_open_equity_positions()
+                if post_pos is not None and len(post_pos) == 0:
+                    log_event(
+                        "GUARDRAIL",
+                        f"POST-LOCK WATCHDOG ({lock_context}): Triple-confirmed "
+                        f"0 open equity shares on retry."
+                    )
+                    return
+
+            log_event(
+                "CRITICAL",
+                f"POST-LOCK WATCHDOG ({lock_context}): Straggler equity "
+                f"positions detected after OS lock: {post_pos}! "
+                f"Initiating emergency sweep..."
+            )
+            swept_flat = flatten_equities(adapter, force_flatten=True)
+            if swept_flat:
+                log_event(
+                    "GUARDRAIL",
+                    f"POST-LOCK WATCHDOG ({lock_context}): Emergency post-lock "
+                    f"sweep confirmed 100% flat."
+                )
+            else:
+                log_event(
+                    "CRITICAL",
+                    f"POST-LOCK WATCHDOG ({lock_context}): Post-lock flatten "
+                    f"FAILED! Aborting OS lock and sounding emergency siren!"
+                )
+                cooldown_active = False
+                trigger_alarm(
+                    "POST-LOCK FLATTEN FAILED — CHECK POSITIONS!", ui_button
+                )
+        except Exception as e:
+            log_event("ERROR", f"Post-lock watchdog exception: {e}")
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
+
+def start_cooldown_lock(
+    duration_mins, ui_button, label_prefix="COOL-DOWN LOCK", adapter=None
+):
     global cooldown_active, cooldown_end_time, cooldown_label
     global cooldown_30s_announced, cooldown_announced_mins, alarm_active
     duration_sec = max(5, int(round(float(duration_mins) * 60)))
@@ -2804,6 +2888,7 @@ def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK")
                 f"({duration_mins:g} min). Siren muted."
             )
             speak_async(_format_lock_voice_msg(duration_mins, label_prefix, upgraded=True))
+            _run_post_lock_watchdog(adapter, ui_button, label_prefix)
         return
 
     cooldown_active = True
@@ -2822,7 +2907,8 @@ def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK")
             f"({duration_mins:g} min). Siren muted."
         )
         speak_async(_format_lock_voice_msg(duration_mins, cooldown_label, upgraded=False))
-        while time.time() < cooldown_end_time:
+        watchdog_launched = False
+        while cooldown_active and time.time() < cooldown_end_time:
             alarm_active = False
             rem = int(round(cooldown_end_time - time.time()))
             if rem > 35:
@@ -2849,7 +2935,17 @@ def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK")
                 )
             )
             ctypes.windll.user32.LockWorkStation()
+            if not watchdog_launched:
+                watchdog_launched = True
+                _run_post_lock_watchdog(adapter, ui_button, cooldown_label)
             time.sleep(1.5)
+
+        if not cooldown_active:
+            log_event(
+                "COOLDOWN",
+                f"{cooldown_label} aborted early by post-lock watchdog."
+            )
+            return
 
         cooldown_active = False
         alarm_active = False
@@ -2873,7 +2969,8 @@ def start_cooldown_lock(duration_mins, ui_button, label_prefix="COOL-DOWN LOCK")
 
 def flatten_equities(adapter, force_flatten=False):
     """Cancels working orders, submits RTH Market or EXT Limit liquidations
-    for EQUITIES ONLY, and verifies 0 equity shares remain."""
+    for EQUITIES ONLY, and double-confirms (with 0.8s settlement delay) that
+    0 equity shares remain."""
     should_exec = force_flatten or config.get("enable_auto_flatten", False)
     try:
         if should_exec:
@@ -2881,19 +2978,39 @@ def flatten_equities(adapter, force_flatten=False):
             adapter.cancel_all_working_orders()
 
             open_pos = adapter.get_open_equity_positions()
-            if not open_pos:
-                log_event("FLATTEN", "No open equity shares to flatten.")
-                return True
+            if open_pos is not None and len(open_pos) == 0:
+                log_event(
+                    "FLATTEN",
+                    "Initial check shows 0 open equity shares. Running 0.8s "
+                    "settlement double-confirm..."
+                )
+                time.sleep(0.8)
+                open_pos = adapter.get_open_equity_positions()
+                if open_pos is not None and len(open_pos) == 0:
+                    log_event(
+                        "FLATTEN",
+                        "Double-confirmed 0 open equity shares (no flatten order needed)."
+                    )
+                    return True
 
-            log_event("FLATTEN", f"Equity positions to liquidate: {open_pos}")
-            adapter.submit_liquidation_batch(open_pos)
+            if open_pos:
+                log_event("FLATTEN", f"Equity positions to liquidate: {open_pos}")
+                adapter.submit_liquidation_batch(open_pos)
+            elif open_pos is None:
+                log_event(
+                    "WARNING",
+                    "Initial position query failed (None); entering verification polling loop..."
+                )
         else:
             open_pos = adapter.get_open_equity_positions()
-            if not open_pos:
-                return True
+            if open_pos is not None and len(open_pos) == 0:
+                time.sleep(0.8)
+                open_pos = adapter.get_open_equity_positions()
+                if open_pos is not None and len(open_pos) == 0:
+                    return True
             log_event(
                 "WARNING",
-                f"Auto-Flatten is OFF, but equity shares remain open: {open_pos}"
+                f"Auto-Flatten is OFF, and equity shares remain open (or unverified): {open_pos}"
             )
             return False
 
@@ -2905,12 +3022,43 @@ def flatten_equities(adapter, force_flatten=False):
             polls += 1
             rem_pos = adapter.get_open_equity_positions()
             elapsed = time.time() - start_wait
-            if not rem_pos:
+            if rem_pos is None:
+                log_event(
+                    "WARNING",
+                    f"Check #{polls} ({elapsed:.1f}s): Position query returned None; retrying..."
+                )
+                continue
+
+            if len(rem_pos) == 0:
                 log_event(
                     "FLATTEN",
-                    f"SUCCESS: Confirmed 0 equity shares in {elapsed:.1f}s."
+                    f"Check #{polls} ({elapsed:.1f}s): 0 equity shares reported. "
+                    f"Running 0.8s settlement double-confirm..."
                 )
-                return True
+                time.sleep(0.8)
+                rem_confirm = adapter.get_open_equity_positions()
+                elapsed_confirm = time.time() - start_wait
+                if rem_confirm is not None and len(rem_confirm) == 0:
+                    log_event(
+                        "FLATTEN",
+                        f"SUCCESS: Double-confirmed 0 equity shares in {elapsed_confirm:.1f}s."
+                    )
+                    return True
+                if rem_confirm is None:
+                    log_event(
+                        "WARNING",
+                        "0.8s double-confirm query returned None; continuing verification loop..."
+                    )
+                    continue
+                log_event(
+                    "FLATTEN",
+                    f"Straggler equity shares detected on 0.8s double-confirm: "
+                    f"{rem_confirm} — sweeping..."
+                )
+                if should_exec:
+                    adapter.cancel_all_working_orders()
+                    adapter.submit_liquidation_batch(rem_confirm)
+                continue
 
             log_event(
                 "FLATTEN",
@@ -2924,14 +3072,19 @@ def flatten_equities(adapter, force_flatten=False):
                 )
                 adapter.cancel_all_working_orders()
                 rem_pos = adapter.get_open_equity_positions()
-                if not rem_pos:
-                    log_event(
-                        "FLATTEN",
-                        f"SUCCESS: Confirmed 0 equity shares after cancel "
-                        f"({time.time() - start_wait:.1f}s)."
-                    )
-                    return True
-                adapter.submit_liquidation_batch(rem_pos)
+                if rem_pos is not None and len(rem_pos) == 0:
+                    time.sleep(0.8)
+                    rem_confirm = adapter.get_open_equity_positions()
+                    if rem_confirm is not None and len(rem_confirm) == 0:
+                        log_event(
+                            "FLATTEN",
+                            f"SUCCESS: Double-confirmed 0 equity shares after cancel "
+                            f"({time.time() - start_wait:.1f}s)."
+                        )
+                        return True
+                    rem_pos = rem_confirm
+                if rem_pos:
+                    adapter.submit_liquidation_batch(rem_pos)
 
         log_event(
             "CRITICAL",
@@ -2977,7 +3130,10 @@ def trigger_open_pnl_flatten(
             alarm_active = False
             cd_mins = config.get("open_cooldown_mins", 1.0)
             start_cooldown_lock(
-                cd_mins, ui_button, label_prefix="PENALTY BOX LOCK"
+                cd_mins,
+                ui_button,
+                label_prefix="PENALTY BOX LOCK",
+                adapter=adapter
             )
     else:
         log_event(
@@ -3073,7 +3229,10 @@ def trigger_lockdown(
                 f"for {dl_mins:g} mins..."
             )
             start_cooldown_lock(
-                dl_mins, ui_button, label_prefix="DAILY BREACH OS LOCK"
+                dl_mins,
+                ui_button,
+                label_prefix="DAILY BREACH OS LOCK",
+                adapter=adapter
             )
         else:
             log_event(
@@ -3081,6 +3240,9 @@ def trigger_lockdown(
                 "Confirmed flat. Muting siren and locking Windows once..."
             )
             ctypes.windll.user32.LockWorkStation()
+            _run_post_lock_watchdog(
+                adapter, ui_button, "ONE-SHOT DAILY OS LOCK"
+            )
 
 
 # ==========================================
