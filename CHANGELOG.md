@@ -4,6 +4,19 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.14] — 2026-11-04
+### Changed
+- **Unified "Daily Stop" Terminology Across Pre-Flight & HUD:**
+  - Renamed Card 1 to **`1. SINGLE-TRADE STOP (Open PnL)`** and Card 2 to **`2. DAILY STOP ACTIONS (Max Loss & Profit Lock)`** (`Auto-Flatten Equities on Max Loss / Profit Stop`, `Lock Windows OS on Max Loss / Profit Stop`).
+  - Renamed the HUD column headers from `TERMINATE LVL` / `$ TO TERMINATE` to **`DAILY STOP`** and **`$ TO STOP`** (preserving internal config keys for seamless backwards compatibility).
+- **Signed (`-` / `0` / `+`) RTH Tier 2 & Tier 3 Stop Ratchets (`Stop Level ($)`):**
+  - RTH Tiers 2 and 3 (`Fixed Stop Ratchet ($0 Siren)`) now accept negative, zero, or positive PnL stop levels (e.g. `-1000` or `-500` for a tightened loss stop, `0` for breakeven, or `+250` for a locked-in profit stop before Tier 4's trailing stop activates), with automatic one-time migration for existing saved configs.
+- **Pre-Flight Visual Polish & Consolidated `📜 Logs ▾` Menu:**
+  - Highlighted primary Max Loss labels (`Max Open Loss ($):` and `Starting Max Loss ($):`) in coral red (`#eb7067`) and trailing profit locks in emerald green (`#58d68d`), while displaying all loss/warning alarm inputs as negative values (`-250`, `-500`, `-1500`) with automatic sign normalization.
+  - Consolidated `View Log`, `Export Safe Log (Balances Redacted)`, and `Open Archived Logs (90-Day History)` into a single **`📜 Logs ▾`** dropdown menu in the Pre-Flight top bar.
+
+---
+
 ## [v0.9.13] — 2026-11-03
 ### Added
 - **Custom Application & Taskbar Icon (`enforcer.ico`):**

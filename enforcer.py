@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.13"
+APP_VERSION = "0.9.14"
 
 import os
 import sys
@@ -151,11 +151,12 @@ DEFAULT_CONFIG = {
     "t1_warn_2": 1500.0,
     "t1_max_loss": 2000.0,
     "t2_trigger": 250.0,
-    "t2_max_loss": 1000.0,
+    "t2_max_loss": -1000.0,
     "t3_trigger": 500.0,
-    "t3_max_loss": 500.0,
+    "t3_max_loss": -500.0,
     "t4_trigger": 1000.0,
     "t4_trail": 500.0,
+    "signed_tier_stops": True,
     "session_date": "",
     "saved_start_equity": None,
     "saved_max_equity": None,
@@ -168,12 +169,14 @@ DEFAULT_CONFIG = {
     "saved_account_id": ""
 }
 
+SIGNED_DOLLAR_KEYS = ("t2_max_loss", "t3_max_loss")
+
 HUD_COLUMN_CATALOG = [
     ("realized_pnl", "REALIZED PnL", "Closed (flat) PnL for the day"),
     ("open_pnl", "OPEN PnL", "Live unrealized PnL on open positions"),
     ("net_pnl", "NET PnL", "Total daily PnL (Realized + Open)"),
-    ("terminate_lvl", "TERMINATE LVL", "Active Rulebook floor (Max Loss, Ratcheted Tier, or Trailing Lock)"),
-    ("dist_to_term", "$ TO TERMINATE", "Remaining dollar cushion above active Termination Floor"),
+    ("terminate_lvl", "DAILY STOP", "Active Rulebook stop (Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock)"),
+    ("dist_to_term", "$ TO STOP", "Remaining dollar cushion before hitting your active Daily Stop"),
     ("session_high", "SESSION HIGH", "Highest flat realized PnL of the day"),
     ("from_high", "FROM HIGH", "Current drawdown/giveback from Session High"),
     ("trades_wl", "TRADES (W/L)", "Completed round-trip Wins & Losses (%)"),
@@ -198,9 +201,9 @@ HALF_RISK_DOLLARS = {
     "t1_warn_2": 750.0,
     "t1_max_loss": 1000.0,
     "t2_trigger": 125.0,
-    "t2_max_loss": 500.0,
+    "t2_max_loss": -500.0,
     "t3_trigger": 250.0,
-    "t3_max_loss": 250.0,
+    "t3_max_loss": -250.0,
     "t4_trigger": 500.0,
     "t4_trail": 250.0
 }
@@ -744,6 +747,7 @@ def load_config(log_restore=False):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
+                was_signed = bool(saved.get("signed_tier_stops", False))
                 saved_brokers = saved.pop("brokers", {})
                 saved_sessions = saved.pop("account_sessions", {})
                 saved_user_defs = saved.pop("user_defaults", {})
@@ -755,6 +759,23 @@ def load_config(log_restore=False):
                     config["account_sessions"].update(saved_sessions)
                 if isinstance(saved_user_defs, dict):
                     config["user_defaults"] = saved_user_defs
+
+                # One-time migration: convert legacy unsigned t2_max_loss /
+                # t3_max_loss values (where 1000 meant -$1000) to signed values.
+                if not was_signed:
+                    for sk in SIGNED_DOLLAR_KEYS:
+                        if sk in config and float(config[sk]) > 0:
+                            config[sk] = -abs(float(config[sk]))
+                        if (
+                            isinstance(config.get("user_defaults"), dict)
+                            and sk in config["user_defaults"]
+                            and float(config["user_defaults"][sk]) > 0
+                        ):
+                            config["user_defaults"][sk] = -abs(
+                                float(config["user_defaults"][sk])
+                            )
+                    config["signed_tier_stops"] = True
+                    save_config(config)
         except Exception as e:
             print(f"Could not load saved config: {e}")
 
@@ -3321,9 +3342,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     else (
                         max_equity - t4_trail
                         if (t4_on and max_realized_profit >= t4_trig)
-                        else start_equity - t3_max
+                        else start_equity + t3_max
                         if (t3_on and max_realized_profit >= t3_trig)
-                        else start_equity - t2_max
+                        else start_equity + t2_max
                         if (t2_on and max_realized_profit >= t2_trig)
                         else start_equity - t1_max
                     )
@@ -3464,8 +3485,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         (max_equity - pm_trail if (pm_lock_on and max_realized_profit >= pm_trig) else start_equity - pm_max)
                         if not is_rth() else
                         (max_equity - t4_trail if (t4_on and max_realized_profit >= t4_trig) else
-                         start_equity - t3_max if (t3_on and max_realized_profit >= t3_trig) else
-                         start_equity - t2_max if (t2_on and max_realized_profit >= t2_trig) else
+                         start_equity + t3_max if (t3_on and max_realized_profit >= t3_trig) else
+                         start_equity + t2_max if (t2_on and max_realized_profit >= t2_trig) else
                          start_equity - t1_max)
                     )
                     if current_eq <= active_floor:
@@ -3556,11 +3577,12 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
 
                     elif t3_on and max_realized_profit >= t3_trig:
-                        floor_equity = start_equity - t3_max
+                        floor_equity = start_equity + t3_max
                         r_t3 = "Hit $0 (Tier 3)"
-                        check_alarm_rearm(r_t3, current_eq, start_equity)
+                        if t3_max < 0:
+                            check_alarm_rearm(r_t3, current_eq, start_equity)
                         if not is_locked_down and current_eq <= floor_equity:
-                            msg = f"Breached Tier 3 Floor (-${t3_max:,.0f})"
+                            msg = f"Breached Tier 3 Stop ({format_dollar(t3_max)})"
                             trigger_lockdown(
                                 active_adapter, msg, mute_btn, has_options, ctx
                             )
@@ -3569,7 +3591,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             and not is_flat
                             and open_pnl <= -open_max
                         ):
-                            if current_eq <= start_equity:
+                            if t3_max < 0 and current_eq <= start_equity:
                                 triggered_alarms.setdefault(r_t3, time.time())
                             r_open = f"Open PnL -${open_max:,.0f} Stop"
                             trigger_open_pnl_flatten(
@@ -3579,15 +3601,16 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 has_options,
                                 ctx
                             )
-                        elif current_eq <= start_equity:
+                        elif t3_max < 0 and current_eq <= start_equity:
                             trigger_alarm(r_t3, mute_btn, ctx)
 
                     elif t2_on and max_realized_profit >= t2_trig:
-                        floor_equity = start_equity - t2_max
+                        floor_equity = start_equity + t2_max
                         r_t2 = "Hit $0 (Tier 2)"
-                        check_alarm_rearm(r_t2, current_eq, start_equity)
+                        if t2_max < 0:
+                            check_alarm_rearm(r_t2, current_eq, start_equity)
                         if not is_locked_down and current_eq <= floor_equity:
-                            msg = f"Breached Tier 2 Floor (-${t2_max:,.0f})"
+                            msg = f"Breached Tier 2 Stop ({format_dollar(t2_max)})"
                             trigger_lockdown(
                                 active_adapter, msg, mute_btn, has_options, ctx
                             )
@@ -3596,7 +3619,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             and not is_flat
                             and open_pnl <= -open_max
                         ):
-                            if current_eq <= start_equity:
+                            if t2_max < 0 and current_eq <= start_equity:
                                 triggered_alarms.setdefault(r_t2, time.time())
                             r_open = f"Open PnL -${open_max:,.0f} Stop"
                             trigger_open_pnl_flatten(
@@ -3606,7 +3629,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 has_options,
                                 ctx
                             )
-                        elif current_eq <= start_equity:
+                        elif t2_max < 0 and current_eq <= start_equity:
                             trigger_alarm(r_t2, mute_btn, ctx)
 
                     else:
@@ -4011,10 +4034,32 @@ def show_preflight_window(parent=None, mute_btn=None):
         "t3_trigger", "t3_max_loss",
         "t4_trigger", "t4_trail"
     ]
+    loss_display_keys = {
+        "open_max_loss",
+        "pm_warn_1", "pm_warn_2", "pm_max_loss",
+        "t1_warn_1", "t1_warn_2", "t1_max_loss",
+    }
+
+    def _fmt_ui_dollar(key, val):
+        v = float(val)
+        if key in loss_display_keys:
+            mag = abs(v)
+            return f"-{mag:.0f}" if mag > 0 else "0"
+        return f"{v:.0f}"
+
     dollar_vars = {
-        k: tk.StringVar(value=f"{config.get(k, DEFAULT_CONFIG[k]):.0f}")
+        k: tk.StringVar(value=_fmt_ui_dollar(k, config.get(k, DEFAULT_CONFIG[k])))
         for k in dollar_keys
     }
+
+    def _bind_loss_sign_normalizer(var_obj):
+        def _on_focus_out(_event=None):
+            try:
+                mag = abs(float(var_obj.get().strip()))
+                var_obj.set(f"-{mag:.0f}" if mag > 0 else "0")
+            except ValueError:
+                pass
+        return _on_focus_out
 
     def refresh_baseline_preview():
         """Updates the Active Baseline label in Card 3 to match the
@@ -4359,7 +4404,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(
         hud_cols_btn,
         "Choose which metrics appear on your live HUD bar (Realized PnL, Open PnL, Net PnL,\n"
-        "Terminate Level, $ to Terminate, Session High, From High, Trades W/L) and reorder them."
+        "Daily Stop, $ to Stop, Session High, From High, Trades W/L) and reorder them."
     )
 
     def open_log_file():
@@ -4384,24 +4429,6 @@ def show_preflight_window(parent=None, mute_btn=None):
                 f"Your 90-day log archive folder is located at:\n{LOG_ARCHIVE_DIR}\n\n({e})",
                 parent=pf
             )
-
-    btn_view_log = tk.Button(
-        top_bar,
-        text="📂 View Log",
-        font=("Arial", 9, "bold"),
-        bg="#333333",
-        fg="white",
-        padx=9,
-        pady=3,
-        command=open_log_file
-    )
-    btn_view_log.pack(side="left", padx=(0, 6))
-    btn_view_log.bind("<Button-3>", open_log_archive_folder)
-    attach_tooltip(
-        btn_view_log,
-        f"Left-Click: Open today's full audit & trade log in Notepad ({LOG_PATH})\n"
-        f"Right-Click: Open the {LOG_RETENTION_DAYS}-day log archive folder ({LOG_ARCHIVE_DIR})"
-    )
 
     def _prepare_sanitized_log():
         """Generates ~/enforcer_log_sanitized.txt (and a convenience copy in
@@ -4476,24 +4503,54 @@ def show_preflight_window(parent=None, mute_btn=None):
                 parent=pf,
             )
 
-    btn_export_sanitized = tk.Button(
-        top_bar,
-        text="🔒 Safe Log",
-        font=("Arial", 9, "bold"),
-        bg="#2c3e50",
-        fg="#a3e4d7",
-        padx=9,
-        pady=3,
-        command=export_sanitized_log_action,
+    tk.Frame(top_bar, bg="#383838", width=1).pack(
+        side="left", fill="y", padx=(4, 10), pady=2
     )
-    btn_export_sanitized.pack(side="left", padx=(0, 6))
+
+    btn_logs_menu = tk.Menubutton(
+        top_bar,
+        text="📜 Logs ▾",
+        font=("Arial", 9, "bold"),
+        bg="#2e2e2e",
+        fg="#e5e8e8",
+        activebackground="#1f538d",
+        activeforeground="white",
+        padx=10,
+        pady=4,
+        bd=1,
+        relief="raised",
+        direction="below"
+    )
+    logs_dropdown = tk.Menu(
+        btn_logs_menu,
+        tearoff=0,
+        font=("Arial", 9, "bold"),
+        bg="#262626",
+        fg="white",
+        activebackground="#1f538d",
+        activeforeground="white"
+    )
+    logs_dropdown.add_command(
+        label="📄 View Today's Log",
+        command=open_log_file
+    )
+    logs_dropdown.add_command(
+        label="🔒 Export Safe Log (Balances Redacted)",
+        command=export_sanitized_log_action
+    )
+    logs_dropdown.add_separator()
+    logs_dropdown.add_command(
+        label=f"📁 Open Archived Logs ({LOG_RETENTION_DAYS}-Day History)",
+        command=open_log_archive_folder
+    )
+    btn_logs_menu.config(menu=logs_dropdown)
+    btn_logs_menu.pack(side="left", padx=(0, 6))
     attach_tooltip(
-        btn_export_sanitized,
-        "Export Sanitized Log (Safe for Sharing / Preview):\n"
-        "Creates a privacy-scrubbed copy of today's log (enforcer_log_sanitized.txt), "
-        "copies it to your clipboard, and opens it in Notepad.\n"
-        "• Redacts total account balances ($[REDACTED]), Windows usernames (~), and full order IDs (...1234)\n"
-        "• Keeps relative PnL (Realized, Open, Net, High) and guardrail events intact."
+        btn_logs_menu,
+        "Session & Audit Logs Menu:\n"
+        f"• View Today's Log: Opens your local audit log in Notepad ({_mask_user_path(LOG_PATH)})\n"
+        "• Export Safe Log: Creates a privacy-scrubbed copy with total account balances redacted ($[REDACTED]) and copies it to clipboard\n"
+        f"• Open Archived Logs: Opens your {LOG_RETENTION_DAYS}-day historical log folder ({_mask_user_path(LOG_ARCHIVE_DIR)})"
     )
 
     btn_report_bug = tk.Button(
@@ -4522,14 +4579,17 @@ def show_preflight_window(parent=None, mute_btn=None):
     def apply_dollar_preset(preset_dict):
         for k, val in preset_dict.items():
             if k in dollar_vars:
-                dollar_vars[k].set(f"{val:.0f}")
+                dollar_vars[k].set(_fmt_ui_dollar(k, val))
 
     def apply_half_risk_preset():
         base_src = config.get("user_defaults") or DEFAULT_CONFIG
         half_dict = {}
         for k in dollar_keys:
             full_val = float(base_src.get(k, DEFAULT_CONFIG[k]))
-            half_dict[k] = round(full_val * 0.5) if full_val > 0 else 0.0
+            if k in SIGNED_DOLLAR_KEYS:
+                half_dict[k] = round(full_val * 0.5)
+            else:
+                half_dict[k] = round(full_val * 0.5) if full_val > 0 else 0.0
         apply_dollar_preset(half_dict)
         if default_status_lbl is not None:
             src_name = "your saved Default" if config.get("user_defaults") else "Factory Default"
@@ -4697,9 +4757,14 @@ def show_preflight_window(parent=None, mute_btn=None):
                 "poll_interval": max(1, int(float(var_poll.get())))
             }
             for k in dollar_keys:
-                custom_def[k] = abs(float(dollar_vars[k].get()))
+                raw_v = float(dollar_vars[k].get())
+                custom_def[k] = (
+                    raw_v if k in SIGNED_DOLLAR_KEYS else abs(raw_v)
+                )
+                dollar_vars[k].set(_fmt_ui_dollar(k, custom_def[k]))
 
             config["user_defaults"] = custom_def
+            config["signed_tier_stops"] = True
             save_config(config)
             log_event("CONFIG", "Saved current Pre-Flight settings as User Defaults.")
             if default_status_lbl is not None:
@@ -4785,7 +4850,11 @@ def show_preflight_window(parent=None, mute_btn=None):
             new_cfg["poll_interval"] = max(1, int(float(var_poll.get())))
 
             for k in dollar_keys:
-                new_cfg[k] = abs(float(dollar_vars[k].get()))
+                raw_v = float(dollar_vars[k].get())
+                new_cfg[k] = (
+                    raw_v if k in SIGNED_DOLLAR_KEYS else abs(raw_v)
+                )
+            new_cfg["signed_tier_stops"] = True
 
             is_locked_down = False
             first_poll_of_launch = True
@@ -4855,8 +4924,10 @@ def show_preflight_window(parent=None, mute_btn=None):
         tk.Frame(card, bg="#2c2c2c", height=1).pack(fill="x", pady=(0, 6))
         return card
 
+    loss_var_ids = {id(dollar_vars[k]) for k in loss_display_keys}
+
     def make_entry(parent_w, var, width=8):
-        return tk.Entry(
+        ent = tk.Entry(
             parent_w,
             textvariable=var,
             font=("Arial", 11, "bold"),
@@ -4870,6 +4941,9 @@ def show_preflight_window(parent=None, mute_btn=None):
             bd=1,
             relief="solid"
         )
+        if id(var) in loss_var_ids:
+            ent.bind("<FocusOut>", _bind_loss_sign_normalizer(var))
+        return ent
 
     def make_dual_field_row(
         parent_w,
@@ -4880,7 +4954,9 @@ def show_preflight_window(parent=None, mute_btn=None):
         cb_var1=None,
         cb_var2=None,
         tip1=None,
-        tip2=None
+        tip2=None,
+        fg1="#f2f2f2",
+        fg2="#f2f2f2"
     ):
         row = tk.Frame(parent_w, bg="#1b1b1b")
         row.pack(fill="x", pady=4)
@@ -4895,11 +4971,11 @@ def show_preflight_window(parent=None, mute_btn=None):
                 text=lbl1,
                 variable=cb_var1,
                 font=("Arial", 10, "bold"),
-                fg="#f2f2f2",
+                fg=fg1,
                 bg="#1b1b1b",
                 selectcolor="#2a2a2a",
                 activebackground="#1b1b1b",
-                activeforeground="#ffffff",
+                activeforeground=fg1,
                 anchor="w"
             )
         else:
@@ -4907,7 +4983,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 row,
                 text=lbl1,
                 font=("Arial", 10, "bold"),
-                fg="#f2f2f2",
+                fg=fg1,
                 bg="#1b1b1b",
                 anchor="w"
             )
@@ -4926,11 +5002,11 @@ def show_preflight_window(parent=None, mute_btn=None):
                     text=lbl2,
                     variable=cb_var2,
                     font=("Arial", 10, "bold"),
-                    fg="#f2f2f2",
+                    fg=fg2,
                     bg="#1b1b1b",
                     selectcolor="#2a2a2a",
                     activebackground="#1b1b1b",
-                    activeforeground="#ffffff",
+                    activeforeground=fg2,
                     anchor="w"
                 )
             else:
@@ -4938,7 +5014,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                     row,
                     text=lbl2,
                     font=("Arial", 10, "bold"),
-                    fg="#f2f2f2",
+                    fg=fg2,
                     bg="#1b1b1b",
                     anchor="w"
                 )
@@ -4955,8 +5031,8 @@ def show_preflight_window(parent=None, mute_btn=None):
     # ==========================================================
     c1 = make_card(
         left_col,
-        "1. SINGLE-TRADE CIRCUIT BREAKER (Open PnL Stop)",
-        "Flattens open Equities in Extended Hours or RTH without ending your day "
+        "1. SINGLE-TRADE STOP (Open PnL)",
+        "Flattens open Equities on a single trade without ending your day "
         "(Options = Siren Only).",
         accent="#5dade2"
     )
@@ -4982,12 +5058,12 @@ def show_preflight_window(parent=None, mute_btn=None):
         r_open1,
         text="Max Open Loss ($):",
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
+        fg="#eb7067",
         bg="#1b1b1b"
     )
     lbl_open_loss.pack(side="right", padx=(16, 8))
     open_stop_tip = (
-        "Single-Trade Circuit Breaker:\n"
+        "Single-Trade Open PnL Stop:\n"
         "If your combined unrealized Open PnL drops to or below -Max Open Loss ($),\n"
         "Enforcer cancels working orders and flattens open EQUITY shares immediately\n"
         "(Market order in RTH 9:30–4:00 ET; marketable GTC_EXT limit order in Extended Hours).\n"
@@ -5036,18 +5112,17 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(lbl_cd_mins, open_cd_tip)
     attach_tooltip(ent_cd_mins, open_cd_tip)
 
-    # --- CARD 2: FLOOR BREACH ACTIONS (MAX LOSS & PROFIT LOCKS) ---
+    # --- CARD 2: DAILY STOP ACTIONS (MAX LOSS & PROFIT LOCK) ---
     c2 = make_card(
         left_col,
-        "2. FLOOR BREACH ACTIONS (Max Loss & Profit Locks)",
-        "Fires when Net PnL breaches your active floor in Rulebook 4 or 5 "
-        "(Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock).",
+        "2. DAILY STOP ACTIONS (Max Loss & Profit Lock)",
+        "Fires when Net PnL hits your active Max Loss or Profit Lock in Rulebook 4 or 5.",
         accent="#f5b041"
     )
 
     cb_day_flat = tk.Checkbutton(
         c2,
-        text="Auto-Flatten Equities on Active Floor Breach",
+        text="Auto-Flatten Equities on Max Loss / Profit Stop",
         variable=var_flatten,
         font=("Arial", 10, "bold"),
         fg="#ffffff",
@@ -5060,10 +5135,10 @@ def show_preflight_window(parent=None, mute_btn=None):
     cb_day_flat.pack(fill="x", pady=3)
     attach_tooltip(
         cb_day_flat,
-        "Auto-Flatten on Active Floor Breach:\n"
-        "When your total Net PnL (Realized + Open) touches your active Termination Floor "
-        "(whether that floor is your Starting Max Loss, a tightened Tier 2/3 floor, or a "
-        "green Trailing Profit Lock), Enforcer cancels all working orders and liquidates open Equity shares.\n"
+        "Auto-Flatten on Daily Stop (Max Loss or Profit Lock):\n"
+        "When your total Net PnL (Realized + Open) hits your active Daily Stop in Rulebook 4 or 5\n"
+        "(whether that is your Starting Max Loss, a tightened Tier 2/3 Max Loss, or a green\n"
+        "Trailing Profit Lock), Enforcer cancels working orders and liquidates open Equity shares.\n"
         "• Option contracts are never auto-flattened; if options are open, the siren blares until you close them."
     )
 
@@ -5104,7 +5179,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     kill_tip = (
         "Platform Kill-Switch (When Flat):\n"
         "Force-closes your desktop trading platform (thinkorswim.exe and/or Webull Desktop) "
-        "when your active floor (Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock) is breached.\n"
+        "when your active Max Loss or Profit Lock is hit.\n"
         "• SAFETY GUARANTEE: Only closes the app AFTER confirming your account is 100% flat."
     )
     attach_tooltip(lbl_kill, kill_tip)
@@ -5115,7 +5190,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     r_day_lock.pack(fill="x", pady=3)
     cb_lock_os = tk.Checkbutton(
         r_day_lock,
-        text="Lock Windows OS on Floor Breach",
+        text="Lock Windows OS on Max Loss / Profit Stop",
         variable=var_lock_os,
         font=("Arial", 10, "bold"),
         fg="#f2f2f2",
@@ -5130,17 +5205,17 @@ def show_preflight_window(parent=None, mute_btn=None):
     ent_daily_lock_mins.pack(side="right")
     lbl_daily_lock_mins = tk.Label(
         r_day_lock,
-        text="Lock Duration (Mins, 0 = 1x):",
+        text="Lock Duration (Mins):",
         font=("Arial", 10, "bold"),
         fg="#f2f2f2",
         bg="#1b1b1b"
     )
     lbl_daily_lock_mins.pack(side="right", padx=(12, 8))
     day_lock_tip = (
-        "Windows OS Lockout on Active Floor Breach:\n"
-        "Locks your Windows workstation for this exact duration whenever your active floor "
-        "(Starting Max Loss, Tier 2/3 Ratchet, or Trailing Profit Lock) is breached.\n"
-        "• 0 = Locks Windows one single time.\n"
+        "Windows OS Lockout on Max Loss / Profit Stop:\n"
+        "Locks your Windows workstation for this duration whenever your active Max Loss, "
+        "Tier 2/3 Ratchet, or Trailing Profit Lock is hit.\n"
+        "• 0 = Locks Windows one single time (1x).\n"
         "• > 0 (e.g. 15) = Persistent lockout timer that re-locks Windows every few seconds if you log back in early.\n"
         "• SAFETY GUARANTEE: Always confirms with the broker API that 100% of open positions are flat before locking."
     )
@@ -5370,15 +5445,15 @@ def show_preflight_window(parent=None, mute_btn=None):
     c4 = make_card(
         right_col,
         "4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)",
-        "Active before 9:25 AM and after 4:00 PM ET. Breaching your Max Loss "
-        "or Trailing Profit Lock triggers Card 2.",
+        "Active before 9:25 AM and after 4:00 PM ET. Hitting your Max Loss "
+        "or Profit Lock triggers Card 2.",
         accent="#5dade2"
     )
     cb_pm_w1, ent_pm_w1, cb_pm_w2, ent_pm_w2 = make_dual_field_row(
         c4,
-        "Warning Alarm 1 (-$):",
+        "Warning Alarm 1 ($):",
         dollar_vars["pm_warn_1"],
-        "Warning Alarm 2 (-$):",
+        "Warning Alarm 2 ($):",
         dollar_vars["pm_warn_2"],
         cb_var1=var_pm_w1_on,
         cb_var2=var_pm_w2_on,
@@ -5390,62 +5465,65 @@ def show_preflight_window(parent=None, mute_btn=None):
         tip2=(
             "Extended-Hours Warning Alarm 2:\n"
             "Sounds a second warning siren when Extended-Hours Net PnL reaches this deeper loss.\n"
-            "Uncheck if you only want a single warning alarm before your Starting Max Loss floor."
+            "Uncheck if you only want a single warning alarm before your Starting Max Loss."
         )
     )
     make_dual_field_row(
         c4,
-        "Starting Max Loss (-$):",
+        "Starting Max Loss ($):",
         dollar_vars["pm_max_loss"],
         None,
         None,
+        fg1="#eb7067",
         tip1=(
-            "Extended-Hours Starting Max Loss Floor:\n"
-            "Your initial worst-case Extended-Hours loss floor before Profit Lock is triggered.\n"
+            "Extended-Hours Starting Max Loss:\n"
+            "Your initial worst-case Extended-Hours loss limit before Profit Lock is triggered.\n"
             "If Extended-Hours Net PnL reaches this loss, it immediately triggers your Card 2\n"
-            "Floor Breach Actions (Auto-Flatten Equities via Extended-Hours limit order,\n"
+            "Daily Stop Actions (Auto-Flatten Equities via Extended-Hours limit order,\n"
             "Kill Apps, and Windows OS Lock for the duration set in Card 2)."
         )
     )
     tk.Frame(c4, bg="#2c2c2c", height=1).pack(fill="x", pady=7)
     cb_pm_lock, ent_pm_trig, lbl_pm_trail, ent_pm_trail = make_dual_field_row(
         c4,
-        "Profit Lock Trigger (+$):",
+        "Profit Lock Trigger ($):",
         dollar_vars["pm_lock_trigger"],
         "Trail Peak By ($):",
         dollar_vars["pm_trail_cushion"],
         cb_var1=var_pm_lock_on,
+        fg1="#58d68d",
+        fg2="#f2f2f2",
         tip1=(
             "Extended-Hours Trailing Profit Lock:\n"
             "Once your closed Extended-Hours Realized PnL reaches +Profit Lock Trigger ($),\n"
-            "this trailing floor replaces your Starting Max Loss as your active Termination Floor.\n"
-            "• IMPORTANT: If Net PnL pulls back and touches this trailed floor, it triggers the\n"
-            "  exact same Card 2 Floor Breach Actions (Auto-Flatten, Kill Apps, and OS Lock\n"
+            "this trailing stop replaces your Starting Max Loss as your active Daily Stop.\n"
+            "• IMPORTANT: If Net PnL pulls back and touches this trailed stop, it triggers the\n"
+            "  exact same Card 2 Daily Stop Actions (Auto-Flatten, Kill Apps, and OS Lock\n"
             "  for your Card 2 lock duration).\n"
             "Uncheck to disable Extended-Hours profit trailing."
         ),
         tip2=(
             "Extended-Hours Trailing Cushion ($):\n"
-            "Once Profit Lock Trigger (+$) is reached, your active Termination Floor trails behind\n"
+            "Once Profit Lock Trigger ($) is reached, your active Daily Stop trails behind\n"
             "your highest closed Realized PnL by this dollar amount.\n"
-            "(Example: Trigger +$500 with $500 Trail locks your floor at $0.00 breakeven\n"
+            "(Example: Trigger +$500 with $500 Trail locks your stop at $0.00 breakeven\n"
             "at +$500, and raises it to +$200 if you reach +$700.)\n"
-            "• Breaching this trailed floor triggers your Card 2 Floor Breach Actions & OS Lock timer."
+            "• Hitting this trailed stop triggers your Card 2 Daily Stop Actions & OS Lock timer."
         )
     )
 
     c5 = make_card(
         right_col,
         "5. REGULAR HOURS RULEBOOK (9:25 AM – 4:00 PM)",
-        "Starts at Base Tier 1 and ratchets your floor upward "
-        "as realized profit grows. Breaching your active floor triggers Card 2.",
+        "Starts at Base Tier 1 and ratchets your stop upward "
+        "as realized profit grows. Hitting your stop triggers Card 2.",
         accent="#5dade2",
         expand=True
     )
 
     tk.Label(
         c5,
-        text="BASE TIER 1 — Starting Max Loss Floor",
+        text="BASE TIER 1 — Starting Daily Stop",
         font=("Arial", 10, "bold"),
         fg="#aed6f1",
         bg="#1b1b1b",
@@ -5454,9 +5532,9 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     cb_t1_w1, ent_t1_w1, cb_t1_w2, ent_t1_w2 = make_dual_field_row(
         c5,
-        "Warning Alarm 1 (-$):",
+        "Warning Alarm 1 ($):",
         dollar_vars["t1_warn_1"],
-        "Warning Alarm 2 (-$):",
+        "Warning Alarm 2 ($):",
         dollar_vars["t1_warn_2"],
         cb_var1=var_t1_w1_on,
         cb_var2=var_t1_w2_on,
@@ -5468,19 +5546,20 @@ def show_preflight_window(parent=None, mute_btn=None):
         tip2=(
             "RTH Base Tier 1 — Warning Alarm 2:\n"
             "Sounds a second warning siren when Net PnL reaches this deeper loss.\n"
-            "Uncheck if you only want 1 warning alarm before your Starting Max Loss floor."
+            "Uncheck if you only want 1 warning alarm before your Starting Max Loss."
         )
     )
     make_dual_field_row(
         c5,
-        "Starting Max Loss (-$):",
+        "Starting Max Loss ($):",
         dollar_vars["t1_max_loss"],
         None,
         None,
+        fg1="#eb7067",
         tip1=(
-            "RTH Base Tier 1 — Starting Max Loss Floor:\n"
-            "Your initial worst-case RTH loss floor before any profit ratchet tiers are unlocked.\n"
-            "If Net PnL reaches this loss, it triggers your Card 2 Floor Breach Actions\n"
+            "RTH Base Tier 1 — Starting Max Loss:\n"
+            "Your initial worst-case RTH loss limit before any profit ratchet tiers are unlocked.\n"
+            "If Net PnL reaches this loss, it triggers your Card 2 Daily Stop Actions\n"
             "(Auto-Flatten Equities, Kill Apps, and Windows OS Lock for the duration set in Card 2)."
         )
     )
@@ -5495,7 +5574,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     tk.Label(
         tbl,
-        text="PROFIT RATCHET TIERS (Replaces Active Floor)",
+        text="PROFIT RATCHET TIERS (Raises Daily Stop)",
         font=("Arial", 10, "bold"),
         fg="#aed6f1",
         bg="#1b1b1b",
@@ -5503,14 +5582,14 @@ def show_preflight_window(parent=None, mute_btn=None):
     ).grid(row=0, column=0, sticky="w", pady=(0, 6))
     tk.Label(
         tbl,
-        text="ACTIVATE AT (+$)",
+        text="TRIGGER ($)",
         font=("Arial", 9, "bold"),
         fg="#aaaaaa",
         bg="#1b1b1b"
     ).grid(row=0, column=1, pady=(0, 6))
     tk.Label(
         tbl,
-        text="NEW TERMINATION FLOOR",
+        text="NEW DAILY STOP",
         font=("Arial", 9, "bold"),
         fg="#aaaaaa",
         bg="#1b1b1b"
@@ -5518,34 +5597,36 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     tier_rows = [
         (
-            "Tier 2 — Tighten Floor ($0 Siren)",
+            "Tier 2 — Fixed Stop Ratchet ($0 Siren)",
             var_t2_on,
             dollar_vars["t2_trigger"],
-            "New Max Loss (-$):",
+            "Stop Level ($):",
             dollar_vars["t2_max_loss"],
+            "#f2f2f2",
             (
-                "RTH Tier 2 — Reduced Max Loss Termination Floor:\n"
-                "Once your closed Realized PnL reaches 'Activate At (+$)', your active Termination Floor\n"
-                "tightens to 'New Max Loss (-$)' (e.g. from -$1,500 up to -$1,000), and a warning siren\n"
-                "sounds if PnL pulls back to $0.00.\n"
-                "• IMPORTANT: Breaching this tightened floor triggers your Card 2 Floor Breach Actions\n"
-                "  (Auto-Flatten, Kill Apps, and Windows OS Lock for your Card 2 lock duration).\n"
+                "RTH Tier 2 — Fixed Daily Stop Ratchet:\n"
+                "Once your closed Realized PnL reaches 'Trigger ($)', your active Daily Stop\n"
+                "moves to 'Stop Level ($)' — supports negative, zero, or positive PnL levels!\n"
+                "• Examples: Enter -1000 for a -$1,000 tightened stop, 0 for breakeven, or 250 for a +$250 profit lock.\n"
+                "• If 'Stop Level ($)' is below $0, a warning siren sounds if PnL pulls back to $0.00.\n"
+                "• Hitting 'Stop Level ($)' triggers your Card 2 Daily Stop Actions.\n"
                 "Uncheck to skip Tier 2."
             )
         ),
         (
-            "Tier 3 — Tighten Floor ($0 Siren)",
+            "Tier 3 — Fixed Stop Ratchet ($0 Siren)",
             var_t3_on,
             dollar_vars["t3_trigger"],
-            "New Max Loss (-$):",
+            "Stop Level ($):",
             dollar_vars["t3_max_loss"],
+            "#f2f2f2",
             (
-                "RTH Tier 3 — Tighter Max Loss / Breakeven Termination Floor:\n"
-                "Once your closed Realized PnL reaches 'Activate At (+$)', your active Termination Floor\n"
-                "tightens further to 'New Max Loss (-$)' (set to 0 for a $0.00 breakeven floor),\n"
-                "with a warning siren at $0.00.\n"
-                "• IMPORTANT: Breaching this tightened floor triggers your Card 2 Floor Breach Actions\n"
-                "  (Auto-Flatten, Kill Apps, and Windows OS Lock for your Card 2 lock duration).\n"
+                "RTH Tier 3 — Fixed Daily Stop Ratchet:\n"
+                "Once your closed Realized PnL reaches 'Trigger ($)', your active Daily Stop\n"
+                "moves to 'Stop Level ($)' — supports negative, zero, or positive PnL levels!\n"
+                "• Examples: Enter -500 for a -$500 tightened stop, 0 for $0.00 breakeven, or 250 for a +$250 locked profit stop.\n"
+                "• If 'Stop Level ($)' is below $0, a warning siren sounds if PnL pulls back to $0.00.\n"
+                "• Hitting 'Stop Level ($)' triggers your Card 2 Daily Stop Actions.\n"
                 "Uncheck to skip Tier 3."
             )
         ),
@@ -5555,14 +5636,15 @@ def show_preflight_window(parent=None, mute_btn=None):
             dollar_vars["t4_trigger"],
             "Trail Peak By ($):",
             dollar_vars["t4_trail"],
+            "#58d68d",
             (
-                "RTH Tier 4 — Dynamic Trailing Profit Termination Floor:\n"
-                "Once your closed Realized PnL reaches 'Activate At (+$)', your active Termination Floor\n"
+                "RTH Tier 4 — Dynamic Trailing Profit Stop:\n"
+                "Once your closed Realized PnL reaches 'Trigger ($)', your active Daily Stop\n"
                 "locks in green and trails behind your highest realized PnL peak by 'Trail Peak By ($)'.\n"
-                "(Example: Activate at +$1,000 with $500 Trail locks in +$500 minimum, and ratchets\n"
+                "(Example: Trigger at +$1,000 with $500 Trail locks in +$500 minimum, and ratchets\n"
                 "to +$900 if your closed Realized PnL reaches +$1,400.)\n"
-                "• IMPORTANT: If Net PnL pulls back and touches this trailed floor, it triggers the\n"
-                "  exact same Card 2 Floor Breach Actions (Auto-Flatten, Kill Apps, and OS Lock\n"
+                "• IMPORTANT: If Net PnL pulls back and touches this trailed stop, it triggers the\n"
+                "  exact same Card 2 Daily Stop Actions (Auto-Flatten, Kill Apps, and OS Lock\n"
                 "  for your Card 2 lock duration).\n"
                 "Uncheck to disable Tier 4."
             )
@@ -5570,19 +5652,19 @@ def show_preflight_window(parent=None, mute_btn=None):
     ]
 
     tier_widget_refs = []
-    for idx, (t_name, t_cb_var, trig_var, fl_lbl, fl_var, t_tip) in enumerate(
-        tier_rows, start=1
-    ):
+    for idx, (
+        t_name, t_cb_var, trig_var, fl_lbl, fl_var, cb_fg_col, t_tip
+    ) in enumerate(tier_rows, start=1):
         cb_t = tk.Checkbutton(
             tbl,
             text=t_name,
             variable=t_cb_var,
             font=("Arial", 10, "bold"),
-            fg="#f2f2f2",
+            fg=cb_fg_col,
             bg="#1b1b1b",
             selectcolor="#2a2a2a",
             activebackground="#1b1b1b",
-            activeforeground="#ffffff",
+            activeforeground=cb_fg_col,
             anchor="w"
         )
         cb_t.grid(row=idx, column=0, sticky="w", pady=4)
@@ -5607,13 +5689,15 @@ def show_preflight_window(parent=None, mute_btn=None):
         attach_tooltip(ent_trig, t_tip)
         attach_tooltip(lbl_fl, t_tip)
         attach_tooltip(ent_fl, t_tip)
-        tier_widget_refs.append((t_cb_var, cb_t, ent_trig, lbl_fl, ent_fl))
+        tier_widget_refs.append(
+            (t_cb_var, cb_t, ent_trig, lbl_fl, ent_fl, cb_fg_col)
+        )
 
     # --- INTERACTIVE SMART DIMMING LOGIC ---
     def refresh_smart_dimming(*_):
         if var_open_flat.get():
             ent_open_loss.config(state="normal")
-            lbl_open_loss.config(fg="#f2f2f2")
+            lbl_open_loss.config(fg="#eb7067")
             cb_open_cd.config(state="normal")
             if var_open_cd.get():
                 ent_cd_mins.config(state="normal")
@@ -5641,7 +5725,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         ent_pm_w2.config(state="normal" if var_pm_w2_on.get() else "disabled")
         cb_pm_w2.config(fg="#f2f2f2" if var_pm_w2_on.get() else "#666666")
         if var_pm_lock_on.get():
-            cb_pm_lock.config(fg="#f2f2f2")
+            cb_pm_lock.config(fg="#58d68d")
             ent_pm_trig.config(state="normal")
             lbl_pm_trail.config(fg="#f2f2f2")
             ent_pm_trail.config(state="normal")
@@ -5656,9 +5740,11 @@ def show_preflight_window(parent=None, mute_btn=None):
         cb_t1_w1.config(fg="#f2f2f2" if var_t1_w1_on.get() else "#666666")
         ent_t1_w2.config(state="normal" if var_t1_w2_on.get() else "disabled")
         cb_t1_w2.config(fg="#f2f2f2" if var_t1_w2_on.get() else "#666666")
-        for t_cb_var, cb_t, ent_trig, lbl_fl, ent_fl in tier_widget_refs:
+        for (
+            t_cb_var, cb_t, ent_trig, lbl_fl, ent_fl, cb_fg_col
+        ) in tier_widget_refs:
             if t_cb_var.get():
-                cb_t.config(fg="#f2f2f2")
+                cb_t.config(fg=cb_fg_col)
                 ent_trig.config(state="normal")
                 lbl_fl.config(fg="#bbbbbb")
                 ent_fl.config(state="normal")
