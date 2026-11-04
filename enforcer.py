@@ -5977,6 +5977,40 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     default_status_lbl.pack(side="left")
 
+    ver_frame = tk.Frame(btn_frame, bg="#121212")
+    ver_frame.place(relx=0.56, rely=0.5, anchor="center")
+
+    tk.Label(
+        ver_frame,
+        text=f"Version v{APP_VERSION}   ·",
+        font=("Arial", 9, "bold"),
+        fg="#777777",
+        bg="#121212",
+    ).pack(side="left", padx=(0, 6))
+
+    rel_notes_lbl = tk.Label(
+        ver_frame,
+        text="View Release Notes",
+        font=("Arial", 9, "bold underline"),
+        fg="#5dade2",
+        bg="#121212",
+        cursor="hand2",
+    )
+    rel_notes_lbl.pack(side="left")
+    rel_notes_lbl.bind(
+        "<Enter>", lambda e: rel_notes_lbl.config(fg="#85c1e9")
+    )
+    rel_notes_lbl.bind(
+        "<Leave>", lambda e: rel_notes_lbl.config(fg="#5dade2")
+    )
+    rel_notes_lbl.bind(
+        "<Button-1>", lambda e: show_release_notes_dialog(parent=pf)
+    )
+    attach_tooltip(
+        rel_notes_lbl,
+        "View the PnL Enforcer Beta Changelog and version release history."
+    )
+
     launch_txt = (
         "SAVE & LAUNCH ENFORCER >>"
         if parent is None else "SAVE & APPLY CHANGES >>"
@@ -6440,6 +6474,122 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
             f"Download and install v{new_ver} now? (Y/N): "
         ).strip().lower()
         return ans in ("y", "yes")
+
+
+def show_release_notes_dialog(parent=None):
+    """Opens a dark-themed modal viewer displaying the local or remote
+    CHANGELOG.md release notes, with a button to open the full web Changelog."""
+    cl_text = ""
+    cl_path = os.path.join(SCRIPT_DIR, "CHANGELOG.md")
+    if os.path.exists(cl_path):
+        try:
+            with open(cl_path, "r", encoding="utf-8", errors="replace") as f:
+                cl_text = f.read()
+        except Exception:
+            pass
+    if not cl_text.strip():
+        cl_bytes = _fetch_remote_doc_bytes("CHANGELOG.md")
+        if cl_bytes:
+            cl_text = cl_bytes.decode("utf-8", errors="replace")
+
+    if not cl_text.strip():
+        webbrowser.open(CHANGELOG_WEB_URL)
+        return
+
+    is_standalone = parent is None
+    win = tk.Tk() if is_standalone else tk.Toplevel(parent)
+    if not is_standalone:
+        win.transient(parent)
+        win.grab_set()
+    if os.path.exists(ICON_PATH):
+        try:
+            win.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+
+    win.title(f"PnL Enforcer Beta — Release Notes (v{APP_VERSION})")
+    win.config(bg="#121212", padx=24, pady=18)
+    win.resizable(True, True)
+    win.attributes("-topmost", True)
+
+    w, h = 720, 480
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = max(20, (sw - w) // 2)
+    y = max(20, (sh - h) // 2)
+    win.geometry(f"{w}x{h}+{x}+{y}")
+
+    hdr_row = tk.Frame(win, bg="#121212")
+    hdr_row.pack(fill="x", pady=(0, 10))
+
+    tk.Label(
+        hdr_row,
+        text=f"📋 RELEASE NOTES & CHANGELOG  (Current: v{APP_VERSION})",
+        font=("Arial", 12, "bold"),
+        fg="#5dade2",
+        bg="#121212",
+        anchor="w",
+    ).pack(side="left")
+
+    tk.Button(
+        hdr_row,
+        text="Open Full Changelog on Web ↗",
+        font=("Arial", 9, "bold"),
+        bg="#2c3e50",
+        fg="#aed6f1",
+        padx=10,
+        pady=3,
+        command=lambda: webbrowser.open(CHANGELOG_WEB_URL),
+    ).pack(side="right")
+
+    btn_bar = tk.Frame(win, bg="#121212", pady=10)
+    btn_bar.pack(fill="x", side="bottom")
+
+    tk.Button(
+        btn_bar,
+        text="Close",
+        font=("Arial", 10, "bold"),
+        bg="#333333",
+        fg="white",
+        padx=22,
+        pady=6,
+        command=win.destroy,
+    ).pack(side="right")
+
+    card = tk.Frame(
+        win, bg="#1b1b1b", bd=1, relief="solid", padx=12, pady=10
+    )
+    card.pack(fill="both", expand=True)
+
+    txt_frame = tk.Frame(card, bg="#141414")
+    txt_frame.pack(fill="both", expand=True)
+
+    sb = tk.Scrollbar(txt_frame)
+    sb.pack(side="right", fill="y")
+
+    txt_box = tk.Text(
+        txt_frame,
+        height=16,
+        bg="#141414",
+        fg="#e5e8e8",
+        font=("Consolas", 9),
+        wrap="word",
+        bd=0,
+        padx=10,
+        pady=8,
+        yscrollcommand=sb.set,
+    )
+    txt_box.pack(side="left", fill="both", expand=True)
+    sb.config(command=txt_box.yview)
+
+    txt_box.insert("1.0", cl_text.strip())
+    txt_box.see("1.0")
+    txt_box.config(state="disabled")
+
+    win.lift()
+    win.focus_force()
+    if is_standalone:
+        win.mainloop()
 
 
 def check_for_updates_cli():

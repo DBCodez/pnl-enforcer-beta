@@ -10,6 +10,8 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
   - **Layer 1 — Explicit `HTTP 200` Flat Verification:** `SchwabAdapter.get_open_equity_positions()` and `WebullAdapter.get_open_equity_positions()` now return `None` (instead of an empty list `[]`) on any non-`200` HTTP status or network exception, preventing transient API hiccups from falsely reporting 0 open shares.
   - **Layer 2 — 0.8s Pre-Lock Settlement Double-Confirmation:** `flatten_equities()` now waits `0.8s` after detecting `0` open equity shares and queries the broker API a second time before declaring the account flat or engaging the Windows OS lock (catching any in-flight partial fills and giving Thinkorswim / Webull Desktop time to play local fill chimes before locking).
   - **Layer 3 — 2.0s Post-Lock Watchdog Sweep (`_run_post_lock_watchdog`):** Automatically queries the broker API `2.0s` after Windows OS lock engages (`PENALTY BOX LOCK`, `DAILY BREACH OS LOCK`, or one-shot OS lock) to triple-confirm `0` open equity shares remain. If any straggler shares are detected, it immediately initiates an emergency flatten sweep and, if unable to confirm flat, aborts the OS lock and sounds the emergency siren.
+- **Pre-Flight Footer Version Badge & Release Notes Viewer (`show_release_notes_dialog`):**
+  - Added a subtle **`Version v0.9.15 · View Release Notes`** link in the Pre-Flight bottom bar to open an in-app scrollable Changelog viewer (with a direct link to the web Changelog).
 
 ---
 
