@@ -6946,8 +6946,8 @@ def show_preflight_window(parent=None, mute_btn=None):
     refresh_smart_dimming()
 
     # --- BOTTOM ACTION BAR ---
-    btn_frame = tk.Frame(pf, bg="#121212", pady=12)
-    btn_frame.pack(fill="x")
+    btn_frame = tk.Frame(pf, bg="#121212")
+    btn_frame.pack(fill="x", pady=(10, 2))
 
     btn_restore_def = tk.Button(
         btn_frame,
@@ -6998,8 +6998,25 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     default_status_lbl.pack(side="left")
 
-    ver_frame = tk.Frame(btn_frame, bg="#121212")
-    ver_frame.place(relx=0.56, rely=0.5, anchor="center")
+    launch_txt = (
+        "SAVE & LAUNCH ENFORCER >>"
+        if parent is None else "SAVE & APPLY CHANGES >>"
+    )
+    tk.Button(
+        btn_frame,
+        text=launch_txt,
+        font=("Arial", 10, "bold"),
+        bg="#1e8449",
+        fg="white",
+        padx=24,
+        pady=7,
+        command=save_and_launch
+    ).pack(side="right")
+
+    ver_outer = tk.Frame(pf, bg="#121212")
+    ver_outer.pack(fill="x", pady=(4, 0))
+    ver_frame = tk.Frame(ver_outer, bg="#121212")
+    ver_frame.pack(anchor="center")
 
     tk.Label(
         ver_frame,
@@ -7031,21 +7048,6 @@ def show_preflight_window(parent=None, mute_btn=None):
         rel_notes_lbl,
         "View the PnL Enforcer Beta Changelog and version release history."
     )
-
-    launch_txt = (
-        "SAVE & LAUNCH ENFORCER >>"
-        if parent is None else "SAVE & APPLY CHANGES >>"
-    )
-    tk.Button(
-        btn_frame,
-        text=launch_txt,
-        font=("Arial", 10, "bold"),
-        bg="#1e8449",
-        fg="white",
-        padx=24,
-        pady=7,
-        command=save_and_launch
-    ).pack(side="right")
 
     if parent is None:
         pf.mainloop()
