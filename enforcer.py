@@ -398,6 +398,7 @@ DEFAULT_CONFIG = {
     },
     "account_sessions": {},
     "user_defaults": {},
+    "alarms_only_mode": False,
     "enable_auto_flatten": False,
     "enable_kill_tos": False,
     "enable_kill_webull": False,
@@ -1130,6 +1131,7 @@ def format_config_summary(cfg):
 
     return (
         f"Broker={broker} | Poll={cfg.get('poll_interval')}s | "
+        f"AlarmsOnly={'ON' if cfg.get('alarms_only_mode') else 'OFF'} | "
         f"OpenStop={'ON' if cfg.get('enable_open_flatten') else 'OFF'}"
         f"(-${cfg.get('open_max_loss', 0):,.0f}, CoolDown={cd_str}) | "
         f"DayFlat={'ON' if cfg.get('enable_auto_flatten') else 'OFF'} | "
@@ -3110,6 +3112,8 @@ def connect_broker_adapter(broker_name, parent=None, force_wizard=False):
 # ==========================================
 def get_idle_button_text():
     b_name = config.get("active_broker", "SCHWAB")
+    if config.get("alarms_only_mode", False):
+        return f"{b_name} : ALARMS ONLY MODE (OBSERVATION / SIREN ONLY)"
     pills = [b_name]
     if config.get("enable_open_flatten", False):
         oml = config.get("open_max_loss", 500.0)
@@ -3541,7 +3545,10 @@ def flatten_equities(adapter, force_flatten=False):
     """Cancels working orders, submits RTH Market or EXT Limit liquidations
     for EQUITIES ONLY, and double-confirms (with 0.8s settlement delay) that
     0 equity shares remain."""
-    should_exec = force_flatten or config.get("enable_auto_flatten", False)
+    alarms_only = config.get("alarms_only_mode", False)
+    should_exec = (not alarms_only) and (
+        force_flatten or config.get("enable_auto_flatten", False)
+    )
     try:
         if should_exec:
             log_event("FLATTEN", "Starting emergency equity flatten sequence...")
@@ -3743,17 +3750,23 @@ def trigger_lockdown(
     if is_locked_down:
         return
 
-    flat_on = config.get("enable_auto_flatten", False)
-    kill_tos = config.get("enable_kill_tos", False)
-    kill_wb = config.get("enable_kill_webull", False)
-    lock_on = config.get("enable_lock_os", False)
+    alarms_only = config.get("alarms_only_mode", False)
+    flat_on = (not alarms_only) and config.get("enable_auto_flatten", False)
+    kill_tos = (not alarms_only) and config.get("enable_kill_tos", False)
+    kill_wb = (not alarms_only) and config.get("enable_kill_webull", False)
+    lock_on = (not alarms_only) and config.get("enable_lock_os", False)
 
     if not flat_on and not kill_tos and not kill_wb and not lock_on:
         trigger_alarm(reason, ui_button, context_str)
+        mode_desc = (
+            "Alarms Only Mode is ON"
+            if alarms_only
+            else "all enforcement toggles are OFF"
+        )
         log_event(
             "GUARDRAIL",
-            f"Daily floor breached ({reason}), but all enforcement toggles "
-            f"are OFF (Observation Mode)."
+            f"Daily floor breached ({reason}), but {mode_desc} "
+            f"(Observation Mode — Siren Only)."
         )
         return
 
@@ -4027,7 +4040,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     daily_max_equity - start_equity, 2
                 )
 
-                open_flat_on = config.get("enable_open_flatten", False)
+                alarms_only = config.get("alarms_only_mode", False)
+                open_flat_on = (
+                    (not alarms_only)
+                    and config.get("enable_open_flatten", False)
+                )
                 open_max = config.get("open_max_loss", 500.0)
 
                 pm_w1 = config["pm_warn_1"]
@@ -4758,6 +4775,9 @@ def show_preflight_window(parent=None, mute_btn=None):
         value=f"{config.get('open_cooldown_mins', 1.0):g}"
     )
 
+    var_alarms_only = tk.BooleanVar(
+        value=config.get("alarms_only_mode", False)
+    )
     var_flatten = tk.BooleanVar(value=config["enable_auto_flatten"])
     var_kill_tos = tk.BooleanVar(value=config.get("enable_kill_tos", False))
     var_kill_wb = tk.BooleanVar(value=config.get("enable_kill_webull", False))
@@ -5533,6 +5553,9 @@ def show_preflight_window(parent=None, mute_btn=None):
         var_cd_mins.set(
             f"{src.get('open_cooldown_mins', DEFAULT_CONFIG['open_cooldown_mins']):g}"
         )
+        var_alarms_only.set(
+            src.get("alarms_only_mode", DEFAULT_CONFIG["alarms_only_mode"])
+        )
         var_flatten.set(
             src.get("enable_auto_flatten", DEFAULT_CONFIG["enable_auto_flatten"])
         )
@@ -5605,6 +5628,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     def save_as_user_defaults():
         try:
             custom_def = {
+                "alarms_only_mode": bool(var_alarms_only.get()),
                 "enable_open_flatten": bool(var_open_flat.get()),
                 "enable_open_cooldown": bool(var_open_cd.get()),
                 "open_cooldown_mins": max(0.1, abs(float(var_cd_mins.get()))),
@@ -5696,6 +5720,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             if not had_saved:
                 force_reanchor = True
 
+            new_cfg["alarms_only_mode"] = bool(var_alarms_only.get())
             new_cfg["enable_open_flatten"] = bool(var_open_flat.get())
             new_cfg["enable_open_cooldown"] = bool(var_open_cd.get())
             new_cfg["open_cooldown_mins"] = max(
@@ -6001,6 +6026,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         font=("Arial", 10, "bold"),
         fg="#ffffff",
         bg="#1b1b1b",
+        disabledforeground="#555555",
         selectcolor="#2a2a2a",
         activebackground="#1b1b1b",
         activeforeground="#ffffff",
@@ -6076,19 +6102,22 @@ def show_preflight_window(parent=None, mute_btn=None):
         bar_color="#fbbf24"
     )
 
+    r_day_top = tk.Frame(c2, bg="#1b1b1b")
+    r_day_top.pack(fill="x", pady=3)
     cb_day_flat = tk.Checkbutton(
-        c2,
+        r_day_top,
         text="Auto-Flatten Equities on Max Loss / Profit Stop",
         variable=var_flatten,
         font=("Arial", 10, "bold"),
         fg="#ffffff",
         bg="#1b1b1b",
+        disabledforeground="#555555",
         selectcolor="#2a2a2a",
         activebackground="#1b1b1b",
         activeforeground="#ffffff",
         anchor="w"
     )
-    cb_day_flat.pack(fill="x", pady=3)
+    cb_day_flat.pack(side="left")
     attach_tooltip(
         cb_day_flat,
         "Auto-Flatten on Daily Stop (Max Loss or Profit Lock):\n"
@@ -6096,6 +6125,30 @@ def show_preflight_window(parent=None, mute_btn=None):
         "(whether that is your Starting Max Loss, a tightened Tier 2/3 Max Loss, or a green\n"
         "Trailing Profit Lock), Enforcer cancels working orders and liquidates open Equity shares.\n"
         "• Option contracts are never auto-flattened; if options are open, the siren blares until you close them."
+    )
+
+    cb_alarms_only = tk.Checkbutton(
+        r_day_top,
+        text="Alarms Only Mode",
+        variable=var_alarms_only,
+        font=("Arial", 10, "bold"),
+        fg="#f5b041",
+        bg="#1b1b1b",
+        selectcolor="#2a2a2a",
+        activebackground="#1b1b1b",
+        activeforeground="#ffd166",
+        anchor="e"
+    )
+    cb_alarms_only.pack(side="right")
+    attach_tooltip(
+        cb_alarms_only,
+        "Alarms Only Mode (Passive Observation / Siren Mode):\n"
+        "When checked, all automated broker order execution, platform kill-switches, and Windows OS\n"
+        "lockouts across Cards 1 & 2 are completely disabled and greyed out.\n"
+        "• Tracks your live Realized, Open, and Net PnL, Session High, and Profit Ratchet Tiers normally.\n"
+        "• Sounds audible warning sirens and breach alarms at every configured threshold.\n"
+        "• NEVER submits flatten orders, closes trading apps, or locks your Windows screen.\n"
+        "• Unchecking this box immediately restores your saved Auto-Flatten and OS Lock checkmarks."
     )
 
     r_kill = tk.Frame(c2, bg="#1b1b1b")
@@ -6115,6 +6168,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         font=("Arial", 10, "bold"),
         fg="#eb7067",
         bg="#1b1b1b",
+        disabledforeground="#555555",
         selectcolor="#2a2a2a",
         activebackground="#1b1b1b",
         activeforeground="#eb7067"
@@ -6127,6 +6181,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         font=("Arial", 10, "bold"),
         fg="#eb7067",
         bg="#1b1b1b",
+        disabledforeground="#555555",
         selectcolor="#2a2a2a",
         activebackground="#1b1b1b",
         activeforeground="#eb7067"
@@ -6151,6 +6206,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         font=("Arial", 10, "bold"),
         fg="#f2f2f2",
         bg="#1b1b1b",
+        disabledforeground="#555555",
         selectcolor="#2a2a2a",
         activebackground="#1b1b1b",
         activeforeground="#ffffff",
@@ -6776,29 +6832,51 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     # --- INTERACTIVE SMART DIMMING LOGIC ---
     def refresh_smart_dimming(*_):
-        if var_open_flat.get():
-            ent_open_loss.config(state="normal")
-            lbl_open_loss.config(fg="#eb7067")
-            cb_open_cd.config(state="normal")
-            if var_open_cd.get():
-                ent_cd_mins.config(state="normal")
-                lbl_cd_mins.config(fg="#f2f2f2")
-            else:
-                ent_cd_mins.config(state="disabled")
-                lbl_cd_mins.config(fg="#555555")
-        else:
+        if var_alarms_only.get():
+            cb_open_flat.config(state="disabled")
             ent_open_loss.config(state="disabled")
             lbl_open_loss.config(fg="#555555")
             cb_open_cd.config(state="disabled")
             ent_cd_mins.config(state="disabled")
             lbl_cd_mins.config(fg="#555555")
 
-        if var_lock_os.get():
-            ent_daily_lock_mins.config(state="normal")
-            lbl_daily_lock_mins.config(fg="#f2f2f2")
-        else:
+            cb_day_flat.config(state="disabled")
+            lbl_kill.config(fg="#555555")
+            cb_kill_tos.config(state="disabled")
+            cb_kill_wb.config(state="disabled")
+            cb_lock_os.config(state="disabled")
             ent_daily_lock_mins.config(state="disabled")
             lbl_daily_lock_mins.config(fg="#555555")
+        else:
+            cb_open_flat.config(state="normal")
+            if var_open_flat.get():
+                ent_open_loss.config(state="normal")
+                lbl_open_loss.config(fg="#eb7067")
+                cb_open_cd.config(state="normal")
+                if var_open_cd.get():
+                    ent_cd_mins.config(state="normal")
+                    lbl_cd_mins.config(fg="#f2f2f2")
+                else:
+                    ent_cd_mins.config(state="disabled")
+                    lbl_cd_mins.config(fg="#555555")
+            else:
+                ent_open_loss.config(state="disabled")
+                lbl_open_loss.config(fg="#555555")
+                cb_open_cd.config(state="disabled")
+                ent_cd_mins.config(state="disabled")
+                lbl_cd_mins.config(fg="#555555")
+
+            cb_day_flat.config(state="normal")
+            lbl_kill.config(fg="#f2f2f2")
+            cb_kill_tos.config(state="normal")
+            cb_kill_wb.config(state="normal")
+            cb_lock_os.config(state="normal")
+            if var_lock_os.get():
+                ent_daily_lock_mins.config(state="normal")
+                lbl_daily_lock_mins.config(fg="#f2f2f2")
+            else:
+                ent_daily_lock_mins.config(state="disabled")
+                lbl_daily_lock_mins.config(fg="#555555")
 
         # Card 4: Pre-Market Warning Alarms & Profit Lock
         ent_pm_w1.config(state="normal" if var_pm_w1_on.get() else "disabled")
@@ -6836,6 +6914,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 ent_fl.config(state="disabled")
 
     for trace_var in (
+        var_alarms_only,
         var_open_flat, var_open_cd, var_lock_os,
         var_pm_w1_on, var_pm_w2_on, var_pm_lock_on,
         var_t1_w1_on, var_t1_w2_on, var_t2_on, var_t3_on, var_t4_on

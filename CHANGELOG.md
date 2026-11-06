@@ -23,6 +23,9 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
   - Added a `10px` glowing neon progress bar along the bottom edge of the **`$ TO STOP`** column that visualizes remaining distance to the active stop (`> 50%` Emerald `#00e676`, `25%–50%` Amber `#ffab00`, `< 25%` Crimson `#ff1744`).
 - **90-Day Sanitized Log Archive & Automatic Retroactive Backfill (`_sync_sanitized_log_archive`):**
   - Automatically maintains balance-redacted copies of all 90-day archived logs inside `~/enforcer_logs/sanitized/enforcer_log_YYYY-MM-DD_sanitized.txt` (including retroactively generating sanitized copies for all existing archived logs on startup) and adds **`🔒 Open Safe Archived Logs (90-Day Redacted)`** to the **`📜 Logs ▾`** menu.
+- **`Alarms Only Mode` Master Toggle & Formatted Release Notes Viewer:**
+  - Added an **`Alarms Only Mode`** checkbox in Card 2 that greys out all automated flatten, app-kill, and Windows OS lock options across Cards 1 & 2 (preserving saved checkmarks when unchecked) and runs Enforcer in 100% passive observation/siren mode.
+  - Upgraded the in-app **Release Notes** and **Update Available** dialogs with rich-text Markdown typography, color-coded version banner pills, and clean hierarchy.
 
 ---
 
