@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.15"
+APP_VERSION = "0.9.20"
 
 import os
 import sys
@@ -61,7 +61,26 @@ try:
 except Exception:
     pass
 
+def apply_dark_title_bar(win):
+    """Applies native Windows 10/11 dark mode to a Tkinter window's title bar
+    via DwmSetWindowAttribute (checking attribute 20 and fallback 19)."""
+    try:
+        win.update_idletasks()
+        hwnd = win.winfo_id()
+        parent_hwnd = ctypes.windll.user32.GetParent(hwnd)
+        target_hwnds = [h for h in (parent_hwnd, hwnd) if h]
+        val = ctypes.c_int(1)
+        for h in target_hwnds:
+            for attr in (20, 19):
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    h, attr, ctypes.byref(val), ctypes.sizeof(val)
+                )
+    except Exception:
+        pass
+
+
 _orig_tk_init = tk.Tk.__init__
+_orig_toplevel_init = tk.Toplevel.__init__
 
 
 def _icon_tk_init(self, *args, **kwargs):
@@ -71,15 +90,280 @@ def _icon_tk_init(self, *args, **kwargs):
             self.iconbitmap(default=ICON_PATH)
         except Exception:
             pass
+    try:
+        self.after(15, lambda w=self: apply_dark_title_bar(w))
+    except Exception:
+        pass
+
+
+def _dark_toplevel_init(self, *args, **kwargs):
+    _orig_toplevel_init(self, *args, **kwargs)
+    try:
+        self.after(15, lambda w=self: apply_dark_title_bar(w))
+    except Exception:
+        pass
 
 
 tk.Tk.__init__ = _icon_tk_init
+tk.Toplevel.__init__ = _dark_toplevel_init
+
+
+def _blend_hex(c1, c2, t):
+    """Smoothly interpolates between two #RRGGBB hex colors (0.0 <= t <= 1.0)."""
+    try:
+        t = max(0.0, min(1.0, float(t)))
+        h1 = str(c1).lstrip("#")
+        h2 = str(c2).lstrip("#")
+        if len(h1) != 6 or len(h2) != 6:
+            return c2 if t >= 0.5 else c1
+        r1, g1, b1 = int(h1[0:2], 16), int(h1[2:4], 16), int(h1[4:6], 16)
+        r2, g2, b2 = int(h2[0:2], 16), int(h2[2:4], 16), int(h2[4:6], 16)
+        r = int(round(r1 + (r2 - r1) * t))
+        g = int(round(g1 + (g2 - g1) * t))
+        b = int(round(b1 + (b2 - b1) * t))
+        return f"#{r:02x}{g:02x}{b:02x}"
+    except Exception:
+        return c2
+
+
+def _draw_filled_stadium(cv, x1, y1, x2, y2, color):
+    """Draws a seamless filled stadium capsule on a tk.Canvas."""
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return
+    if w <= h:
+        cv.create_oval(x1, y1, x2, y2, fill=color, outline=color)
+        return
+    r = h / 2.0
+    cv.create_oval(x1, y1, x1 + h, y2, fill=color, outline=color)
+    cv.create_oval(x2 - h, y1, x2, y2, fill=color, outline=color)
+    cv.create_rectangle(x1 + r, y1, x2 - r, y2, fill=color, outline=color)
+
+
+class NeonBarCanvas(tk.Canvas):
+    """Vertical neon light-bar with a soft horizontal bloom into the card background."""
+
+    def __init__(self, parent, core_color="#38bdf8", card_bg="#1b1b1b", glow_on=True):
+        super().__init__(
+            parent,
+            width=16,
+            height=1,
+            bg=card_bg,
+            bd=0,
+            highlightthickness=0
+        )
+        self._core_color = core_color
+        self._card_bg = card_bg
+        self._glow_on = glow_on
+        self.bind("<Configure>", self._redraw)
+
+    def set_neon(self, core_color, glow_on=True):
+        self._core_color = core_color
+        self._glow_on = glow_on
+        self._redraw()
+
+    def _redraw(self, event=None):
+        self.delete("all")
+        h = self.winfo_height()
+        if h <= 4:
+            h = 300
+        if self._glow_on:
+            # 11-column horizontal light-bleed gradient (x = 5..15) flush top-to-bottom
+            for x in range(5, 16):
+                falloff = ((16 - x) / 11.0) ** 2.1
+                col = _blend_hex(self._card_bg, self._core_color, falloff * 0.42)
+                self.create_line(x, 0, x, h, fill=col)
+            # Outer neon halo flush top-to-bottom
+            halo_col = _blend_hex(self._card_bg, self._core_color, 0.55)
+            self.create_rectangle(0, 0, 6, h, fill=halo_col, outline="")
+            # Bright neon bar core flush top-to-bottom
+            self.create_rectangle(0, 0, 5, h, fill=self._core_color, outline="")
+            # Hot specular center spine flush top-to-bottom
+            spine_col = _blend_hex(self._core_color, "#ffffff", 0.58)
+            self.create_rectangle(1, 0, 3, h, fill=spine_col, outline="")
+        else:
+            self.create_rectangle(0, 0, 4, h, fill=self._core_color, outline="")
+
+
+class RulebookPillBadge(tk.Canvas):
+    """Glowing rounded capsule badge ('ACTIVE NOW' vs 'STANDBY') for Rulebook cards."""
+
+    def __init__(self, parent, card_bg="#1b1b1b"):
+        super().__init__(
+            parent,
+            width=118,
+            height=26,
+            bg=card_bg,
+            bd=0,
+            highlightthickness=0
+        )
+        self._card_bg = card_bg
+        self._active = True
+        self.bind("<Configure>", self._redraw)
+
+    def set_active(self, is_active):
+        self._active = bool(is_active)
+        self._redraw()
+
+    def _redraw(self, event=None):
+        self.delete("all")
+        w = max(118, self.winfo_width())
+        h = max(26, self.winfo_height())
+        if self._active:
+            # Multi-ring neon emerald outer bloom + glowing capsule
+            _draw_filled_stadium(
+                self, 0, 0, w - 1, h - 1, _blend_hex(self._card_bg, "#00e676", 0.25)
+            )
+            _draw_filled_stadium(
+                self, 1, 1, w - 2, h - 2, _blend_hex(self._card_bg, "#00e676", 0.50)
+            )
+            _draw_filled_stadium(self, 2, 2, w - 3, h - 3, "#69f0ae")
+            _draw_filled_stadium(self, 3, 3, w - 4, h - 4, "#00c86f")
+            self.create_text(
+                w / 2,
+                h / 2,
+                text="ACTIVE NOW",
+                font=("Arial", 8, "bold"),
+                fill="#ffffff"
+            )
+        else:
+            _draw_filled_stadium(self, 2, 2, w - 3, h - 3, "#34495e")
+            _draw_filled_stadium(self, 3, 3, w - 4, h - 4, "#222a30")
+            self.create_text(
+                w / 2,
+                h / 2,
+                text="STANDBY",
+                font=("Arial", 8, "bold"),
+                fill="#7f8c8d"
+            )
+
+
+class HudCapsulePill(tk.Canvas):
+    """Rounded stadium capsule widget for the HUD bottom bar with drop-in
+    tk.Button / tk.Label .config() compatibility."""
+
+    def __init__(
+        self,
+        parent,
+        text="",
+        bg="#282c31",
+        fg="#f8f9fa",
+        rim="#6c757d",
+        glow="#343a40",
+        font=("Arial", 8, "bold"),
+        width=140,
+        height=24,
+        state="normal",
+        command=None,
+        cursor=""
+    ):
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bg="#1a1a1a",
+            bd=0,
+            highlightthickness=0,
+            cursor=cursor
+        )
+        self._text = text
+        self._bg = bg
+        self._fg = fg
+        self._disabled_fg = fg
+        self._rim = rim
+        self._glow = glow
+        self._font = font
+        self._state = state
+        self._command = command
+        self.bind("<Configure>", self._redraw)
+        self.bind("<Button-1>", self._on_click)
+
+    def _on_click(self, event=None):
+        if self._command is not None and self._state == "normal":
+            self._command()
+
+    def config(self, **kwargs):
+        self.configure(**kwargs)
+
+    def configure(self, **kwargs):
+        redraw_needed = False
+        if "text" in kwargs:
+            self._text = kwargs.pop("text")
+            redraw_needed = True
+        if "bg" in kwargs:
+            new_bg = kwargs.pop("bg")
+            if new_bg in ("#333333", "#222629", "#262626"):
+                self._bg = "#282c31"
+                self._rim = "#6c757d"
+                self._glow = "#343a40"
+            elif new_bg in ("#ff0000", "#8b0000", "#922b21"):
+                self._bg = new_bg
+                self._rim = "#ff6b6b"
+                self._glow = _blend_hex("#1a1a1a", new_bg, 0.55)
+            elif new_bg in (
+                "#00e676", "#2ecc71", "#27ae60", "#1e8449", "#196f3d", "#145a32"
+            ):
+                self._bg = new_bg
+                self._rim = "#69f0ae"
+                self._glow = _blend_hex("#1a1a1a", "#00e676", 0.55)
+            else:
+                self._bg = new_bg
+                self._rim = _blend_hex(new_bg, "#ffffff", 0.32)
+                self._glow = _blend_hex("#1a1a1a", new_bg, 0.45)
+            redraw_needed = True
+        if "fg" in kwargs:
+            self._fg = kwargs.pop("fg")
+            redraw_needed = True
+        if "disabledforeground" in kwargs:
+            self._disabled_fg = kwargs.pop("disabledforeground")
+            redraw_needed = True
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            self.configure(
+                cursor="hand2"
+                if (self._state == "normal" and self._command is not None)
+                else ""
+            )
+            redraw_needed = True
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if kwargs:
+            super().configure(**kwargs)
+        if redraw_needed:
+            self._redraw()
+
+    def _redraw(self, event=None):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 10:
+            w = int(self["width"])
+        if h <= 6:
+            h = int(self["height"])
+        # Outer subtle halo stadium
+        _draw_filled_stadium(self, 0, 0, w - 1, h - 1, self._glow)
+        # Bright capsule rim
+        _draw_filled_stadium(self, 1, 1, w - 2, h - 2, self._rim)
+        # Inner dark/colored stadium fill
+        _draw_filled_stadium(self, 2, 2, w - 3, h - 3, self._bg)
+        txt_col = (
+            self._fg if self._state == "normal" else (self._disabled_fg or self._fg)
+        )
+        self.create_text(
+            w / 2,
+            h / 2,
+            text=self._text,
+            font=self._font,
+            fill=txt_col
+        )
 
 SCHWAB_TOKEN_PATH = os.path.join(USER_HOME, "schwab_token.json")
 CONFIG_PATH = os.path.join(USER_HOME, "enforcer_config.json")
 LOG_PATH = os.path.join(USER_HOME, "enforcer_log.txt")
 SANITIZED_LOG_PATH = os.path.join(USER_HOME, "enforcer_log_sanitized.txt")
 LOG_ARCHIVE_DIR = os.path.join(USER_HOME, "enforcer_logs")
+SANITIZED_ARCHIVE_DIR = os.path.join(LOG_ARCHIVE_DIR, "sanitized")
 LOG_RETENTION_DAYS = 90
 CALLBACK_URL = "https://127.0.0.1"
 BUG_REPORT_FORM_URL = "https://tally.so/r/Z98y4V"
@@ -124,6 +408,7 @@ DEFAULT_CONFIG = {
     "enable_open_cooldown": False,
     "open_cooldown_mins": 1.0,
     "enable_voice_cues": True,
+    "tts_voice": "Zira",
     "enable_upside_chime": True,
     "hud_columns": [
         "realized_pnl",
@@ -170,6 +455,70 @@ DEFAULT_CONFIG = {
 }
 
 SIGNED_DOLLAR_KEYS = ("t2_max_loss", "t3_max_loss")
+
+def _discover_windows_tts_voices():
+    """Dynamically enumerates installed Windows OneCore and SAPI5 TTS voices
+    from the local Windows Registry (<1ms) with a safe fallback."""
+    found = {}
+    try:
+        import winreg
+        reg_paths = (
+            r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens",
+            r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
+        )
+        for r_path in reg_paths:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r_path) as k_root:
+                    num_sub = winreg.QueryInfoKey(k_root)[0]
+                    for i in range(num_sub):
+                        sub_name = winreg.EnumKey(k_root, i)
+                        try:
+                            with winreg.OpenKey(
+                                k_root, f"{sub_name}\\Attributes"
+                            ) as k_attr:
+                                raw_name, _ = winreg.QueryValueEx(k_attr, "Name")
+                                try:
+                                    gender, _ = winreg.QueryValueEx(
+                                        k_attr, "Gender"
+                                    )
+                                except OSError:
+                                    gender = ""
+                                short_id = (
+                                    str(raw_name)
+                                    .replace("Microsoft ", "")
+                                    .replace(" Desktop", "")
+                                    .strip()
+                                )
+                                if short_id and short_id not in found:
+                                    lbl = (
+                                        f"{short_id} ({gender})"
+                                        if gender
+                                        else short_id
+                                    )
+                                    found[short_id] = (lbl, short_id)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    except Exception:
+        pass
+
+    if not found:
+        return [
+            ("Zira (Female)", "Zira"),
+            ("Mark (Male)", "Mark"),
+            ("David (Male)", "David"),
+        ]
+
+    preferred_order = ["Zira", "Mark", "David"]
+    ordered = [found.pop(k) for k in preferred_order if k in found]
+    ordered.extend(sorted(found.values(), key=lambda x: x[0]))
+    return ordered
+
+
+TTS_VOICE_CATALOG = _discover_windows_tts_voices()
+TTS_LABEL_TO_ID = {lbl: vid for lbl, vid in TTS_VOICE_CATALOG}
+TTS_ID_TO_LABEL = {vid: lbl for lbl, vid in TTS_VOICE_CATALOG}
 
 HUD_COLUMN_CATALOG = [
     ("realized_pnl", "REALIZED PnL", "Closed (flat) PnL for the day"),
@@ -509,6 +858,70 @@ def sanitize_log_for_export(raw_log_text):
     return "\n".join(out_lines) + "\n"
 
 
+def _sync_sanitized_log_archive():
+    """Ensures every archived log in ~/enforcer_logs/ has a corresponding
+    balance-redacted copy in ~/enforcer_logs/sanitized/enforcer_log_YYYY-MM-DD_sanitized.txt
+    (retroactively backfilling any existing archived logs) and prunes files
+    older than LOG_RETENTION_DAYS."""
+    backfilled = 0
+    try:
+        os.makedirs(LOG_ARCHIVE_DIR, exist_ok=True)
+        os.makedirs(SANITIZED_ARCHIVE_DIR, exist_ok=True)
+    except Exception:
+        return 0
+
+    cutoff_dt = datetime.now() - timedelta(days=LOG_RETENTION_DAYS)
+    cutoff_date_str = cutoff_dt.strftime("%Y-%m-%d")
+
+    try:
+        for fname in os.listdir(LOG_ARCHIVE_DIR):
+            m = re.match(r"^enforcer_log_(\d{4}-\d{2}-\d{2})\.txt$", fname)
+            if not m:
+                continue
+            date_part = m.group(1)
+            raw_path = os.path.join(LOG_ARCHIVE_DIR, fname)
+            if date_part < cutoff_date_str:
+                continue
+            san_fname = f"enforcer_log_{date_part}_sanitized.txt"
+            san_path = os.path.join(SANITIZED_ARCHIVE_DIR, san_fname)
+            needs_gen = not os.path.exists(san_path)
+            if not needs_gen:
+                try:
+                    if os.path.getmtime(raw_path) > os.path.getmtime(san_path):
+                        needs_gen = True
+                except OSError:
+                    pass
+            if needs_gen:
+                try:
+                    with open(
+                        raw_path, "r", encoding="utf-8", errors="replace"
+                    ) as rf:
+                        raw_txt = rf.read()
+                    san_txt = sanitize_log_for_export(raw_txt)
+                    with open(san_path, "w", encoding="utf-8") as sf:
+                        sf.write(san_txt)
+                    backfilled += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        for s_fname in os.listdir(SANITIZED_ARCHIVE_DIR):
+            m_s = re.match(
+                r"^enforcer_log_(\d{4}-\d{2}-\d{2})_sanitized\.txt$", s_fname
+            )
+            if m_s and m_s.group(1) < cutoff_date_str:
+                try:
+                    os.remove(os.path.join(SANITIZED_ARCHIVE_DIR, s_fname))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return backfilled
+
+
 def init_daily_log():
     today_str = get_today_str()
     header_line = (
@@ -528,6 +941,7 @@ def init_daily_log():
     try:
         if needs_wipe:
             archived_path, pruned_cnt = _archive_previous_log_and_prune(today_str)
+            _sync_sanitized_log_archive()
             with open(LOG_PATH, "w", encoding="utf-8") as f:
                 f.write(header_line)
                 f.write(f"Log File Path: {_mask_user_path(LOG_PATH)}\n")
@@ -551,6 +965,7 @@ def init_daily_log():
                     f"{LOG_RETENTION_DAYS} days."
                 )
         else:
+            _sync_sanitized_log_archive()
             log_event(
                 "SESSION",
                 f"--- APPLICATION LAUNCHED / RESUMED (v{APP_VERSION}) ---"
@@ -576,6 +991,8 @@ def _custom_showwarning(message, category, filename, lineno, file=None, line=Non
     short_file = os.path.basename(str(filename)) if filename else "unknown"
     cat_name = getattr(category, "__name__", str(category))
     msg_clean = str(message).strip().replace("\n", " ")
+    if cat_name == "AuthlibDeprecationWarning" or "httpx2" in msg_clean:
+        return
     log_event("PY_WARN", f"{cat_name} ({short_file}:{lineno}): {msg_clean}")
 
 
@@ -602,6 +1019,102 @@ class _EnforcerFileLogHandler(logging.Handler):
 
 
 logging.getLogger().addHandler(_EnforcerFileLogHandler())
+
+
+class _StderrToLogTee:
+    """Tees any raw stderr output (such as Tcl/Tk C-level 'after' script errors
+    or C-extension messages) into enforcer_log.txt while preserving console stderr."""
+
+    def __init__(self, orig_stderr):
+        self._orig = orig_stderr
+        self._buf = ""
+        self._in_write = False
+
+    def write(self, data):
+        if self._orig is not None:
+            try:
+                self._orig.write(data)
+            except Exception:
+                pass
+        if self._in_write or not data:
+            return
+        try:
+            self._in_write = True
+            self._buf += str(data)
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                clean = line.strip()
+                if clean and not re.match(r"^\[\d{2}:\d{2}:\d{2}\.\d{3}\]", clean):
+                    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    scrubbed = _scrub_log_line(clean)
+                    entry = f"[{ts}] [{'STDERR':<10}] {scrubbed}"
+                    with log_lock:
+                        try:
+                            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                                f.write(entry + "\n")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        finally:
+            self._in_write = False
+
+    def flush(self):
+        if self._orig is not None:
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+
+def _install_global_error_hooks():
+    """Routes all uncaught main-thread, background-thread, Tkinter callback,
+    and Tcl/stderr errors into enforcer_log.txt."""
+    if not isinstance(sys.stderr, _StderrToLogTee):
+        sys.stderr = _StderrToLogTee(sys.stderr)
+
+    def _handle_uncaught(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        tb_str = " | ".join(
+            ln.strip()
+            for ln in traceback.format_exception(exc_type, exc_value, exc_tb)
+            if ln.strip()
+        )
+        log_event("UNCAUGHT", tb_str)
+
+    def _handle_thread_uncaught(args):
+        if issubclass(args.exc_type, (KeyboardInterrupt, SystemExit)):
+            return
+        t_name = getattr(args.thread, "name", "Thread")
+        tb_str = " | ".join(
+            ln.strip()
+            for ln in traceback.format_exception(
+                args.exc_type, args.exc_value, args.exc_traceback
+            )
+            if ln.strip()
+        )
+        log_event("THRD_ERR", f"[{t_name}] {tb_str}")
+
+    def _handle_tk_callback_exc(self, exc_type, exc_value, exc_tb):
+        tb_str = " | ".join(
+            ln.strip()
+            for ln in traceback.format_exception(exc_type, exc_value, exc_tb)
+            if ln.strip()
+        )
+        log_event("TK_ERROR", tb_str)
+
+    sys.excepthook = _handle_uncaught
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _handle_thread_uncaught
+    tk.Tk.report_callback_exception = _handle_tk_callback_exc
+
+
+_install_global_error_hooks()
 
 
 def format_config_summary(cfg):
@@ -2597,29 +3110,32 @@ def connect_broker_adapter(broker_name, parent=None, force_wizard=False):
 # ==========================================
 def get_idle_button_text():
     b_name = config.get("active_broker", "SCHWAB")
-    active_modes = [b_name]
+    pills = [b_name]
     if config.get("enable_open_flatten", False):
         oml = config.get("open_max_loss", 500.0)
         if config.get("enable_open_cooldown", False):
             cd_m = config.get("open_cooldown_mins", 1.0)
-            active_modes.append(f"OPEN STOP (-${oml:,.0f} + {cd_m:g}m LOCK)")
+            pills.append(f"OPEN STOP (-${oml:,.0f} + {cd_m:g}m LOCK)")
         else:
-            active_modes.append(f"OPEN STOP (-${oml:,.0f})")
+            pills.append(f"OPEN STOP (-${oml:,.0f})")
+    daily_parts = []
     if config.get("enable_auto_flatten", False):
-        active_modes.append("DAY FLATTEN")
+        daily_parts.append("DAY FLATTEN")
     if config.get("enable_kill_tos", False):
-        active_modes.append("KILL TOS")
+        daily_parts.append("KILL TOS")
     if config.get("enable_kill_webull", False):
-        active_modes.append("KILL WEBULL")
+        daily_parts.append("KILL WEBULL")
     if config.get("enable_lock_os", False):
         dl_m = config.get("daily_lock_mins", 15.0)
-        active_modes.append(
+        daily_parts.append(
             f"LOCK OS ({dl_m:g}m)" if dl_m > 0 else "LOCK OS (1x)"
         )
+    if daily_parts:
+        pills.append(" + ".join(daily_parts))
 
-    if len(active_modes) == 1:
-        return f"[{b_name}] MODE: ALARM ONLY (OBSERVATION)"
-    return "ARMED: " + " + ".join(active_modes)
+    if len(pills) == 1:
+        return f"{b_name} : ALARM ONLY (OBSERVATION MODE)"
+    return "ARMED: " + " + ".join(pills)
 
 
 def sound_alarm_loop():
@@ -2681,8 +3197,9 @@ def mute_alarm(ui_button):
     if not cooldown_active:
         ui_button.config(
             text=get_idle_button_text(),
-            bg="#333333",
-            fg="white",
+            bg="#222629",
+            fg="#f5b041",
+            disabledforeground="#f5b041",
             state="disabled"
         )
 
@@ -2698,16 +3215,33 @@ def play_unlock_chimes():
         pass
 
 
-def speak_async(text, force=False):
-    """Speaks text asynchronously using Windows built-in SAPI speech synthesizer."""
+def speak_async(text, force=False, voice_override=None):
+    """Speaks text asynchronously using Windows OneCore / SAPI speech synthesis
+    (supports Zira, Mark, and David voices)."""
     if not force and not config.get("enable_voice_cues", True):
         return
     try:
         safe_text = str(text).replace("'", "")
+        voice_id = (
+            voice_override
+            or config.get("tts_voice", "Zira")
+            or "Zira"
+        )
+        safe_voice = str(voice_id).replace("'", "")
         ps_cmd = (
+            "try { "
+            "$sp = New-Object -ComObject SAPI.SpVoice; "
+            "$cat = New-Object -ComObject SAPI.SpObjectTokenCategory; "
+            "$cat.SetId('HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices', $false); "
+            f"foreach ($t in $cat.EnumerateTokens()) {{ if ($t.GetDescription() -match '{safe_voice}') {{ $sp.Voice = $t; break }} }}; "
+            "$sp.Rate = 1; "
+            f"[void]$sp.Speak('{safe_text}') "
+            "} catch { "
             "Add-Type -AssemblyName System.Speech; "
             "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            f"$s.Speak('{safe_text}')"
+            f"try {{ $s.SelectVoice('Microsoft {safe_voice} Desktop') }} catch {{}}; "
+            f"$s.Speak('{safe_text}') "
+            "}"
         )
         subprocess.Popen(
             ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
@@ -2775,15 +3309,20 @@ def trigger_upside_tier_glow(ui_button, banner_text, log_msg):
         if idx < len(glow_steps):
             bg_c, fg_c = glow_steps[idx]
             ui_button.config(
-                text=banner_text, bg=bg_c, fg=fg_c, state="disabled"
+                text=banner_text,
+                bg=bg_c,
+                fg=fg_c,
+                disabledforeground=fg_c,
+                state="disabled"
             )
             ui_button.after(500, lambda: _step(idx + 1))
         else:
             if not alarm_active and not cooldown_active:
                 ui_button.config(
                     text=get_idle_button_text(),
-                    bg="#333333",
-                    fg="white",
+                    bg="#222629",
+                    fg="#f5b041",
+                    disabledforeground="#f5b041",
                     state="disabled"
                 )
 
@@ -2802,62 +3341,88 @@ def _format_lock_voice_msg(duration_mins, label_prefix, upgraded=False):
 
 
 def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
-    """Waits 2.0s after Windows OS lock engages and performs a final watchdog
-    check to guarantee 0 open equity shares remain on the account."""
+    """Executes a Two-Stage Post-Lock Straggler Watchdog (Stage 1 at T+2.0s and
+    Stage 2 at T+15.0s) after Windows OS lock engages, with verbal confirmations."""
     if adapter is None:
         return
 
-    def _watchdog():
-        global cooldown_active
-        time.sleep(2.0)
-        try:
-            post_pos = adapter.get_open_equity_positions()
-            if post_pos is not None and len(post_pos) == 0:
-                log_event(
-                    "GUARDRAIL",
-                    f"POST-LOCK WATCHDOG ({lock_context}): Triple-confirmed 0 "
-                    f"open equity shares 2.0s after OS lock."
-                )
-                return
-            if post_pos is None:
-                log_event(
-                    "WARNING",
-                    f"POST-LOCK WATCHDOG ({lock_context}): Position check "
-                    f"returned None; retrying in 1.5s..."
-                )
-                time.sleep(1.5)
-                post_pos = adapter.get_open_equity_positions()
-                if post_pos is not None and len(post_pos) == 0:
-                    log_event(
-                        "GUARDRAIL",
-                        f"POST-LOCK WATCHDOG ({lock_context}): Triple-confirmed "
-                        f"0 open equity shares on retry."
-                    )
-                    return
+    is_one_shot = "ONE-SHOT" in str(lock_context).upper()
 
+    def _check_or_sweep_stage(stage_num, elapsed_tag):
+        global cooldown_active
+        post_pos = adapter.get_open_equity_positions()
+        if post_pos is None:
             log_event(
-                "CRITICAL",
-                f"POST-LOCK WATCHDOG ({lock_context}): Straggler equity "
-                f"positions detected after OS lock: {post_pos}! "
-                f"Initiating emergency sweep..."
+                "WARNING",
+                f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
+                f"Position check returned None; retrying in 1.5s..."
             )
-            swept_flat = flatten_equities(adapter, force_flatten=True)
-            if swept_flat:
+            time.sleep(1.5)
+            post_pos = adapter.get_open_equity_positions()
+
+        if post_pos is not None and len(post_pos) == 0:
+            if stage_num == 1:
                 log_event(
                     "GUARDRAIL",
-                    f"POST-LOCK WATCHDOG ({lock_context}): Emergency post-lock "
-                    f"sweep confirmed 100% flat."
+                    f"POST-LOCK WATCHDOG STAGE 1 (2.0s | {lock_context}): "
+                    f"Triple-confirmed 0 open equity shares."
                 )
+                if not is_one_shot:
+                    time.sleep(1.8)
+                speak_async("Initial flat check passed.")
             else:
                 log_event(
-                    "CRITICAL",
-                    f"POST-LOCK WATCHDOG ({lock_context}): Post-lock flatten "
-                    f"FAILED! Aborting OS lock and sounding emergency siren!"
+                    "GUARDRAIL",
+                    f"POST-LOCK WATCHDOG STAGE 2 (15.0s | {lock_context}): "
+                    f"15-second sweep clear — confirmed 0 open equity shares."
                 )
-                cooldown_active = False
-                trigger_alarm(
-                    "POST-LOCK FLATTEN FAILED — CHECK POSITIONS!", ui_button
-                )
+                speak_async("15 second sweep clear, account confirmed flat.")
+            return True
+
+        log_event(
+            "CRITICAL",
+            f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
+            f"Straggler equity positions detected after OS lock: {post_pos}! "
+            f"Initiating emergency sweep..."
+        )
+        speak_async("Warning, straggler shares detected, flattening now.")
+        swept_flat = flatten_equities(adapter, force_flatten=True)
+        if swept_flat:
+            log_event(
+                "GUARDRAIL",
+                f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
+                f"Emergency post-lock sweep confirmed 100% flat."
+            )
+            speak_async("Emergency flatten complete, account confirmed flat.")
+            return True
+
+        log_event(
+            "CRITICAL",
+            f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
+            f"Post-lock flatten FAILED! Aborting OS lock and sounding emergency siren!"
+        )
+        cooldown_active = False
+        trigger_alarm(
+            "POST-LOCK FLATTEN FAILED — CHECK POSITIONS!", ui_button
+        )
+        return False
+
+    def _watchdog():
+        lock_start_ts = time.time()
+        try:
+            # Stage 1: T + 2.0s initial post-lock verification
+            time.sleep(2.0)
+            if not is_one_shot and not cooldown_active:
+                return
+            if not _check_or_sweep_stage(1, "2.0s"):
+                return
+
+            # Stage 2: T + 15.0s delayed sweep to catch late ECN/unhalt prints
+            rem_wait = max(1.0, 15.0 - (time.time() - lock_start_ts))
+            time.sleep(rem_wait)
+            if not is_one_shot and not cooldown_active:
+                return
+            _check_or_sweep_stage(2, "15.0s")
         except Exception as e:
             log_event("ERROR", f"Post-lock watchdog exception: {e}")
 
@@ -2931,7 +3496,11 @@ def start_cooldown_lock(
             ui_button.after(
                 0,
                 lambda t=txt: ui_button.config(
-                    text=t, bg="#922b21", fg="white", state="disabled"
+                    text=t,
+                    bg="#922b21",
+                    fg="white",
+                    disabledforeground="white",
+                    state="disabled"
                 )
             )
             ctypes.windll.user32.LockWorkStation()
@@ -2957,8 +3526,9 @@ def start_cooldown_lock(
             0,
             lambda: ui_button.config(
                 text=get_idle_button_text(),
-                bg="#333333",
-                fg="white",
+                bg="#222629",
+                fg="#f5b041",
+                disabledforeground="#f5b041",
                 state="disabled"
             )
         )
@@ -3345,8 +3915,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 0,
                                 lambda: mute_btn.config(
                                     text=get_idle_button_text(),
-                                    bg="#333333",
-                                    fg="white",
+                                    bg="#222629",
+                                    fg="#f5b041",
+                                    disabledforeground="#f5b041",
                                     state="disabled"
                                 )
                             )
@@ -3845,6 +4416,33 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 terminate_pnl_level = round(floor_equity - start_equity, 2)
                 distance_to_terminate = round(current_eq - floor_equity, 2)
 
+                if not rth_now:
+                    full_leash = (
+                        max(1.0, float(pm_trail))
+                        if (pm_lock_on and max_realized_profit >= pm_trig)
+                        else max(1.0, float(pm_max))
+                    )
+                else:
+                    if t4_on and max_realized_profit >= t4_trig:
+                        full_leash = max(1.0, float(t4_trail))
+                    elif t3_on and max_realized_profit >= t3_trig:
+                        full_leash = max(
+                            1.0,
+                            float(max_realized_profit - t3_max),
+                            float(t1_max)
+                        )
+                    elif t2_on and max_realized_profit >= t2_trig:
+                        full_leash = max(
+                            1.0,
+                            float(max_realized_profit - t2_max),
+                            float(t1_max)
+                        )
+                    else:
+                        full_leash = max(1.0, float(t1_max))
+                leash_pct = max(
+                    0.0, min(1.0, distance_to_terminate / full_leash)
+                )
+
                 new_upside_tier = compute_upside_tier(
                     rth_now, max_realized_profit, config
                 )
@@ -3926,8 +4524,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 root.after(
                     0,
-                    lambda d=col_data, f=is_flat: update_gui(
-                        ui_labels, d, f, settings_btn, close_btn
+                    lambda d=col_data, f=is_flat, lp=leash_pct: update_gui(
+                        ui_labels, d, f, settings_btn, close_btn, leash_pct=lp
                     )
                 )
             else:
@@ -4007,6 +4605,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     load_config()
     launched = {"status": False}
+    pf_timer_state = {"rulebook_after_id": None, "closing": False}
 
     if parent is None:
         pf = tk.Tk()
@@ -4020,8 +4619,19 @@ def show_preflight_window(parent=None, mute_btn=None):
     pf.resizable(False, False)
     pf.attributes("-topmost", True)
 
+    def _cancel_pf_timers():
+        pf_timer_state["closing"] = True
+        aid = pf_timer_state.get("rulebook_after_id")
+        if aid is not None:
+            pf_timer_state["rulebook_after_id"] = None
+            try:
+                pf.after_cancel(aid)
+            except Exception:
+                pass
+
     def on_close():
         global settings_win_open, first_poll_of_launch
+        _cancel_pf_timers()
         first_poll_of_launch = True
         settings_win_open = False
         pf.destroy()
@@ -4160,6 +4770,10 @@ def show_preflight_window(parent=None, mute_btn=None):
     var_reanchor = tk.BooleanVar(value=False)
     var_voice_cues = tk.BooleanVar(
         value=config.get("enable_voice_cues", True)
+    )
+    init_voice_id = config.get("tts_voice", "Zira")
+    var_tts_voice = tk.StringVar(
+        value=TTS_ID_TO_LABEL.get(init_voice_id, "Zira (Female)")
     )
     var_upside_chime = tk.BooleanVar(
         value=config.get("enable_upside_chime", True)
@@ -4592,6 +5206,17 @@ def show_preflight_window(parent=None, mute_btn=None):
                 parent=pf
             )
 
+    def open_sanitized_archive_folder(event=None):
+        try:
+            _sync_sanitized_log_archive()
+            os.startfile(SANITIZED_ARCHIVE_DIR)
+        except Exception as e:
+            messagebox.showinfo(
+                "Safe Log Archive Folder",
+                f"Your 90-day balance-redacted log archive folder is located at:\n{SANITIZED_ARCHIVE_DIR}\n\n({e})",
+                parent=pf
+            )
+
     def _prepare_sanitized_log():
         """Generates ~/enforcer_log_sanitized.txt (and a convenience copy in
         ~/Downloads if present) and copies the sanitized text to the clipboard."""
@@ -4697,12 +5322,16 @@ def show_preflight_window(parent=None, mute_btn=None):
         command=open_log_file
     )
     logs_dropdown.add_command(
-        label="🔒 Export Safe Log (Balances Redacted)",
+        label="🔒 Export Today's Safe Log (Balances Redacted)",
         command=export_sanitized_log_action
     )
     logs_dropdown.add_separator()
     logs_dropdown.add_command(
-        label=f"📁 Open Archived Logs ({LOG_RETENTION_DAYS}-Day History)",
+        label=f"🔒 Open Safe Archived Logs ({LOG_RETENTION_DAYS}-Day Redacted)",
+        command=open_sanitized_archive_folder
+    )
+    logs_dropdown.add_command(
+        label=f"📁 Open Raw Archived Logs ({LOG_RETENTION_DAYS}-Day Full)",
         command=open_log_archive_folder
     )
     btn_logs_menu.config(menu=logs_dropdown)
@@ -4711,8 +5340,9 @@ def show_preflight_window(parent=None, mute_btn=None):
         btn_logs_menu,
         "Session & Audit Logs Menu:\n"
         f"• View Today's Log: Opens your local audit log in Notepad ({_mask_user_path(LOG_PATH)})\n"
-        "• Export Safe Log: Creates a privacy-scrubbed copy with total account balances redacted ($[REDACTED]) and copies it to clipboard\n"
-        f"• Open Archived Logs: Opens your {LOG_RETENTION_DAYS}-day historical log folder ({_mask_user_path(LOG_ARCHIVE_DIR)})"
+        "• Export Today's Safe Log: Creates a privacy-scrubbed copy with total account balances redacted ($[REDACTED]) and copies it to clipboard\n"
+        f"• Open Safe Archived Logs: Opens your {LOG_RETENTION_DAYS}-day redacted log archive ({_mask_user_path(SANITIZED_ARCHIVE_DIR)})\n"
+        f"• Open Raw Archived Logs: Opens your {LOG_RETENTION_DAYS}-day full local log archive ({_mask_user_path(LOG_ARCHIVE_DIR)})"
     )
 
     btn_report_bug = tk.Button(
@@ -4738,20 +5368,93 @@ def show_preflight_window(parent=None, mute_btn=None):
     populate_account_dropdown()
     var_broker.trace_add("write", on_broker_change)
 
+    def _get_preset_target_dicts():
+        base_src = config.get("user_defaults") or DEFAULT_CONFIG
+        full_d = {}
+        half_d = {}
+        for k in dollar_keys:
+            fv = float(base_src.get(k, DEFAULT_CONFIG[k]))
+            full_d[k] = round(fv) if k in SIGNED_DOLLAR_KEYS else round(abs(fv))
+            if k in SIGNED_DOLLAR_KEYS:
+                half_d[k] = round(fv * 0.5)
+            else:
+                half_d[k] = round(abs(fv) * 0.5) if fv != 0 else 0.0
+        return full_d, half_d
+
+    def refresh_preset_buttons_highlight(*_):
+        try:
+            full_d, half_d = _get_preset_target_dicts()
+            curr_d = {}
+            for k in dollar_keys:
+                raw_v = float(dollar_vars[k].get().strip())
+                curr_d[k] = (
+                    round(raw_v)
+                    if k in SIGNED_DOLLAR_KEYS
+                    else round(abs(raw_v))
+                )
+            is_full = all(abs(curr_d[k] - full_d[k]) < 0.5 for k in dollar_keys)
+            is_half = (
+                not is_full
+                and all(abs(curr_d[k] - half_d[k]) < 0.5 for k in dollar_keys)
+            )
+        except Exception:
+            is_full = False
+            is_half = False
+
+        if is_full:
+            btn_full_risk.config(
+                text="✓ Standard Full Risk",
+                bg="#1f618d",
+                fg="#ffffff",
+                bd=2,
+                relief="solid"
+            )
+            btn_half_risk.config(
+                text="50% Low Energy",
+                bg="#5c4b06",
+                fg="#cccccc",
+                bd=1,
+                relief="raised"
+            )
+        elif is_half:
+            btn_full_risk.config(
+                text="Standard Full Risk",
+                bg="#163a5f",
+                fg="#cccccc",
+                bd=1,
+                relief="raised"
+            )
+            btn_half_risk.config(
+                text="✓ 50% Low Energy",
+                bg="#9a7d0a",
+                fg="#ffffff",
+                bd=2,
+                relief="solid"
+            )
+        else:
+            btn_full_risk.config(
+                text="Standard Full Risk",
+                bg="#1f538d",
+                fg="white",
+                bd=1,
+                relief="raised"
+            )
+            btn_half_risk.config(
+                text="50% Low Energy",
+                bg="#7d6608",
+                fg="white",
+                bd=1,
+                relief="raised"
+            )
+
     def apply_dollar_preset(preset_dict):
         for k, val in preset_dict.items():
             if k in dollar_vars:
                 dollar_vars[k].set(_fmt_ui_dollar(k, val))
+        refresh_preset_buttons_highlight()
 
     def apply_half_risk_preset():
-        base_src = config.get("user_defaults") or DEFAULT_CONFIG
-        half_dict = {}
-        for k in dollar_keys:
-            full_val = float(base_src.get(k, DEFAULT_CONFIG[k]))
-            if k in SIGNED_DOLLAR_KEYS:
-                half_dict[k] = round(full_val * 0.5)
-            else:
-                half_dict[k] = round(full_val * 0.5) if full_val > 0 else 0.0
+        _, half_dict = _get_preset_target_dicts()
         apply_dollar_preset(half_dict)
         if default_status_lbl is not None:
             src_name = "your saved Default" if config.get("user_defaults") else "Factory Default"
@@ -4805,6 +5508,10 @@ def show_preflight_window(parent=None, mute_btn=None):
         "(or Factory Default dollar thresholds if you haven't clicked 'Save as Default' yet)."
     )
 
+    for dv in dollar_vars.values():
+        dv.trace_add("write", refresh_preset_buttons_highlight)
+    refresh_preset_buttons_highlight()
+
     tk.Label(
         top_bar,
         text="PRESETS:",
@@ -4847,6 +5554,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         var_voice_cues.set(
             src.get("enable_voice_cues", DEFAULT_CONFIG["enable_voice_cues"])
         )
+        restored_vid = src.get("tts_voice", DEFAULT_CONFIG["tts_voice"])
+        var_tts_voice.set(TTS_ID_TO_LABEL.get(restored_vid, "Zira (Female)"))
         var_upside_chime.set(
             src.get("enable_upside_chime", DEFAULT_CONFIG["enable_upside_chime"])
         )
@@ -4906,6 +5615,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 "daily_lock_mins": max(0.0, abs(float(var_daily_lock_mins.get()))),
                 "reset_at_925": bool(var_reset925.get()),
                 "enable_voice_cues": bool(var_voice_cues.get()),
+                "tts_voice": TTS_LABEL_TO_ID.get(var_tts_voice.get(), "Zira"),
                 "enable_upside_chime": bool(var_upside_chime.get()),
                 "enable_pm_warn_1": bool(var_pm_w1_on.get()),
                 "enable_pm_warn_2": bool(var_pm_w2_on.get()),
@@ -4928,6 +5638,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             config["user_defaults"] = custom_def
             config["signed_tier_stops"] = True
             save_config(config)
+            refresh_preset_buttons_highlight()
             log_event("CONFIG", "Saved current Pre-Flight settings as User Defaults.")
             if default_status_lbl is not None:
                 default_status_lbl.config(
@@ -4999,6 +5710,9 @@ def show_preflight_window(parent=None, mute_btn=None):
             )
             new_cfg["reset_at_925"] = bool(var_reset925.get())
             new_cfg["enable_voice_cues"] = bool(var_voice_cues.get())
+            new_cfg["tts_voice"] = TTS_LABEL_TO_ID.get(
+                var_tts_voice.get(), "Zira"
+            )
             new_cfg["enable_upside_chime"] = bool(var_upside_chime.get())
             new_cfg["enable_pm_warn_1"] = bool(var_pm_w1_on.get())
             new_cfg["enable_pm_warn_2"] = bool(var_pm_w2_on.get())
@@ -5041,6 +5755,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
             launched["status"] = True
             settings_win_open = False
+            _cancel_pf_timers()
             pf.destroy()
         except ValueError:
             messagebox.showerror(
@@ -5061,19 +5776,68 @@ def show_preflight_window(parent=None, mute_btn=None):
     right_col = tk.Frame(body_frame, bg="#121212")
     right_col.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
-    def make_card(parent_col, title, subtitle, accent="#5dade2", expand=False):
-        card = tk.Frame(
-            parent_col, bg="#1b1b1b", bd=1, relief="solid", padx=18, pady=12
+    def make_card(
+        parent_col,
+        title,
+        subtitle,
+        accent="#5dade2",
+        bar_color=None,
+        expand=False,
+        return_parts=False
+    ):
+        core_c = bar_color or accent
+        halo0 = tk.Frame(
+            parent_col,
+            bg=_blend_hex("#121212", core_c, 0.12),
+            padx=1,
+            pady=1
         )
-        card.pack(fill="both", expand=expand, pady=6)
-        tk.Label(
-            card,
+        halo0.pack(fill="both", expand=expand, pady=3)
+        halo1 = tk.Frame(
+            halo0,
+            bg=_blend_hex("#121212", core_c, 0.24),
+            padx=1,
+            pady=1
+        )
+        halo1.pack(fill="both", expand=True)
+        halo2 = tk.Frame(
+            halo1,
+            bg=_blend_hex("#1b1b1b", core_c, 0.38),
+            padx=1,
+            pady=1
+        )
+        halo2.pack(fill="both", expand=True)
+        outer = tk.Frame(
+            halo2,
+            bg="#1b1b1b",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=_blend_hex("#2c2c2c", core_c, 0.45)
+        )
+        outer.pack(fill="both", expand=True)
+        accent_bar = NeonBarCanvas(
+            outer, core_color=core_c, card_bg="#1b1b1b", glow_on=True
+        )
+        accent_bar.pack(side="left", fill="y")
+        card = tk.Frame(
+            outer, bg="#1b1b1b", padx=12, pady=11
+        )
+        card.pack(side="left", fill="both", expand=True)
+        hdr_row = tk.Frame(card, bg="#1b1b1b")
+        hdr_row.pack(fill="x")
+        title_lbl = tk.Label(
+            hdr_row,
             text=title,
             font=("Arial", 11, "bold"),
             fg=accent,
             bg="#1b1b1b",
             anchor="w"
-        ).pack(fill="x")
+        )
+        title_lbl.pack(side="left", fill="x", expand=True)
+        badge_pill = None
+        if return_parts:
+            badge_pill = RulebookPillBadge(hdr_row, card_bg="#1b1b1b")
+            badge_pill.pack(side="right", padx=(6, 0))
         if subtitle:
             tk.Label(
                 card,
@@ -5084,26 +5848,54 @@ def show_preflight_window(parent=None, mute_btn=None):
                 anchor="w"
             ).pack(fill="x", pady=(2, 6))
         tk.Frame(card, bg="#2c2c2c", height=1).pack(fill="x", pady=(0, 6))
+        if return_parts:
+            return (
+                card,
+                (halo0, halo1, halo2, outer),
+                accent_bar,
+                title_lbl,
+                badge_pill
+            )
         return card
 
     loss_var_ids = {id(dollar_vars[k]) for k in loss_display_keys}
+    green_var_ids = {
+        id(dollar_vars[k])
+        for k in ("pm_lock_trigger", "pm_trail_cushion", "t4_trigger", "t4_trail")
+        if k in dollar_vars
+    }
 
     def make_entry(parent_w, var, width=8):
+        vid = id(var)
+        if vid in loss_var_ids:
+            e_bg = "#2b1d20"
+            e_rim = "#642b31"
+            e_focus = "#ff5252"
+        elif vid in green_var_ids:
+            e_bg = "#192d23"
+            e_rim = "#236b45"
+            e_focus = "#00ff9d"
+        else:
+            e_bg = "#2b2b2b"
+            e_rim = "#3e3e3e"
+            e_focus = "#5dade2"
         ent = tk.Entry(
             parent_w,
             textvariable=var,
             font=("Arial", 11, "bold"),
             width=width,
-            bg="#2e2e2e",
+            bg=e_bg,
             fg="#ffffff",
             disabledbackground="#161616",
             disabledforeground="#555555",
             insertbackground="white",
             justify="center",
-            bd=1,
-            relief="solid"
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=e_rim,
+            highlightcolor=e_focus
         )
-        if id(var) in loss_var_ids:
+        if vid in loss_var_ids:
             ent.bind("<FocusOut>", _bind_loss_sign_normalizer(var))
         return ent
 
@@ -5196,7 +5988,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         "1. SINGLE-TRADE STOP (Open PnL)",
         "Flattens open Equities on a single trade without ending your day "
         "(Options = Siren Only).",
-        accent="#5dade2"
+        accent="#5dade2",
+        bar_color="#38bdf8"
     )
 
     r_open1 = tk.Frame(c1, bg="#1b1b1b")
@@ -5279,7 +6072,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         left_col,
         "2. DAILY STOP ACTIONS (Max Loss & Profit Lock)",
         "Fires when Net PnL hits your active Max Loss or Profit Lock in Rulebook 4 or 5.",
-        accent="#f5b041"
+        accent="#f5b041",
+        bar_color="#fbbf24"
     )
 
     cb_day_flat = tk.Checkbutton(
@@ -5386,10 +6180,42 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(ent_daily_lock_mins, day_lock_tip)
 
     # --- CARD 3: SESSION & SYSTEM SETTINGS (WITH EXPLICIT BASELINE LABEL) ---
-    c3 = tk.Frame(
-        left_col, bg="#1b1b1b", bd=1, relief="solid", padx=18, pady=12
+    c3_core = "#00e676"
+    c3_h0 = tk.Frame(
+        left_col,
+        bg=_blend_hex("#121212", c3_core, 0.12),
+        padx=1,
+        pady=1
     )
-    c3.pack(fill="both", expand=True, pady=6)
+    c3_h0.pack(fill="both", expand=True, pady=3)
+    c3_h1 = tk.Frame(
+        c3_h0,
+        bg=_blend_hex("#121212", c3_core, 0.24),
+        padx=1,
+        pady=1
+    )
+    c3_h1.pack(fill="both", expand=True)
+    c3_h2 = tk.Frame(
+        c3_h1,
+        bg=_blend_hex("#1b1b1b", c3_core, 0.38),
+        padx=1,
+        pady=1
+    )
+    c3_h2.pack(fill="both", expand=True)
+    c3_outer = tk.Frame(
+        c3_h2,
+        bg="#1b1b1b",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground=_blend_hex("#2c2c2c", c3_core, 0.45)
+    )
+    c3_outer.pack(fill="both", expand=True)
+    c3_bar = NeonBarCanvas(
+        c3_outer, core_color=c3_core, card_bg="#1b1b1b", glow_on=True
+    )
+    c3_bar.pack(side="left", fill="y")
+    c3 = tk.Frame(c3_outer, bg="#1b1b1b", padx=12, pady=11)
+    c3.pack(side="left", fill="both", expand=True)
     tk.Label(
         c3,
         text="3. SESSION & SYSTEM SETTINGS",
@@ -5471,13 +6297,12 @@ def show_preflight_window(parent=None, mute_btn=None):
         activeforeground="#ffffff",
         anchor="w"
     )
-    cb_voice.pack(side="left", padx=(0, 18))
+    cb_voice.pack(side="left", padx=(0, 12))
     attach_tooltip(
         cb_voice,
-        "Uses Windows Speech Synthesis to speak the lockout reason and duration out loud\n"
-        "when a Penalty Box or Daily Lockout triggers (e.g. 'Open PnL stop triggered. Locked out\n"
-        "for 2 minutes'), plus an announcement every whole minute remaining and at 30 seconds\n"
-        "remaining before your screen unlocks."
+        "Uses Windows Speech Synthesis to speak the lockout reason, duration, and 2s/15s\n"
+        "post-lock flat check confirmations out loud when a Penalty Box or Daily Lockout triggers,\n"
+        "plus an announcement every whole minute remaining and at 30 seconds remaining."
     )
 
     cb_chime = tk.Checkbutton(
@@ -5504,18 +6329,44 @@ def show_preflight_window(parent=None, mute_btn=None):
     r_test_audio.pack(fill="x", pady=(4, 2))
     lbl_preview_audio = tk.Label(
         r_test_audio,
-        text="Preview Audio Cue:",
+        text="Voice / Cue:",
         font=("Arial", 9, "bold"),
         fg="#bbbbbb",
         bg="#1b1b1b",
         anchor="w"
     )
-    lbl_preview_audio.pack(side="left", padx=(0, 8))
+    lbl_preview_audio.pack(side="left", padx=(0, 4))
+
+    voice_choices = [lbl for lbl, _ in TTS_VOICE_CATALOG]
+    voice_menu = tk.OptionMenu(r_test_audio, var_tts_voice, *voice_choices)
+    voice_menu.config(
+        font=("Arial", 9, "bold"),
+        bg="#2a2a2a",
+        fg="#aed6f1",
+        activebackground="#1f538d",
+        activeforeground="white",
+        highlightthickness=0,
+        bd=1,
+        relief="solid",
+        width=12
+    )
+    voice_menu["menu"].config(
+        font=("Arial", 9, "bold"), bg="#2a2a2a", fg="white"
+    )
+    voice_menu.pack(side="left", padx=(0, 5))
+    attach_tooltip(
+        voice_menu,
+        "Choose the Windows Speech voice used for Verbal Lockout Voice Cues:\n"
+        "• Zira (Female) — Clear female voice (Default)\n"
+        "• Mark (Male) — Natural Windows OneCore male voice\n"
+        "• David (Male) — Deep classic male voice"
+    )
 
     audio_choices = [
         "Warning Siren (Short Preview)",
         "Upside Tier Chime",
         "Voice: Lockout Alert",
+        "Voice: 15s Sweep Clear",
         "Voice: 1m Warning",
         "Voice: 30s Warning",
         "Unlock Chime (3-Tone)",
@@ -5530,15 +6381,16 @@ def show_preflight_window(parent=None, mute_btn=None):
         highlightthickness=0,
         bd=1,
         relief="solid",
-        width=24
+        width=26
     )
     audio_menu["menu"].config(
         font=("Arial", 9, "bold"), bg="#2a2a2a", fg="white"
     )
-    audio_menu.pack(side="left", padx=(0, 8))
+    audio_menu.pack(side="left", padx=(0, 5))
 
     def play_selected_test_audio():
         choice = var_audio_test.get()
+        sel_voice_id = TTS_LABEL_TO_ID.get(var_tts_voice.get(), "Zira")
         if choice == "Warning Siren (Short Preview)":
             def _siren_sample():
                 try:
@@ -5552,13 +6404,28 @@ def show_preflight_window(parent=None, mute_btn=None):
             play_upside_tier_chime()
         elif choice == "Voice: Lockout Alert":
             speak_async(
-                "Open P and L stop triggered. Locked out for 2 minutes.",
-                force=True
+                "Open P and L stop triggered. Locked out for 2 minutes. Initial flat check passed.",
+                force=True,
+                voice_override=sel_voice_id
+            )
+        elif choice == "Voice: 15s Sweep Clear":
+            speak_async(
+                "15 second sweep clear, account confirmed flat.",
+                force=True,
+                voice_override=sel_voice_id
             )
         elif choice == "Voice: 1m Warning":
-            speak_async("1 minute remaining until unlock.", force=True)
+            speak_async(
+                "1 minute remaining until unlock.",
+                force=True,
+                voice_override=sel_voice_id
+            )
         elif choice == "Voice: 30s Warning":
-            speak_async("30 seconds remaining until unlock.", force=True)
+            speak_async(
+                "30 seconds remaining until unlock.",
+                force=True,
+                voice_override=sel_voice_id
+            )
         elif choice == "Unlock Chime (3-Tone)":
             threading.Thread(target=play_unlock_chimes, daemon=True).start()
 
@@ -5568,13 +6435,13 @@ def show_preflight_window(parent=None, mute_btn=None):
         font=("Arial", 9, "bold"),
         bg="#2c3e50",
         fg="#aed6f1",
-        padx=10,
+        padx=8,
         pady=2,
         command=play_selected_test_audio
     )
     btn_test_audio.pack(side="left")
     audio_test_tip = (
-        "Select any sound or voice announcement from the dropdown and click '🔊 Test'\n"
+        "Select a voice and any sound or voice announcement from the dropdown, then click '🔊 Test'\n"
         "to preview how it sounds at your current speaker/headset volume."
     )
     attach_tooltip(lbl_preview_audio, audio_test_tip)
@@ -5604,13 +6471,16 @@ def show_preflight_window(parent=None, mute_btn=None):
     # ==========================================================
     # RIGHT COLUMN: 4. EXTENDED HOURS RULEBOOK, 5. REGULAR HOURS RULEBOOK
     # ==========================================================
-    c4 = make_card(
+    c4, c4_halos, c4_bar, c4_title_lbl, c4_badge_pill = make_card(
         right_col,
         "4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)",
         "Active before 9:25 AM and after 4:00 PM ET. Hitting your Max Loss "
         "or Profit Lock triggers Card 2.",
-        accent="#5dade2"
+        accent="#5dade2",
+        bar_color="#00ff9d",
+        return_parts=True
     )
+
     cb_pm_w1, ent_pm_w1, cb_pm_w2, ent_pm_w2 = make_dual_field_row(
         c4,
         "Warning Alarm 1 ($):",
@@ -5674,14 +6544,63 @@ def show_preflight_window(parent=None, mute_btn=None):
         )
     )
 
-    c5 = make_card(
+    c5, c5_halos, c5_bar, c5_title_lbl, c5_badge_pill = make_card(
         right_col,
         "5. REGULAR HOURS RULEBOOK (9:25 AM – 4:00 PM)",
         "Starts at Base Tier 1 and ratchets your stop upward "
         "as realized profit grows. Hitting your stop triggers Card 2.",
         accent="#5dade2",
-        expand=True
+        bar_color="#34495e",
+        expand=True,
+        return_parts=True
     )
+
+    def _apply_rulebook_aura(halos, bar_cv, title_w, badge_w, is_active):
+        h0, h1, h2, outer_w = halos
+        if is_active:
+            h0.config(bg="#0f291e", padx=2, pady=2)
+            h1.config(bg="#0e5235", padx=2, pady=2)
+            h2.config(bg="#08a05c", padx=1, pady=1)
+            outer_w.config(highlightbackground="#00ff9d", highlightthickness=2)
+            bar_cv.set_neon("#00ff9d", glow_on=True)
+            title_w.config(fg="#00e676")
+            if badge_w is not None:
+                badge_w.set_active(True)
+        else:
+            h0.config(bg="#121212", padx=2, pady=2)
+            h1.config(bg="#121212", padx=2, pady=2)
+            h2.config(bg="#121212", padx=1, pady=1)
+            outer_w.config(highlightbackground="#2a2a2a", highlightthickness=1)
+            bar_cv.set_neon("#34495e", glow_on=False)
+            title_w.config(fg="#7f8c8d")
+            if badge_w is not None:
+                badge_w.set_active(False)
+
+    def refresh_active_rulebook_highlight():
+        pf_timer_state["rulebook_after_id"] = None
+        if pf_timer_state["closing"]:
+            return
+        try:
+            if not pf.winfo_exists():
+                return
+        except Exception:
+            return
+        rth_now = is_rth()
+        _apply_rulebook_aura(
+            c5_halos, c5_bar, c5_title_lbl, c5_badge_pill, is_active=rth_now
+        )
+        _apply_rulebook_aura(
+            c4_halos, c4_bar, c4_title_lbl, c4_badge_pill, is_active=(not rth_now)
+        )
+        if not pf_timer_state["closing"]:
+            try:
+                pf_timer_state["rulebook_after_id"] = pf.after(
+                    5000, refresh_active_rulebook_highlight
+                )
+            except Exception:
+                pass
+
+    refresh_active_rulebook_highlight()
 
     tk.Label(
         c5,
@@ -6040,6 +6959,11 @@ acct_badge_lbl = None
 hud_root = None
 hud_grid_frame = None
 hud_ui_labels = []
+hud_leash_bar = None
+hud_leash_col_frame = None
+hud_leash_idx = None
+hud_last_leash_pct = 1.0
+hud_last_leash_bg = "#262a2e"
 hud_start_move_fn = None
 hud_do_move_fn = None
 
@@ -6052,14 +6976,14 @@ def refresh_acct_badge():
     if acct_badge_mode == 1:
         val = start_equity
         txt = f"BASE: ${val:,.2f}" if (val is not None and val > 0) else "BASE: ---"
-        fg_col = "#85929e"
+        fg_col = "#aed6f1"
     elif acct_badge_mode == 2:
         txt = format_trades_wl_inline(win_trades, loss_trades)
-        fg_col = "#a6acaf"
+        fg_col = "#e5e8e8"
     else:
         val = last_flat_equity if last_flat_equity is not None else start_equity
         txt = f"FLAT: ${val:,.2f}" if (val is not None and val > 0) else "FLAT: ---"
-        fg_col = "#a6acaf"
+        fg_col = "#ffffff"
 
     acct_badge_lbl.config(text=txt, fg=fg_col)
 
@@ -6070,10 +6994,61 @@ def toggle_acct_badge(event=None):
     refresh_acct_badge()
 
 
+def _redraw_hud_leash_canvas(event=None):
+    """Draws the glowing neon '$ TO STOP' progress bar with an upward bloom."""
+    if hud_leash_bar is None:
+        return
+    try:
+        hud_leash_bar.delete("all")
+        w = hud_leash_bar.winfo_width()
+        h = hud_leash_bar.winfo_height()
+        if w <= 4:
+            w = 156
+        if h <= 4:
+            h = 10
+        lp = max(0.0, min(1.0, float(hud_last_leash_pct)))
+        bg_c = hud_last_leash_bg
+        if lp > 0.50:
+            core_col = "#00e676"
+            spec_col = "#b9f6ca"
+        elif lp >= 0.25:
+            core_col = "#ffab00"
+            spec_col = "#ffe57f"
+        else:
+            core_col = "#ff1744"
+            spec_col = "#ff8a80"
+
+        bar_w = int(round(w * lp))
+        # Top 5px (y = 0..4): Upward neon glow bloom into the column background
+        for y in range(5):
+            bloom_t = ((y + 1) / 5.0) ** 1.8 * 0.48
+            bloom_col = _blend_hex(bg_c, core_col, bloom_t)
+            if bar_w > 0:
+                hud_leash_bar.create_line(0, y, bar_w, y, fill=bloom_col)
+            if bar_w < w:
+                hud_leash_bar.create_line(bar_w, y, w, y, fill=bg_c)
+
+        # Dark recessed trough for the bottom 5px (y = 5..9)
+        hud_leash_bar.create_rectangle(0, 5, w, h, fill="#16181b", outline="")
+
+        # Filled neon bar with 1px bright specular top highlight
+        if bar_w > 0:
+            hud_leash_bar.create_line(0, 5, bar_w, 5, fill=spec_col)
+            hud_leash_bar.create_rectangle(
+                0, 6, bar_w, h, fill=core_col, outline=""
+            )
+
+        if hud_leash_col_frame is not None:
+            rim_col = _blend_hex("#34393f", core_col, 0.55)
+            hud_leash_col_frame.config(highlightbackground=rim_col)
+    except Exception:
+        pass
+
+
 def rebuild_hud_columns():
     """Dynamically builds or rebuilds the HUD columns inside hud_grid_frame
     and adjusts the HUD window width while preserving screen position."""
-    global hud_ui_labels
+    global hud_ui_labels, hud_leash_bar, hud_leash_col_frame, hud_leash_idx
     if hud_grid_frame is None or hud_root is None:
         return
 
@@ -6085,23 +7060,45 @@ def rebuild_hud_columns():
 
     active_cols = get_active_hud_columns(config)
     hud_ui_labels.clear()
+    hud_leash_bar = None
+    hud_leash_col_frame = None
+    hud_leash_idx = None
 
     for i, col_id in enumerate(active_cols):
         title = HUD_COL_HEADERS.get(col_id, col_id.upper())
         hud_grid_frame.columnconfigure(i, weight=1, uniform="col")
 
-        col_frame = tk.Frame(hud_grid_frame, bg="#222222", bd=1, relief="solid")
-        col_frame.grid(row=0, column=i, sticky="nsew", padx=1, pady=1)
+        col_frame = tk.Frame(
+            hud_grid_frame,
+            bg="#262a2e",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#34393f"
+        )
+        col_frame.grid(row=0, column=i, sticky="nsew", padx=2, pady=(2, 1))
 
         hdr_lbl = tk.Label(
             col_frame,
             text=title,
             font=("Arial", 8, "bold"),
             fg="#cccccc",
-            bg="#1a1a1a",
+            bg="#1b1e22",
             pady=3
         )
         hdr_lbl.pack(fill="x")
+
+        if col_id == "dist_to_term":
+            hud_leash_idx = i
+            hud_leash_col_frame = col_frame
+            hud_leash_bar = tk.Canvas(
+                col_frame,
+                bg="#262a2e",
+                height=10,
+                bd=0,
+                highlightthickness=0
+            )
+            hud_leash_bar.pack(side="bottom", fill="x")
+            hud_leash_bar.bind("<Configure>", _redraw_hud_leash_canvas)
 
         val_font = (
             ("Arial", 9, "bold")
@@ -6113,13 +7110,16 @@ def rebuild_hud_columns():
             text="---",
             font=val_font,
             fg="white",
-            bg="#2c3e50",
+            bg="#262a2e",
             justify="center"
         )
         val_lbl.pack(fill="both", expand=True)
 
         if hud_start_move_fn and hud_do_move_fn:
-            for widget in (col_frame, hdr_lbl, val_lbl):
+            bind_list = [col_frame, hdr_lbl, val_lbl]
+            if col_id == "dist_to_term" and hud_leash_bar is not None:
+                bind_list.append(hud_leash_bar)
+            for widget in bind_list:
                 widget.bind("<Button-1>", hud_start_move_fn)
                 widget.bind("<B1-Motion>", hud_do_move_fn)
 
@@ -6132,15 +7132,25 @@ def rebuild_hud_columns():
         cur_y = hud_root.winfo_y()
         if cur_x <= 0 and cur_y <= 0:
             cur_x, cur_y = 50, 50
-        hud_root.geometry(f"{w_px}x85+{cur_x}+{cur_y}")
+        hud_root.geometry(f"{w_px}x88+{cur_x}+{cur_y}")
     except Exception:
-        hud_root.geometry(f"{w_px}x85+50+50")
+        hud_root.geometry(f"{w_px}x88+50+50")
 
 
-def update_gui(ui_labels, col_data, is_flat, settings_btn, close_btn):
+def update_gui(
+    ui_labels, col_data, is_flat, settings_btn, close_btn, leash_pct=None
+):
+    global hud_last_leash_pct, hud_last_leash_bg
     for i, (text_val, bg_col) in enumerate(col_data):
+        disp_bg = "#262a2e" if bg_col in ("#2c3e50", "#1f538d") else bg_col
         if i < len(ui_labels):
-            ui_labels[i].config(text=text_val, bg=bg_col)
+            ui_labels[i].config(text=text_val, bg=disp_bg)
+        if i == hud_leash_idx:
+            hud_last_leash_bg = disp_bg
+
+    if hud_leash_bar is not None and leash_pct is not None:
+        hud_last_leash_pct = max(0.0, min(1.0, float(leash_pct)))
+        _redraw_hud_leash_canvas()
 
     refresh_acct_badge()
 
@@ -6174,7 +7184,7 @@ def start_gui():
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     w_init = max(800, len(get_active_hud_columns(config)) * 160)
-    root.geometry(f"{w_init}x85+50+50")
+    root.geometry(f"{w_init}x88+50+50")
     root.config(bg="#1a1a1a")
 
     def start_move(event):
@@ -6212,35 +7222,41 @@ def start_gui():
     rebuild_hud_columns()
     ui_labels = hud_ui_labels
 
-    bottom_bar = tk.Frame(root, bg="#1a1a1a")
+    bottom_bar = tk.Frame(root, bg="#1a1a1a", pady=1)
     bottom_bar.pack(fill="x", side="bottom")
 
-    # Muted clickable Left Badge (Toggles between FLAT and BASE)
-    acct_badge_lbl = tk.Label(
+    # Rounded Stadium Capsule Left Badge (Toggles between FLAT, BASE, and W/L)
+    acct_badge_lbl = HudCapsulePill(
         bottom_bar,
         text="FLAT: ---",
         font=("Arial", 8, "bold"),
-        bg="#262626",
-        fg="#a6acaf",
-        padx=10,
-        bd=1,
-        relief="solid",
+        bg="#282c31",
+        fg="#ffffff",
+        rim="#6c757d",
+        glow="#343a40",
+        width=136,
+        height=24,
+        state="normal",
+        command=toggle_acct_badge,
         cursor="hand2"
     )
-    acct_badge_lbl.pack(side="left", fill="y", padx=(1, 1))
-    acct_badge_lbl.bind("<Button-1>", toggle_acct_badge)
+    acct_badge_lbl.pack(side="left", padx=(2, 4))
     refresh_acct_badge()
 
-    mute_btn = tk.Button(
+    mute_btn = HudCapsulePill(
         bottom_bar,
         text=get_idle_button_text(),
         font=("Arial", 8, "bold"),
-        bg="#333333",
-        fg="white",
+        bg="#282c31",
+        fg="#ffca58",
+        rim="#6c757d",
+        glow="#343a40",
+        width=480,
+        height=24,
         state="disabled",
         command=lambda: mute_alarm(mute_btn)
     )
-    mute_btn.pack(side="left", fill="x", expand=True)
+    mute_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
     close_btn = tk.Button(
         bottom_bar,
@@ -6329,6 +7345,146 @@ def _fetch_remote_doc_bytes(doc_name, ts=None):
         except Exception:
             continue
     return None
+
+
+def _insert_formatted_changelog(txt_box, markdown_text):
+    """Renders Markdown release notes into a tk.Text widget with rich typography,
+    comfortable line spacing, hanging bullet indents, and color-coded highlights."""
+    txt_box.config(
+        font=("Segoe UI", 10),
+        fg="#e5e8e8",
+        bg="#141414",
+        padx=16,
+        pady=12,
+    )
+    txt_box.tag_configure(
+        "doc_title",
+        font=("Segoe UI", 13, "bold"),
+        foreground="#ffffff",
+        spacing1=2,
+        spacing3=4,
+    )
+    txt_box.tag_configure(
+        "doc_sub",
+        font=("Segoe UI", 10),
+        foreground="#99a3a4",
+        spacing1=0,
+        spacing3=8,
+    )
+    txt_box.tag_configure(
+        "ver_hdr",
+        font=("Segoe UI", 12, "bold"),
+        foreground="#00e676",
+        background="#182b22",
+        spacing1=10,
+        spacing3=6,
+    )
+    txt_box.tag_configure(
+        "sec_hdr",
+        font=("Segoe UI", 10, "bold"),
+        foreground="#5dade2",
+        spacing1=6,
+        spacing3=3,
+    )
+    txt_box.tag_configure(
+        "bullet_1",
+        font=("Segoe UI", 10),
+        foreground="#e5e8e8",
+        lmargin1=8,
+        lmargin2=24,
+        spacing1=5,
+        spacing2=3,
+        spacing3=3,
+    )
+    txt_box.tag_configure(
+        "bullet_2",
+        font=("Segoe UI", 10),
+        foreground="#d0d7de",
+        lmargin1=28,
+        lmargin2=44,
+        spacing1=3,
+        spacing2=2,
+        spacing3=3,
+    )
+    txt_box.tag_configure(
+        "body_line",
+        font=("Segoe UI", 10),
+        foreground="#e5e8e8",
+        spacing1=3,
+        spacing2=2,
+        spacing3=3,
+    )
+    txt_box.tag_configure(
+        "bold_lead",
+        font=("Segoe UI", 10, "bold"),
+        foreground="#ffd166",
+    )
+    txt_box.tag_configure(
+        "bold_inline",
+        font=("Segoe UI", 10, "bold"),
+        foreground="#ffffff",
+    )
+    txt_box.tag_configure(
+        "code_span",
+        font=("Consolas", 10, "bold"),
+        foreground="#76d7ea",
+    )
+    txt_box.tag_configure(
+        "italic_span",
+        font=("Segoe UI", 10, "italic"),
+        foreground="#a3e4d7",
+    )
+    txt_box.tag_configure(
+        "hr_div",
+        font=("Segoe UI", 7),
+        foreground="#2c3e50",
+        spacing1=6,
+        spacing3=4,
+    )
+
+    def _insert_rich_spans(text_line, base_tag):
+        parts = re.split(r"(\*\*.*?\*\*|`[^`]+`|\*\"[^\"]+\"\*)", text_line)
+        first_bold_seen = False
+        for part in parts:
+            if not part:
+                continue
+            if part.startswith("**") and part.endswith("**") and len(part) > 4:
+                inner = part[2:-2].replace("`", "")
+                b_tag = "bold_lead" if not first_bold_seen else "bold_inline"
+                first_bold_seen = True
+                txt_box.insert("end", inner, (base_tag, b_tag))
+            elif part.startswith("`") and part.endswith("`") and len(part) > 2:
+                txt_box.insert("end", part[1:-1], (base_tag, "code_span"))
+            elif part.startswith('*"') and part.endswith('"*') and len(part) > 4:
+                txt_box.insert("end", part[1:-1], (base_tag, "italic_span"))
+            else:
+                txt_box.insert("end", part, (base_tag,))
+        txt_box.insert("end", "\n", (base_tag,))
+
+    for raw_ln in str(markdown_text or "").splitlines():
+        stripped = raw_ln.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("# "):
+            txt_box.insert("end", stripped[2:].strip() + "\n", ("doc_title",))
+        elif stripped.startswith("## "):
+            ver_txt = stripped[3:].strip().replace("[", "").replace("]", "")
+            txt_box.insert("end", f"  {ver_txt}  \n", ("ver_hdr",))
+        elif stripped.startswith("### "):
+            sec_txt = stripped[4:].strip().upper()
+            txt_box.insert("end", f"▸ {sec_txt}\n", ("sec_hdr",))
+        elif stripped.startswith("---"):
+            txt_box.insert("end", "─" * 78 + "\n", ("hr_div",))
+        elif raw_ln.startswith("  - ") or raw_ln.startswith("    - "):
+            txt_box.insert("end", "◦  ", ("bullet_2", "bold_inline"))
+            _insert_rich_spans(stripped[2:].strip(), "bullet_2")
+        elif stripped.startswith("- "):
+            txt_box.insert("end", "•  ", ("bullet_1", "bold_lead"))
+            _insert_rich_spans(stripped[2:].strip(), "bullet_1")
+        elif stripped.startswith("All notable updates"):
+            txt_box.insert("end", stripped + "\n", ("doc_sub",))
+        else:
+            _insert_rich_spans(stripped, "body_line")
 
 
 def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
@@ -6460,7 +7616,7 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
                 f"PnL Enforcer Beta v{new_ver} is ready to install.\n\n"
                 f"Click 'Open Full Changelog ↗' above to view full release notes."
             )
-        txt_box.insert("1.0", display_notes)
+        _insert_formatted_changelog(txt_box, display_notes)
         txt_box.see("1.0")
         txt_box.config(state="disabled")
 
@@ -6512,7 +7668,7 @@ def show_release_notes_dialog(parent=None):
     win.resizable(True, True)
     win.attributes("-topmost", True)
 
-    w, h = 720, 480
+    w, h = 780, 560
     sw = win.winfo_screenwidth()
     sh = win.winfo_screenheight()
     x = max(20, (sw - w) // 2)
@@ -6582,7 +7738,7 @@ def show_release_notes_dialog(parent=None):
     txt_box.pack(side="left", fill="both", expand=True)
     sb.config(command=txt_box.yview)
 
-    txt_box.insert("1.0", cl_text.strip())
+    _insert_formatted_changelog(txt_box, cl_text.strip())
     txt_box.see("1.0")
     txt_box.config(state="disabled")
 

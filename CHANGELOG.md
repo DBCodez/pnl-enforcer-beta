@@ -4,6 +4,28 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.20] — 2026-11-06
+### Added
+- **Two-Stage Post-Lock Straggler Watchdog (`2.0s` + `15.0s`) with Verbal Confirmations:**
+  - **Stage 1 (`T + 2.0s`):** Performs the initial post-lock flat check against `get_open_equity_positions()`. When `0` open equity shares are confirmed (`HTTP 200`), logs the Stage 1 pass and announces via TTS: *"Initial flat check passed."*
+  - **Stage 2 (`T + 15.0s`):** Runs a second delayed verification sweep `15.0s` after the OS lock engages (while the lock remains active) to catch late ECN fills, unhalt prints, or hanging cancel-and-replace orders. When `0` open equity shares are confirmed, logs the Stage 2 pass and announces via TTS: *"15 second sweep clear, account confirmed flat."*
+  - **Emergency Straggler Sweep:** If straggler shares are detected on either the `2.0s` or `15.0s` sweep, Enforcer immediately announces *"Warning, straggler shares detected, flattening now"*, executes an emergency `flatten_equities()` sweep, and if unable to confirm flat, aborts the OS lock and sounds the emergency siren.
+- **Selectable Windows OneCore TTS Voices (`Zira`, `Mark`, `David`):**
+  - Added a voice selector in Card 3 (`Zira (Female)`, `Mark (Male)`, `David (Male)`) backed by the Windows OneCore speech registry (`HKLM\SOFTWARE\Microsoft\Speech_OneCore\Voices`) so all installed Windows voices can be selected and previewed via **`🔊 Test`**.
+- **Native Windows Dark Mode Title Bars (`apply_dark_title_bar`):**
+  - Applied `DwmSetWindowAttribute` (`DWMWA_USE_IMMERSIVE_DARK_MODE`, attributes `20` and `19`) to the Pre-Flight window and all pop-up dialogs (API Keys, HUD Columns, Release Notes, Schwab OAuth, and Update Available).
+- **Pre-Flight Card Accent Bars & Dynamic `[● ACTIVE NOW]` / `[STANDBY]` Rulebook Highlight:**
+  - Added `4px` left-edge colored accent strips across Cards 1–5 (`#3498db` Steel Blue for Card 1, `#f39c12` Amber for Card 2, `#2ecc71` Emerald for Card 3, and dynamic session-aware coloring for Cards 4 & 5).
+  - Cards 4 (`Extended Hours`) and 5 (`Regular Hours 9:25 AM – 4:00 PM ET`) now dynamically highlight whichever rulebook is currently governing the HUD with a bright **`● ACTIVE NOW`** emerald badge and border while placing the inactive rulebook in **`STANDBY`**.
+  - Top-bar **`Standard Full Risk`** and **`50% Low Energy`** preset buttons now display an active **`✓`** indicator and bright border highlight whenever the current dollar fields match that preset.
+- **HUD Visual Upgrade — Status Bar Pill Styling & Dynamic `$ TO STOP` Leash Bar:**
+  - Styled the HUD bottom bar with rounded stadium capsules (`FLAT` / `BASE` / `W/L` and `ARMED: SCHWAB + ...`) and high-contrast warm gold status text (`#ffca58` on `#282c31`).
+  - Added a `10px` glowing neon progress bar along the bottom edge of the **`$ TO STOP`** column that visualizes remaining distance to the active stop (`> 50%` Emerald `#00e676`, `25%–50%` Amber `#ffab00`, `< 25%` Crimson `#ff1744`).
+- **90-Day Sanitized Log Archive & Automatic Retroactive Backfill (`_sync_sanitized_log_archive`):**
+  - Automatically maintains balance-redacted copies of all 90-day archived logs inside `~/enforcer_logs/sanitized/enforcer_log_YYYY-MM-DD_sanitized.txt` (including retroactively generating sanitized copies for all existing archived logs on startup) and adds **`🔒 Open Safe Archived Logs (90-Day Redacted)`** to the **`📜 Logs ▾`** menu.
+
+---
+
 ## [v0.9.15] — 2026-11-04
 ### Added
 - **3-Layer Flat Confirmation & Post-Lock Watchdog (Schwab & Webull Parity):**
