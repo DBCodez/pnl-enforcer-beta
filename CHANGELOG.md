@@ -4,6 +4,17 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.21] — 2026-11-06
+### Fixed
+- **US Eastern Market Time Synchronization (`get_eastern_now()`):**
+  - Anchored `is_rth()` (`9:25 AM – 4:00 PM ET`), `is_market_hours()` (`9:30 AM – 4:00 PM ET`), `is_after_hours()` (`>= 4:00 PM ET`), and `get_today_str()` directly to US Eastern Time (`America/New_York`, with built-in zero-dependency `EST`/`EDT` Daylight Saving Time handling) instead of local computer clock time. Traders in Pacific (`PT`), Mountain (`MT`), Central (`CT`), or international timezones now automatically switch between Extended Hours (`Card 4`) and Regular Hours (`Card 5`) at exact US market hours.
+- **Webull Partial-Fill Balance & Position Settlement Sync (`WebullAdapter.fetch_account_data`):**
+  - Eliminated 1-poll transient `Realized` / `Net` PnL spikes on Webull when scaling in or out of an open position by querying positions before account balance, performing an automatic `0.25s` settlement re-sync whenever share quantity changes mid-trade, and requiring a `0.35s` anti-wick confirmation whenever a breach candidate coincides with a share-quantity change.
+- **Zero-Delay Gist API Update Discovery (`check_for_updates_cli`):**
+  - Queries the un-cached GitHub Gist API (`api.github.com/gists/...`) to resolve the exact commit-pinned `raw_url` before falling back to CDN raw URLs, plus runs an automatic startup update check inside `enforcer.py` so updates are detected immediately regardless of how the app is launched.
+
+---
+
 ## [v0.9.20] — 2026-11-06
 ### Added
 - **Two-Stage Post-Lock Straggler Watchdog (`2.0s` + `15.0s`) with Verbal Confirmations:**

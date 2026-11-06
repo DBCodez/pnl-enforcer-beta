@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.20"
+APP_VERSION = "0.9.21"
 
 import os
 import sys
@@ -24,7 +24,7 @@ import winsound
 import logging
 import warnings
 import subprocess
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, time as dt_time, timedelta, timezone
 
 # Suppress harmless Tkinter Variable.__del__ RuntimeError when Python's
 # cyclic garbage collector runs on the background API polling thread
@@ -618,8 +618,27 @@ prev_pos_snapshot = {}
 active_adapter = None
 
 
+def get_eastern_now():
+    """Returns the current datetime in US Eastern Time (America/New_York,
+    automatically handling EST UTC-5 and EDT UTC-4 via US DST rules) so market
+    hours (9:25 AM, 9:30 AM, 4:00 PM ET) and session dates are 100% synced
+    regardless of the user's local computer timezone."""
+    utc_now = datetime.now(timezone.utc)
+    y = utc_now.year
+    # US DST starts 2nd Sunday in March at 02:00 EST (07:00 UTC)
+    mar1_w = datetime(y, 3, 1).weekday()
+    dst_start_day = 8 + (6 - mar1_w) % 7
+    dst_start_utc = datetime(y, 3, dst_start_day, 7, 0, 0, tzinfo=timezone.utc)
+    # US DST ends 1st Sunday in November at 02:00 EDT (06:00 UTC)
+    nov1_w = datetime(y, 11, 1).weekday()
+    dst_end_day = 1 + (6 - nov1_w) % 7
+    dst_end_utc = datetime(y, 11, dst_end_day, 6, 0, 0, tzinfo=timezone.utc)
+    offset_hours = -4 if (dst_start_utc <= utc_now < dst_end_utc) else -5
+    return (utc_now + timedelta(hours=offset_hours)).replace(tzinfo=None)
+
+
 def get_today_str():
-    return datetime.now().strftime("%Y-%m-%d")
+    return get_eastern_now().strftime("%Y-%m-%d")
 
 
 def get_session_key(broker_name, account_id):
@@ -1397,17 +1416,17 @@ def save_session_state():
 
 
 def is_rth():
-    now = datetime.now().time()
+    now = get_eastern_now().time()
     return dt_time(9, 25) <= now < dt_time(16, 0)
 
 
 def is_after_hours():
-    now = datetime.now().time()
+    now = get_eastern_now().time()
     return now >= dt_time(16, 0)
 
 
 def is_market_hours():
-    now = datetime.now().time()
+    now = get_eastern_now().time()
     return dt_time(9, 30) <= now < dt_time(16, 0)
 
 
@@ -1865,7 +1884,9 @@ class SchwabAdapter:
 
     def cancel_all_working_orders(self):
         try:
-            today_start = datetime.combine(datetime.now().date(), dt_time(0, 0))
+            today_start = datetime.combine(
+                get_eastern_now().date() - timedelta(days=2), dt_time(0, 0)
+            )
             orders_resp = self.client.get_orders_for_account(
                 self.account_id, from_entered_datetime=today_start
             )
@@ -2187,6 +2208,7 @@ class WebullAdapter:
         self.account_id = None
         self.accounts = []
         self._logged_accounts = set()
+        self._prev_pos_qty_map = {}
         self.last_error = ""
 
     def authenticate(self):
@@ -2543,6 +2565,48 @@ class WebullAdapter:
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         for Webull accounts."""
         try:
+            p_res = self._call_get_positions()
+            if p_res.status_code != 200:
+                self.last_error = (
+                    f"HTTP {p_res.status_code}: {getattr(p_res, 'text', '')[:80]}"
+                )
+                log_event(
+                    "ERROR",
+                    f"Webull get_account_position HTTP {p_res.status_code}"
+                )
+                return None, True, 0.0, {}, False
+
+            p_json = p_res.json()
+            pos_list = (
+                p_json if isinstance(p_json, list)
+                else p_json.get("data", p_json.get("positions", []))
+            )
+
+            probe_qty_map = {}
+            for p_item in pos_list:
+                q_val = int(float(p_item.get("quantity") or p_item.get("position") or 0))
+                if q_val != 0:
+                    s_val = (
+                        p_item.get("symbol")
+                        or p_item.get("ticker", {}).get("symbol")
+                        or "UNKNOWN"
+                    )
+                    probe_qty_map[s_val] = q_val
+
+            prev_q_map = self._prev_pos_qty_map.get(self.account_id)
+            if prev_q_map is not None and probe_qty_map != prev_q_map:
+                # Share quantity just changed (entry, scale-out, or exit).
+                # Wait briefly and re-fetch positions before balance so Webull's
+                # cash_balance and position quantities settle into sync.
+                time.sleep(0.25)
+                p_res2 = self._call_get_positions()
+                if p_res2.status_code == 200:
+                    p_json = p_res2.json()
+                    pos_list = (
+                        p_json if isinstance(p_json, list)
+                        else p_json.get("data", p_json.get("positions", []))
+                    )
+
             b_res = self._call_get_balance()
             if b_res.status_code != 200:
                 self.last_error = (
@@ -2568,23 +2632,6 @@ class WebullAdapter:
                     f"Webull Balance Parsed -> TotalAccountValue=${raw_eq:,.2f} "
                     f"(Cash=${cash_bal if cash_bal is not None else 0.0:,.2f})"
                 )
-
-            p_res = self._call_get_positions()
-            if p_res.status_code != 200:
-                self.last_error = (
-                    f"HTTP {p_res.status_code}: {getattr(p_res, 'text', '')[:80]}"
-                )
-                log_event(
-                    "ERROR",
-                    f"Webull get_account_position HTTP {p_res.status_code}"
-                )
-                return None, True, 0.0, {}, False
-
-            p_json = p_res.json()
-            pos_list = (
-                p_json if isinstance(p_json, list)
-                else p_json.get("data", p_json.get("positions", []))
-            )
 
             total_open_pnl = 0.0
             total_pos_mkt_val = 0.0
@@ -2686,6 +2733,10 @@ class WebullAdapter:
                 }
 
             is_flat = (len(pos_details) == 0)
+            self._prev_pos_qty_map[self.account_id] = {
+                s_k.replace(" (OPT)", ""): d_v["qty"]
+                for s_k, d_v in pos_details.items()
+            }
 
             if cash_bal is not None and cash_bal > 0:
                 adj_eq = round(cash_bal + total_pos_mkt_val, 2)
@@ -4149,19 +4200,23 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     book_confirms_open = (
                         open_breach_cand and conf_open_pnl <= -open_max
                     )
+                    qty_just_changed = (
+                        {k: v.get("qty") for k, v in pos_details.items()}
+                        != {k: v.get("qty") for k, v in prev_pos_snapshot.items()}
+                    )
                     spike_ctx = (
                         f"Realized={format_dollar(realized_pnl)}, "
                         f"Open={format_dollar(open_pnl)}, "
                         f"Net={format_dollar(net_pnl)}"
                     )
-                    if book_confirms_floor or book_confirms_open:
+                    if (book_confirms_floor or book_confirms_open) and not qty_just_changed:
                         log_event(
                             "GUARDRAIL",
                             f"Breach confirmed immediately by NBBO book & "
                             f"account snapshot (0s delay | {spike_ctx})."
                         )
                     else:
-                        time.sleep(0.2)
+                        time.sleep(0.35 if qty_just_changed else 0.2)
                         v_eq, v_flat, v_open, v_pos, v_opt = (
                             active_adapter.fetch_account_data()
                         )
@@ -7882,10 +7937,28 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
 
         import urllib.request
         ts = int(now_ts)
-        candidate_urls = [
+        candidate_urls = []
+        try:
+            api_req = urllib.request.Request(
+                "https://api.github.com/gists/6442a3ab2767aeb5ba0b13940d012634",
+                headers={
+                    "User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}",
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+            with urllib.request.urlopen(api_req, timeout=3) as api_resp:
+                g_meta = json.loads(api_resp.read().decode("utf-8", errors="replace"))
+            live_raw = (
+                g_meta.get("files", {}).get("enforcer.py", {}).get("raw_url")
+            )
+            if live_raw:
+                candidate_urls.append(live_raw)
+        except Exception:
+            pass
+        candidate_urls.extend([
             f"{GIST_ENFORCER_RAW_URL}?t={ts}",
             f"{GITHUB_RAW_BASE}enforcer.py?t={ts}",
-        ]
+        ])
         best_ver = None
         best_bytes = None
         best_txt = None
