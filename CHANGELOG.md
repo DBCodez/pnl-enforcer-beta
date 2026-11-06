@@ -4,6 +4,34 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.23] — 2026-11-06
+### Added
+- **Modern `6px` Rounded-Rectangle (Squircle) Button Engine (`_render_glass_pill_image` / `_get_glass_pill_photo` / `GlassStadiumButton`):**
+  - Built a cached `PIL` / SDF anti-aliased button renderer featuring:
+    - **Crisp `6px` Rounded-Rectangle Geometry (`corner_radius=6`):** All clickable buttons, dropdowns, and the unified `BROKER / ACCOUNT` bar use a modern `6px` rounded-rectangle radius, while non-clickable status badges (`● ACTIVE NOW`, `STANDBY`, and HUD `FLAT:` / `ARMED:` readouts) retain full stadium capsules (`height // 2`).
+    - **One-Way Top-Down Micro-Fade:** Replaces dark-center tube gradients with a smooth, continuous one-way top-to-bottom linear fade (`#1c212b` top edge fading smoothly downward to `#141820` bottom).
+    - **Razor-Sharp `1px` Top Catch-Light Border:** Removes fuzzy edge blur in favor of a tack-sharp `1px` anti-aliased border where the top horizontal edge is `25%` brighter than the sides and bottom.
+- **Custom Dark-Glass Checkboxes (`GlassCheckbutton` / `make_glass_checkbutton`):**
+  - Replaced legacy Windows sunken square checkboxes across Pre-Flight and all setup dialogs with a custom `tk.Label`-backed dark-glass checkbox widget (`GlassCheckbutton` + `_get_glass_checkbox_photo`) featuring an anti-aliased `18x18` rounded dark-glass icon, glowing emerald/amber/coral border with a vector `✓` checkmark when checked, and zero Windows `selectcolor` white boxes or relief borders.
+- **Pre-Flight Top Bar — Single Un-Nested `BROKER / ACCOUNT` Bar, Unified Neutral Utility Buttons & Segmented Presets:**
+  - Un-nested the top-left **`BROKER / ACCOUNT`** container into **one unified dark-slate `6px` rounded bar** (`#1c212b -> #141820` top-down fade + `#2e3746` `1px` border) where **`BROKER: SCHWAB ▾   ● ACCOUNT: Schwab Account ... ▾`** and the glowing emerald status orb (**`●`** `_get_glow_dot_photo`) sit directly on the surface without inner outlines at rest.
+  - Unified all secondary utility buttons (**`🔑 API Keys`**, **`📊 HUD Columns (5)`**, **`📜 Logs ▾`**, **`Restore Defaults`**, **`Save as Default`**, and Card 3's **`Voice / Cue`** dropdowns and **`🔊 Test`**) onto a cohesive neutral dark-slate surface (`#1c212b -> #141820` with `#2e3746` border brightening to `#475569` on hover), with a subtle muted rose border (`#5c2836`) on **`🐞 Report Bug`**.
+  - Reserved saturated color fills strictly for the active preset (**`✓ Standard Full Risk`** in deep steel-blue `#163052 -> #0f213a` with `#38bdf8` border, or **`✓ 50% Low Energy`** in deep emerald `#144332 -> #0d2e22` with `#10b981` border) and the primary **`🚀 SAVE & LAUNCH ENFORCER >>`** button (`#14532d -> #0d3b20` top-to-bottom fade with a crisp `1px` `#10b981` border).
+- **Pre-Flight Bottom Action Bar & HUD Right Controls:**
+  - Upgraded HUD **`⚙ SETTINGS`** and **`✕`** to `6px` rounded rectangles with crisp `1px` borders while preserving full stadium capsules on **`FLAT:`** and **`ARMED:`** and honoring the **`🔒 IN TRADE`** tamper lock.
+- **Calm Left-Accent Card Borders, Crisp `Arial` / `Consolas` Typography & Live Telemetry Strip (Cards 1–5):**
+  - Replaced 4-sided neon box borders around Cards 1–5 with calm `1px` dark-slate card perimeters (`#243040`) paired with a single glowing left vertical accent bar (`NeonBarCanvas`), dark-glass numeric entry boxes, and crisp integer-aligned `Arial` / `Consolas` GDI ClearType typography.
+  - Added geometric **`▶  `** prefixes to Cards 1–5 numbered headers, crisp `1px` (`#222d3d`) horizontal section dividers across Cards 1–5 (including between Base Tier 1 and Profit Ratchet Tiers in Card 5), **`▸ `** prefixes on Tiers 2–4, and an SDF **`● ACTIVE NOW` / `STANDBY`** rulebook badge (`RulebookPillBadge`).
+  - Upgraded Card 3's live telemetry row into a multi-color inline strip: Baseline dollar value in soft cyan (`#7dd3fc`), Token time remaining in emerald (`#4ade80`, or amber `#fbbf24` when `< 1.5d`), **`W:`** count/percentage in emerald (`#58d68d`), and **`L:`** count/percentage in soft coral (`#e07a7a`).
+  - Styled Card 3's **`Voice / Cue`** dropdowns as quiet, flat dark-glass selector boxes (`#0e141d` fill, `#283546` border) so they never compete visually with the risk inputs.
+- **Expanded, Un-Truncated API Keys Setup Wizard & Unified Modal Popups:**
+  - Upgraded the **Schwab & Webull API Credential Setup Wizard** (`show_broker_setup_wizard`) with complete, un-truncated multi-line step-by-step instructions (including the full Step 5 browser approval + clipboard auto-detection walkthrough), cyan step badges (`1.`–`5.`), color-highlighted pill badges (`Accounts and Trading Production`, `https://127.0.0.1` with a one-click **`📋 Copy`** button, `Ready for Use`), a header **`🌐 Open ... Developer Portal ↗`** button, and frosted-glass action pills.
+  - Upgraded **`Customize HUD Columns & Order`**, **`Release Notes`**, **`Update Available`**, **`Schwab OAuth`**, and **`Liability Waiver`** modals to match the frosted-glass aesthetic.
+- **Dropdown Menu Tooltip Auto-Dismiss:**
+  - Hover tooltips on all dropdown menus (`BROKER / ACCOUNT` bar, `📜 Logs ▾`, and Card 3 `Voice / Cue` selectors) now immediately cancel and disappear before `tk_popup` opens the dropdown menu so tooltips never linger behind open menus.
+
+---
+
 ## [v0.9.22] — 2026-11-06
 ### Added
 - **Windows Kernel Single-Instance Guard (`_ensure_single_instance_or_exit`):**

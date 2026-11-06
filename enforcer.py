@@ -5,11 +5,14 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.22"
+APP_VERSION = "0.9.23"
 
 import os
 import sys
 import re
+import math
+import zlib
+import struct
 import uuid
 import json
 import hashlib
@@ -127,6 +130,607 @@ def _blend_hex(c1, c2, t):
         return c2
 
 
+def _hex_to_rgb_tuple(h, fallback=(20, 26, 36)):
+    try:
+        s = str(h).lstrip("#")
+        if len(s) == 3:
+            s = "".join(c * 2 for c in s)
+        if len(s) == 6:
+            return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except Exception:
+        pass
+    return fallback
+
+
+def _pack_rgba_png(w, h, raw_rows_bytes):
+    """Packs raw scanlines (each prefixed with filter byte 0x00) into an RGBA PNG."""
+    def _chunk(tag, data):
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", int(w), int(h), 8, 6, 0, 0, 0)
+    idat = zlib.compress(raw_rows_bytes, 1)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", idat)
+        + _chunk(b"IEND", b"")
+    )
+
+
+try:
+    from PIL import Image as _PILImage, ImageDraw as _PILImageDraw, ImageFilter as _PILImageFilter, ImageTk as _PILImageTk
+    _HAS_PIL = True
+except ImportError:
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "pillow"],
+            check=False,
+        )
+        from PIL import Image as _PILImage, ImageDraw as _PILImageDraw, ImageFilter as _PILImageFilter, ImageTk as _PILImageTk
+        _HAS_PIL = True
+    except Exception:
+        _HAS_PIL = False
+
+_GLASS_PIL_IMAGE_CACHE = {}
+_GLASS_PNG_BYTES_CACHE = {}
+_GLASS_PHOTO_CACHE = {}
+
+
+def _render_glass_pill_image(
+    w,
+    h,
+    bg_hex="#0d1117",
+    fill_hex="#141820",
+    border_hex="#2e3746",
+    glow_hex=None,
+    hover=False,
+    glow_strength=0.0,
+    pad=0.5,
+    corner_radius=6,
+    fill_top_hex=None,
+):
+    """Renders a crisp, sub-pixel anti-aliased rounded rectangle (default 6px
+    squircle for buttons/dropdowns, or full stadium capsule when corner_radius
+    is None) with:
+    1. Subtle one-way top-to-bottom linear micro-fade (slightly lighter at y=0
+       fading smoothly downward to fill_hex at y=height — zero dark-center tube)
+    2. Razor-sharp 1px anti-aliased border (zero fuzzy GaussianBlur) where the
+       top horizontal edge is 25% brighter to simulate an overhead catch-light."""
+    w = max(16, int(w))
+    h = max(14, int(h))
+    pad = 0.5
+    rad_key = -1 if corner_radius is None else int(corner_radius)
+    cache_key = (
+        "modern_squircle_v5",
+        w,
+        h,
+        bg_hex,
+        fill_hex,
+        fill_top_hex or "",
+        border_hex,
+        bool(hover),
+        rad_key,
+    )
+    cached_img = _GLASS_PIL_IMAGE_CACHE.get(cache_key)
+    if cached_img is not None:
+        return cached_img
+
+    bg_r, bg_g, bg_b = _hex_to_rgb_tuple(bg_hex, (13, 17, 23))
+    fl_r, fl_g, fl_b = _hex_to_rgb_tuple(fill_hex, (20, 24, 32))
+    bd_r, bd_g, bd_b = _hex_to_rgb_tuple(border_hex, (46, 55, 70))
+
+    if fill_top_hex:
+        top_r, top_g, top_b = _hex_to_rgb_tuple(fill_top_hex, (28, 33, 43))
+    else:
+        # One-way top-down fade: start ~10% lighter at y=0 and fade to fill_hex
+        lift = 0.13 if hover else 0.10
+        tint_r = bd_r * 0.35 + 255.0 * 0.65
+        tint_g = bd_g * 0.35 + 255.0 * 0.65
+        tint_b = bd_b * 0.35 + 255.0 * 0.65
+        top_r = fl_r + (tint_r - fl_r) * lift
+        top_g = fl_g + (tint_g - fl_g) * lift
+        top_b = fl_b + (tint_b - fl_b) * lift
+
+    cx = (w - 1.0) / 2.0
+    cy = (h - 1.0) / 2.0
+    hw = max(4.0, (w - 2.0 * pad) / 2.0)
+    hh = max(4.0, (h - 2.0 * pad) / 2.0)
+    if corner_radius is None:
+        r = min(hw, hh)
+    else:
+        r = min(hw, hh, float(corner_radius))
+
+    left_cx = min(w // 2, int(math.ceil(pad + r + 1.5)))
+    mid_w = max(0, w - 2 * left_cx)
+    border_w = 1.05
+    span_h = max(1.0, h - 2.0 * pad)
+
+    def _squircle_rgba(d, t):
+        if d > 0.5:
+            return b"\x00\x00\x00\x00"
+
+        # 1. One-way top-to-bottom linear gradient (top_rgb at t=0 -> fl_rgb at t=1)
+        ir = top_r + (fl_r - top_r) * t
+        ig = top_g + (fl_g - top_g) * t
+        ib = top_b + (fl_b - top_b) * t
+
+        # 2. Razor-sharp 1px border with 25% brighter top horizontal catch-light
+        if t < 0.22:
+            top_catch = ((0.22 - t) / 0.22) * (0.30 if hover else 0.25)
+        else:
+            top_catch = 0.0
+        br = bd_r + (255.0 - bd_r) * top_catch
+        bg_c = bd_g + (255.0 - bd_g) * top_catch
+        bb = bd_b + (255.0 - bd_b) * top_catch
+
+        outer_cov = max(0.0, min(1.0, 0.5 - d))
+        inner_cov = max(0.0, min(1.0, (-border_w + 0.5) - d))
+
+        pr = br * (1.0 - inner_cov) + ir * inner_cov
+        pg = bg_c * (1.0 - inner_cov) + ig * inner_cov
+        pb = bb * (1.0 - inner_cov) + ib * inner_cov
+        pa = int(round(outer_cov * 255.0))
+        return bytes(
+            (
+                max(0, min(255, int(round(pr)))),
+                max(0, min(255, int(round(pg)))),
+                max(0, min(255, int(round(pb)))),
+                max(0, min(255, pa)),
+            )
+        )
+
+    hx_inner = hw - r
+    hy_inner = hh - r
+    raw_buf = bytearray()
+    for y in range(h):
+        t = max(0.0, min(1.0, (y - pad) / span_h))
+        qy = abs(y - cy) - hy_inner
+        left_row = bytearray()
+        right_row = bytearray()
+        for x in range(left_cx):
+            qx = abs(x - cx) - hx_inner
+            d = math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - r
+            px = _squircle_rgba(d, t)
+            left_row += px
+            right_row = px + right_row
+        mid_d = qy - r
+        mid_px = _squircle_rgba(mid_d, t) * mid_w
+        raw_buf += left_row + mid_px + right_row
+
+    if _HAS_PIL:
+        base_img = _PILImage.new("RGBA", (w, h), (bg_r, bg_g, bg_b, 255))
+        pill_layer = _PILImage.frombytes("RGBA", (w, h), bytes(raw_buf))
+        final_img = _PILImage.alpha_composite(base_img, pill_layer).convert("RGB")
+        if len(_GLASS_PIL_IMAGE_CACHE) > 400:
+            _GLASS_PIL_IMAGE_CACHE.clear()
+        _GLASS_PIL_IMAGE_CACHE[cache_key] = final_img
+        return final_img
+    return bytes(raw_buf)
+
+
+def _get_glass_pill_photo(
+    widget,
+    w,
+    h,
+    bg_hex="#0d1117",
+    fill_hex="#141820",
+    border_hex="#2e3746",
+    glow_hex=None,
+    hover=False,
+    glow_strength=0.0,
+    pad=0.5,
+    corner_radius=6,
+    fill_top_hex=None,
+):
+    """Returns a cached ImageTk.PhotoImage (or tk.PhotoImage fallback) for a
+    crisp 6px rounded rectangle (or stadium capsule when corner_radius is None)
+    with a one-way top-down linear micro-fade and razor-sharp 1px border."""
+    w = max(16, int(w))
+    h = max(14, int(h))
+    rad_key = -1 if corner_radius is None else int(corner_radius)
+    bytes_key = (
+        "modern_squircle_v5",
+        w,
+        h,
+        bg_hex,
+        fill_hex,
+        fill_top_hex or "",
+        border_hex,
+        bool(hover),
+        rad_key,
+    )
+    tk_id = id(widget.tk)
+    photo_key = (tk_id, bytes_key)
+    cached_photo = _GLASS_PHOTO_CACHE.get(photo_key)
+    if cached_photo is not None:
+        return cached_photo
+
+    rendered = _render_glass_pill_image(
+        w,
+        h,
+        bg_hex=bg_hex,
+        fill_hex=fill_hex,
+        border_hex=border_hex,
+        glow_hex=glow_hex,
+        hover=hover,
+        glow_strength=glow_strength,
+        pad=pad,
+        corner_radius=corner_radius,
+        fill_top_hex=fill_top_hex,
+    )
+    if _HAS_PIL and not isinstance(rendered, (bytes, bytearray)):
+        photo = _PILImageTk.PhotoImage(rendered, master=widget)
+    else:
+        bg_r, bg_g, bg_b = _hex_to_rgb_tuple(bg_hex, (13, 17, 23))
+        rows = []
+        stride = w * 4
+        for y in range(h):
+            row_bytes = bytearray(b"\x00")
+            off = y * stride
+            for x in range(w):
+                px = rendered[off + x * 4 : off + x * 4 + 4]
+                a = px[3] / 255.0
+                row_bytes += bytes(
+                    (
+                        int(bg_r * (1.0 - a) + px[0] * a),
+                        int(bg_g * (1.0 - a) + px[1] * a),
+                        int(bg_b * (1.0 - a) + px[2] * a),
+                        255,
+                    )
+                )
+            rows.append(bytes(row_bytes))
+        png_bytes = _pack_rgba_png(w, h, b"".join(rows))
+        photo = tk.PhotoImage(master=widget, data=png_bytes)
+
+    if len(_GLASS_PHOTO_CACHE) > 400:
+        _GLASS_PHOTO_CACHE.clear()
+    _GLASS_PHOTO_CACHE[photo_key] = photo
+    return photo
+
+
+def _get_glow_dot_photo(widget, bg_hex="#141c28", dot_hex="#00e676", size=18):
+    """Renders an anti-aliased glowing LED status orb with radial neon bloom."""
+    bytes_key = ("glow_dot", bg_hex, dot_hex, int(size))
+    tk_id = id(widget.tk)
+    photo_key = (tk_id, bytes_key)
+    cached = _GLASS_PHOTO_CACHE.get(photo_key)
+    if cached is not None:
+        return cached
+    png_bytes = _GLASS_PNG_BYTES_CACHE.get(bytes_key)
+    if png_bytes is None:
+        bg_r, bg_g, bg_b = _hex_to_rgb_tuple(bg_hex, (20, 28, 40))
+        dt_r, dt_g, dt_b = _hex_to_rgb_tuple(dot_hex, (0, 230, 118))
+        cx = (size - 1) / 2.0
+        cy = (size - 1) / 2.0
+        core_r = 4.2
+        rows = []
+        for y in range(size):
+            row = bytearray(b"\x00")
+            for x in range(size):
+                dist = math.hypot(x - cx, y - cy)
+                if dist <= core_r + 0.5:
+                    cov = max(0.0, min(1.0, (core_r + 0.5) - dist))
+                    # Specular white highlight near upper-left of orb
+                    spec = max(
+                        0.0,
+                        1.0 - math.hypot(x - (cx - 1.3), y - (cy - 1.3)) / 3.2,
+                    ) * 0.65
+                    cr = dt_r + (255 - dt_r) * spec
+                    cg = dt_g + (255 - dt_g) * spec
+                    cb = dt_b + (255 - dt_b) * spec
+                    ga = 0.55
+                    or_ = bg_r + (dt_r - bg_r) * ga
+                    og_ = bg_g + (dt_g - bg_g) * ga
+                    ob_ = bg_b + (dt_b - bg_b) * ga
+                    fr = int(or_ * (1.0 - cov) + cr * cov)
+                    fg = int(og_ * (1.0 - cov) + cg * cov)
+                    fb = int(ob_ * (1.0 - cov) + cb * cov)
+                else:
+                    ga = 0.55 * math.exp(-(dist - core_r) * 0.55)
+                    fr = int(bg_r + (dt_r - bg_r) * ga)
+                    fg = int(bg_g + (dt_g - bg_g) * ga)
+                    fb = int(bg_b + (dt_b - bg_b) * ga)
+                row += bytes(
+                    (
+                        max(0, min(255, fr)),
+                        max(0, min(255, fg)),
+                        max(0, min(255, fb)),
+                        255,
+                    )
+                )
+            rows.append(bytes(row))
+        png_bytes = _pack_rgba_png(size, size, b"".join(rows))
+        _GLASS_PNG_BYTES_CACHE[bytes_key] = png_bytes
+    photo = tk.PhotoImage(master=widget, data=png_bytes)
+    _GLASS_PHOTO_CACHE[photo_key] = photo
+    return photo
+
+
+def _get_glass_checkbox_photo(
+    widget,
+    bg_hex="#131922",
+    checked=True,
+    dimmed=False,
+    accent_hex="#28b882",
+    check_hex="#4ade80",
+):
+    """Renders an anti-aliased 18x18 rounded dark-glass checkbox icon with 6px
+    right spacing before the label text."""
+    bytes_key = (
+        "cb_v2",
+        bg_hex,
+        bool(checked),
+        bool(dimmed),
+        accent_hex,
+        check_hex,
+    )
+    tk_id = id(widget.tk)
+    photo_key = (tk_id, bytes_key)
+    cached = _GLASS_PHOTO_CACHE.get(photo_key)
+    if cached is not None:
+        return cached
+
+    png_bytes = _GLASS_PNG_BYTES_CACHE.get(bytes_key)
+    if png_bytes is None:
+        bg_r, bg_g, bg_b = _hex_to_rgb_tuple(bg_hex, (19, 25, 34))
+        if checked and not dimmed:
+            fl_r, fl_g, fl_b = _hex_to_rgb_tuple(
+                _blend_hex(bg_hex, accent_hex, 0.30), (16, 54, 42)
+            )
+            bd_r, bd_g, bd_b = _hex_to_rgb_tuple(accent_hex, (40, 184, 130))
+            ck_r, ck_g, ck_b = _hex_to_rgb_tuple(check_hex, (105, 240, 174))
+        elif checked and dimmed:
+            fl_r, fl_g, fl_b = _hex_to_rgb_tuple("#121e1d", (18, 30, 29))
+            bd_r, bd_g, bd_b = _hex_to_rgb_tuple("#264a40", (38, 74, 64))
+            ck_r, ck_g, ck_b = _hex_to_rgb_tuple("#3a7560", (58, 117, 96))
+        elif not checked and not dimmed:
+            fl_r, fl_g, fl_b = _hex_to_rgb_tuple("#151f2c", (21, 31, 44))
+            bd_r, bd_g, bd_b = _hex_to_rgb_tuple("#475b73", (71, 91, 115))
+            ck_r, ck_g, ck_b = (0, 0, 0)
+        else:
+            fl_r, fl_g, fl_b = _hex_to_rgb_tuple("#121720", (18, 23, 32))
+            bd_r, bd_g, bd_b = _hex_to_rgb_tuple("#283444", (40, 52, 68))
+            ck_r, ck_g, ck_b = (0, 0, 0)
+
+        size = 18
+        w = size + 6
+        h = size
+        cx = (size - 1) / 2.0
+        cy = (size - 1) / 2.0
+        half = 6.5
+        rad = 3.4
+        border_w = 1.45
+
+        def _seg_dist(px, py, ax, ay, bx, by):
+            vx, vy = bx - ax, by - ay
+            wx, wy = px - ax, py - ay
+            c1 = vx * wx + vy * wy
+            c2 = vx * vx + vy * vy
+            t_seg = max(0.0, min(1.0, c1 / c2)) if c2 > 0 else 0.0
+            return math.hypot(px - (ax + t_seg * vx), py - (ay + t_seg * vy))
+
+        rows = []
+        for y in range(h):
+            row = bytearray(b"\x00")
+            for x in range(w):
+                if x >= size:
+                    row += bytes((bg_r, bg_g, bg_b, 255))
+                    continue
+                dx = abs(x - cx) - (half - rad)
+                dy = abs(y - cy) - (half - rad)
+                d = (
+                    math.hypot(max(dx, 0.0), max(dy, 0.0))
+                    + min(max(dx, dy), 0.0)
+                    - rad
+                )
+                ny = max(-1.0, min(1.0, (y - cy) / half))
+                t = (ny + 1.0) * 0.5
+
+                if d > 0.5:
+                    if checked and not dimmed and d < 2.6:
+                        ga = 0.26 * math.exp(-d * 1.0)
+                        r_ = int(bg_r + (bd_r - bg_r) * ga)
+                        g_ = int(bg_g + (bd_g - bg_g) * ga)
+                        b_ = int(bg_b + (bd_b - bg_b) * ga)
+                        row += bytes((r_, g_, b_, 255))
+                    else:
+                        row += bytes((bg_r, bg_g, bg_b, 255))
+                    continue
+
+                ir, ig, ib = float(fl_r), float(fl_g), float(fl_b)
+                if t < 0.48:
+                    sheen = 0.24 * ((0.48 - t) / 0.48)
+                    ir = ir + (230 - ir) * sheen
+                    ig = ig + (245 - ig) * sheen
+                    ib = ib + (255 - ib) * sheen
+
+                if checked:
+                    d1 = _seg_dist(x, y, cx - 3.2, cy + 0.2, cx - 0.7, cy + 2.7)
+                    d2 = _seg_dist(x, y, cx - 0.7, cy + 2.7, cx + 3.6, cy - 2.4)
+                    cd = min(d1, d2)
+                    ck_cov = max(0.0, min(1.0, 1.30 - cd))
+                    ir = ir * (1.0 - ck_cov) + ck_r * ck_cov
+                    ig = ig * (1.0 - ck_cov) + ck_g * ck_cov
+                    ib = ib * (1.0 - ck_cov) + ck_b * ck_cov
+
+                spec = max(0.0, -ny) * 0.36
+                br = bd_r + (255 - bd_r) * spec
+                bg_c = bd_g + (255 - bd_g) * spec
+                bb = bd_b + (255 - bd_b) * spec
+
+                outer_cov = max(0.0, min(1.0, 0.5 - d))
+                inner_cov = max(0.0, min(1.0, (-border_w + 0.5) - d))
+                pr = br * (1.0 - inner_cov) + ir * inner_cov
+                pg = bg_c * (1.0 - inner_cov) + ig * inner_cov
+                pb = bb * (1.0 - inner_cov) + ib * inner_cov
+                fr = int(bg_r * (1.0 - outer_cov) + pr * outer_cov)
+                fg = int(bg_g * (1.0 - outer_cov) + pg * outer_cov)
+                fb = int(bg_b * (1.0 - outer_cov) + pb * outer_cov)
+                row += bytes(
+                    (
+                        max(0, min(255, fr)),
+                        max(0, min(255, fg)),
+                        max(0, min(255, fb)),
+                        255,
+                    )
+                )
+            rows.append(bytes(row))
+
+        png_bytes = _pack_rgba_png(w, h, b"".join(rows))
+        _GLASS_PNG_BYTES_CACHE[bytes_key] = png_bytes
+
+    photo = tk.PhotoImage(master=widget, data=png_bytes)
+    _GLASS_PHOTO_CACHE[photo_key] = photo
+    return photo
+
+
+class GlassCheckbutton(tk.Label):
+    """Dark-glass custom checkbox widget backed by tk.Label so it never suffers
+    from Windows tk.Checkbutton white selectcolor boxes, sunken relief borders,
+    or GDI disabled stipple dithering."""
+
+    def __init__(
+        self,
+        parent,
+        text="",
+        variable=None,
+        font=("Arial", 10, "bold"),
+        fg="#dce4ee",
+        bg="#131922",
+        disabledforeground="#526070",
+        accent_hex="#28b882",
+        check_hex="#69f0ae",
+        anchor="w",
+        command=None,
+        **kwargs,
+    ):
+        for k in (
+            "selectcolor",
+            "activebackground",
+            "activeforeground",
+            "indicatoron",
+        ):
+            kwargs.pop(k, None)
+        self._bg_hex = bg
+        self._fg_normal = fg
+        self._fg_disabled = disabledforeground
+        self._accent_hex = accent_hex
+        self._check_hex = check_hex
+        self._variable = variable
+        self._command = command
+        self._disabled = False
+        self._img_off = _get_glass_checkbox_photo(
+            parent, bg, checked=False, dimmed=False,
+            accent_hex=accent_hex, check_hex=check_hex
+        )
+        self._img_on = _get_glass_checkbox_photo(
+            parent, bg, checked=True, dimmed=False,
+            accent_hex=accent_hex, check_hex=check_hex
+        )
+        self._img_off_dim = _get_glass_checkbox_photo(
+            parent, bg, checked=False, dimmed=True,
+            accent_hex=accent_hex, check_hex=check_hex
+        )
+        self._img_on_dim = _get_glass_checkbox_photo(
+            parent, bg, checked=True, dimmed=True,
+            accent_hex=accent_hex, check_hex=check_hex
+        )
+        is_checked = bool(variable.get()) if variable is not None else False
+        super().__init__(
+            parent,
+            text=text,
+            font=font,
+            fg=fg,
+            bg=bg,
+            image=self._img_on if is_checked else self._img_off,
+            compound="left",
+            bd=0,
+            highlightthickness=0,
+            padx=0,
+            pady=1,
+            anchor=anchor,
+            cursor="hand2",
+            **kwargs,
+        )
+        self.bind("<Button-1>", self._on_click, add="+")
+        if self._variable is not None:
+            try:
+                self._variable.trace_add(
+                    "write", lambda *_: self._sync_visual()
+                )
+            except Exception:
+                pass
+
+    def _is_checked(self):
+        if self._variable is not None:
+            try:
+                return bool(self._variable.get())
+            except Exception:
+                return False
+        return False
+
+    def _sync_visual(self):
+        try:
+            if not self.winfo_exists():
+                return
+            chk = self._is_checked()
+            if self._disabled:
+                img = self._img_on_dim if chk else self._img_off_dim
+                super().configure(image=img, fg=self._fg_disabled, cursor="")
+            else:
+                img = self._img_on if chk else self._img_off
+                super().configure(image=img, fg=self._fg_normal, cursor="hand2")
+        except Exception:
+            pass
+
+    def _on_click(self, _event=None):
+        if self._disabled:
+            return "break"
+        if self._variable is not None:
+            try:
+                self._variable.set(not bool(self._variable.get()))
+            except Exception:
+                pass
+        self._sync_visual()
+        if self._command is not None:
+            self._command()
+        return "break"
+
+    def config(self, **kwargs):
+        self.configure(**kwargs)
+
+    def configure(self, **kwargs):
+        if "state" in kwargs:
+            st = str(kwargs.pop("state")).lower()
+            self._disabled = st == "disabled"
+        if "fg" in kwargs:
+            new_fg = kwargs.pop("fg")
+            if new_fg not in ("#555555", "#666666", "#526070"):
+                self._fg_normal = new_fg
+            if not self._disabled:
+                super().configure(fg=new_fg)
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "variable" in kwargs:
+            self._variable = kwargs.pop("variable")
+        for k in (
+            "selectcolor",
+            "disabledforeground",
+            "activebackground",
+            "activeforeground",
+        ):
+            kwargs.pop(k, None)
+        if kwargs:
+            super().configure(**kwargs)
+        self._sync_visual()
+
+
+def make_glass_checkbutton(parent, **kwargs):
+    """Factory helper to create a GlassCheckbutton."""
+    return GlassCheckbutton(parent, **kwargs)
+
+
 def _draw_filled_stadium(cv, x1, y1, x2, y2, color):
     """Draws a seamless filled stadium capsule on a tk.Canvas."""
     w = x2 - x1
@@ -143,12 +747,12 @@ def _draw_filled_stadium(cv, x1, y1, x2, y2, color):
 
 
 class NeonBarCanvas(tk.Canvas):
-    """Vertical neon light-bar with a soft horizontal bloom into the card background."""
+    """Vertical neon left-accent bar with a soft horizontal glass fade into the card."""
 
-    def __init__(self, parent, core_color="#38bdf8", card_bg="#1b1b1b", glow_on=True):
+    def __init__(self, parent, core_color="#38bdf8", card_bg="#131922", glow_on=True):
         super().__init__(
             parent,
-            width=16,
+            width=12,
             height=1,
             bg=card_bg,
             bd=0,
@@ -170,30 +774,26 @@ class NeonBarCanvas(tk.Canvas):
         if h <= 4:
             h = 300
         if self._glow_on:
-            # 11-column horizontal light-bleed gradient (x = 5..15) flush top-to-bottom
-            for x in range(5, 16):
-                falloff = ((16 - x) / 11.0) ** 2.1
-                col = _blend_hex(self._card_bg, self._core_color, falloff * 0.42)
+            # Soft 8px horizontal ambient light-bleed into card interior (x = 4..11)
+            for x in range(4, 12):
+                falloff = ((12 - x) / 8.0) ** 2.2
+                col = _blend_hex(self._card_bg, self._core_color, falloff * 0.26)
                 self.create_line(x, 0, x, h, fill=col)
-            # Outer neon halo flush top-to-bottom
-            halo_col = _blend_hex(self._card_bg, self._core_color, 0.55)
-            self.create_rectangle(0, 0, 6, h, fill=halo_col, outline="")
-            # Bright neon bar core flush top-to-bottom
-            self.create_rectangle(0, 0, 5, h, fill=self._core_color, outline="")
-            # Hot specular center spine flush top-to-bottom
-            spine_col = _blend_hex(self._core_color, "#ffffff", 0.58)
-            self.create_rectangle(1, 0, 3, h, fill=spine_col, outline="")
-        else:
+            # Crisp 4px vertical accent bar with subtle specular spine
             self.create_rectangle(0, 0, 4, h, fill=self._core_color, outline="")
+            spine_col = _blend_hex(self._core_color, "#ffffff", 0.42)
+            self.create_rectangle(1, 0, 2, h, fill=spine_col, outline="")
+        else:
+            self.create_rectangle(0, 0, 3, h, fill=self._core_color, outline="")
 
 
 class RulebookPillBadge(tk.Canvas):
-    """Glowing rounded capsule badge ('ACTIVE NOW' vs 'STANDBY') for Rulebook cards."""
+    """Flat-glass rounded stadium badge ('● ACTIVE NOW' vs 'STANDBY') for Rulebook cards."""
 
-    def __init__(self, parent, card_bg="#1b1b1b"):
+    def __init__(self, parent, card_bg="#131922"):
         super().__init__(
             parent,
-            width=118,
+            width=124,
             height=26,
             bg=card_bg,
             bd=0,
@@ -201,6 +801,7 @@ class RulebookPillBadge(tk.Canvas):
         )
         self._card_bg = card_bg
         self._active = True
+        self._bg_photo = None
         self.bind("<Configure>", self._redraw)
 
     def set_active(self, is_active):
@@ -209,40 +810,54 @@ class RulebookPillBadge(tk.Canvas):
 
     def _redraw(self, event=None):
         self.delete("all")
-        w = max(118, self.winfo_width())
+        w = max(124, self.winfo_width())
         h = max(26, self.winfo_height())
         if self._active:
-            # Multi-ring neon emerald outer bloom + glowing capsule
-            _draw_filled_stadium(
-                self, 0, 0, w - 1, h - 1, _blend_hex(self._card_bg, "#00e676", 0.25)
+            self._bg_photo = _get_glass_pill_photo(
+                self,
+                w,
+                h,
+                bg_hex=self._card_bg,
+                fill_hex="#0d3b20",
+                fill_top_hex="#14532d",
+                border_hex="#10b981",
+                hover=True,
+                corner_radius=None,
             )
-            _draw_filled_stadium(
-                self, 1, 1, w - 2, h - 2, _blend_hex(self._card_bg, "#00e676", 0.50)
-            )
-            _draw_filled_stadium(self, 2, 2, w - 3, h - 3, "#69f0ae")
-            _draw_filled_stadium(self, 3, 3, w - 4, h - 4, "#00c86f")
+            self.create_image(0, 0, image=self._bg_photo, anchor="nw")
             self.create_text(
-                w / 2,
-                h / 2,
-                text="ACTIVE NOW",
+                int(w // 2),
+                int(h // 2),
+                text="● ACTIVE NOW",
                 font=("Arial", 8, "bold"),
-                fill="#ffffff"
+                fill="#69f0ae"
             )
         else:
-            _draw_filled_stadium(self, 2, 2, w - 3, h - 3, "#34495e")
-            _draw_filled_stadium(self, 3, 3, w - 4, h - 4, "#222a30")
+            self._bg_photo = _get_glass_pill_photo(
+                self,
+                w,
+                h,
+                bg_hex=self._card_bg,
+                fill_hex="#141820",
+                fill_top_hex="#1c212b",
+                border_hex="#2e3746",
+                hover=False,
+                corner_radius=None,
+            )
+            self.create_image(0, 0, image=self._bg_photo, anchor="nw")
             self.create_text(
-                w / 2,
-                h / 2,
+                int(w // 2),
+                int(h // 2),
                 text="STANDBY",
                 font=("Arial", 8, "bold"),
-                fill="#7f8c8d"
+                fill="#7f8fa3"
             )
 
 
 class HudCapsulePill(tk.Canvas):
-    """Rounded stadium capsule widget for the HUD bottom bar with drop-in
-    tk.Button / tk.Label .config() compatibility."""
+    """Anti-aliased flat-glass stadium capsule widget for the HUD bottom bar
+    with a single 1px border, flat dark fill, and drop-in tk.Button / tk.Label
+    .config() compatibility."""
 
     def __init__(
         self,
@@ -250,7 +865,7 @@ class HudCapsulePill(tk.Canvas):
         text="",
         bg="#282c31",
         fg="#f8f9fa",
-        rim="#6c757d",
+        rim="#4b5563",
         glow="#343a40",
         font=("Arial", 8, "bold"),
         width=140,
@@ -282,6 +897,7 @@ class HudCapsulePill(tk.Canvas):
         self._min_width = int(width)
         self._auto_width = bool(auto_width)
         self._pad_x = int(pad_x)
+        self._bg_photo = None
         self.bind("<Configure>", self._redraw)
         self.bind("<Button-1>", self._on_click)
 
@@ -299,24 +915,24 @@ class HudCapsulePill(tk.Canvas):
             redraw_needed = True
         if "bg" in kwargs:
             new_bg = kwargs.pop("bg")
-            if new_bg in ("#333333", "#222629", "#262626"):
-                self._bg = "#282c31"
-                self._rim = "#6c757d"
-                self._glow = "#343a40"
+            if new_bg in ("#333333", "#222629", "#262626", "#282c31"):
+                self._bg = "#1b222c"
+                self._rim = "#475569"
+                self._glow = "#3b4c63"
             elif new_bg in ("#ff0000", "#8b0000", "#922b21"):
-                self._bg = new_bg
-                self._rim = "#ff6b6b"
-                self._glow = _blend_hex("#1a1a1a", new_bg, 0.55)
+                self._bg = "#45141e"
+                self._rim = "#ff5252"
+                self._glow = "#ff1744"
             elif new_bg in (
                 "#00e676", "#2ecc71", "#27ae60", "#1e8449", "#196f3d", "#145a32"
             ):
-                self._bg = new_bg
-                self._rim = "#69f0ae"
-                self._glow = _blend_hex("#1a1a1a", "#00e676", 0.55)
+                self._bg = "#10452c"
+                self._rim = "#00e676"
+                self._glow = "#00e676"
             else:
                 self._bg = new_bg
                 self._rim = _blend_hex(new_bg, "#ffffff", 0.32)
-                self._glow = _blend_hex("#1a1a1a", new_bg, 0.45)
+                self._glow = self._rim
             redraw_needed = True
         if "fg" in kwargs:
             self._fg = kwargs.pop("fg")
@@ -365,22 +981,336 @@ class HudCapsulePill(tk.Canvas):
                 smaller_pt = max(7, int(self._font[1]) - 1)
                 render_font = (self._font[0], smaller_pt) + tuple(self._font[2:])
 
-        # Outer subtle halo stadium
-        _draw_filled_stadium(self, 0, 0, w - 1, h - 1, self._glow)
-        # Bright capsule rim
-        _draw_filled_stadium(self, 1, 1, w - 2, h - 2, self._rim)
-        # Inner dark/colored stadium fill
-        _draw_filled_stadium(self, 2, 2, w - 3, h - 3, self._bg)
+        self._bg_photo = _get_glass_pill_photo(
+            self,
+            w,
+            h,
+            bg_hex="#1a1a1a",
+            fill_hex=self._bg if self._bg != "#282c31" else "#181d26",
+            border_hex=self._rim if self._rim != "#6c757d" else "#364152",
+            glow_hex=self._glow,
+            hover=False,
+            corner_radius=None,
+        )
+        self.create_image(0, 0, image=self._bg_photo, anchor="nw")
         txt_col = (
             self._fg if self._state == "normal" else (self._disabled_fg or self._fg)
         )
         self.create_text(
-            w / 2,
-            h / 2,
+            int(w // 2),
+            int(h // 2),
             text=self._text,
             font=render_font,
             fill=txt_col
         )
+
+
+class GlassStadiumButton(tk.Canvas):
+    """Reusable crisp 6px rounded-rectangle (squircle) button with a one-way
+    top-to-bottom linear micro-fade, razor-sharp 1px border (top catch-light),
+    hover illumination, and dropdown support."""
+
+    def __init__(
+        self,
+        parent,
+        text="",
+        fill_color="#141820",
+        fill_top_color=None,
+        border_color="#2e3746",
+        fg="#e2e8f0",
+        hover_fill=None,
+        hover_fill_top=None,
+        hover_border=None,
+        hover_fg=None,
+        glow_color=None,
+        glow_strength=0.0,
+        corner_radius=6,
+        canvas_bg=None,
+        font=("Arial", 9, "bold"),
+        width=90,
+        height=32,
+        auto_width=True,
+        pad_x=22,
+        state="normal",
+        command=None,
+        menu=None,
+        chevron=None,
+        chevron_color=None,
+        inner_highlight=True,
+        cursor="hand2",
+    ):
+        if canvas_bg is None:
+            try:
+                canvas_bg = parent.cget("bg")
+            except Exception:
+                canvas_bg = "#0d1117"
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bg=canvas_bg,
+            bd=0,
+            highlightthickness=0,
+            cursor=cursor if state == "normal" else "",
+        )
+        self._text = text
+        self._fill = fill_color
+        self._fill_top = fill_top_color
+        self._border = border_color
+        self._fg = fg
+        self._disabled_fg = "#7a8899"
+        self._hover_fill = hover_fill
+        self._hover_fill_top = hover_fill_top
+        self._hover_border = hover_border
+        self._hover_fg = hover_fg
+        self._glow = glow_color
+        self._glow_strength = float(glow_strength)
+        self._corner_radius = corner_radius
+        self._canvas_bg = canvas_bg
+        self._font = font
+        self._min_width = int(width)
+        self._height = int(height)
+        self._auto_width = bool(auto_width)
+        self._pad_x = int(pad_x)
+        self._state = state
+        self._command = command
+        self._menu = menu
+        self._chevron = chevron
+        self._chevron_color = chevron_color
+        self._inner_highlight = bool(inner_highlight)
+        self._hovered = False
+        self._bg_photo = None
+
+        self.bind("<Configure>", self._redraw, add="+")
+        self.bind("<Enter>", self._on_enter, add="+")
+        self.bind("<Leave>", self._on_leave, add="+")
+        self.bind("<Button-1>", self._on_click, add="+")
+
+    def _on_enter(self, _event=None):
+        if self._state == "normal" and not self._hovered:
+            self._hovered = True
+            self._redraw()
+
+    def _on_leave(self, _event=None):
+        if self._hovered:
+            self._hovered = False
+            self._redraw()
+
+    def _on_click(self, _event=None):
+        hide_fn = getattr(self, "_hide_tooltip_fn", None)
+        if callable(hide_fn):
+            hide_fn()
+        if self._state != "normal":
+            return
+        if self._menu is not None:
+            self._menu_open = True
+            try:
+                self._menu.tk_popup(
+                    self.winfo_rootx(),
+                    self.winfo_rooty() + self.winfo_height() + 2,
+                )
+            finally:
+                self._menu_open = False
+                if callable(hide_fn):
+                    hide_fn()
+                try:
+                    self._menu.grab_release()
+                except Exception:
+                    pass
+                self._hovered = False
+                self._redraw()
+        elif self._command is not None:
+            self._command()
+
+    def config(self, **kwargs):
+        self.configure(**kwargs)
+
+    def configure(self, **kwargs):
+        redraw_needed = False
+        if "text" in kwargs:
+            self._text = kwargs.pop("text")
+            redraw_needed = True
+        if "fill_color" in kwargs:
+            self._fill = kwargs.pop("fill_color")
+            redraw_needed = True
+        if "fill_top_color" in kwargs:
+            self._fill_top = kwargs.pop("fill_top_color")
+            redraw_needed = True
+        if "bg" in kwargs:
+            self._fill = kwargs.pop("bg")
+            redraw_needed = True
+        if "border_color" in kwargs:
+            self._border = kwargs.pop("border_color")
+            redraw_needed = True
+        if "rim" in kwargs:
+            self._border = kwargs.pop("rim")
+            redraw_needed = True
+        if "fg" in kwargs:
+            self._fg = kwargs.pop("fg")
+            redraw_needed = True
+        if "disabledforeground" in kwargs:
+            self._disabled_fg = kwargs.pop("disabledforeground")
+            redraw_needed = True
+        if "hover_fill" in kwargs:
+            self._hover_fill = kwargs.pop("hover_fill")
+            redraw_needed = True
+        if "hover_fill_top" in kwargs:
+            self._hover_fill_top = kwargs.pop("hover_fill_top")
+            redraw_needed = True
+        if "activebackground" in kwargs:
+            self._hover_fill = kwargs.pop("activebackground")
+            redraw_needed = True
+        if "hover_border" in kwargs:
+            self._hover_border = kwargs.pop("hover_border")
+            redraw_needed = True
+        if "hover_fg" in kwargs:
+            self._hover_fg = kwargs.pop("hover_fg")
+            redraw_needed = True
+        if "activeforeground" in kwargs:
+            self._hover_fg = kwargs.pop("activeforeground")
+            redraw_needed = True
+        if "glow_color" in kwargs:
+            self._glow = kwargs.pop("glow_color")
+            redraw_needed = True
+        if "glow_strength" in kwargs:
+            self._glow_strength = float(kwargs.pop("glow_strength"))
+            redraw_needed = True
+        if "corner_radius" in kwargs:
+            self._corner_radius = kwargs.pop("corner_radius")
+            redraw_needed = True
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            if self._state != "normal":
+                self._hovered = False
+            super().configure(
+                cursor="hand2"
+                if (
+                    self._state == "normal"
+                    and (self._command is not None or self._menu is not None)
+                )
+                else ""
+            )
+            redraw_needed = True
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "menu" in kwargs:
+            self._menu = kwargs.pop("menu")
+        if "chevron" in kwargs:
+            self._chevron = kwargs.pop("chevron")
+            redraw_needed = True
+        if "chevron_color" in kwargs:
+            self._chevron_color = kwargs.pop("chevron_color")
+            redraw_needed = True
+        for ignored_k in ("bd", "relief", "padx", "pady"):
+            kwargs.pop(ignored_k, None)
+        if kwargs:
+            super().configure(**kwargs)
+        if redraw_needed:
+            self._redraw()
+
+    def _redraw(self, _event=None):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 10:
+            w = int(self["width"])
+        if h <= 6:
+            h = int(self["height"])
+
+        text_w = 0
+        if self._text:
+            probe_id = self.create_text(
+                0, 0, text=self._text, font=self._font, anchor="nw"
+            )
+            bbox = self.bbox(probe_id)
+            self.delete(probe_id)
+            text_w = (bbox[2] - bbox[0]) if bbox else 0
+
+        chev_extra = 16 if self._chevron else 0
+        if self._auto_width:
+            target_w = max(
+                self._min_width, int(text_w + chev_extra + self._pad_x)
+            )
+            if abs(int(self["width"]) - target_w) > 1:
+                super().configure(width=target_w)
+            w = max(w, target_w) if w <= target_w + 4 else target_w
+
+        if self._state != "normal":
+            cur_fill = self._fill
+            cur_top = self._fill_top
+            cur_border = self._border
+            cur_fg = self._disabled_fg or self._fg
+            is_hov = False
+        elif self._hovered:
+            cur_fill = self._hover_fill or _blend_hex(
+                self._fill, "#ffffff", 0.06
+            )
+            cur_top = self._hover_fill_top or (
+                _blend_hex(self._fill_top, "#ffffff", 0.08)
+                if self._fill_top
+                else None
+            )
+            cur_border = self._hover_border or _blend_hex(
+                self._border, "#ffffff", 0.25
+            )
+            cur_fg = self._hover_fg or "#ffffff"
+            is_hov = True
+        else:
+            cur_fill = self._fill
+            cur_top = self._fill_top
+            cur_border = self._border
+            cur_fg = self._fg
+            is_hov = False
+
+        self._bg_photo = _get_glass_pill_photo(
+            self,
+            w,
+            h,
+            bg_hex=self._canvas_bg,
+            fill_hex=cur_fill,
+            fill_top_hex=cur_top,
+            border_hex=cur_border,
+            hover=is_hov,
+            corner_radius=self._corner_radius,
+        )
+        self.create_image(0, 0, image=self._bg_photo, anchor="nw")
+
+        cy_i = int(h // 2)
+        if self._chevron:
+            self.create_text(
+                int((w - 13) // 2),
+                cy_i,
+                text=self._text,
+                font=self._font,
+                fill=cur_fg,
+            )
+            c_col = (
+                _blend_hex(self._chevron_color or cur_border, "#ffffff", 0.35)
+                if self._hovered
+                else (self._chevron_color or cur_border)
+            )
+            self.create_text(
+                int(w - 14),
+                cy_i,
+                text=self._chevron,
+                font=self._font,
+                fill=c_col,
+            )
+        else:
+            self.create_text(
+                int(w // 2),
+                cy_i,
+                text=self._text,
+                font=self._font,
+                fill=cur_fg,
+            )
+
+
+def make_stadium_button(parent, text="", **kwargs):
+    """Factory helper to create a GlassStadiumButton."""
+    if text and "text" not in kwargs:
+        kwargs["text"] = text
+    return GlassStadiumButton(parent, **kwargs)
 
 SCHWAB_TOKEN_PATH = os.path.join(USER_HOME, "schwab_token.json")
 CONFIG_PATH = os.path.join(USER_HOME, "enforcer_config.json")
@@ -1571,7 +2501,7 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
         dlg.grab_set()
 
     dlg.title("Schwab 7-Day Security Login — Step-by-Step")
-    dlg.config(bg="#141414", padx=24, pady=18)
+    dlg.config(bg="#0d1117", padx=24, pady=18)
     dlg.resizable(False, False)
     dlg.attributes("-topmost", True)
 
@@ -1580,14 +2510,21 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
         text="🔐 SCHWAB 7-DAY SECURITY LOGIN (STEP-BY-STEP)",
         font=("Arial", 12, "bold"),
         fg="#5dade2",
-        bg="#141414",
+        bg="#0d1117",
         anchor="w"
     ).pack(fill="x", pady=(0, 8))
 
-    steps_frame = tk.Frame(
-        dlg, bg="#1e1e1e", bd=1, relief="solid", padx=16, pady=12
+    steps_outer = tk.Frame(
+        dlg, bg="#131922", bd=0, highlightthickness=1, highlightbackground="#243040"
     )
-    steps_frame.pack(fill="x", pady=(0, 12))
+    steps_outer.pack(fill="x", pady=(0, 12))
+    NeonBarCanvas(
+        steps_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
+    ).pack(side="left", fill="y")
+    steps_frame = tk.Frame(
+        steps_outer, bg="#131922", padx=16, pady=12
+    )
+    steps_frame.pack(side="left", fill="both", expand=True)
 
     tk.Label(
         steps_frame,
@@ -1596,8 +2533,8 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
             "        and approve account access. (If your browser didn't open, click the link below):"
         ),
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
-        bg="#1e1e1e",
+        fg="#dce4ee",
+        bg="#131922",
         justify="left",
         anchor="w"
     ).pack(fill="x", pady=(0, 4))
@@ -1606,8 +2543,8 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
         steps_frame,
         text="🌐 Click Here to Open / Re-Open the Charles Schwab Login Page in Your Browser",
         font=("Arial", 10, "bold underline"),
-        fg="#5dade2",
-        bg="#1e1e1e",
+        fg="#38bdf8",
+        bg="#131922",
         cursor="hand2",
         anchor="w"
     )
@@ -1623,8 +2560,8 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
             "        (it starts with  https://127.0.0.1/?code=... ) and paste it below:"
         ),
         font=("Arial", 10),
-        fg="#dddddd",
-        bg="#1e1e1e",
+        fg="#97a7b9",
+        bg="#131922",
         justify="left",
         anchor="w"
     ).pack(fill="x")
@@ -1633,8 +2570,8 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
         dlg,
         text="Redirected Browser URL (https://127.0.0.1/?code=...):",
         font=("Arial", 10, "bold"),
-        fg="#ffffff",
-        bg="#141414",
+        fg="#dce4ee",
+        bg="#0d1117",
         anchor="w"
     ).pack(fill="x", pady=(2, 4))
 
@@ -1642,13 +2579,15 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
         dlg,
         font=("Consolas", 10, "bold"),
         width=74,
-        bg="#2a2a2a",
-        fg="#ffffff",
-        insertbackground="white",
-        bd=1,
-        relief="solid"
+        bg="#12202e",
+        fg="#e2e8f0",
+        insertbackground="#e2e8f0",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#294760",
+        highlightcolor="#38bdf8"
     )
-    url_entry.pack(fill="x", pady=(0, 6))
+    url_entry.pack(fill="x", pady=(0, 6), ipady=4)
     url_entry.focus_set()
 
     status_lbl = tk.Label(
@@ -1656,7 +2595,7 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
         text="⏳ Waiting for https://127.0.0.1/?code=... URL (auto-fills as soon as you copy it in your browser)...",
         font=("Arial", 9, "bold"),
         fg="#f5b041",
-        bg="#141414",
+        bg="#0d1117",
         anchor="w"
     )
     status_lbl.pack(fill="x", pady=(0, 10))
@@ -1719,40 +2658,59 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
 
     url_entry.bind("<Return>", submit_url)
 
-    btn_row = tk.Frame(dlg, bg="#141414", pady=6)
+    btn_row = tk.Frame(dlg, bg="#0d1117", pady=6)
     btn_row.pack(fill="x")
 
-    tk.Button(
+    make_stadium_button(
         btn_row,
         text="Cancel",
         font=("Arial", 10, "bold"),
-        bg="#333333",
-        fg="white",
-        padx=14,
-        pady=6,
-        command=dlg.destroy
+        fill_color="#182230",
+        border_color="#52657c",
+        hover_fill="#223042",
+        hover_border="#7a90ad",
+        fg="#e2e8f0",
+        canvas_bg="#0d1117",
+        width=108,
+        height=36,
+        pad_x=28,
+        glow_strength=0.38,
+        command=dlg.destroy,
     ).pack(side="left")
 
-    tk.Button(
+    make_stadium_button(
         btn_row,
         text="📋 Paste from Clipboard",
         font=("Arial", 10, "bold"),
-        bg="#1f538d",
-        fg="white",
-        padx=16,
-        pady=6,
-        command=paste_from_clipboard
+        fill_color="#142942",
+        border_color="#38bdf8",
+        hover_fill="#1c3859",
+        hover_border="#7dd3fc",
+        fg="#e0f2fe",
+        canvas_bg="#0d1117",
+        width=192,
+        height=36,
+        pad_x=28,
+        glow_strength=0.45,
+        command=paste_from_clipboard,
     ).pack(side="left", padx=10)
 
-    tk.Button(
+    make_stadium_button(
         btn_row,
         text="Complete Schwab Login >>",
         font=("Arial", 10, "bold"),
-        bg="#1e8449",
-        fg="white",
-        padx=20,
-        pady=6,
-        command=submit_url
+        fill_color="#105e35",
+        border_color="#22ff88",
+        hover_fill="#157a46",
+        hover_border="#69f0ae",
+        glow_color="#00e676",
+        fg="#ffffff",
+        canvas_bg="#0d1117",
+        width=226,
+        height=36,
+        pad_x=32,
+        glow_strength=0.65,
+        command=submit_url,
     ).pack(side="right")
 
     if is_standalone:
@@ -2809,7 +3767,7 @@ def show_liability_waiver():
     accepted = {"ok": False}
     w = tk.Tk()
     w.title(f"PnL Enforcer Beta — Legal Disclaimer & Assumption of Risk (v{WAIVER_VERSION})")
-    w.config(bg="#141414", padx=28, pady=22)
+    w.config(bg="#0d1117", padx=28, pady=22)
     w.resizable(False, False)
     w.attributes("-topmost", True)
 
@@ -2818,27 +3776,32 @@ def show_liability_waiver():
         text=f"⚠️ EXPERIMENTAL BETA SOFTWARE — ASSUMPTION OF RISK (v{WAIVER_VERSION})",
         font=("Arial", 12, "bold"),
         fg="#f5b041",
-        bg="#141414",
+        bg="#0d1117",
         anchor="w"
     ).pack(fill="x", pady=(0, 12))
 
+    msg_outer = tk.Frame(
+        w, bg="#131922", bd=0, highlightthickness=1, highlightbackground="#243040"
+    )
+    msg_outer.pack(fill="x", pady=(0, 14))
+    NeonBarCanvas(
+        msg_outer, core_color="#fbbf24", card_bg="#131922", glow_on=True
+    ).pack(side="left", fill="y")
     msg_box = tk.Label(
-        w,
+        msg_outer,
         text=waiver_text,
         font=("Arial", 9),
-        fg="#e0e0e0",
-        bg="#1e1e1e",
+        fg="#dce4ee",
+        bg="#131922",
         justify="left",
         anchor="w",
         padx=16,
         pady=14,
-        bd=1,
-        relief="solid"
     )
-    msg_box.pack(fill="x", pady=(0, 14))
+    msg_box.pack(side="left", fill="both", expand=True)
 
     var_agree = tk.BooleanVar(value=False)
-    tk.Checkbutton(
+    make_glass_checkbutton(
         w,
         text=(
             "I have read this disclaimer and LICENSE.txt, understand that losses cannot be guaranteed, "
@@ -2847,13 +3810,10 @@ def show_liability_waiver():
         variable=var_agree,
         font=("Arial", 9, "bold"),
         fg="#58d68d",
-        bg="#141414",
-        selectcolor="#2a2a2a",
-        activebackground="#141414",
-        activeforeground="#58d68d"
+        bg="#0d1117",
     ).pack(anchor="w", pady=(0, 14))
 
-    btn_row = tk.Frame(w, bg="#141414")
+    btn_row = tk.Frame(w, bg="#0d1117")
     btn_row.pack(fill="x")
 
     def on_accept():
@@ -2878,26 +3838,39 @@ def show_liability_waiver():
         accepted["ok"] = True
         w.destroy()
 
-    tk.Button(
+    make_stadium_button(
         btn_row,
         text="Decline & Exit",
         font=("Arial", 10, "bold"),
-        bg="#922b21",
-        fg="white",
-        padx=16,
-        pady=6,
-        command=w.destroy
+        fill_color="#3b1520",
+        border_color="#f43f5e",
+        hover_fill="#4f1c2b",
+        hover_border="#fb7185",
+        fg="#ffe4e6",
+        canvas_bg="#0d1117",
+        width=142,
+        height=36,
+        pad_x=28,
+        glow_strength=0.45,
+        command=w.destroy,
     ).pack(side="left")
 
-    tk.Button(
+    make_stadium_button(
         btn_row,
         text="I Understand & Assume All Risk >>",
         font=("Arial", 10, "bold"),
-        bg="#1e8449",
-        fg="white",
-        padx=20,
-        pady=6,
-        command=on_accept
+        fill_color="#105e35",
+        border_color="#22ff88",
+        hover_fill="#157a46",
+        hover_border="#69f0ae",
+        glow_color="#00e676",
+        fg="#ffffff",
+        canvas_bg="#0d1117",
+        width=268,
+        height=36,
+        pad_x=32,
+        glow_strength=0.65,
+        command=on_accept,
     ).pack(side="right")
 
     w.mainloop()
@@ -2912,131 +3885,313 @@ def show_broker_setup_wizard(broker_name, parent=None):
     wiz = tk.Tk() if parent is None else tk.Toplevel(parent)
     if parent is not None:
         wiz.grab_set()
+    if os.path.exists(ICON_PATH):
+        try:
+            wiz.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+    apply_dark_title_bar(wiz)
 
     wiz.title(f"PnL Enforcer — {broker_name} API Setup Wizard")
-    wiz.config(bg="#141414", padx=26, pady=20)
+    wiz.config(bg="#0d1117", padx=26, pady=20)
     wiz.resizable(False, False)
     wiz.attributes("-topmost", True)
 
+    hdr_row = tk.Frame(wiz, bg="#0d1117")
+    hdr_row.pack(fill="x", pady=(0, 10))
     tk.Label(
-        wiz,
-        text=f"🔑 {broker_name} API CREDENTIAL SETUP",
+        hdr_row,
+        text=f"▶ 🔑 {broker_name} API CREDENTIAL SETUP",
         font=("Arial", 12, "bold"),
-        fg="#5dade2",
-        bg="#141414",
+        fg="#38bdf8",
+        bg="#0d1117",
         anchor="w"
-    ).pack(fill="x", pady=(0, 8))
+    ).pack(side="left")
 
     if broker_name == "SCHWAB":
-        guide_txt = (
-            "HOW TO GET YOUR SCHWAB API KEYS (One-Time Setup):\n"
-            "1. Log in at https://developer.schwab.com and create a free Individual Developer account.\n"
-            "2. Click 'Apps' -> 'Create App' and select 'Accounts and Trading Production'.\n"
-            "3. Set the Callback URL to exactly:   https://127.0.0.1\n"
-            "4. Once your App status is 'Ready for Use', paste your App Key & Secret below.\n"
-            "5. When you click Save & Connect, your browser will open to log into Schwab.\n"
-            "   After approving, copy the full https://127.0.0.1/?code=... URL from your browser\n"
-            "   address bar — our popup window will auto-detect it from your clipboard!"
-        )
         portal_url = "https://developer.schwab.com"
-        portal_btn_lbl = "🌐 Open Schwab Developer Portal in Browser"
+        portal_btn_lbl = "🌐 Open Schwab Developer Portal ↗"
+        guide_title = "HOW TO GET YOUR SCHWAB API KEYS (One-Time Setup)"
     else:
-        guide_txt = (
-            "HOW TO GET YOUR WEBULL OPENAPI KEYS (One-Time Setup):\n"
-            "1. Go to https://developer.webull.com/apis/docs/authentication/IndividualApplicationAPI\n"
-            "   (or Webull Web -> Account Management -> OpenAPI Management).\n"
-            "2. Apply for a Retail Trading API Key (often approved within minutes).\n"
-            "3. Generate your App Key and App Secret in the Webull portal and paste them below.\n"
-            "4. ⚠️ IMPORTANT MOBILE 2FA STEP: On your first connection attempt, check your\n"
-            "   Webull Mobile App / SMS! Webull may push a notification asking you to enter\n"
-            "   a texted 2FA verification code (unless 2FA is disabled in your OpenAPI portal)."
-        )
         portal_url = "https://developer.webull.com/apis/docs/authentication/IndividualApplicationAPI"
-        portal_btn_lbl = "🌐 Open Webull API Setup Guide in Browser"
+        portal_btn_lbl = "🌐 Open Webull API Setup Guide ↗"
+        guide_title = "HOW TO GET YOUR WEBULL OPENAPI KEYS (One-Time Setup)"
 
-    guide_lbl = tk.Label(
-        wiz,
-        text=guide_txt,
-        font=("Arial", 10),
-        fg="#dddddd",
-        bg="#1e1e1e",
-        justify="left",
-        anchor="w",
-        padx=16,
-        pady=12,
-        bd=1,
-        relief="solid"
-    )
-    guide_lbl.pack(fill="x", pady=(0, 8))
-
-    link_row = tk.Frame(wiz, bg="#141414")
-    link_row.pack(fill="x", pady=(0, 12))
-    tk.Button(
-        link_row,
+    make_stadium_button(
+        hdr_row,
         text=portal_btn_lbl,
         font=("Arial", 9, "bold"),
-        bg="#1f538d",
-        fg="white",
-        padx=12,
-        pady=4,
-        command=lambda: webbrowser.open(portal_url)
-    ).pack(side="left", padx=(0, 12))
-    portal_link = tk.Label(
-        link_row,
-        text=f"{portal_url} (Click to launch)",
-        font=("Arial", 9, "bold underline"),
-        fg="#5dade2",
-        bg="#141414",
-        cursor="hand2"
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#e2e8f0",
+        canvas_bg="#0d1117",
+        height=30,
+        pad_x=22,
+        command=lambda: webbrowser.open(portal_url),
+    ).pack(side="right")
+
+    guide_outer = tk.Frame(
+        wiz, bg="#131922", bd=0, highlightthickness=1, highlightbackground="#243040"
     )
-    portal_link.pack(side="left")
-    portal_link.bind("<Button-1>", lambda _e: webbrowser.open(portal_url))
+    guide_outer.pack(fill="x", pady=(0, 14))
+    NeonBarCanvas(
+        guide_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
+    ).pack(side="left", fill="y")
+    guide_card = tk.Frame(guide_outer, bg="#131922", padx=18, pady=14)
+    guide_card.pack(side="left", fill="both", expand=True)
+
+    tk.Label(
+        guide_card,
+        text=guide_title,
+        font=("Arial", 10, "bold"),
+        fg="#7dd3fc",
+        bg="#131922",
+        anchor="w",
+    ).pack(fill="x", pady=(0, 6))
+    tk.Frame(guide_card, bg="#222d3d", height=1).pack(fill="x", pady=(0, 8))
+
+    def _add_step_row(step_num, lines_of_segments):
+        row = tk.Frame(guide_card, bg="#131922")
+        row.pack(fill="x", pady=4)
+        tk.Label(
+            row,
+            text=f"{step_num}.",
+            font=("Arial", 10, "bold"),
+            fg="#38bdf8",
+            bg="#131922",
+            width=2,
+            anchor="nw",
+        ).pack(side="left", padx=(0, 6), anchor="n")
+        body_col = tk.Frame(row, bg="#131922")
+        body_col.pack(side="left", fill="x", expand=True)
+        line_frames = []
+        for line_idx, seg_list in enumerate(lines_of_segments):
+            l_frame = tk.Frame(body_col, bg="#131922")
+            l_frame.pack(fill="x", pady=(2 if line_idx > 0 else 0, 0))
+            for seg_txt, seg_fg, seg_font, seg_bg in seg_list:
+                tk.Label(
+                    l_frame,
+                    text=seg_txt,
+                    font=seg_font,
+                    fg=seg_fg,
+                    bg=seg_bg or "#131922",
+                    padx=5 if seg_bg else 0,
+                    pady=1 if seg_bg else 0,
+                    anchor="w",
+                ).pack(side="left")
+            line_frames.append(l_frame)
+        return line_frames[0] if line_frames else body_col
+
+    if broker_name == "SCHWAB":
+        _add_step_row(
+            1,
+            [
+                [
+                    ("Log in at ", "#cbd5e1", ("Arial", 10), None),
+                    ("https://developer.schwab.com", "#7dd3fc", ("Consolas", 10, "bold"), "#192536"),
+                    (" and create a free ", "#cbd5e1", ("Arial", 10), None),
+                    ("Individual Developer", "#ffffff", ("Arial", 10, "bold"), None),
+                    (" account.", "#cbd5e1", ("Arial", 10), None),
+                ]
+            ],
+        )
+        _add_step_row(
+            2,
+            [
+                [
+                    ("Click ", "#cbd5e1", ("Arial", 10), None),
+                    ("'Apps' ➔ 'Create App'", "#ffffff", ("Arial", 10, "bold"), None),
+                    (" and select the API product ", "#cbd5e1", ("Arial", 10), None),
+                    ("Accounts and Trading Production", "#fbbf24", ("Arial", 10, "bold"), "#262115"),
+                    (".", "#cbd5e1", ("Arial", 10), None),
+                ]
+            ],
+        )
+        s3_body = _add_step_row(
+            3,
+            [
+                [
+                    ("Set the ", "#cbd5e1", ("Arial", 10), None),
+                    ("Callback URL", "#ffffff", ("Arial", 10, "bold"), None),
+                    (" to exactly:  ", "#cbd5e1", ("Arial", 10), None),
+                    ("https://127.0.0.1", "#69f0ae", ("Consolas", 10, "bold"), "#122b22"),
+                ]
+            ],
+        )
+
+        def _copy_cb_url():
+            try:
+                wiz.clipboard_clear()
+                wiz.clipboard_append("https://127.0.0.1")
+                wiz.update()
+                btn_copy_cb.config(text="✓ Copied", fg="#69f0ae", border_color="#00e676")
+            except Exception:
+                pass
+
+        btn_copy_cb = make_stadium_button(
+            s3_body,
+            text="📋 Copy",
+            font=("Arial", 8, "bold"),
+            fill_color="#141820",
+            fill_top_color="#1c212b",
+            border_color="#2e3746",
+            hover_fill="#181e28",
+            hover_fill_top="#232a36",
+            hover_border="#475569",
+            fg="#e2e8f0",
+            canvas_bg="#131922",
+            width=72,
+            height=22,
+            auto_width=False,
+            command=_copy_cb_url,
+        )
+        btn_copy_cb.pack(side="left", padx=(8, 0))
+
+        _add_step_row(
+            4,
+            [
+                [
+                    ("Once your App status changes to ", "#cbd5e1", ("Arial", 10), None),
+                    ("Ready for Use", "#69f0ae", ("Arial", 10, "bold"), "#122b22"),
+                    (", paste your ", "#cbd5e1", ("Arial", 10), None),
+                    ("App Key", "#ffffff", ("Arial", 10, "bold"), None),
+                    (" & ", "#cbd5e1", ("Arial", 10), None),
+                    ("App Secret", "#ffffff", ("Arial", 10, "bold"), None),
+                    (" into the fields below.", "#cbd5e1", ("Arial", 10), None),
+                ]
+            ],
+        )
+        _add_step_row(
+            5,
+            [
+                [
+                    ("When you click ", "#cbd5e1", ("Arial", 10), None),
+                    ("Save & Connect", "#69f0ae", ("Arial", 10, "bold"), None),
+                    (", your browser will open to log into Schwab and approve your account.", "#cbd5e1", ("Arial", 10), None),
+                ],
+                [
+                    ("After approving, copy the full ", "#cbd5e1", ("Arial", 10), None),
+                    ("https://127.0.0.1/?code=...", "#7dd3fc", ("Consolas", 9, "bold"), "#192536"),
+                    (" URL from your browser address bar", "#cbd5e1", ("Arial", 10), None),
+                ],
+                [
+                    ("— our popup window will ", "#94a3b8", ("Arial", 10), None),
+                    ("auto-detect it directly from your clipboard!", "#ffffff", ("Arial", 10, "bold"), None),
+                ],
+            ],
+        )
+    else:
+        _add_step_row(
+            1,
+            [
+                [
+                    ("Log in to ", "#cbd5e1", ("Arial", 10), None),
+                    ("Webull Web ➔ Account Management ➔ OpenAPI Management", "#ffffff", ("Arial", 10, "bold"), None),
+                    (".", "#cbd5e1", ("Arial", 10), None),
+                ]
+            ],
+        )
+        _add_step_row(
+            2,
+            [
+                [
+                    ("Apply for a ", "#cbd5e1", ("Arial", 10), None),
+                    ("Retail Trading API Key", "#7dd3fc", ("Arial", 10, "bold"), "#192536"),
+                    (" (typically approved within a few minutes).", "#cbd5e1", ("Arial", 10), None),
+                ]
+            ],
+        )
+        _add_step_row(
+            3,
+            [
+                [
+                    ("Generate your ", "#cbd5e1", ("Arial", 10), None),
+                    ("App Key", "#ffffff", ("Arial", 10, "bold"), None),
+                    (" and ", "#cbd5e1", ("Arial", 10), None),
+                    ("App Secret", "#ffffff", ("Arial", 10, "bold"), None),
+                    (" in the Webull portal and paste both into the fields below.", "#cbd5e1", ("Arial", 10), None),
+                ]
+            ],
+        )
+        _add_step_row(
+            4,
+            [
+                [
+                    ("Click ", "#cbd5e1", ("Arial", 10), None),
+                    ("Save & Connect", "#69f0ae", ("Arial", 10, "bold"), None),
+                    (" below to verify your credentials and load your Webull trading accounts.", "#cbd5e1", ("Arial", 10), None),
+                ]
+            ],
+        )
+        _add_step_row(
+            5,
+            [
+                [
+                    ("⚠️ Mobile 2FA:", "#fbbf24", ("Arial", 10, "bold"), "#262115"),
+                    (" On first connection, check your ", "#cbd5e1", ("Arial", 10), None),
+                    ("Webull Mobile App / SMS", "#ffffff", ("Arial", 10, "bold"), None),
+                    (" if prompted for a verification code.", "#cbd5e1", ("Arial", 10), None),
+                ]
+            ],
+        )
 
     b_cfg = config.get("brokers", {}).get(broker_name, {})
     var_key = tk.StringVar(value=b_cfg.get("app_key", ""))
     var_sec = tk.StringVar(value=b_cfg.get("app_secret", ""))
 
-    form = tk.Frame(wiz, bg="#141414")
-    form.pack(fill="x", pady=6)
+    form = tk.Frame(wiz, bg="#0d1117")
+    form.pack(fill="x", pady=4)
 
     tk.Label(
         form,
         text=f"{broker_name} App Key:",
         font=("Arial", 10, "bold"),
-        fg="white",
-        bg="#141414",
-        width=20,
+        fg="#dce4ee",
+        bg="#0d1117",
+        width=18,
         anchor="w"
     ).grid(row=0, column=0, pady=6, sticky="w")
     tk.Entry(
         form,
         textvariable=var_key,
-        font=("Arial", 10, "bold"),
-        width=48,
-        bg="#2a2a2a",
-        fg="white",
-        insertbackground="white"
-    ).grid(row=0, column=1, pady=6, padx=8)
+        font=("Consolas", 10, "bold"),
+        width=52,
+        bg="#0e141d",
+        fg="#e2e8f0",
+        insertbackground="#e2e8f0",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#28374a",
+        highlightcolor="#38bdf8",
+    ).grid(row=0, column=1, pady=6, padx=8, ipady=5)
 
     tk.Label(
         form,
         text=f"{broker_name} App Secret:",
         font=("Arial", 10, "bold"),
-        fg="white",
-        bg="#141414",
-        width=20,
+        fg="#dce4ee",
+        bg="#0d1117",
+        width=18,
         anchor="w"
     ).grid(row=1, column=0, pady=6, sticky="w")
     tk.Entry(
         form,
         textvariable=var_sec,
-        font=("Arial", 10, "bold"),
-        width=48,
-        bg="#2a2a2a",
-        fg="white",
-        insertbackground="white",
-        show="*"
-    ).grid(row=1, column=1, pady=6, padx=8)
+        font=("Consolas", 10, "bold"),
+        width=52,
+        bg="#0e141d",
+        fg="#e2e8f0",
+        insertbackground="#e2e8f0",
+        show="*",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#28374a",
+        highlightcolor="#38bdf8",
+    ).grid(row=1, column=1, pady=6, padx=8, ipady=5)
 
     def save_keys(force_token_renew=False):
         k = var_key.get().strip()
@@ -3065,58 +4220,79 @@ def show_broker_setup_wizard(broker_name, parent=None):
     if broker_name == "SCHWAB":
         rem_h = get_schwab_token_remaining_hours()
         if rem_h is not None and rem_h > 0:
-            tok_info = f"Current 7-Day Schwab Token Status: {rem_h / 24.0:.1f} days ({rem_h:.0f}h) remaining."
-            tok_col = "#58d68d" if rem_h >= 24.0 else "#f5b041"
+            tok_info = f"● Current 7-Day Schwab Token Status: {rem_h / 24.0:.1f} days ({rem_h:.0f}h) remaining."
+            tok_col = "#4ade80" if rem_h >= 36.0 else "#fbbf24"
         elif os.path.exists(SCHWAB_TOKEN_PATH):
-            tok_info = "Current 7-Day Schwab Token Status: Expired — will prompt browser login on connect."
+            tok_info = "● Current 7-Day Schwab Token Status: Expired — will prompt browser login on connect."
             tok_col = "#eb7067"
         else:
-            tok_info = "Current 7-Day Schwab Token Status: Not yet authenticated."
-            tok_col = "#aaaaaa"
+            tok_info = "● Current 7-Day Schwab Token Status: Not yet authenticated."
+            tok_col = "#8b9bb0"
         tk.Label(
             wiz,
             text=tok_info,
             font=("Arial", 9, "bold"),
             fg=tok_col,
-            bg="#141414",
+            bg="#0d1117",
             anchor="w"
-        ).pack(fill="x", pady=(4, 2))
+        ).pack(fill="x", pady=(6, 2))
 
-    btn_bar = tk.Frame(wiz, bg="#141414", pady=12)
+    btn_bar = tk.Frame(wiz, bg="#0d1117", pady=12)
     btn_bar.pack(fill="x")
 
-    tk.Button(
+    make_stadium_button(
         btn_bar,
         text="Cancel",
         font=("Arial", 10, "bold"),
-        bg="#333333",
-        fg="white",
-        padx=14,
-        pady=6,
-        command=wiz.destroy
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#cbd5e1",
+        canvas_bg="#0d1117",
+        width=112,
+        height=36,
+        pad_x=28,
+        command=wiz.destroy,
     ).pack(side="left")
 
-    tk.Button(
+    make_stadium_button(
         btn_bar,
-        text=f"Save & Connect {broker_name} >>",
+        text=f"🚀 Save & Connect {broker_name} >>",
         font=("Arial", 10, "bold"),
-        bg="#1e8449",
-        fg="white",
-        padx=20,
-        pady=6,
-        command=lambda: save_keys(force_token_renew=False)
+        fill_color="#0d3b20",
+        fill_top_color="#14532d",
+        border_color="#10b981",
+        hover_fill="#114b29",
+        hover_fill_top="#196638",
+        hover_border="#34d399",
+        fg="#ffffff",
+        canvas_bg="#0d1117",
+        width=226,
+        height=36,
+        pad_x=32,
+        command=lambda: save_keys(force_token_renew=False),
     ).pack(side="right")
 
     if broker_name == "SCHWAB" and os.path.exists(SCHWAB_TOKEN_PATH):
-        tk.Button(
+        make_stadium_button(
             btn_bar,
             text="🔄 Renew 7-Day Token Now",
             font=("Arial", 10, "bold"),
-            bg="#1f538d",
-            fg="white",
-            padx=14,
-            pady=6,
-            command=lambda: save_keys(force_token_renew=True)
+            fill_color="#141820",
+            fill_top_color="#1c212b",
+            border_color="#2e3746",
+            hover_fill="#181e28",
+            hover_fill_top="#232a36",
+            hover_border="#475569",
+            fg="#e2e8f0",
+            canvas_bg="#0d1117",
+            width=206,
+            height=36,
+            pad_x=28,
+            command=lambda: save_keys(force_token_renew=True),
         ).pack(side="right", padx=(0, 10))
 
     if parent is None:
@@ -4711,7 +5887,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         pf.grab_set()
 
     pf.title(f"PnL Enforcer Beta v{APP_VERSION} — Pre-Flight & Risk Rulebook")
-    pf.config(bg="#121212", padx=26, pady=18)
+    pf.config(bg="#0d1117", padx=24, pady=16)
     pf.resizable(False, False)
     pf.attributes("-topmost", True)
 
@@ -4760,6 +5936,15 @@ def show_preflight_window(parent=None, mute_btn=None):
                 paragraphs[-1] = f"{prev} {ln}"
         return paragraphs
 
+    _all_hide_tip_callbacks = []
+
+    def hide_all_tooltips(_event=None):
+        for fn in _all_hide_tip_callbacks:
+            try:
+                fn()
+            except Exception:
+                pass
+
     def attach_tooltip(widget, text):
         """Attaches a clean dark-themed hover tooltip card to any widget."""
         tip_state = {"win": None, "after_id": None}
@@ -4767,7 +5952,11 @@ def show_preflight_window(parent=None, mute_btn=None):
 
         def show_tip():
             tip_state["after_id"] = None
-            if tip_state["win"] is not None or not widget.winfo_exists():
+            if (
+                tip_state["win"] is not None
+                or not widget.winfo_exists()
+                or getattr(widget, "_menu_open", False)
+            ):
                 return
             try:
                 tw = tk.Toplevel(pf)
@@ -4828,11 +6017,15 @@ def show_preflight_window(parent=None, mute_btn=None):
 
         def schedule_tip(_event=None):
             hide_tip()
+            if getattr(widget, "_menu_open", False):
+                return
             try:
                 tip_state["after_id"] = widget.after(320, show_tip)
             except Exception:
                 pass
 
+        _all_hide_tip_callbacks.append(hide_tip)
+        widget._hide_tooltip_fn = hide_tip
         widget.bind("<Enter>", schedule_tip, add="+")
         widget.bind("<Leave>", hide_tip, add="+")
         widget.bind("<ButtonPress>", hide_tip, add="+")
@@ -4936,110 +6129,335 @@ def show_preflight_window(parent=None, mute_btn=None):
                 pass
         return _on_focus_out
 
+    def _render_baseline_telemetry_spans(spans):
+        """Renders multi-color inline telemetry spans inside base_sub_lbl frame."""
+        if base_sub_lbl is None or not base_sub_lbl.winfo_exists():
+            return
+        for child in base_sub_lbl.winfo_children():
+            child.destroy()
+        base_tip = (
+            "Shows today's anchored starting account equity ($0.00 PnL reference point),\n"
+            "remaining Schwab 7-day token lifetime, and today's completed Win/Loss trade count."
+        )
+        for seg_txt, seg_col in spans:
+            lbl = tk.Label(
+                base_sub_lbl,
+                text=seg_txt,
+                font=("Arial", 9, "bold"),
+                fg=seg_col,
+                bg="#131922",
+                bd=0,
+                padx=0,
+                pady=0,
+                anchor="w",
+            )
+            lbl.pack(side="left")
+            attach_tooltip(lbl, base_tip)
+
     def refresh_baseline_preview():
-        """Updates the Active Baseline label in Card 3 to match the
-        currently selected Broker + Account."""
+        """Updates the Active Baseline multi-color telemetry strip in Card 3 to
+        match the currently selected Broker + Account."""
         global start_equity, force_reanchor
         if base_sub_lbl is None:
             return
         if active_adapter is None or not active_adapter.account_id:
-            base_sub_lbl.config(
-                text="No broker connected — click API Keys or select broker above."
+            _render_baseline_telemetry_spans(
+                [
+                    (
+                        "No broker connected — click API Keys or select broker above.",
+                        "#f5b041",
+                    )
+                ]
             )
             return
 
         b_name = active_adapter.name
         acct_id = active_adapter.account_id
         had_saved = restore_account_session(b_name, acct_id, log_restore=False)
-        tok_suffix = ""
-        if b_name == "SCHWAB":
-            rem_h = get_schwab_token_remaining_hours()
-            if rem_h is not None and rem_h > 0:
-                tok_suffix = f" | Token: {rem_h / 24.0:.1f}d left"
-        wl_suffix = f" | {format_trades_wl_inline(win_trades, loss_trades)}"
 
         if had_saved and start_equity is not None and start_equity > 0:
             force_reanchor = False
-            base_sub_lbl.config(
-                text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Preserved){tok_suffix}{wl_suffix}"
-            )
+            eq_str = f"${start_equity:,.2f} (Preserved)"
         else:
             eq, _, _, _, _ = active_adapter.fetch_account_data()
             if eq is not None and eq > 0:
                 start_equity = eq
                 force_reanchor = True
-                base_sub_lbl.config(
-                    text=f"Active Baseline ({b_name}): ${start_equity:,.2f} (Live equity){tok_suffix}{wl_suffix}"
-                )
+                eq_str = f"${start_equity:,.2f} (Live equity)"
             else:
-                base_sub_lbl.config(
-                    text=f"Active Baseline ({b_name}): Will anchor on first API poll.{tok_suffix}{wl_suffix}"
-                )
+                eq_str = "Will anchor on first API poll"
 
-    # --- TOP BAR: BROKER & ACCOUNT SELECTOR + PRESETS ---
+        spans = [
+            (f"Active Baseline ({b_name}): ", "#94a3b8"),
+            (eq_str, "#7dd3fc"),
+        ]
+        if b_name == "SCHWAB":
+            rem_h = get_schwab_token_remaining_hours()
+            if rem_h is not None and rem_h > 0:
+                rem_d = rem_h / 24.0
+                tok_col = "#fbbf24" if rem_d < 1.5 else "#4ade80"
+                spans.append(("  |  ", "#475569"))
+                spans.append((f"Token: {rem_d:.1f}d left", tok_col))
+
+        tot_t = int(win_trades) + int(loss_trades)
+        w_pct = (win_trades / tot_t * 100.0) if tot_t > 0 else 0.0
+        l_pct = (loss_trades / tot_t * 100.0) if tot_t > 0 else 0.0
+        spans.append(("  |  ", "#475569"))
+        spans.append((f"W: {win_trades} ({w_pct:.1f}%)", "#58d68d"))
+        spans.append(("  |  ", "#475569"))
+        spans.append((f"L: {loss_trades} ({l_pct:.1f}%)", "#e07a7a"))
+        _render_baseline_telemetry_spans(spans)
+
+    # --- TOP BAR: UNIFIED BROKER/ACCOUNT CAPSULE, UTILITY PILLS & PRESETS ---
     top_bar = tk.Frame(
-        pf, bg="#1c1c1c", bd=1, relief="solid", padx=16, pady=10
+        pf,
+        bg="#11161f",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#222d3d",
+        padx=10,
+        pady=7,
     )
-    top_bar.pack(fill="x", pady=(0, 14))
+    top_bar.pack(fill="x", pady=(0, 12))
 
-    tk.Label(
+    # 1. Unified Broker & Account Frosted Glass Stadium Bar (Single Un-Nested Bar)
+    broker_acct_capsule = tk.Canvas(
         top_bar,
-        text="BROKER:",
-        font=("Arial", 10, "bold"),
-        fg="#5dade2",
-        bg="#1c1c1c"
-    ).pack(side="left", padx=(0, 6))
+        bg="#11161f",
+        width=408,
+        height=32,
+        bd=0,
+        highlightthickness=0,
+        cursor="hand2",
+    )
+    broker_acct_capsule.pack(side="left", padx=(0, 6))
 
-    broker_menu = tk.OptionMenu(top_bar, var_broker, "SCHWAB", "WEBULL")
-    broker_menu.config(
-        font=("Arial", 10, "bold"),
-        bg="#2a2a2a",
+    broker_dropdown = tk.Menu(
+        pf,
+        tearoff=0,
+        font=("Arial", 9, "bold"),
+        bg="#18202c",
         fg="white",
         activebackground="#1f538d",
         activeforeground="white",
-        highlightthickness=0,
-        bd=1,
-        relief="solid"
     )
-    broker_menu["menu"].config(
-        font=("Arial", 10, "bold"), bg="#2a2a2a", fg="white"
-    )
-    broker_menu.pack(side="left", padx=(0, 10))
+    for b_opt in ("SCHWAB", "WEBULL"):
+        broker_dropdown.add_command(
+            label=b_opt, command=lambda b=b_opt: var_broker.set(b)
+        )
 
-    tk.Label(
-        top_bar,
-        text="ACCOUNT:",
-        font=("Arial", 10, "bold"),
-        fg="#5dade2",
-        bg="#1c1c1c"
-    ).pack(side="left", padx=(4, 6))
-
-    acct_menu = tk.OptionMenu(top_bar, var_account_label, "Loading...")
-    acct_menu.config(
-        font=("Arial", 10, "bold"),
-        bg="#2a2a2a",
+    acct_dropdown = tk.Menu(
+        pf,
+        tearoff=0,
+        font=("Arial", 9, "bold"),
+        bg="#18202c",
         fg="white",
         activebackground="#1f538d",
         activeforeground="white",
-        highlightthickness=0,
-        bd=1,
-        relief="solid",
-        padx=12
     )
-    acct_menu["menu"].config(
-        font=("Arial", 10, "bold"), bg="#2a2a2a", fg="white"
-    )
-    acct_menu.pack(side="left", padx=(0, 8))
+
+    _capsule_state = {
+        "bg_photo": None,
+        "dot_photo": None,
+        "hover_zone": None,
+        "divider_x": 165,
+        "broker_x": 74,
+        "acct_x": 248,
+        "connected": True,
+    }
+
+    def _measure_canvas_txt(cvs, txt, fnt):
+        pid = cvs.create_text(0, 0, text=txt, font=fnt, anchor="nw")
+        bb = cvs.bbox(pid)
+        cvs.delete(pid)
+        return (bb[2] - bb[0]) if bb else 0
+
+    def _redraw_broker_acct_capsule(_event=None):
+        broker_acct_capsule.delete("all")
+        fnt_lbl = ("Arial", 9, "bold")
+        fnt_val = ("Arial", 9, "bold")
+        b_val = var_broker.get() or "SCHWAB"
+        a_val = var_account_label.get() or "Loading..."
+
+        w_b_lbl = _measure_canvas_txt(broker_acct_capsule, "BROKER:", fnt_lbl)
+        w_b_val = _measure_canvas_txt(broker_acct_capsule, b_val, fnt_val)
+        w_a_lbl = _measure_canvas_txt(broker_acct_capsule, "ACCOUNT:", fnt_lbl)
+        w_a_val = _measure_canvas_txt(broker_acct_capsule, a_val, fnt_val)
+
+        pad_l = 16
+        x_b_lbl = pad_l
+        x_b_val = x_b_lbl + w_b_lbl + 7
+        x_b_chev = x_b_val + w_b_val + 6
+        x_div = x_b_chev + 18
+        x_dot = x_div + 4
+        x_a_lbl = x_dot + 19
+        x_a_val = x_a_lbl + w_a_lbl + 7
+        x_a_chev = x_a_val + w_a_val + 6
+        total_w = max(360, int(x_a_chev + 20))
+        h = 32
+        cy = h // 2
+
+        _capsule_state["divider_x"] = x_div
+        _capsule_state["broker_x"] = x_b_val - 4
+        _capsule_state["acct_x"] = x_a_val - 4
+
+        if abs(int(broker_acct_capsule["width"]) - total_w) > 1:
+            broker_acct_capsule.configure(width=total_w, height=h)
+
+        hz = _capsule_state["hover_zone"]
+        _capsule_state["bg_photo"] = _get_glass_pill_photo(
+            broker_acct_capsule,
+            total_w,
+            h,
+            bg_hex="#11161f",
+            fill_hex="#141820",
+            fill_top_hex="#1c212b",
+            border_hex="#2e3746" if hz is None else "#475569",
+            hover=(hz is not None),
+            corner_radius=6,
+        )
+        broker_acct_capsule.create_image(
+            0, 0, image=_capsule_state["bg_photo"], anchor="nw"
+        )
+
+        # Subtle hover highlight directly on the surface when hovering a selector
+        if hz == "broker":
+            broker_acct_capsule.create_rectangle(
+                x_b_val - 5,
+                5,
+                x_b_chev + 10,
+                h - 5,
+                fill="#1f2735",
+                outline="#3b495e",
+                width=1,
+            )
+        elif hz == "account":
+            broker_acct_capsule.create_rectangle(
+                x_a_val - 5,
+                5,
+                x_a_chev + 10,
+                h - 5,
+                fill="#1f2735",
+                outline="#3b495e",
+                width=1,
+            )
+
+        broker_acct_capsule.create_text(
+            x_b_lbl, cy, text="BROKER:", font=fnt_lbl, fill="#60a5fa", anchor="w"
+        )
+        broker_acct_capsule.create_text(
+            x_b_val,
+            cy,
+            text=b_val,
+            font=fnt_val,
+            fill="#ffffff" if hz == "broker" else "#f8fafc",
+            anchor="w",
+        )
+        broker_acct_capsule.create_text(
+            x_b_chev,
+            cy,
+            text="▾",
+            font=fnt_val,
+            fill="#7dd3fc" if hz == "broker" else "#38bdf8",
+            anchor="w",
+        )
+
+        dot_c = "#00e676" if _capsule_state["connected"] else "#fbbf24"
+        _capsule_state["dot_photo"] = _get_glow_dot_photo(
+            broker_acct_capsule, bg_hex="#171c25", dot_hex=dot_c, size=18
+        )
+        broker_acct_capsule.create_image(
+            x_dot + 7, cy, image=_capsule_state["dot_photo"], anchor="center"
+        )
+
+        broker_acct_capsule.create_text(
+            x_a_lbl, cy, text="ACCOUNT:", font=fnt_lbl, fill="#94a3b8", anchor="w"
+        )
+        broker_acct_capsule.create_text(
+            x_a_val,
+            cy,
+            text=a_val,
+            font=fnt_val,
+            fill="#ffffff" if hz == "account" else "#f8fafc",
+            anchor="w",
+        )
+        broker_acct_capsule.create_text(
+            x_a_chev,
+            cy,
+            text="▾",
+            font=fnt_val,
+            fill="#69f0ae" if hz == "account" else "#00e676",
+            anchor="w",
+        )
+
+    def _on_capsule_motion(event):
+        new_z = "broker" if event.x < _capsule_state["divider_x"] else "account"
+        if new_z != _capsule_state["hover_zone"]:
+            _capsule_state["hover_zone"] = new_z
+            _redraw_broker_acct_capsule()
+
+    def _on_capsule_leave(_event):
+        if _capsule_state["hover_zone"] is not None:
+            _capsule_state["hover_zone"] = None
+            _redraw_broker_acct_capsule()
+
+    def _on_capsule_click(event):
+        hide_all_tooltips()
+        broker_acct_capsule._menu_open = True
+        root_x = broker_acct_capsule.winfo_rootx()
+        root_y = (
+            broker_acct_capsule.winfo_rooty()
+            + broker_acct_capsule.winfo_height()
+            + 2
+        )
+        if event.x < _capsule_state["divider_x"]:
+            try:
+                broker_dropdown.tk_popup(
+                    root_x + int(_capsule_state["broker_x"]), root_y
+                )
+            finally:
+                broker_acct_capsule._menu_open = False
+                hide_all_tooltips()
+                try:
+                    broker_dropdown.grab_release()
+                except Exception:
+                    pass
+                _capsule_state["hover_zone"] = None
+                _redraw_broker_acct_capsule()
+        else:
+            try:
+                acct_dropdown.tk_popup(
+                    root_x + int(_capsule_state["acct_x"]), root_y
+                )
+            finally:
+                broker_acct_capsule._menu_open = False
+                hide_all_tooltips()
+                try:
+                    acct_dropdown.grab_release()
+                except Exception:
+                    pass
+                _capsule_state["hover_zone"] = None
+                _redraw_broker_acct_capsule()
+
+    broker_acct_capsule.bind("<Configure>", _redraw_broker_acct_capsule, add="+")
+    broker_acct_capsule.bind("<Motion>", _on_capsule_motion, add="+")
+    broker_acct_capsule.bind("<Leave>", _on_capsule_leave, add="+")
+    broker_acct_capsule.bind("<Button-1>", _on_capsule_click, add="+")
+
     attach_tooltip(
-        broker_menu,
-        "Select which broker API to monitor (Charles Schwab / Thinkorswim or Webull).\n"
+        broker_acct_capsule,
+        "Click BROKER (left) to switch between Charles Schwab / Thinkorswim and Webull.\n"
+        "Click ACCOUNT (right) to choose which sub-account to monitor.\n"
         "Each broker and account tracks its own separate daily baseline and session history."
     )
-    attach_tooltip(
-        acct_menu,
-        "Choose which sub-account to monitor under the active broker.\n"
-        "Switching accounts preserves each account's independent starting equity and PnL."
-    )
+
+    def _sync_broker_acct_pills(*_):
+        _capsule_state["connected"] = bool(
+            active_adapter and active_adapter.accounts
+        )
+        _redraw_broker_acct_capsule()
+
+    var_account_label.trace_add("write", _sync_broker_acct_pills)
 
     def on_account_select(chosen_lbl):
         var_account_label.set(chosen_lbl)
@@ -5052,15 +6470,14 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     def populate_account_dropdown():
         account_label_to_id.clear()
-        menu = acct_menu["menu"]
-        menu.delete(0, "end")
+        acct_dropdown.delete(0, "end")
         if active_adapter and active_adapter.accounts:
             selected_lbl = active_adapter.accounts[0]["label"]
             for acc in active_adapter.accounts:
                 lbl = acc["label"]
                 aid = acc["id"]
                 account_label_to_id[lbl] = aid
-                menu.add_command(
+                acct_dropdown.add_command(
                     label=lbl,
                     command=lambda v=lbl: on_account_select(v)
                 )
@@ -5069,10 +6486,12 @@ def show_preflight_window(parent=None, mute_btn=None):
             var_account_label.set(selected_lbl)
         else:
             var_account_label.set("No Account Connected")
+        _sync_broker_acct_pills()
 
     def on_broker_change(*_):
         global active_adapter
         chosen = var_broker.get()
+        _sync_broker_acct_pills()
         if active_adapter is None or active_adapter.name != chosen:
             new_ad = connect_broker_adapter(chosen, parent=pf, force_wizard=False)
             if new_ad is not None:
@@ -5083,6 +6502,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             else:
                 if active_adapter is not None:
                     var_broker.set(active_adapter.name)
+                    _sync_broker_acct_pills()
 
     def edit_api_keys():
         global active_adapter
@@ -5094,17 +6514,24 @@ def show_preflight_window(parent=None, mute_btn=None):
             populate_account_dropdown()
             refresh_baseline_preview()
 
-    btn_api_keys = tk.Button(
+    btn_api_keys = make_stadium_button(
         top_bar,
         text="🔑 API Keys",
         font=("Arial", 9, "bold"),
-        bg="#333333",
-        fg="white",
-        padx=9,
-        pady=3,
-        command=edit_api_keys
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#e2e8f0",
+        canvas_bg="#11161f",
+        width=98,
+        height=32,
+        pad_x=22,
+        command=edit_api_keys,
     )
-    btn_api_keys.pack(side="left", padx=(0, 6))
+    btn_api_keys.pack(side="left", padx=(0, 5))
     attach_tooltip(
         btn_api_keys,
         "Open the API Credential Setup Wizard to enter or update your App Key & Secret,\n"
@@ -5114,7 +6541,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     def open_hud_columns_dialog():
         dlg = tk.Toplevel(pf)
         dlg.title("Customize HUD Columns & Order")
-        dlg.config(bg="#161616", padx=22, pady=16)
+        dlg.config(bg="#0d1117", padx=22, pady=16)
         dlg.resizable(False, False)
         dlg.attributes("-topmost", True)
         dlg.grab_set()
@@ -5124,15 +6551,15 @@ def show_preflight_window(parent=None, mute_btn=None):
             text="📊 CUSTOMIZE HUD COLUMNS & DISPLAY ORDER",
             font=("Arial", 11, "bold"),
             fg="#5dade2",
-            bg="#161616",
+            bg="#0d1117",
             anchor="w"
         ).pack(fill="x")
         tk.Label(
             dlg,
             text="Check the columns you want on your HUD and use ▲ / ▼ to arrange their left-to-right order.",
             font=("Arial", 9),
-            fg="#aaaaaa",
-            bg="#161616",
+            fg="#94a3b8",
+            bg="#0d1117",
             anchor="w"
         ).pack(fill="x", pady=(2, 10))
 
@@ -5146,28 +6573,32 @@ def show_preflight_window(parent=None, mute_btn=None):
         }
         desc_map = {cid: (hdr, desc) for cid, hdr, desc in HUD_COLUMN_CATALOG}
 
-        list_frame = tk.Frame(dlg, bg="#1f1f1f", bd=1, relief="solid", padx=12, pady=8)
-        list_frame.pack(fill="both", expand=True)
+        list_outer = tk.Frame(
+            dlg, bg="#131922", bd=0, highlightthickness=1, highlightbackground="#243040"
+        )
+        list_outer.pack(fill="both", expand=True)
+        NeonBarCanvas(
+            list_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+        list_frame = tk.Frame(list_outer, bg="#131922", padx=14, pady=10)
+        list_frame.pack(side="left", fill="both", expand=True)
 
         def render_rows():
             for w in list_frame.winfo_children():
                 w.destroy()
             for idx, cid in enumerate(ordered_ids):
                 hdr, desc = desc_map[cid]
-                row = tk.Frame(list_frame, bg="#1f1f1f", pady=3)
+                row = tk.Frame(list_frame, bg="#131922", pady=3)
                 row.pack(fill="x")
 
-                tk.Checkbutton(
+                make_glass_checkbutton(
                     row,
                     text=f"{idx + 1}. {hdr}",
                     variable=checked_vars[cid],
                     font=("Arial", 10, "bold"),
-                    fg="#ffffff",
-                    bg="#1f1f1f",
-                    selectcolor="#2a2a2a",
-                    activebackground="#1f1f1f",
-                    activeforeground="#ffffff",
-                    width=18,
+                    fg="#dce4ee",
+                    bg="#131922",
+                    width=180,
                     anchor="w"
                 ).pack(side="left")
 
@@ -5175,11 +6606,11 @@ def show_preflight_window(parent=None, mute_btn=None):
                     row,
                     text=desc,
                     font=("Arial", 9),
-                    fg="#999999",
-                    bg="#1f1f1f",
+                    fg="#8b9bb0",
+                    bg="#131922",
                     anchor="w",
                     width=42
-                ).pack(side="left", padx=(6, 10))
+                ).pack(side="left", padx=(8, 12))
 
                 def move_up(i=idx):
                     if i > 0:
@@ -5197,23 +6628,37 @@ def show_preflight_window(parent=None, mute_btn=None):
                         )
                         render_rows()
 
-                tk.Button(
+                make_stadium_button(
                     row,
                     text="▼",
                     font=("Arial", 8, "bold"),
-                    bg="#2e2e2e",
-                    fg="white",
-                    width=3,
-                    command=move_down
+                    fill_color="#182434",
+                    border_color="#475b73",
+                    hover_fill="#22344a",
+                    hover_border="#38bdf8",
+                    fg="#e2e8f0",
+                    canvas_bg="#131922",
+                    width=36,
+                    height=24,
+                    auto_width=False,
+                    glow_strength=0.35,
+                    command=move_down,
                 ).pack(side="right", padx=2)
-                tk.Button(
+                make_stadium_button(
                     row,
                     text="▲",
                     font=("Arial", 8, "bold"),
-                    bg="#2e2e2e",
-                    fg="white",
-                    width=3,
-                    command=move_up
+                    fill_color="#182434",
+                    border_color="#475b73",
+                    hover_fill="#22344a",
+                    hover_border="#38bdf8",
+                    fg="#e2e8f0",
+                    canvas_bg="#131922",
+                    width=36,
+                    height=24,
+                    auto_width=False,
+                    glow_strength=0.35,
+                    command=move_up,
                 ).pack(side="right", padx=2)
 
         render_rows()
@@ -5242,40 +6687,61 @@ def show_preflight_window(parent=None, mute_btn=None):
             hud_cols_btn.config(text=f"📊 HUD Columns ({len(chosen)})")
             dlg.destroy()
 
-        b_bar = tk.Frame(dlg, bg="#161616", pady=10)
+        b_bar = tk.Frame(dlg, bg="#0d1117", pady=12)
         b_bar.pack(fill="x")
-        tk.Button(
+        make_stadium_button(
             b_bar,
             text="Reset Default 5",
             font=("Arial", 9, "bold"),
-            bg="#333333",
-            fg="white",
-            padx=12,
-            pady=4,
-            command=reset_standard_5
+            fill_color="#141820",
+            fill_top_color="#1c212b",
+            border_color="#2e3746",
+            hover_fill="#181e28",
+            hover_fill_top="#232a36",
+            hover_border="#475569",
+            fg="#e2e8f0",
+            canvas_bg="#0d1117",
+            width=142,
+            height=34,
+            pad_x=26,
+            command=reset_standard_5,
         ).pack(side="left")
-        tk.Button(
+        make_stadium_button(
             b_bar,
             text="Done ✓",
             font=("Arial", 9, "bold"),
-            bg="#1e8449",
-            fg="white",
-            padx=18,
-            pady=4,
-            command=apply_and_close
+            fill_color="#0d3b20",
+            fill_top_color="#14532d",
+            border_color="#10b981",
+            hover_fill="#114b29",
+            hover_fill_top="#196638",
+            hover_border="#34d399",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=126,
+            height=34,
+            pad_x=28,
+            command=apply_and_close,
         ).pack(side="right")
 
-    hud_cols_btn = tk.Button(
+    hud_cols_btn = make_stadium_button(
         top_bar,
         text=f"📊 HUD Columns ({len(selected_hud_columns)})",
         font=("Arial", 9, "bold"),
-        bg="#2c3e50",
-        fg="#aed6f1",
-        padx=9,
-        pady=3,
-        command=open_hud_columns_dialog
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#e2e8f0",
+        canvas_bg="#11161f",
+        width=138,
+        height=32,
+        pad_x=22,
+        command=open_hud_columns_dialog,
     )
-    hud_cols_btn.pack(side="left", padx=(0, 6))
+    hud_cols_btn.pack(side="left", padx=(0, 5))
     attach_tooltip(
         hud_cols_btn,
         "Choose which metrics appear on your live HUD bar (Realized PnL, Open PnL, Net PnL,\n"
@@ -5389,29 +6855,11 @@ def show_preflight_window(parent=None, mute_btn=None):
                 parent=pf,
             )
 
-    tk.Frame(top_bar, bg="#383838", width=1).pack(
-        side="left", fill="y", padx=(4, 10), pady=2
-    )
-
-    btn_logs_menu = tk.Menubutton(
-        top_bar,
-        text="📜 Logs ▾",
-        font=("Arial", 9, "bold"),
-        bg="#2e2e2e",
-        fg="#e5e8e8",
-        activebackground="#1f538d",
-        activeforeground="white",
-        padx=10,
-        pady=4,
-        bd=1,
-        relief="raised",
-        direction="below"
-    )
     logs_dropdown = tk.Menu(
-        btn_logs_menu,
+        pf,
         tearoff=0,
         font=("Arial", 9, "bold"),
-        bg="#262626",
+        bg="#18202c",
         fg="white",
         activebackground="#1f538d",
         activeforeground="white"
@@ -5433,8 +6881,24 @@ def show_preflight_window(parent=None, mute_btn=None):
         label=f"📁 Open Raw Archived Logs ({LOG_RETENTION_DAYS}-Day Full)",
         command=open_log_archive_folder
     )
-    btn_logs_menu.config(menu=logs_dropdown)
-    btn_logs_menu.pack(side="left", padx=(0, 6))
+    btn_logs_menu = make_stadium_button(
+        top_bar,
+        text="📜 Logs ▾",
+        font=("Arial", 9, "bold"),
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#e2e8f0",
+        canvas_bg="#11161f",
+        width=88,
+        height=32,
+        pad_x=22,
+        menu=logs_dropdown,
+    )
+    btn_logs_menu.pack(side="left", padx=(0, 5))
     attach_tooltip(
         btn_logs_menu,
         "Session & Audit Logs Menu:\n"
@@ -5444,17 +6908,24 @@ def show_preflight_window(parent=None, mute_btn=None):
         f"• Open Raw Archived Logs: Opens your {LOG_RETENTION_DAYS}-day full local log archive ({_mask_user_path(LOG_ARCHIVE_DIR)})"
     )
 
-    btn_report_bug = tk.Button(
+    btn_report_bug = make_stadium_button(
         top_bar,
         text="🐞 Report Bug",
         font=("Arial", 9, "bold"),
-        bg="#4a235a",
-        fg="#f5cba7",
-        padx=9,
-        pady=3,
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#5c2836",
+        hover_fill="#1f161c",
+        hover_fill_top="#2a1d25",
+        hover_border="#9f3a56",
+        fg="#f4d6de",
+        canvas_bg="#11161f",
+        width=108,
+        height=32,
+        pad_x=22,
         command=report_bug_action,
     )
-    btn_report_bug.pack(side="left", padx=(0, 10))
+    btn_report_bug.pack(side="left", padx=(0, 6))
     attach_tooltip(
         btn_report_bug,
         "One-Click Bug Report & Safe Log Prep:\n"
@@ -5503,47 +6974,65 @@ def show_preflight_window(parent=None, mute_btn=None):
         if is_full:
             btn_full_risk.config(
                 text="✓ Standard Full Risk",
-                bg="#1f618d",
+                fill_color="#0f213a",
+                fill_top_color="#163052",
+                border_color="#38bdf8",
+                hover_fill="#132a48",
+                hover_fill_top="#1c3b63",
+                hover_border="#7dd3fc",
                 fg="#ffffff",
-                bd=2,
-                relief="solid"
             )
             btn_half_risk.config(
                 text="50% Low Energy",
-                bg="#5c4b06",
-                fg="#cccccc",
-                bd=1,
-                relief="raised"
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#475569",
+                fg="#94a3b8",
             )
         elif is_half:
             btn_full_risk.config(
                 text="Standard Full Risk",
-                bg="#163a5f",
-                fg="#cccccc",
-                bd=1,
-                relief="raised"
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#475569",
+                fg="#94a3b8",
             )
             btn_half_risk.config(
                 text="✓ 50% Low Energy",
-                bg="#9a7d0a",
+                fill_color="#0d2e22",
+                fill_top_color="#144332",
+                border_color="#10b981",
+                hover_fill="#113b2c",
+                hover_fill_top="#19543f",
+                hover_border="#34d399",
                 fg="#ffffff",
-                bd=2,
-                relief="solid"
             )
         else:
             btn_full_risk.config(
                 text="Standard Full Risk",
-                bg="#1f538d",
-                fg="white",
-                bd=1,
-                relief="raised"
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#475569",
+                fg="#94a3b8",
             )
             btn_half_risk.config(
                 text="50% Low Energy",
-                bg="#7d6608",
-                fg="white",
-                bd=1,
-                relief="raised"
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#475569",
+                fg="#94a3b8",
             )
 
     def apply_dollar_preset(preset_dict):
@@ -5572,17 +7061,24 @@ def show_preflight_window(parent=None, mute_btn=None):
                 fg="#5dade2"
             )
 
-    btn_half_risk = tk.Button(
+    btn_half_risk = make_stadium_button(
         top_bar,
         text="50% Low Energy",
         font=("Arial", 9, "bold"),
-        bg="#7d6608",
-        fg="white",
-        padx=9,
-        pady=3,
-        command=apply_half_risk_preset
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#94a3b8",
+        canvas_bg="#11161f",
+        width=122,
+        height=32,
+        pad_x=22,
+        command=apply_half_risk_preset,
     )
-    btn_half_risk.pack(side="right", padx=3)
+    btn_half_risk.pack(side="right", padx=(3, 0))
     attach_tooltip(
         btn_half_risk,
         "Cuts all dollar risk thresholds, warning alarms, and tier triggers in half (50%)\n"
@@ -5590,15 +7086,22 @@ def show_preflight_window(parent=None, mute_btn=None):
         "Ideal for choppy markets, B-setup days, or low-energy sessions."
     )
 
-    btn_full_risk = tk.Button(
+    btn_full_risk = make_stadium_button(
         top_bar,
         text="Standard Full Risk",
         font=("Arial", 9, "bold"),
-        bg="#1f538d",
-        fg="white",
-        padx=9,
-        pady=3,
-        command=apply_standard_full_preset
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#94a3b8",
+        canvas_bg="#11161f",
+        width=142,
+        height=32,
+        pad_x=22,
+        command=apply_standard_full_preset,
     )
     btn_full_risk.pack(side="right", padx=3)
     attach_tooltip(
@@ -5615,9 +7118,9 @@ def show_preflight_window(parent=None, mute_btn=None):
         top_bar,
         text="PRESETS:",
         font=("Arial", 9, "bold"),
-        fg="#dddddd",
-        bg="#1c1c1c"
-    ).pack(side="right", padx=(6, 4))
+        fg="#94a3b8",
+        bg="#11161f"
+    ).pack(side="right", padx=(4, 3))
 
     default_status_lbl = None
 
@@ -5869,15 +7372,15 @@ def show_preflight_window(parent=None, mute_btn=None):
             )
 
     # --- SPACIOUS 2-COLUMN BODY CONTAINER ---
-    body_frame = tk.Frame(pf, bg="#121212")
+    body_frame = tk.Frame(pf, bg="#0d1117")
     body_frame.pack(fill="both", expand=True)
     body_frame.columnconfigure(0, weight=1, minsize=520)
     body_frame.columnconfigure(1, weight=1, minsize=520)
 
-    left_col = tk.Frame(body_frame, bg="#121212")
+    left_col = tk.Frame(body_frame, bg="#0d1117")
     left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
-    right_col = tk.Frame(body_frame, bg="#121212")
+    right_col = tk.Frame(body_frame, bg="#0d1117")
     right_col.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
     def make_card(
@@ -5892,70 +7395,56 @@ def show_preflight_window(parent=None, mute_btn=None):
         core_c = bar_color or accent
         halo0 = tk.Frame(
             parent_col,
-            bg=_blend_hex("#121212", core_c, 0.12),
+            bg="#151d28",
             padx=1,
             pady=1
         )
-        halo0.pack(fill="both", expand=expand, pady=3)
-        halo1 = tk.Frame(
-            halo0,
-            bg=_blend_hex("#121212", core_c, 0.24),
-            padx=1,
-            pady=1
-        )
-        halo1.pack(fill="both", expand=True)
-        halo2 = tk.Frame(
-            halo1,
-            bg=_blend_hex("#1b1b1b", core_c, 0.38),
-            padx=1,
-            pady=1
-        )
-        halo2.pack(fill="both", expand=True)
+        halo0.pack(fill="both", expand=expand, pady=4)
         outer = tk.Frame(
-            halo2,
-            bg="#1b1b1b",
+            halo0,
+            bg="#131922",
             bd=0,
             highlightthickness=1,
-            highlightbackground=_blend_hex("#2c2c2c", core_c, 0.45)
+            highlightbackground="#243040"
         )
         outer.pack(fill="both", expand=True)
         accent_bar = NeonBarCanvas(
-            outer, core_color=core_c, card_bg="#1b1b1b", glow_on=True
+            outer, core_color=core_c, card_bg="#131922", glow_on=True
         )
         accent_bar.pack(side="left", fill="y")
         card = tk.Frame(
-            outer, bg="#1b1b1b", padx=12, pady=11
+            outer, bg="#131922", padx=14, pady=11
         )
         card.pack(side="left", fill="both", expand=True)
-        hdr_row = tk.Frame(card, bg="#1b1b1b")
+        hdr_row = tk.Frame(card, bg="#131922")
         hdr_row.pack(fill="x")
         title_lbl = tk.Label(
             hdr_row,
             text=title,
             font=("Arial", 11, "bold"),
             fg=accent,
-            bg="#1b1b1b",
+            bg="#131922",
             anchor="w"
         )
         title_lbl.pack(side="left", fill="x", expand=True)
         badge_pill = None
         if return_parts:
-            badge_pill = RulebookPillBadge(hdr_row, card_bg="#1b1b1b")
+            badge_pill = RulebookPillBadge(hdr_row, card_bg="#131922")
             badge_pill.pack(side="right", padx=(6, 0))
         if subtitle:
             tk.Label(
                 card,
                 text=subtitle,
                 font=("Arial", 9),
-                fg="#aaaaaa",
-                bg="#1b1b1b",
+                fg="#8b9bb0",
+                bg="#131922",
                 anchor="w"
             ).pack(fill="x", pady=(2, 6))
-        tk.Frame(card, bg="#2c2c2c", height=1).pack(fill="x", pady=(0, 6))
+        tk.Frame(card, bg="#222d3d", height=1).pack(fill="x", pady=(0, 6))
         if return_parts:
             return (
                 card,
-                (halo0, halo1, halo2, outer),
+                (halo0, outer),
                 accent_bar,
                 title_lbl,
                 badge_pill
@@ -5972,27 +7461,30 @@ def show_preflight_window(parent=None, mute_btn=None):
     def make_entry(parent_w, var, width=8):
         vid = id(var)
         if vid in loss_var_ids:
-            e_bg = "#2b1d20"
-            e_rim = "#642b31"
-            e_focus = "#ff5252"
+            e_bg = "#24141a"
+            e_rim = "#632d3b"
+            e_focus = "#f43f5e"
+            e_fg = "#f8e4e7"
         elif vid in green_var_ids:
-            e_bg = "#192d23"
-            e_rim = "#236b45"
-            e_focus = "#00ff9d"
+            e_bg = "#10261e"
+            e_rim = "#266149"
+            e_focus = "#10b981"
+            e_fg = "#e2f7ec"
         else:
-            e_bg = "#2b2b2b"
-            e_rim = "#3e3e3e"
-            e_focus = "#5dade2"
+            e_bg = "#132333"
+            e_rim = "#2e526e"
+            e_focus = "#38bdf8"
+            e_fg = "#e6eef8"
         ent = tk.Entry(
             parent_w,
             textvariable=var,
-            font=("Arial", 11, "bold"),
+            font=("Consolas", 11, "bold"),
             width=width,
             bg=e_bg,
-            fg="#ffffff",
-            disabledbackground="#161616",
-            disabledforeground="#555555",
-            insertbackground="white",
+            fg=e_fg,
+            disabledbackground="#11161e",
+            disabledforeground="#475569",
+            insertbackground="#f1f5f9",
             justify="center",
             bd=0,
             highlightthickness=1,
@@ -6013,10 +7505,10 @@ def show_preflight_window(parent=None, mute_btn=None):
         cb_var2=None,
         tip1=None,
         tip2=None,
-        fg1="#f2f2f2",
-        fg2="#f2f2f2"
+        fg1="#dce4ee",
+        fg2="#dce4ee"
     ):
-        row = tk.Frame(parent_w, bg="#1b1b1b")
+        row = tk.Frame(parent_w, bg="#131922")
         row.pack(fill="x", pady=4)
         row.columnconfigure(0, weight=1, uniform="dual_lbl")
         row.columnconfigure(1, weight=0, minsize=108)
@@ -6024,16 +7516,13 @@ def show_preflight_window(parent=None, mute_btn=None):
         row.columnconfigure(3, weight=0, minsize=84)
 
         if cb_var1 is not None:
-            w1 = tk.Checkbutton(
+            w1 = make_glass_checkbutton(
                 row,
                 text=lbl1,
                 variable=cb_var1,
                 font=("Arial", 10, "bold"),
                 fg=fg1,
-                bg="#1b1b1b",
-                selectcolor="#2a2a2a",
-                activebackground="#1b1b1b",
-                activeforeground=fg1,
+                bg="#131922",
                 anchor="w"
             )
         else:
@@ -6042,7 +7531,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 text=lbl1,
                 font=("Arial", 10, "bold"),
                 fg=fg1,
-                bg="#1b1b1b",
+                bg="#131922",
                 anchor="w"
             )
         w1.grid(row=0, column=0, sticky="w", padx=(0, 8))
@@ -6055,16 +7544,13 @@ def show_preflight_window(parent=None, mute_btn=None):
         w2, e2 = None, None
         if lbl2 and var2 is not None:
             if cb_var2 is not None:
-                w2 = tk.Checkbutton(
+                w2 = make_glass_checkbutton(
                     row,
                     text=lbl2,
                     variable=cb_var2,
                     font=("Arial", 10, "bold"),
                     fg=fg2,
-                    bg="#1b1b1b",
-                    selectcolor="#2a2a2a",
-                    activebackground="#1b1b1b",
-                    activeforeground=fg2,
+                    bg="#131922",
                     anchor="w"
                 )
             else:
@@ -6073,7 +7559,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                     text=lbl2,
                     font=("Arial", 10, "bold"),
                     fg=fg2,
-                    bg="#1b1b1b",
+                    bg="#131922",
                     anchor="w"
                 )
             w2.grid(row=0, column=2, sticky="w", padx=(0, 8))
@@ -6089,26 +7575,22 @@ def show_preflight_window(parent=None, mute_btn=None):
     # ==========================================================
     c1 = make_card(
         left_col,
-        "1. SINGLE-TRADE STOP (Open PnL)",
+        "▶  1. SINGLE-TRADE STOP (Open PnL)",
         "Flattens open Equities on a single trade without ending your day "
         "(Options = Siren Only).",
         accent="#5dade2",
         bar_color="#38bdf8"
     )
 
-    r_open1 = tk.Frame(c1, bg="#1b1b1b")
+    r_open1 = tk.Frame(c1, bg="#131922")
     r_open1.pack(fill="x", pady=4)
-    cb_open_flat = tk.Checkbutton(
+    cb_open_flat = make_glass_checkbutton(
         r_open1,
         text="Enable Open PnL Auto-Flatten (Equities)",
         variable=var_open_flat,
         font=("Arial", 10, "bold"),
-        fg="#ffffff",
-        bg="#1b1b1b",
-        disabledforeground="#555555",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#ffffff",
+        fg="#dce4ee",
+        bg="#131922",
         anchor="w"
     )
     cb_open_flat.pack(side="left")
@@ -6118,8 +7600,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         r_open1,
         text="Max Open Loss ($):",
         font=("Arial", 10, "bold"),
-        fg="#eb7067",
-        bg="#1b1b1b"
+        fg="#dc6d72",
+        bg="#131922"
     )
     lbl_open_loss.pack(side="right", padx=(16, 8))
     open_stop_tip = (
@@ -6134,19 +7616,15 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(lbl_open_loss, open_stop_tip)
     attach_tooltip(ent_open_loss, open_stop_tip)
 
-    r_open2 = tk.Frame(c1, bg="#1b1b1b")
+    r_open2 = tk.Frame(c1, bg="#131922")
     r_open2.pack(fill="x", pady=4)
-    cb_open_cd = tk.Checkbutton(
+    cb_open_cd = make_glass_checkbutton(
         r_open2,
         text="└─ Penalty Box OS Lock After Open Stop",
         variable=var_open_cd,
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
-        bg="#1b1b1b",
-        disabledforeground="#555555",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#ffffff",
+        fg="#c8d4e0",
+        bg="#131922",
         anchor="w"
     )
     cb_open_cd.pack(side="left", padx=(18, 0))
@@ -6156,8 +7634,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         r_open2,
         text="Lock Duration (Mins):",
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
-        bg="#1b1b1b"
+        fg="#97a7b9",
+        bg="#131922"
     )
     lbl_cd_mins.pack(side="right", padx=(16, 8))
     open_cd_tip = (
@@ -6175,25 +7653,21 @@ def show_preflight_window(parent=None, mute_btn=None):
     # --- CARD 2: DAILY STOP ACTIONS (MAX LOSS & PROFIT LOCK) ---
     c2 = make_card(
         left_col,
-        "2. DAILY STOP ACTIONS (Max Loss & Profit Lock)",
+        "▶  2. DAILY STOP ACTIONS (Max Loss & Profit Lock)",
         "Fires when Net PnL hits your active Max Loss or Profit Lock in Rulebook 4 or 5.",
         accent="#f5b041",
         bar_color="#fbbf24"
     )
 
-    r_day_top = tk.Frame(c2, bg="#1b1b1b")
+    r_day_top = tk.Frame(c2, bg="#131922")
     r_day_top.pack(fill="x", pady=3)
-    cb_day_flat = tk.Checkbutton(
+    cb_day_flat = make_glass_checkbutton(
         r_day_top,
         text="Auto-Flatten Equities on Max Loss / Profit Stop",
         variable=var_flatten,
         font=("Arial", 10, "bold"),
-        fg="#ffffff",
-        bg="#1b1b1b",
-        disabledforeground="#555555",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#ffffff",
+        fg="#dce4ee",
+        bg="#131922",
         anchor="w"
     )
     cb_day_flat.pack(side="left")
@@ -6206,16 +7680,15 @@ def show_preflight_window(parent=None, mute_btn=None):
         "• Option contracts are never auto-flattened; if options are open, the siren blares until you close them."
     )
 
-    cb_alarms_only = tk.Checkbutton(
+    cb_alarms_only = make_glass_checkbutton(
         r_day_top,
         text="Alarms Only Mode",
         variable=var_alarms_only,
         font=("Arial", 10, "bold"),
         fg="#f5b041",
-        bg="#1b1b1b",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#ffd166",
+        bg="#131922",
+        accent_hex="#d97706",
+        check_hex="#fbbf24",
         anchor="e"
     )
     cb_alarms_only.pack(side="right")
@@ -6230,40 +7703,32 @@ def show_preflight_window(parent=None, mute_btn=None):
         "• Unchecking this box immediately restores your saved Auto-Flatten and OS Lock checkmarks."
     )
 
-    r_kill = tk.Frame(c2, bg="#1b1b1b")
+    r_kill = tk.Frame(c2, bg="#131922")
     r_kill.pack(fill="x", pady=3)
     lbl_kill = tk.Label(
         r_kill,
         text="Kill Apps (When Flat):",
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
-        bg="#1b1b1b"
+        fg="#97a7b9",
+        bg="#131922"
     )
     lbl_kill.pack(side="left", padx=(0, 10))
-    cb_kill_tos = tk.Checkbutton(
+    cb_kill_tos = make_glass_checkbutton(
         r_kill,
         text="Thinkorswim",
         variable=var_kill_tos,
         font=("Arial", 10, "bold"),
-        fg="#eb7067",
-        bg="#1b1b1b",
-        disabledforeground="#555555",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#eb7067"
+        fg="#dc6d72",
+        bg="#131922"
     )
     cb_kill_tos.pack(side="left", padx=(0, 12))
-    cb_kill_wb = tk.Checkbutton(
+    cb_kill_wb = make_glass_checkbutton(
         r_kill,
         text="Webull Desktop",
         variable=var_kill_wb,
         font=("Arial", 10, "bold"),
-        fg="#eb7067",
-        bg="#1b1b1b",
-        disabledforeground="#555555",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#eb7067"
+        fg="#dc6d72",
+        bg="#131922"
     )
     cb_kill_wb.pack(side="left")
     kill_tip = (
@@ -6276,19 +7741,15 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(cb_kill_tos, kill_tip)
     attach_tooltip(cb_kill_wb, kill_tip)
 
-    r_day_lock = tk.Frame(c2, bg="#1b1b1b")
+    r_day_lock = tk.Frame(c2, bg="#131922")
     r_day_lock.pack(fill="x", pady=3)
-    cb_lock_os = tk.Checkbutton(
+    cb_lock_os = make_glass_checkbutton(
         r_day_lock,
         text="Lock Windows OS on Max Loss / Profit Stop",
         variable=var_lock_os,
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
-        bg="#1b1b1b",
-        disabledforeground="#555555",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#ffffff",
+        fg="#dce4ee",
+        bg="#131922",
         anchor="w"
     )
     cb_lock_os.pack(side="left")
@@ -6298,8 +7759,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         r_day_lock,
         text="Lock Duration (Mins):",
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
-        bg="#1b1b1b"
+        fg="#97a7b9",
+        bg="#131922"
     )
     lbl_daily_lock_mins.pack(side="right", padx=(12, 8))
     day_lock_tip = (
@@ -6314,62 +7775,41 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(lbl_daily_lock_mins, day_lock_tip)
     attach_tooltip(ent_daily_lock_mins, day_lock_tip)
 
-    # --- CARD 3: SESSION & SYSTEM SETTINGS (WITH EXPLICIT BASELINE LABEL) ---
-    c3_core = "#00e676"
+    # --- CARD 3: SESSION & SYSTEM SETTINGS (WITH MULTI-COLOR TELEMETRY STRIP) ---
+    c3_core = "#10b981"
     c3_h0 = tk.Frame(
         left_col,
-        bg=_blend_hex("#121212", c3_core, 0.12),
+        bg="#151d28",
         padx=1,
         pady=1
     )
-    c3_h0.pack(fill="both", expand=True, pady=3)
-    c3_h1 = tk.Frame(
-        c3_h0,
-        bg=_blend_hex("#121212", c3_core, 0.24),
-        padx=1,
-        pady=1
-    )
-    c3_h1.pack(fill="both", expand=True)
-    c3_h2 = tk.Frame(
-        c3_h1,
-        bg=_blend_hex("#1b1b1b", c3_core, 0.38),
-        padx=1,
-        pady=1
-    )
-    c3_h2.pack(fill="both", expand=True)
+    c3_h0.pack(fill="both", expand=True, pady=4)
     c3_outer = tk.Frame(
-        c3_h2,
-        bg="#1b1b1b",
+        c3_h0,
+        bg="#131922",
         bd=0,
         highlightthickness=1,
-        highlightbackground=_blend_hex("#2c2c2c", c3_core, 0.45)
+        highlightbackground="#243040"
     )
     c3_outer.pack(fill="both", expand=True)
     c3_bar = NeonBarCanvas(
-        c3_outer, core_color=c3_core, card_bg="#1b1b1b", glow_on=True
+        c3_outer, core_color=c3_core, card_bg="#131922", glow_on=True
     )
     c3_bar.pack(side="left", fill="y")
-    c3 = tk.Frame(c3_outer, bg="#1b1b1b", padx=12, pady=11)
+    c3 = tk.Frame(c3_outer, bg="#131922", padx=14, pady=11)
     c3.pack(side="left", fill="both", expand=True)
     tk.Label(
         c3,
-        text="3. SESSION & SYSTEM SETTINGS",
+        text="▶  3. SESSION & SYSTEM SETTINGS",
         font=("Arial", 11, "bold"),
-        fg="#58d68d",
-        bg="#1b1b1b",
+        fg="#4ec994",
+        bg="#131922",
         anchor="w"
     ).pack(fill="x")
 
-    base_sub_lbl = tk.Label(
-        c3,
-        text="Checking active broker baseline...",
-        font=("Arial", 9),
-        fg="#aaaaaa",
-        bg="#1b1b1b",
-        anchor="w"
-    )
+    base_sub_lbl = tk.Frame(c3, bg="#131922")
     base_sub_lbl.pack(fill="x", pady=(2, 6))
-    tk.Frame(c3, bg="#2c2c2c", height=1).pack(fill="x", pady=(0, 6))
+    tk.Frame(c3, bg="#222d3d", height=1).pack(fill="x", pady=(0, 6))
     refresh_baseline_preview()
     attach_tooltip(
         base_sub_lbl,
@@ -6377,16 +7817,13 @@ def show_preflight_window(parent=None, mute_btn=None):
         "remaining Schwab 7-day token lifetime, and today's completed Win/Loss trade count."
     )
 
-    cb_reset925 = tk.Checkbutton(
+    cb_reset925 = make_glass_checkbutton(
         c3,
         text="Start Fresh on Rulebook Switch (9:25 AM & 4:00 PM)",
         variable=var_reset925,
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
-        bg="#1b1b1b",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#ffffff",
+        fg="#dce4ee",
+        bg="#131922",
         anchor="w"
     )
     cb_reset925.pack(fill="x", pady=2)
@@ -6397,16 +7834,15 @@ def show_preflight_window(parent=None, mute_btn=None):
         "trigger a tier ratchet or trailing stop. (Your SESSION HIGH column still preserves your full-day peak.)"
     )
 
-    cb_reanchor = tk.Checkbutton(
+    cb_reanchor = make_glass_checkbutton(
         c3,
         text="Re-Zero Today's Starting Baseline to Current Equity",
         variable=var_reanchor,
         font=("Arial", 10, "bold"),
         fg="#f5b041",
-        bg="#1b1b1b",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#f5b041",
+        bg="#131922",
+        accent_hex="#d97706",
+        check_hex="#fbbf24",
         anchor="w"
     )
     cb_reanchor.pack(fill="x", pady=2)
@@ -6418,21 +7854,18 @@ def show_preflight_window(parent=None, mute_btn=None):
         "Useful after a deposit/withdrawal or if starting a fresh afternoon session."
     )
 
-    r_audio = tk.Frame(c3, bg="#1b1b1b")
+    r_audio = tk.Frame(c3, bg="#131922")
     r_audio.pack(fill="x", pady=2)
-    cb_voice = tk.Checkbutton(
+    cb_voice = make_glass_checkbutton(
         r_audio,
         text="Verbal Lockout Voice Cues",
         variable=var_voice_cues,
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
-        bg="#1b1b1b",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#ffffff",
+        fg="#dce4ee",
+        bg="#131922",
         anchor="w"
     )
-    cb_voice.pack(side="left", padx=(0, 12))
+    cb_voice.pack(side="left", padx=(0, 14))
     attach_tooltip(
         cb_voice,
         "Uses Windows Speech Synthesis to speak the lockout reason, duration, and 2s/15s\n"
@@ -6440,16 +7873,13 @@ def show_preflight_window(parent=None, mute_btn=None):
         "plus an announcement every whole minute remaining and at 30 seconds remaining."
     )
 
-    cb_chime = tk.Checkbutton(
+    cb_chime = make_glass_checkbutton(
         r_audio,
         text="Upside Tier Chime & Glow",
         variable=var_upside_chime,
         font=("Arial", 10, "bold"),
-        fg="#58d68d",
-        bg="#1b1b1b",
-        selectcolor="#2a2a2a",
-        activebackground="#1b1b1b",
-        activeforeground="#58d68d",
+        fg="#4ec994",
+        bg="#131922",
         anchor="w"
     )
     cb_chime.pack(side="left")
@@ -6460,35 +7890,55 @@ def show_preflight_window(parent=None, mute_btn=None):
         "and glows the HUD status bar emerald green for 3 seconds."
     )
 
-    r_test_audio = tk.Frame(c3, bg="#1b1b1b")
+    r_test_audio = tk.Frame(c3, bg="#131922")
     r_test_audio.pack(fill="x", pady=(4, 2))
     lbl_preview_audio = tk.Label(
         r_test_audio,
         text="Voice / Cue:",
         font=("Arial", 9, "bold"),
-        fg="#bbbbbb",
-        bg="#1b1b1b",
+        fg="#97a7b9",
+        bg="#131922",
         anchor="w"
     )
-    lbl_preview_audio.pack(side="left", padx=(0, 4))
+    lbl_preview_audio.pack(side="left", padx=(0, 5))
 
     voice_choices = [lbl for lbl, _ in TTS_VOICE_CATALOG]
-    voice_menu = tk.OptionMenu(r_test_audio, var_tts_voice, *voice_choices)
-    voice_menu.config(
+    voice_dropdown = tk.Menu(
+        pf,
+        tearoff=0,
         font=("Arial", 9, "bold"),
-        bg="#2a2a2a",
-        fg="#aed6f1",
+        bg="#18202c",
+        fg="white",
         activebackground="#1f538d",
         activeforeground="white",
-        highlightthickness=0,
-        bd=1,
-        relief="solid",
-        width=12
     )
-    voice_menu["menu"].config(
-        font=("Arial", 9, "bold"), bg="#2a2a2a", fg="white"
+    for v_lbl in voice_choices:
+        voice_dropdown.add_command(
+            label=v_lbl, command=lambda v=v_lbl: var_tts_voice.set(v)
+        )
+    voice_menu = make_stadium_button(
+        r_test_audio,
+        text=var_tts_voice.get(),
+        chevron="▾",
+        chevron_color="#64748b",
+        font=("Arial", 9, "bold"),
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#cbd5e1",
+        canvas_bg="#131922",
+        width=118,
+        height=26,
+        pad_x=20,
+        menu=voice_dropdown,
     )
     voice_menu.pack(side="left", padx=(0, 5))
+    var_tts_voice.trace_add(
+        "write", lambda *_: voice_menu.config(text=var_tts_voice.get())
+    )
     attach_tooltip(
         voice_menu,
         "Choose the Windows Speech voice used for Verbal Lockout Voice Cues:\n"
@@ -6506,22 +7956,42 @@ def show_preflight_window(parent=None, mute_btn=None):
         "Voice: 30s Warning",
         "Unlock Chime (3-Tone)",
     ]
-    audio_menu = tk.OptionMenu(r_test_audio, var_audio_test, *audio_choices)
-    audio_menu.config(
+    audio_dropdown = tk.Menu(
+        pf,
+        tearoff=0,
         font=("Arial", 9, "bold"),
-        bg="#2a2a2a",
+        bg="#18202c",
         fg="white",
         activebackground="#1f538d",
         activeforeground="white",
-        highlightthickness=0,
-        bd=1,
-        relief="solid",
-        width=26
     )
-    audio_menu["menu"].config(
-        font=("Arial", 9, "bold"), bg="#2a2a2a", fg="white"
+    for a_lbl in audio_choices:
+        audio_dropdown.add_command(
+            label=a_lbl, command=lambda a=a_lbl: var_audio_test.set(a)
+        )
+    audio_menu = make_stadium_button(
+        r_test_audio,
+        text=var_audio_test.get(),
+        chevron="▾",
+        chevron_color="#64748b",
+        font=("Arial", 9, "bold"),
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#cbd5e1",
+        canvas_bg="#131922",
+        width=216,
+        height=26,
+        pad_x=22,
+        menu=audio_dropdown,
     )
-    audio_menu.pack(side="left", padx=(0, 5))
+    audio_menu.pack(side="left", padx=(0, 6))
+    var_audio_test.trace_add(
+        "write", lambda *_: audio_menu.config(text=var_audio_test.get())
+    )
 
     def play_selected_test_audio():
         choice = var_audio_test.get()
@@ -6564,15 +8034,22 @@ def show_preflight_window(parent=None, mute_btn=None):
         elif choice == "Unlock Chime (3-Tone)":
             threading.Thread(target=play_unlock_chimes, daemon=True).start()
 
-    btn_test_audio = tk.Button(
+    btn_test_audio = make_stadium_button(
         r_test_audio,
         text="🔊 Test",
         font=("Arial", 9, "bold"),
-        bg="#2c3e50",
-        fg="#aed6f1",
-        padx=8,
-        pady=2,
-        command=play_selected_test_audio
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#dce4ee",
+        canvas_bg="#131922",
+        width=74,
+        height=26,
+        pad_x=16,
+        command=play_selected_test_audio,
     )
     btn_test_audio.pack(side="left")
     audio_test_tip = (
@@ -6583,14 +8060,14 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(audio_menu, audio_test_tip)
     attach_tooltip(btn_test_audio, audio_test_tip)
 
-    r_poll = tk.Frame(c3, bg="#1b1b1b")
+    r_poll = tk.Frame(c3, bg="#131922")
     r_poll.pack(fill="x", pady=(4, 2))
     lbl_poll = tk.Label(
         r_poll,
         text="Broker API Poll Interval (Seconds):",
         font=("Arial", 10, "bold"),
-        fg="#f2f2f2",
-        bg="#1b1b1b",
+        fg="#97a7b9",
+        bg="#131922",
         anchor="w"
     )
     lbl_poll.pack(side="left", padx=(0, 10))
@@ -6608,11 +8085,11 @@ def show_preflight_window(parent=None, mute_btn=None):
     # ==========================================================
     c4, c4_halos, c4_bar, c4_title_lbl, c4_badge_pill = make_card(
         right_col,
-        "4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)",
+        "▶  4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)",
         "Active before 9:25 AM and after 4:00 PM ET. Hitting your Max Loss "
         "or Profit Lock triggers Card 2.",
         accent="#5dade2",
-        bar_color="#00ff9d",
+        bar_color="#10b981",
         return_parts=True
     )
 
@@ -6641,7 +8118,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         dollar_vars["pm_max_loss"],
         None,
         None,
-        fg1="#eb7067",
+        fg1="#dc6d72",
         tip1=(
             "Extended-Hours Starting Max Loss:\n"
             "Your initial worst-case Extended-Hours loss limit before Profit Lock is triggered.\n"
@@ -6650,7 +8127,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             "Kill Apps, and Windows OS Lock for the duration set in Card 2)."
         )
     )
-    tk.Frame(c4, bg="#2c2c2c", height=1).pack(fill="x", pady=7)
+    tk.Frame(c4, bg="#222d3d", height=1).pack(fill="x", pady=7)
     cb_pm_lock, ent_pm_trig, lbl_pm_trail, ent_pm_trail = make_dual_field_row(
         c4,
         "Profit Lock Trigger ($):",
@@ -6658,8 +8135,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         "Trail Peak By ($):",
         dollar_vars["pm_trail_cushion"],
         cb_var1=var_pm_lock_on,
-        fg1="#58d68d",
-        fg2="#f2f2f2",
+        fg1="#4ec994",
+        fg2="#97a7b9",
         tip1=(
             "Extended-Hours Trailing Profit Lock:\n"
             "Once your closed Extended-Hours Realized PnL reaches +Profit Lock Trigger ($),\n"
@@ -6681,7 +8158,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     c5, c5_halos, c5_bar, c5_title_lbl, c5_badge_pill = make_card(
         right_col,
-        "5. REGULAR HOURS RULEBOOK (9:25 AM – 4:00 PM)",
+        "▶  5. REGULAR HOURS RULEBOOK (9:25 AM – 4:00 PM)",
         "Starts at Base Tier 1 and ratchets your stop upward "
         "as realized profit grows. Hitting your stop triggers Card 2.",
         accent="#5dade2",
@@ -6691,23 +8168,19 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
 
     def _apply_rulebook_aura(halos, bar_cv, title_w, badge_w, is_active):
-        h0, h1, h2, outer_w = halos
+        h0, outer_w = halos
         if is_active:
-            h0.config(bg="#0f291e", padx=2, pady=2)
-            h1.config(bg="#0e5235", padx=2, pady=2)
-            h2.config(bg="#08a05c", padx=1, pady=1)
-            outer_w.config(highlightbackground="#00ff9d", highlightthickness=2)
-            bar_cv.set_neon("#00ff9d", glow_on=True)
-            title_w.config(fg="#00e676")
+            h0.config(bg="#132e24", padx=1, pady=1)
+            outer_w.config(highlightbackground="#1f5c43", highlightthickness=1)
+            bar_cv.set_neon("#00e676", glow_on=True)
+            title_w.config(fg="#4ade80")
             if badge_w is not None:
                 badge_w.set_active(True)
         else:
-            h0.config(bg="#121212", padx=2, pady=2)
-            h1.config(bg="#121212", padx=2, pady=2)
-            h2.config(bg="#121212", padx=1, pady=1)
-            outer_w.config(highlightbackground="#2a2a2a", highlightthickness=1)
-            bar_cv.set_neon("#34495e", glow_on=False)
-            title_w.config(fg="#7f8c8d")
+            h0.config(bg="#151d28", padx=1, pady=1)
+            outer_w.config(highlightbackground="#243040", highlightthickness=1)
+            bar_cv.set_neon("#334459", glow_on=False)
+            title_w.config(fg="#7f8fa3")
             if badge_w is not None:
                 badge_w.set_active(False)
 
@@ -6741,8 +8214,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         c5,
         text="BASE TIER 1 — Starting Daily Stop",
         font=("Arial", 10, "bold"),
-        fg="#aed6f1",
-        bg="#1b1b1b",
+        fg="#8ec5fc",
+        bg="#131922",
         anchor="w"
     ).pack(fill="x", pady=(2, 4))
 
@@ -6771,7 +8244,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         dollar_vars["t1_max_loss"],
         None,
         None,
-        fg1="#eb7067",
+        fg1="#dc6d72",
         tip1=(
             "RTH Base Tier 1 — Starting Max Loss:\n"
             "Your initial worst-case RTH loss limit before any profit ratchet tiers are unlocked.\n"
@@ -6780,9 +8253,9 @@ def show_preflight_window(parent=None, mute_btn=None):
         )
     )
 
-    tk.Frame(c5, bg="#2c2c2c", height=1).pack(fill="x", pady=8)
+    tk.Frame(c5, bg="#222d3d", height=1).pack(fill="x", pady=8)
 
-    tbl = tk.Frame(c5, bg="#1b1b1b")
+    tbl = tk.Frame(c5, bg="#131922")
     tbl.pack(fill="x")
     tbl.columnconfigure(0, weight=2)
     tbl.columnconfigure(1, weight=1)
@@ -6792,23 +8265,23 @@ def show_preflight_window(parent=None, mute_btn=None):
         tbl,
         text="PROFIT RATCHET TIERS (Raises Daily Stop)",
         font=("Arial", 10, "bold"),
-        fg="#aed6f1",
-        bg="#1b1b1b",
+        fg="#8ec5fc",
+        bg="#131922",
         anchor="w"
     ).grid(row=0, column=0, sticky="w", pady=(0, 6))
     tk.Label(
         tbl,
         text="TRIGGER ($)",
-        font=("Arial", 9, "bold"),
-        fg="#aaaaaa",
-        bg="#1b1b1b"
+        font=("Arial", 8, "bold"),
+        fg="#8b9bb0",
+        bg="#131922"
     ).grid(row=0, column=1, pady=(0, 6))
     tk.Label(
         tbl,
         text="NEW DAILY STOP",
-        font=("Arial", 9, "bold"),
-        fg="#aaaaaa",
-        bg="#1b1b1b"
+        font=("Arial", 8, "bold"),
+        fg="#8b9bb0",
+        bg="#131922"
     ).grid(row=0, column=2, sticky="e", pady=(0, 6))
 
     tier_rows = [
@@ -6818,7 +8291,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             dollar_vars["t2_trigger"],
             "Stop Level ($):",
             dollar_vars["t2_max_loss"],
-            "#f2f2f2",
+            "#dce4ee",
             (
                 "RTH Tier 2 — Fixed Daily Stop Ratchet:\n"
                 "Once your closed Realized PnL reaches 'Trigger ($)', your active Daily Stop\n"
@@ -6835,7 +8308,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             dollar_vars["t3_trigger"],
             "Stop Level ($):",
             dollar_vars["t3_max_loss"],
-            "#f2f2f2",
+            "#dce4ee",
             (
                 "RTH Tier 3 — Fixed Daily Stop Ratchet:\n"
                 "Once your closed Realized PnL reaches 'Trigger ($)', your active Daily Stop\n"
@@ -6852,7 +8325,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             dollar_vars["t4_trigger"],
             "Trail Peak By ($):",
             dollar_vars["t4_trail"],
-            "#58d68d",
+            "#4ec994",
             (
                 "RTH Tier 4 — Dynamic Trailing Profit Stop:\n"
                 "Once your closed Realized PnL reaches 'Trigger ($)', your active Daily Stop\n"
@@ -6871,16 +8344,13 @@ def show_preflight_window(parent=None, mute_btn=None):
     for idx, (
         t_name, t_cb_var, trig_var, fl_lbl, fl_var, cb_fg_col, t_tip
     ) in enumerate(tier_rows, start=1):
-        cb_t = tk.Checkbutton(
+        cb_t = make_glass_checkbutton(
             tbl,
             text=t_name,
             variable=t_cb_var,
             font=("Arial", 10, "bold"),
             fg=cb_fg_col,
-            bg="#1b1b1b",
-            selectcolor="#2a2a2a",
-            activebackground="#1b1b1b",
-            activeforeground=cb_fg_col,
+            bg="#131922",
             anchor="w"
         )
         cb_t.grid(row=idx, column=0, sticky="w", pady=4)
@@ -6888,14 +8358,14 @@ def show_preflight_window(parent=None, mute_btn=None):
         ent_trig = make_entry(tbl, trig_var, width=8)
         ent_trig.grid(row=idx, column=1, padx=8, pady=4)
 
-        fl_cell = tk.Frame(tbl, bg="#1b1b1b")
+        fl_cell = tk.Frame(tbl, bg="#131922")
         fl_cell.grid(row=idx, column=2, pady=4, sticky="e")
         lbl_fl = tk.Label(
             fl_cell,
             text=fl_lbl,
-            font=("Arial", 9, "bold"),
-            fg="#bbbbbb",
-            bg="#1b1b1b"
+            font=("Arial", 10, "bold"),
+            fg="#97a7b9",
+            bg="#131922"
         )
         lbl_fl.pack(side="left", padx=(0, 6))
         ent_fl = make_entry(fl_cell, fl_var, width=8)
@@ -6914,82 +8384,82 @@ def show_preflight_window(parent=None, mute_btn=None):
         if var_alarms_only.get():
             cb_open_flat.config(state="disabled")
             ent_open_loss.config(state="disabled")
-            lbl_open_loss.config(fg="#555555")
+            lbl_open_loss.config(fg="#526070")
             cb_open_cd.config(state="disabled")
             ent_cd_mins.config(state="disabled")
-            lbl_cd_mins.config(fg="#555555")
+            lbl_cd_mins.config(fg="#526070")
 
             cb_day_flat.config(state="disabled")
-            lbl_kill.config(fg="#555555")
+            lbl_kill.config(fg="#526070")
             cb_kill_tos.config(state="disabled")
             cb_kill_wb.config(state="disabled")
             cb_lock_os.config(state="disabled")
             ent_daily_lock_mins.config(state="disabled")
-            lbl_daily_lock_mins.config(fg="#555555")
+            lbl_daily_lock_mins.config(fg="#526070")
         else:
             cb_open_flat.config(state="normal")
             if var_open_flat.get():
                 ent_open_loss.config(state="normal")
-                lbl_open_loss.config(fg="#eb7067")
+                lbl_open_loss.config(fg="#dc6d72")
                 cb_open_cd.config(state="normal")
                 if var_open_cd.get():
                     ent_cd_mins.config(state="normal")
-                    lbl_cd_mins.config(fg="#f2f2f2")
+                    lbl_cd_mins.config(fg="#97a7b9")
                 else:
                     ent_cd_mins.config(state="disabled")
-                    lbl_cd_mins.config(fg="#555555")
+                    lbl_cd_mins.config(fg="#526070")
             else:
                 ent_open_loss.config(state="disabled")
-                lbl_open_loss.config(fg="#555555")
+                lbl_open_loss.config(fg="#526070")
                 cb_open_cd.config(state="disabled")
                 ent_cd_mins.config(state="disabled")
-                lbl_cd_mins.config(fg="#555555")
+                lbl_cd_mins.config(fg="#526070")
 
             cb_day_flat.config(state="normal")
-            lbl_kill.config(fg="#f2f2f2")
+            lbl_kill.config(fg="#97a7b9")
             cb_kill_tos.config(state="normal")
             cb_kill_wb.config(state="normal")
             cb_lock_os.config(state="normal")
             if var_lock_os.get():
                 ent_daily_lock_mins.config(state="normal")
-                lbl_daily_lock_mins.config(fg="#f2f2f2")
+                lbl_daily_lock_mins.config(fg="#97a7b9")
             else:
                 ent_daily_lock_mins.config(state="disabled")
-                lbl_daily_lock_mins.config(fg="#555555")
+                lbl_daily_lock_mins.config(fg="#526070")
 
         # Card 4: Pre-Market Warning Alarms & Profit Lock
         ent_pm_w1.config(state="normal" if var_pm_w1_on.get() else "disabled")
-        cb_pm_w1.config(fg="#f2f2f2" if var_pm_w1_on.get() else "#666666")
+        cb_pm_w1.config(fg="#dce4ee" if var_pm_w1_on.get() else "#526070")
         ent_pm_w2.config(state="normal" if var_pm_w2_on.get() else "disabled")
-        cb_pm_w2.config(fg="#f2f2f2" if var_pm_w2_on.get() else "#666666")
+        cb_pm_w2.config(fg="#dce4ee" if var_pm_w2_on.get() else "#526070")
         if var_pm_lock_on.get():
-            cb_pm_lock.config(fg="#58d68d")
+            cb_pm_lock.config(fg="#4ec994")
             ent_pm_trig.config(state="normal")
-            lbl_pm_trail.config(fg="#f2f2f2")
+            lbl_pm_trail.config(fg="#97a7b9")
             ent_pm_trail.config(state="normal")
         else:
-            cb_pm_lock.config(fg="#666666")
+            cb_pm_lock.config(fg="#526070")
             ent_pm_trig.config(state="disabled")
-            lbl_pm_trail.config(fg="#555555")
+            lbl_pm_trail.config(fg="#526070")
             ent_pm_trail.config(state="disabled")
 
         # Card 5: RTH Tier 1 Warning Alarms & Profit Ratchet Tiers 2-4
         ent_t1_w1.config(state="normal" if var_t1_w1_on.get() else "disabled")
-        cb_t1_w1.config(fg="#f2f2f2" if var_t1_w1_on.get() else "#666666")
+        cb_t1_w1.config(fg="#dce4ee" if var_t1_w1_on.get() else "#526070")
         ent_t1_w2.config(state="normal" if var_t1_w2_on.get() else "disabled")
-        cb_t1_w2.config(fg="#f2f2f2" if var_t1_w2_on.get() else "#666666")
+        cb_t1_w2.config(fg="#dce4ee" if var_t1_w2_on.get() else "#526070")
         for (
             t_cb_var, cb_t, ent_trig, lbl_fl, ent_fl, cb_fg_col
         ) in tier_widget_refs:
             if t_cb_var.get():
                 cb_t.config(fg=cb_fg_col)
                 ent_trig.config(state="normal")
-                lbl_fl.config(fg="#bbbbbb")
+                lbl_fl.config(fg="#97a7b9")
                 ent_fl.config(state="normal")
             else:
-                cb_t.config(fg="#666666")
+                cb_t.config(fg="#526070")
                 ent_trig.config(state="disabled")
-                lbl_fl.config(fg="#555555")
+                lbl_fl.config(fg="#526070")
                 ent_fl.config(state="disabled")
 
     for trace_var in (
@@ -7001,19 +8471,26 @@ def show_preflight_window(parent=None, mute_btn=None):
         trace_var.trace_add("write", refresh_smart_dimming)
     refresh_smart_dimming()
 
-    # --- BOTTOM ACTION BAR ---
-    btn_frame = tk.Frame(pf, bg="#121212")
+    # --- BOTTOM ACTION BAR (GLASSMORPHIC STADIUMS) ---
+    btn_frame = tk.Frame(pf, bg="#0d1117")
     btn_frame.pack(fill="x", pady=(10, 2))
 
-    btn_restore_def = tk.Button(
+    btn_restore_def = make_stadium_button(
         btn_frame,
         text="Restore Defaults",
         font=("Arial", 10, "bold"),
-        bg="#333333",
-        fg="white",
-        padx=16,
-        pady=7,
-        command=restore_factory_defaults
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#e2e8f0",
+        canvas_bg="#0d1117",
+        width=148,
+        height=38,
+        pad_x=30,
+        command=restore_factory_defaults,
     )
     btn_restore_def.pack(side="left")
     attach_tooltip(
@@ -7022,15 +8499,22 @@ def show_preflight_window(parent=None, mute_btn=None):
         "back to your saved Default settings (or Factory Defaults if none saved yet)."
     )
 
-    btn_save_def = tk.Button(
+    btn_save_def = make_stadium_button(
         btn_frame,
         text="Save as Default",
         font=("Arial", 10, "bold"),
-        bg="#2c3e50",
-        fg="#aed6f1",
-        padx=16,
-        pady=7,
-        command=save_as_user_defaults
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#cbd5e1",
+        canvas_bg="#0d1117",
+        width=148,
+        height=38,
+        pad_x=30,
+        command=save_as_user_defaults,
     )
     btn_save_def.pack(side="left", padx=(10, 14))
     attach_tooltip(
@@ -7048,38 +8532,46 @@ def show_preflight_window(parent=None, mute_btn=None):
         btn_frame,
         text=init_def_txt,
         font=("Arial", 9, "bold"),
-        fg="#888888",
-        bg="#121212",
+        fg="#8b9bb0",
+        bg="#0d1117",
         anchor="w"
     )
     default_status_lbl.pack(side="left")
 
     launch_txt = (
-        "SAVE & LAUNCH ENFORCER >>"
-        if parent is None else "SAVE & APPLY CHANGES >>"
+        "🚀 SAVE & LAUNCH ENFORCER >>"
+        if parent is None else "🚀 SAVE & APPLY CHANGES >>"
     )
-    tk.Button(
+    btn_launch = make_stadium_button(
         btn_frame,
         text=launch_txt,
         font=("Arial", 10, "bold"),
-        bg="#1e8449",
-        fg="white",
-        padx=24,
-        pady=7,
-        command=save_and_launch
-    ).pack(side="right")
+        fill_color="#0d3b20",
+        fill_top_color="#14532d",
+        border_color="#10b981",
+        hover_fill="#114b29",
+        hover_fill_top="#196638",
+        hover_border="#34d399",
+        fg="#ffffff",
+        canvas_bg="#0d1117",
+        width=268,
+        height=38,
+        pad_x=36,
+        command=save_and_launch,
+    )
+    btn_launch.pack(side="right")
 
-    ver_outer = tk.Frame(pf, bg="#121212")
+    ver_outer = tk.Frame(pf, bg="#0d1117")
     ver_outer.pack(fill="x", pady=(4, 0))
-    ver_frame = tk.Frame(ver_outer, bg="#121212")
+    ver_frame = tk.Frame(ver_outer, bg="#0d1117")
     ver_frame.pack(anchor="center")
 
     tk.Label(
         ver_frame,
         text=f"Version v{APP_VERSION}   ·",
         font=("Arial", 9, "bold"),
-        fg="#777777",
-        bg="#121212",
+        fg="#64748b",
+        bg="#0d1117",
     ).pack(side="left", padx=(0, 6))
 
     rel_notes_lbl = tk.Label(
@@ -7087,7 +8579,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         text="View Release Notes",
         font=("Arial", 9, "bold underline"),
         fg="#5dade2",
-        bg="#121212",
+        bg="#0d1117",
         cursor="hand2",
     )
     rel_notes_lbl.pack(side="left")
@@ -7316,17 +8808,39 @@ def update_gui(
 
     if is_flat:
         settings_btn.config(
-            text="⚙ SETTINGS", bg="#1f538d", fg="white", state="normal"
+            text="⚙ SETTINGS",
+            fill_color="#141922",
+            fill_top_color="#1c2430",
+            border_color="#2e3d4f",
+            fg="#e2e8f0",
+            state="normal",
         )
         close_btn.config(
-            text="✕", bg="#922b21", fg="white", state="normal"
+            text="✕",
+            fill_color="#180f13",
+            fill_top_color="#24161c",
+            border_color="#5c2836",
+            fg="#fda4af",
+            state="normal",
         )
     else:
         settings_btn.config(
-            text="🔒 IN TRADE", bg="#444444", fg="#888888", state="disabled"
+            text="🔒 IN TRADE",
+            fill_color="#1e2228",
+            fill_top_color="#262a30",
+            border_color="#6b5b3e",
+            fg="#9ca3af",
+            disabledforeground="#9ca3af",
+            state="disabled",
         )
         close_btn.config(
-            text="🔒", bg="#444444", fg="#888888", state="disabled"
+            text="🔒",
+            fill_color="#1e2228",
+            fill_top_color="#262a30",
+            border_color="#4b5563",
+            fg="#9ca3af",
+            disabledforeground="#9ca3af",
+            state="disabled",
         )
 
     if not settings_win_open and ui_labels:
@@ -7420,27 +8934,46 @@ def start_gui():
     )
     mute_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
-    close_btn = tk.Button(
+    close_btn = make_stadium_button(
         bottom_bar,
         text="✕",
-        font=("Arial", 8, "bold"),
-        bg="#922b21",
-        fg="white",
-        padx=8,
-        command=close_app
+        font=("Arial", 9, "bold"),
+        fill_color="#180f13",
+        fill_top_color="#24161c",
+        border_color="#5c2836",
+        hover_fill="#28161e",
+        hover_fill_top="#361e29",
+        hover_border="#f43f5e",
+        fg="#fda4af",
+        hover_fg="#ffffff",
+        canvas_bg="#1a1a1a",
+        width=30,
+        height=24,
+        auto_width=False,
+        command=close_app,
     )
-    close_btn.pack(side="right")
+    close_btn.pack(side="right", padx=(2, 2))
 
-    settings_btn = tk.Button(
+    settings_btn = make_stadium_button(
         bottom_bar,
         text="⚙ SETTINGS",
         font=("Arial", 8, "bold"),
-        bg="#1f538d",
-        fg="white",
-        padx=10,
-        command=lambda: show_preflight_window(parent=root, mute_btn=mute_btn)
+        fill_color="#141922",
+        fill_top_color="#1c2430",
+        border_color="#2e3d4f",
+        hover_fill="#1b2432",
+        hover_fill_top="#253142",
+        hover_border="#38bdf8",
+        fg="#e2e8f0",
+        hover_fg="#ffffff",
+        canvas_bg="#1a1a1a",
+        width=102,
+        height=24,
+        auto_width=True,
+        pad_x=22,
+        command=lambda: show_preflight_window(parent=root, mute_btn=mute_btn),
     )
-    settings_btn.pack(side="right")
+    settings_btn.pack(side="right", padx=(0, 2))
 
     threading.Thread(
         target=data_loop,
@@ -7517,44 +9050,44 @@ def _insert_formatted_changelog(txt_box, markdown_text):
     """Renders Markdown release notes into a tk.Text widget with rich typography,
     comfortable line spacing, hanging bullet indents, and color-coded highlights."""
     txt_box.config(
-        font=("Segoe UI", 10),
+        font=("Arial", 10),
         fg="#e5e8e8",
-        bg="#141414",
+        bg="#0e131a",
         padx=16,
         pady=12,
     )
     txt_box.tag_configure(
         "doc_title",
-        font=("Segoe UI", 13, "bold"),
+        font=("Arial", 13, "bold"),
         foreground="#ffffff",
         spacing1=2,
         spacing3=4,
     )
     txt_box.tag_configure(
         "doc_sub",
-        font=("Segoe UI", 10),
-        foreground="#99a3a4",
+        font=("Arial", 10),
+        foreground="#94a3b8",
         spacing1=0,
         spacing3=8,
     )
     txt_box.tag_configure(
         "ver_hdr",
-        font=("Segoe UI", 12, "bold"),
+        font=("Arial", 11, "bold"),
         foreground="#00e676",
-        background="#182b22",
+        background="#142b23",
         spacing1=10,
         spacing3=6,
     )
     txt_box.tag_configure(
         "sec_hdr",
-        font=("Segoe UI", 10, "bold"),
-        foreground="#5dade2",
+        font=("Arial", 10, "bold"),
+        foreground="#38bdf8",
         spacing1=6,
         spacing3=3,
     )
     txt_box.tag_configure(
         "bullet_1",
-        font=("Segoe UI", 10),
+        font=("Arial", 10),
         foreground="#e5e8e8",
         lmargin1=8,
         lmargin2=24,
@@ -7564,7 +9097,7 @@ def _insert_formatted_changelog(txt_box, markdown_text):
     )
     txt_box.tag_configure(
         "bullet_2",
-        font=("Segoe UI", 10),
+        font=("Arial", 10),
         foreground="#d0d7de",
         lmargin1=28,
         lmargin2=44,
@@ -7574,7 +9107,7 @@ def _insert_formatted_changelog(txt_box, markdown_text):
     )
     txt_box.tag_configure(
         "body_line",
-        font=("Segoe UI", 10),
+        font=("Arial", 10),
         foreground="#e5e8e8",
         spacing1=3,
         spacing2=2,
@@ -7582,28 +9115,28 @@ def _insert_formatted_changelog(txt_box, markdown_text):
     )
     txt_box.tag_configure(
         "bold_lead",
-        font=("Segoe UI", 10, "bold"),
+        font=("Arial", 10, "bold"),
         foreground="#ffd166",
     )
     txt_box.tag_configure(
         "bold_inline",
-        font=("Segoe UI", 10, "bold"),
+        font=("Arial", 10, "bold"),
         foreground="#ffffff",
     )
     txt_box.tag_configure(
         "code_span",
         font=("Consolas", 10, "bold"),
-        foreground="#76d7ea",
+        foreground="#7dd3fc",
     )
     txt_box.tag_configure(
         "italic_span",
-        font=("Segoe UI", 10, "italic"),
+        font=("Arial", 10, "italic"),
         foreground="#a3e4d7",
     )
     txt_box.tag_configure(
         "hr_div",
-        font=("Segoe UI", 7),
-        foreground="#2c3e50",
+        font=("Arial", 7),
+        foreground="#243040",
         spacing1=6,
         spacing3=4,
     )
@@ -7659,38 +9192,48 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
     decision = {"install": False}
     try:
         win = tk.Tk()
+        if os.path.exists(ICON_PATH):
+            try:
+                win.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
         win.title(f"PnL Enforcer Beta — Update Available (v{new_ver})")
-        win.config(bg="#121212", padx=24, pady=18)
+        win.config(bg="#0d1117", padx=24, pady=18)
         win.resizable(False, False)
         win.attributes("-topmost", True)
 
-        w, h = 700, 460
+        w, h = 720, 480
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
         x = max(20, (sw - w) // 2)
         y = max(20, (sh - h) // 2)
         win.geometry(f"{w}x{h}+{x}+{y}")
 
-        hdr_row = tk.Frame(win, bg="#121212")
+        hdr_row = tk.Frame(win, bg="#0d1117")
         hdr_row.pack(fill="x")
 
         tk.Label(
             hdr_row,
             text=f"🚀 UPDATE AVAILABLE:  v{curr_ver}  ➔  v{new_ver}",
             font=("Arial", 13, "bold"),
-            fg="#58d68d",
-            bg="#121212",
+            fg="#00e676",
+            bg="#0d1117",
             anchor="w",
         ).pack(side="left")
 
-        tk.Button(
+        make_stadium_button(
             hdr_row,
             text="Open Full Changelog ↗",
             font=("Arial", 9, "bold"),
-            bg="#2c3e50",
-            fg="#aed6f1",
-            padx=10,
-            pady=3,
+            fill_color="#132235",
+            border_color="#2b6cb0",
+            hover_fill="#1c3452",
+            hover_border="#63b3ed",
+            fg="#e0f2fe",
+            hover_fg="#ffffff",
+            canvas_bg="#0d1117",
+            height=30,
+            pad_x=22,
             command=lambda: webbrowser.open(CHANGELOG_WEB_URL),
         ).pack(side="right")
 
@@ -7701,14 +9244,14 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
                 "broker API tokens are 100% preserved."
             ),
             font=("Arial", 9),
-            fg="#aaaaaa",
-            bg="#121212",
+            fg="#94a3b8",
+            bg="#0d1117",
             anchor="w",
         ).pack(fill="x", pady=(4, 10))
 
         # Pack bottom button bar BEFORE the expandable changelog card so
         # Tkinter always reserves space for the buttons at the bottom.
-        btn_bar = tk.Frame(win, bg="#121212", pady=12)
+        btn_bar = tk.Frame(win, bg="#0d1117", pady=12)
         btn_bar.pack(fill="x", side="bottom")
 
         def on_skip():
@@ -7719,43 +9262,71 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
             decision["install"] = True
             win.destroy()
 
-        tk.Button(
+        make_stadium_button(
             btn_bar,
             text=f"Skip for Now (Keep v{curr_ver})",
             font=("Arial", 10, "bold"),
-            bg="#333333",
-            fg="#cccccc",
-            padx=16,
-            pady=7,
+            fill_color="#181e26",
+            border_color="#4a5568",
+            hover_fill="#232c38",
+            hover_border="#718096",
+            fg="#d1d5db",
+            hover_fg="#ffffff",
+            canvas_bg="#0d1117",
+            height=34,
+            pad_x=26,
             command=on_skip,
         ).pack(side="left")
 
-        tk.Button(
+        make_stadium_button(
             btn_bar,
-            text=f"Install v{new_ver} & Launch >>",
+            text=f"🚀 Install v{new_ver} & Launch >>",
             font=("Arial", 10, "bold"),
-            bg="#1e8449",
-            fg="white",
-            padx=22,
-            pady=7,
+            fill_color="#0f6b3c",
+            border_color="#00e676",
+            hover_fill="#15854b",
+            hover_border="#69f0ae",
+            glow_color="#00e676",
+            glow_strength=0.68,
+            fg="#ffffff",
+            hover_fg="#ffffff",
+            canvas_bg="#0d1117",
+            height=36,
+            pad_x=30,
             command=on_install,
         ).pack(side="right")
 
-        card = tk.Frame(
-            win, bg="#1b1b1b", bd=1, relief="solid", padx=12, pady=10
+        card_outer = tk.Frame(
+            win,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
         )
-        card.pack(fill="both", expand=True)
+        card_outer.pack(fill="both", expand=True)
+        accent_bar = NeonBarCanvas(
+            card_outer, core_color="#00e676", card_bg="#131922", glow_on=True
+        )
+        accent_bar.pack(side="left", fill="y")
+        card = tk.Frame(card_outer, bg="#131922", padx=12, pady=10)
+        card.pack(side="left", fill="both", expand=True)
 
         tk.Label(
             card,
-            text=f"WHAT'S NEW IN v{new_ver} (CHANGELOG):",
+            text=f"▶ WHAT'S NEW IN v{new_ver} (CHANGELOG):",
             font=("Arial", 9, "bold"),
-            fg="#5dade2",
-            bg="#1b1b1b",
+            fg="#38bdf8",
+            bg="#131922",
             anchor="w",
         ).pack(fill="x", pady=(0, 6))
 
-        txt_frame = tk.Frame(card, bg="#141414")
+        txt_frame = tk.Frame(
+            card,
+            bg="#0e131a",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#1e293b",
+        )
         txt_frame.pack(fill="both", expand=True)
 
         sb = tk.Scrollbar(txt_frame)
@@ -7764,7 +9335,7 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
         txt_box = tk.Text(
             txt_frame,
             height=12,
-            bg="#141414",
+            bg="#0e131a",
             fg="#e5e8e8",
             font=("Consolas", 9),
             wrap="word",
@@ -7830,60 +9401,86 @@ def show_release_notes_dialog(parent=None):
             pass
 
     win.title(f"PnL Enforcer Beta — Release Notes (v{APP_VERSION})")
-    win.config(bg="#121212", padx=24, pady=18)
+    win.config(bg="#0d1117", padx=24, pady=18)
     win.resizable(True, True)
     win.attributes("-topmost", True)
 
-    w, h = 780, 560
+    w, h = 790, 570
     sw = win.winfo_screenwidth()
     sh = win.winfo_screenheight()
     x = max(20, (sw - w) // 2)
     y = max(20, (sh - h) // 2)
     win.geometry(f"{w}x{h}+{x}+{y}")
 
-    hdr_row = tk.Frame(win, bg="#121212")
+    hdr_row = tk.Frame(win, bg="#0d1117")
     hdr_row.pack(fill="x", pady=(0, 10))
 
     tk.Label(
         hdr_row,
-        text=f"📋 RELEASE NOTES & CHANGELOG  (Current: v{APP_VERSION})",
+        text=f"▶ 📋 RELEASE NOTES & CHANGELOG  (Current: v{APP_VERSION})",
         font=("Arial", 12, "bold"),
-        fg="#5dade2",
-        bg="#121212",
+        fg="#38bdf8",
+        bg="#0d1117",
         anchor="w",
     ).pack(side="left")
 
-    tk.Button(
+    make_stadium_button(
         hdr_row,
         text="Open Full Changelog on Web ↗",
         font=("Arial", 9, "bold"),
-        bg="#2c3e50",
-        fg="#aed6f1",
-        padx=10,
-        pady=3,
+        fill_color="#132235",
+        border_color="#2b6cb0",
+        hover_fill="#1c3452",
+        hover_border="#63b3ed",
+        fg="#e0f2fe",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=30,
+        pad_x=22,
         command=lambda: webbrowser.open(CHANGELOG_WEB_URL),
     ).pack(side="right")
 
-    btn_bar = tk.Frame(win, bg="#121212", pady=10)
+    btn_bar = tk.Frame(win, bg="#0d1117", pady=10)
     btn_bar.pack(fill="x", side="bottom")
 
-    tk.Button(
+    make_stadium_button(
         btn_bar,
         text="Close",
         font=("Arial", 10, "bold"),
-        bg="#333333",
-        fg="white",
-        padx=22,
-        pady=6,
+        fill_color="#181e26",
+        border_color="#4a5568",
+        hover_fill="#232c38",
+        hover_border="#718096",
+        fg="#e2e8f0",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=34,
+        pad_x=32,
         command=win.destroy,
     ).pack(side="right")
 
-    card = tk.Frame(
-        win, bg="#1b1b1b", bd=1, relief="solid", padx=12, pady=10
+    card_outer = tk.Frame(
+        win,
+        bg="#131922",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#243040",
     )
-    card.pack(fill="both", expand=True)
+    card_outer.pack(fill="both", expand=True)
+    accent_bar = NeonBarCanvas(
+        card_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
+    )
+    accent_bar.pack(side="left", fill="y")
+    card = tk.Frame(card_outer, bg="#131922", padx=12, pady=10)
+    card.pack(side="left", fill="both", expand=True)
 
-    txt_frame = tk.Frame(card, bg="#141414")
+    txt_frame = tk.Frame(
+        card,
+        bg="#0e131a",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#1e293b",
+    )
     txt_frame.pack(fill="both", expand=True)
 
     sb = tk.Scrollbar(txt_frame)
@@ -7892,7 +9489,7 @@ def show_release_notes_dialog(parent=None):
     txt_box = tk.Text(
         txt_frame,
         height=16,
-        bg="#141414",
+        bg="#0e131a",
         fg="#e5e8e8",
         font=("Consolas", 9),
         wrap="word",
