@@ -256,7 +256,9 @@ class HudCapsulePill(tk.Canvas):
         height=24,
         state="normal",
         command=None,
-        cursor=""
+        cursor="",
+        auto_width=False,
+        pad_x=26
     ):
         super().__init__(
             parent,
@@ -276,6 +278,9 @@ class HudCapsulePill(tk.Canvas):
         self._font = font
         self._state = state
         self._command = command
+        self._min_width = int(width)
+        self._auto_width = bool(auto_width)
+        self._pad_x = int(pad_x)
         self.bind("<Configure>", self._redraw)
         self.bind("<Button-1>", self._on_click)
 
@@ -341,6 +346,24 @@ class HudCapsulePill(tk.Canvas):
             w = int(self["width"])
         if h <= 6:
             h = int(self["height"])
+
+        render_font = self._font
+        if self._text:
+            probe_id = self.create_text(
+                0, 0, text=self._text, font=self._font, anchor="nw"
+            )
+            bbox = self.bbox(probe_id)
+            self.delete(probe_id)
+            text_w = (bbox[2] - bbox[0]) if bbox else 0
+            if self._auto_width:
+                target_w = max(self._min_width, int(text_w + self._pad_x))
+                if abs(int(self["width"]) - target_w) > 1:
+                    super().configure(width=target_w)
+                w = max(w, target_w) if w <= target_w + 4 else target_w
+            elif text_w > (w - 22) and isinstance(self._font, tuple) and len(self._font) >= 2:
+                smaller_pt = max(7, int(self._font[1]) - 1)
+                render_font = (self._font[0], smaller_pt) + tuple(self._font[2:])
+
         # Outer subtle halo stadium
         _draw_filled_stadium(self, 0, 0, w - 1, h - 1, self._glow)
         # Bright capsule rim
@@ -354,7 +377,7 @@ class HudCapsulePill(tk.Canvas):
             w / 2,
             h / 2,
             text=self._text,
-            font=self._font,
+            font=render_font,
             fill=txt_col
         )
 
@@ -7313,11 +7336,13 @@ def start_gui():
         fg="#ffffff",
         rim="#6c757d",
         glow="#343a40",
-        width=136,
+        width=142,
         height=24,
         state="normal",
         command=toggle_acct_badge,
-        cursor="hand2"
+        cursor="hand2",
+        auto_width=True,
+        pad_x=28
     )
     acct_badge_lbl.pack(side="left", padx=(2, 4))
     refresh_acct_badge()
