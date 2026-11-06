@@ -6458,9 +6458,9 @@ def show_preflight_window(parent=None, mute_btn=None):
         bg="#1b1b1b",
         anchor="w"
     )
-    lbl_poll.pack(side="left")
+    lbl_poll.pack(side="left", padx=(0, 10))
     ent_poll = make_entry(r_poll, var_poll, width=8)
-    ent_poll.pack(side="right")
+    ent_poll.pack(side="left")
     poll_tip = (
         "How often (in seconds) Enforcer polls your broker API for live equity and positions.\n"
         "Recommended: 2 seconds (30 requests/min — well within Schwab & Webull rate limits)."
