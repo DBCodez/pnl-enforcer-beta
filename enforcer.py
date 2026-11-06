@@ -7412,6 +7412,10 @@ GIST_DOC_RAW_URLS = {
         "https://gist.githubusercontent.com/DBCodez/"
         "c91f71c6114caf3f2dee17cc8b60a757/raw/CHANGELOG.md"
     ),
+    "Launch_Enforcer.bat": (
+        "https://gist.githubusercontent.com/DBCodez/"
+        "511be5f6bb23f6db3ae1a5b4d3bb2cc0/raw/Launch_Enforcer.bat"
+    ),
     "README.md": (
         "https://gist.githubusercontent.com/DBCodez/"
         "e0cf8acf24c3f42181ce732411abf4d4/raw/README.md"
@@ -7854,15 +7858,33 @@ def show_release_notes_dialog(parent=None):
         win.mainloop()
 
 
-def check_for_updates_cli():
+UPDATE_CHECK_STAMP_PATH = os.path.join(USER_HOME, ".enforcer_update_check_ts")
+
+
+def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
     """Checks GitHub / Gist for a newer APP_VERSION and pops up a GUI dialog
     (with Changelog preview + link) to download and install the latest files."""
     try:
+        now_ts = time.time()
+        if skip_if_recent and os.path.exists(UPDATE_CHECK_STAMP_PATH):
+            try:
+                with open(UPDATE_CHECK_STAMP_PATH, "r", encoding="utf-8") as sf:
+                    last_chk = float(sf.read().strip() or "0")
+                if (now_ts - last_chk) < 25.0:
+                    return
+            except Exception:
+                pass
+        try:
+            with open(UPDATE_CHECK_STAMP_PATH, "w", encoding="utf-8") as sf:
+                sf.write(f"{now_ts:.3f}")
+        except Exception:
+            pass
+
         import urllib.request
-        ts = int(time.time())
+        ts = int(now_ts)
         candidate_urls = [
-            f"{GITHUB_RAW_BASE}enforcer.py?t={ts}",
             f"{GIST_ENFORCER_RAW_URL}?t={ts}",
+            f"{GITHUB_RAW_BASE}enforcer.py?t={ts}",
         ]
         best_ver = None
         best_bytes = None
@@ -7934,7 +7956,12 @@ def check_for_updates_cli():
                 except Exception:
                     pass
 
-            for doc_name in ("README.md", "LICENSE.txt", "enforcer.ico"):
+            for doc_name in (
+                "Launch_Enforcer.bat",
+                "README.md",
+                "LICENSE.txt",
+                "enforcer.ico",
+            ):
                 doc_bytes = _fetch_remote_doc_bytes(doc_name, ts=ts)
                 if doc_bytes:
                     try:
@@ -7943,6 +7970,8 @@ def check_for_updates_cli():
                     except Exception:
                         pass
             print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver}.\n")
+            if restart_on_update:
+                sys.exit(subprocess.call([sys.executable, target_py]))
         else:
             print(f"[SKIPPED] Continuing with local v{APP_VERSION}...\n")
     except Exception:
@@ -7959,8 +7988,9 @@ if __name__ == "__main__":
         show_update_available_dialog("0.9.10", APP_VERSION, cl_local)
         sys.exit(0)
     if "--check-update" in sys.argv:
-        check_for_updates_cli()
+        check_for_updates_cli(restart_on_update=False, skip_if_recent=False)
         sys.exit(0)
+    check_for_updates_cli(restart_on_update=True, skip_if_recent=True)
     init_daily_log()
     print("\n=========================================")
     print(f"  INITIALIZING PnL ENFORCER BETA v{APP_VERSION}  ")
