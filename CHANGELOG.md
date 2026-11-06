@@ -4,6 +4,13 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.22] — 2026-11-06
+### Added
+- **Windows Kernel Single-Instance Guard (`_ensure_single_instance_or_exit`):**
+  - Acquires an OS-level named mutex (`Local\PnLEnforcerBeta_SingleInstance_Mutex`) at startup so two instances of PnL Enforcer can never run simultaneously on top of each other, preventing duplicate flatten orders and double-logged `[POS_CHANGE]` / `W/L` trade counts. If a user launches the app while an instance is already open, Enforcer logs a `[GUARDRAIL]` block, displays an always-on-top alert dialog, and exits cleanly.
+
+---
+
 ## [v0.9.21] — 2026-11-06
 ### Fixed
 - **US Eastern Market Time Synchronization (`get_eastern_now()`):**

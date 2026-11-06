@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.21"
+APP_VERSION = "0.9.22"
 
 import os
 import sys
@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import messagebox
 import winsound
 import logging
+import traceback
 import warnings
 import subprocess
 from datetime import datetime, time as dt_time, timedelta, timezone
@@ -7914,12 +7915,89 @@ def show_release_notes_dialog(parent=None):
 
 
 UPDATE_CHECK_STAMP_PATH = os.path.join(USER_HOME, ".enforcer_update_check_ts")
+_SINGLE_INSTANCE_MUTEX_HANDLE = None
+SINGLE_INSTANCE_MUTEX_NAME = "Local\\PnLEnforcerBeta_SingleInstance_Mutex"
+
+
+def _is_another_instance_running():
+    """Probes whether another instance of PnL Enforcer currently holds the
+    Windows kernel mutex without holding a new handle open."""
+    if _SINGLE_INSTANCE_MUTEX_HANDLE is not None:
+        return False
+    try:
+        kernel32 = ctypes.windll.kernel32
+        h = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        last_err = kernel32.GetLastError()
+        if h:
+            kernel32.CloseHandle(h)
+        return last_err == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
+def _release_single_instance_mutex():
+    """Releases the current process's single-instance mutex handle (used right
+    before restarting into a newly downloaded update)."""
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+    if _SINGLE_INSTANCE_MUTEX_HANDLE:
+        try:
+            ctypes.windll.kernel32.CloseHandle(_SINGLE_INSTANCE_MUTEX_HANDLE)
+        except Exception:
+            pass
+        _SINGLE_INSTANCE_MUTEX_HANDLE = None
+
+
+def _ensure_single_instance_or_exit():
+    """Acquires the Windows kernel single-instance mutex for the lifetime of
+    this process. If another instance of PnL Enforcer is already running, logs
+    a guardrail block, shows a topmost warning popup, and exits cleanly."""
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+    if _SINGLE_INSTANCE_MUTEX_HANDLE is not None:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+        last_err = kernel32.GetLastError()
+        if last_err == 183:  # ERROR_ALREADY_EXISTS
+            if handle:
+                kernel32.CloseHandle(handle)
+            log_event(
+                "GUARDRAIL",
+                "BLOCKED: Attempted to launch a second instance of PnL Enforcer "
+                "while an instance is already running.",
+            )
+            try:
+                alert_root = tk.Tk()
+                alert_root.withdraw()
+                alert_root.attributes("-topmost", True)
+                messagebox.showwarning(
+                    "PnL Enforcer Already Running",
+                    "An instance of PnL Enforcer is already open on your PC.\n\n"
+                    "To prevent duplicate flatten orders and double-logged trades, "
+                    "only one instance can run at a time.\n\n"
+                    "Please close the existing PnL Enforcer HUD or Pre-Flight window first.",
+                    parent=alert_root,
+                )
+                alert_root.destroy()
+            except Exception:
+                print(
+                    "\n[BLOCKED] PnL Enforcer is already running! "
+                    "Please close the existing window first.\n"
+                )
+            sys.exit(0)
+        _SINGLE_INSTANCE_MUTEX_HANDLE = handle
+    except SystemExit:
+        raise
+    except Exception:
+        pass
 
 
 def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
     """Checks GitHub / Gist for a newer APP_VERSION and pops up a GUI dialog
     (with Changelog preview + link) to download and install the latest files."""
     try:
+        if _is_another_instance_running():
+            return
         now_ts = time.time()
         if skip_if_recent and os.path.exists(UPDATE_CHECK_STAMP_PATH):
             try:
@@ -8044,6 +8122,7 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
                         pass
             print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver}.\n")
             if restart_on_update:
+                _release_single_instance_mutex()
                 sys.exit(subprocess.call([sys.executable, target_py]))
         else:
             print(f"[SKIPPED] Continuing with local v{APP_VERSION}...\n")
@@ -8063,6 +8142,7 @@ if __name__ == "__main__":
     if "--check-update" in sys.argv:
         check_for_updates_cli(restart_on_update=False, skip_if_recent=False)
         sys.exit(0)
+    _ensure_single_instance_or_exit()
     check_for_updates_cli(restart_on_update=True, skip_if_recent=True)
     init_daily_log()
     print("\n=========================================")
