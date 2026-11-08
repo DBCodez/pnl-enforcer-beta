@@ -68,7 +68,11 @@ if !errorlevel! neq 0 (
     "!PY_CMD!" -m pip install --upgrade --no-deps --ignore-requires-python webull-openapi-python-sdk
 )
 
-:: 4. Check GitHub / Gist for newer release version and offer 1-keystroke update
+:: 4. Bootstrap missing files if user only downloaded Launch_Enforcer.bat, then check for updates
+if not exist "enforcer.py" (
+    echo Downloading PnL Enforcer Beta files...
+    "!PY_CMD!" -c "import time, urllib.request; base='https://gist.githubusercontent.com/DBCodez/6442a3ab2767aeb5ba0b13940d012634/raw/'; t='?t='+str(int(time.time())); [open(f,'wb').write(urllib.request.urlopen(urllib.request.Request(base+f+t, headers={'User-Agent':'PnL-Enforcer-Updater'}), timeout=10).read()) for f in ('enforcer.py','README.md','CHANGELOG.md','LICENSE.txt')]"
+)
 findstr /c:"--check-update" enforcer.py >nul 2>&1
 if !errorlevel! equ 0 (
     "!PY_CMD!" enforcer.py --check-update
