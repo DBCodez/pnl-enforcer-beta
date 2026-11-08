@@ -1552,7 +1552,7 @@ active_adapter = None
 def get_eastern_now():
     """Returns the current datetime in US Eastern Time (America/New_York,
     automatically handling EST UTC-5 and EDT UTC-4 via US DST rules) so market
-    hours (9:25 AM, 9:30 AM, 4:00 PM ET) and session dates are 100% synced
+    hours (9:30 AM, 4:00 PM ET) and session dates are 100% synced
     regardless of the user's local computer timezone."""
     utc_now = datetime.now(timezone.utc)
     y = utc_now.year
@@ -2348,7 +2348,7 @@ def save_session_state():
 
 def is_rth():
     now = get_eastern_now().time()
-    return dt_time(9, 25) <= now < dt_time(16, 0)
+    return dt_time(9, 30) <= now < dt_time(16, 0)
 
 
 def is_after_hours():
@@ -5228,7 +5228,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         save_session_state()
                         log_event(
                             "SESSION",
-                            f"9:25 AM RTH Transition: Rulebook HWM recalibrated "
+                            f"9:30 AM RTH Transition: Rulebook HWM recalibrated "
                             f"from {format_dollar(old_hwm)} to "
                             f"{format_dollar(new_hwm)} (Session High preserved at "
                             f"{format_dollar(daily_max_equity - start_equity)})."
@@ -5237,7 +5237,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         save_session_state()
                         log_event(
                             "SESSION",
-                            "9:25 AM RTH Transition: Switched from Extended-Hours "
+                            "9:30 AM RTH Transition: Switched from Extended-Hours "
                             "Rulebook to RTH Rulebook."
                         )
 
@@ -5464,7 +5464,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 )
 
                 # Prevent immediate siren blast or flat re-lock on startup,
-                # at the 9:25 AM / 4:00 PM transitions, or right after saving Settings
+                # at the 9:30 AM / 4:00 PM transitions, or right after saving Settings
                 if first_poll_of_launch or last_rth_mode != rth_now:
                     if last_rth_mode is not None and last_rth_mode != rth_now:
                         first_poll_of_launch = True
@@ -7819,7 +7819,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     cb_reset925 = make_glass_checkbutton(
         c3,
-        text="Start Fresh on Rulebook Switch (9:25 AM & 4:00 PM)",
+        text="Start Fresh on Rulebook Switch (9:30 AM & 4:00 PM)",
         variable=var_reset925,
         font=("Arial", 10, "bold"),
         fg="#dce4ee",
@@ -7829,7 +7829,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     cb_reset925.pack(fill="x", pady=2)
     attach_tooltip(
         cb_reset925,
-        "If checked, at 9:25 AM ET (RTH Open) and 4:00 PM ET (After-Hours Open) your active Rulebook\n"
+        "If checked, at 9:30 AM ET (RTH Open) and 4:00 PM ET (After-Hours Open) your active Rulebook\n"
         "starts fresh from current flat equity so an earlier session's profit peak won't immediately\n"
         "trigger a tier ratchet or trailing stop. (Your SESSION HIGH column still preserves your full-day peak.)"
     )
@@ -8086,7 +8086,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     c4, c4_halos, c4_bar, c4_title_lbl, c4_badge_pill = make_card(
         right_col,
         "▶  4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)",
-        "Active before 9:25 AM and after 4:00 PM ET. Hitting your Max Loss "
+        "Active before 9:30 AM and after 4:00 PM ET. Hitting your Max Loss "
         "or Profit Lock triggers Card 2.",
         accent="#5dade2",
         bar_color="#10b981",
@@ -8158,7 +8158,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     c5, c5_halos, c5_bar, c5_title_lbl, c5_badge_pill = make_card(
         right_col,
-        "▶  5. REGULAR HOURS RULEBOOK (9:25 AM – 4:00 PM)",
+        "▶  5. REGULAR HOURS RULEBOOK (9:30 AM – 4:00 PM)",
         "Starts at Base Tier 1 and ratchets your stop upward "
         "as realized profit grows. Hitting your stop triggers Card 2.",
         accent="#5dade2",

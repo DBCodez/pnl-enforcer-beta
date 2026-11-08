@@ -52,7 +52,7 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
    * Copy the **entire URL** from the top of your browser's address bar (starting with `https://127.0.0.1/?code=...`) — the on-screen **Schwab 7-Day Security Login** popup window will automatically detect it from your clipboard (or click **📋 Paste from Clipboard**), then click **Complete Schwab Login >>**.
    * *(Note: Schwab security tokens last 7 days. You don't need to track this yourself — the app displays your remaining token days in Pre-Flight Settings, **automatically walks you through this renewal early at startup** whenever `< 14 hours` remain so it never expires mid-session, and also lets you renew it manually anytime via **`🔑 API Keys -> 🔄 Renew 7-Day Token Now`**.)*
 5. Choose which sub-account you want to monitor from the **`ACCOUNT:`** dropdown at the top-left of the Pre-Flight screen.
-6. **⏰ Launch Before Your First Trade of the Day:** Always launch the app **before taking your first trade of the day** (or before **9:25 AM ET** if trading Regular Hours) so it can snapshot your clean starting account equity baseline (`$0.00` Daily PnL). Once captured, **that baseline is automatically saved for the rest of the day**—so if you ever close and reopen the app later in the session, it will seamlessly restore your morning baseline and full daily PnL without resetting to zero.
+6. **⏰ Launch Before Your First Trade of the Day:** Always launch the app **before taking your first trade of the day** (or before **9:30 AM ET** if trading Regular Hours) so it can snapshot your clean starting account equity baseline (`$0.00` Daily PnL). Once captured, **that baseline is automatically saved for the rest of the day**—so if you ever close and reopen the app later in the session, it will seamlessly restore your morning baseline and full daily PnL without resetting to zero.
 
 ---
 
@@ -62,9 +62,9 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
   * **💡 `Alarms Only Mode`:** Check **`Alarms Only Mode`** in Card 2 to disable all automated flattening, app kills, and OS locks while keeping all HUD tracking and warning sirens active.
 * **Card 3 — Session Baselines & Audio Preview:**
   * **Daily Baseline Persistence:** Your starting baseline is saved per account for the entire trading day (marked `(Preserved)` in Card 3 if you close and relaunch the app mid-day). You can also check **Re-Zero Today's Starting Baseline to Current Equity** if you ever intentionally want to reset your daily PnL to `$0.00` mid-session.
-  * **Start Fresh on Rulebook Switch:** Automatically snapshots a fresh starting baseline at **9:25 AM ET** (Regular Hours) and **4:00 PM ET** (After-Hours) if you are flat. Uncheck this if you want Pre-Market PnL to carry into your Regular Hours total.
+  * **Start Fresh on Rulebook Switch:** Automatically snapshots a fresh starting baseline at **9:30 AM ET** (Regular Hours) and **4:00 PM ET** (After-Hours) if you are flat. Uncheck this if you want Pre-Market PnL to carry into your Regular Hours total.
   * **Audio Tester (`🔊 Test`):** Preview your Warning Siren, Chimes, and Lockout Voice cues at your current speaker volume.
-* **Cards 4 & 5 — Extended Hours vs. Regular Hours (`9:25 AM – 4:00 PM ET`) Rulebooks:**
+* **Cards 4 & 5 — Extended Hours vs. Regular Hours (`9:30 AM – 4:00 PM ET`) Rulebooks:**
   * All session times and order types (**Market** orders during `9:30 AM – 4:00 PM ET`; marketable **Extended-Hours Limit** orders outside RTH) automatically sync to **US Eastern Time (New York)** regardless of your computer's local timezone.
   * **Card 5 Profit Ratchet Tiers:** As your realized profit climbs through Tiers 2, 3, and 4 during Regular Hours, your Daily Stop automatically ratchets upward to prevent green-to-red round-trips.
 * **Positioning & Customizing the HUD:**

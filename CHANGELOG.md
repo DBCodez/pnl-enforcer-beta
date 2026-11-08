@@ -29,6 +29,8 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
   - Upgraded **`Customize HUD Columns & Order`**, **`Release Notes`**, **`Update Available`**, **`Schwab OAuth`**, and **`Liability Waiver`** modals to match the frosted-glass aesthetic.
 - **Dropdown Menu Tooltip Auto-Dismiss:**
   - Hover tooltips on all dropdown menus (`BROKER / ACCOUNT` bar, `📜 Logs ▾`, and Card 3 `Voice / Cue` selectors) now immediately cancel and disappear before `tk_popup` opens the dropdown menu so tooltips never linger behind open menus.
+- **Regular Trading Hours Rulebook Switch Aligned to `9:30 AM – 4:00 PM ET` (`is_rth()`):**
+  - Aligned the Regular Hours Rulebook switch (`is_rth()`), Card 3's *Start Fresh on Rulebook Switch (`9:30 AM & 4:00 PM`)*, Card 4's subtitle (*Active before `9:30 AM` and after `4:00 PM ET`*), and Card 5's header (*`5. REGULAR HOURS RULEBOOK (9:30 AM – 4:00 PM)`*) to the standard `9:30 AM ET` US market open.
 
 ---
 
