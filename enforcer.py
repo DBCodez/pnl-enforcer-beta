@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.24"
+APP_VERSION = "0.9.25"
 
 import os
 import sys
@@ -112,12 +112,34 @@ tk.Tk.__init__ = _icon_tk_init
 tk.Toplevel.__init__ = _dark_toplevel_init
 
 
+_NAMED_COLOR_HEX = {
+    "yellow": "facc15",
+    "gold": "eab308",
+    "amber": "f59e0b",
+    "orange": "f97316",
+    "red": "ef4444",
+    "green": "10b981",
+    "white": "ffffff",
+    "black": "000000",
+}
+
+
+def _normalize_color_hex6(c):
+    s = str(c).strip().lower()
+    if s in _NAMED_COLOR_HEX:
+        return _NAMED_COLOR_HEX[s]
+    s = s.lstrip("#")
+    if len(s) == 3:
+        s = "".join(ch * 2 for ch in s)
+    return s
+
+
 def _blend_hex(c1, c2, t):
     """Smoothly interpolates between two #RRGGBB hex colors (0.0 <= t <= 1.0)."""
     try:
         t = max(0.0, min(1.0, float(t)))
-        h1 = str(c1).lstrip("#")
-        h2 = str(c2).lstrip("#")
+        h1 = _normalize_color_hex6(c1)
+        h2 = _normalize_color_hex6(c2)
         if len(h1) != 6 or len(h2) != 6:
             return c2 if t >= 0.5 else c1
         r1, g1, b1 = int(h1[0:2], 16), int(h1[2:4], 16), int(h1[4:6], 16)
@@ -132,9 +154,7 @@ def _blend_hex(c1, c2, t):
 
 def _hex_to_rgb_tuple(h, fallback=(20, 26, 36)):
     try:
-        s = str(h).lstrip("#")
-        if len(s) == 3:
-            s = "".join(c * 2 for c in s)
+        s = _normalize_color_hex6(h)
         if len(s) == 6:
             return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
     except Exception:
@@ -923,6 +943,10 @@ class HudCapsulePill(tk.Canvas):
                 self._bg = "#45141e"
                 self._rim = "#ff5252"
                 self._glow = "#ff1744"
+            elif new_bg in ("yellow", "#facc15", "#eab308", "#f59e0b", "#fbbf24"):
+                self._bg = "#eab308"
+                self._rim = "#fef08a"
+                self._glow = "#facc15"
             elif new_bg in (
                 "#00e676", "#2ecc71", "#27ae60", "#1e8449", "#196f3d", "#145a32"
             ):
@@ -4626,7 +4650,11 @@ def trigger_alarm(reason, ui_button, context_str=""):
     ui_button.after(
         0,
         lambda: ui_button.config(
-            text=btn_txt, bg="yellow", fg="black", state="normal"
+            text=btn_txt,
+            bg="#eab308",
+            fg="#090d16",
+            disabledforeground="#090d16",
+            state="normal",
         )
     )
     threading.Thread(target=sound_alarm_loop, daemon=True).start()
@@ -4751,8 +4779,8 @@ def trigger_upside_tier_glow(ui_button, banner_text, log_msg):
 
     # 6 steps x 500ms = 3.0 seconds total
     glow_steps = [
-        ("#00e676", "#000000"),
-        ("#2ecc71", "#000000"),
+        ("#00e676", "#ffffff"),
+        ("#2ecc71", "#ffffff"),
         ("#27ae60", "#ffffff"),
         ("#1e8449", "#ffffff"),
         ("#196f3d", "#ffffff"),
