@@ -4,6 +4,18 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.24] — 2026-11-08
+### Added & Changed
+- **Custom Borderless Dark-Slate Dropdown Menus (`DarkDropdownMenu`):**
+  - Replaced native Win32 `tk.Menu` popups across all 5 dropdowns (`BROKER`, `ACCOUNT`, `📜 Logs ▾`, `Voice`, and `Audio Cue`) with a custom borderless `tk.Toplevel` dropdown (`DarkDropdownMenu`) featuring a crisp `1px` `#334155` dark-slate border, `#141820` fill, and `#1e293b` row hover highlight (eliminating Windows' thick white system menu border).
+  - Multi-monitor safe downward positioning (`+{x}+{y}`) and window-relative tooltip bounds so menus and tooltips never flip upward on secondary monitors.
+- **HUD Left Capsule Defaulted to `W/L`:**
+  - Defaulted the HUD bottom-left capsule to **`W/L`** (`W: X (%) | L: Y (%)`) on startup (clicking cycles through `W/L -> FLAT: $... -> BASE: $...`).
+- **Regular Trading Hours Rulebook Switch Aligned to `9:30 AM – 4:00 PM ET` (`is_rth()`):**
+  - Aligned the Regular Hours Rulebook switch (`is_rth()`), Card 3's *Start Fresh on Rulebook Switch (`9:30 AM & 4:00 PM`)*, Card 4's subtitle (*Active before `9:30 AM` and after `4:00 PM ET`*), and Card 5's header (*`5. REGULAR HOURS RULEBOOK (9:30 AM – 4:00 PM)`*) to the standard `9:30 AM ET` US market open.
+
+---
+
 ## [v0.9.23] — 2026-11-06
 ### Added
 - **Modern `6px` Rounded-Rectangle (Squircle) Button Engine (`_render_glass_pill_image` / `_get_glass_pill_photo` / `GlassStadiumButton`):**
@@ -19,7 +31,6 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
   - Reserved saturated color fills strictly for the active preset (**`✓ Standard Full Risk`** in deep steel-blue `#163052 -> #0f213a` with `#38bdf8` border, or **`✓ 50% Low Energy`** in deep emerald `#144332 -> #0d2e22` with `#10b981` border) and the primary **`🚀 SAVE & LAUNCH ENFORCER >>`** button (`#14532d -> #0d3b20` top-to-bottom fade with a crisp `1px` `#10b981` border).
 - **Pre-Flight Bottom Action Bar & HUD Controls:**
   - Upgraded HUD **`⚙ SETTINGS`** and **`✕`** to `6px` rounded rectangles with crisp `1px` borders while preserving full stadium capsules on the left badge and **`ARMED:`** and honoring the **`🔒 IN TRADE`** tamper lock.
-  - Defaulted the HUD bottom-left capsule to **`W/L`** (`W: X (%) | L: Y (%)`) on startup (clicking cycles through `W/L -> FLAT: $... -> BASE: $...`).
 - **Calm Left-Accent Card Borders, Crisp `Arial` / `Consolas` Typography & Live Telemetry Strip (Cards 1–5):**
   - Replaced 4-sided neon box borders around Cards 1–5 with calm `1px` dark-slate card perimeters (`#243040`) paired with a single glowing left vertical accent bar (`NeonBarCanvas`), dark-glass numeric entry boxes, and crisp integer-aligned `Arial` / `Consolas` GDI ClearType typography.
   - Added geometric **`▶  `** prefixes to Cards 1–5 numbered headers, crisp `1px` (`#222d3d`) horizontal section dividers across Cards 1–5 (including between Base Tier 1 and Profit Ratchet Tiers in Card 5), **`▸ `** prefixes on Tiers 2–4, and an SDF **`● ACTIVE NOW` / `STANDBY`** rulebook badge (`RulebookPillBadge`).
@@ -28,11 +39,7 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 - **Expanded, Un-Truncated API Keys Setup Wizard & Unified Modal Popups:**
   - Upgraded the **Schwab & Webull API Credential Setup Wizard** (`show_broker_setup_wizard`) with complete, un-truncated multi-line step-by-step instructions (including the full Step 5 browser approval + clipboard auto-detection walkthrough), cyan step badges (`1.`–`5.`), color-highlighted pill badges (`Accounts and Trading Production`, `https://127.0.0.1` with a one-click **`📋 Copy`** button, `Ready for Use`), a header **`🌐 Open ... Developer Portal ↗`** button, and frosted-glass action pills.
   - Upgraded **`Customize HUD Columns & Order`**, **`Release Notes`**, **`Update Available`**, **`Schwab OAuth`**, and **`Liability Waiver`** modals to match the frosted-glass aesthetic.
-- **Custom Borderless Dark-Slate Dropdown Menus (`DarkDropdownMenu`):**
-  - Replaced native Win32 `tk.Menu` popups across all 5 dropdowns (`BROKER`, `ACCOUNT`, `📜 Logs ▾`, `Voice`, and `Audio Cue`) with a custom borderless `tk.Toplevel` dropdown (`DarkDropdownMenu`) featuring a crisp `1px` `#334155` dark-slate border, `#141820` fill, and `#1e293b` row hover highlight (eliminating Windows' thick white system menu border).
   - Hover tooltips on all dropdown menus now immediately cancel and disappear before opening the dropdown menu so tooltips never linger behind open menus.
-- **Regular Trading Hours Rulebook Switch Aligned to `9:30 AM – 4:00 PM ET` (`is_rth()`):**
-  - Aligned the Regular Hours Rulebook switch (`is_rth()`), Card 3's *Start Fresh on Rulebook Switch (`9:30 AM & 4:00 PM`)*, Card 4's subtitle (*Active before `9:30 AM` and after `4:00 PM ET`*), and Card 5's header (*`5. REGULAR HOURS RULEBOOK (9:30 AM – 4:00 PM)`*) to the standard `9:30 AM ET` US market open.
 
 ---
 
