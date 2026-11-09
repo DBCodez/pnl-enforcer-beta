@@ -1005,6 +1005,195 @@ class HudCapsulePill(tk.Canvas):
         )
 
 
+class DarkDropdownMenu:
+    """Custom borderless dark-slate popup menu replacing native Win32 tk.Menu
+    so dropdowns render with a crisp 1px #334155 dark border instead of
+    Windows' thick white system menu border."""
+
+    _active_instance = None
+
+    def __init__(
+        self,
+        parent,
+        font=("Arial", 9, "bold"),
+        bg="#141820",
+        fg="#e2e8f0",
+        activebackground="#1e293b",
+        activeforeground="#ffffff",
+        border_color="#334155",
+        **_ignored,
+    ):
+        self._parent = parent
+        self._font = font
+        self._bg = bg
+        self._fg = fg
+        self._active_bg = activebackground
+        self._active_fg = activeforeground
+        self._border = border_color
+        self._items = []
+        self._win = None
+        self._owner = None
+        self._on_close = None
+        self._top_bind_ids = []
+        self._last_close_ts = 0.0
+
+    def add_command(self, label="", command=None, **_ignored):
+        self._items.append({"type": "command", "label": str(label), "command": command})
+
+    def add_separator(self):
+        self._items.append({"type": "separator"})
+
+    def delete(self, start, end=None):
+        self._items.clear()
+
+    def grab_release(self):
+        pass
+
+    @classmethod
+    def close_active(cls):
+        if cls._active_instance is not None:
+            cls._active_instance.close()
+
+    def close(self, _event=None):
+        if DarkDropdownMenu._active_instance is self:
+            DarkDropdownMenu._active_instance = None
+        top = None
+        try:
+            top = self._parent.winfo_toplevel()
+        except Exception:
+            pass
+        if top is not None and self._top_bind_ids:
+            for seq, bid in self._top_bind_ids:
+                try:
+                    top.unbind(seq, bid)
+                except Exception:
+                    pass
+        self._top_bind_ids = []
+        if self._win is not None:
+            self._last_close_ts = time.monotonic()
+            w = self._win
+            self._win = None
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        if self._owner is not None:
+            try:
+                self._owner._menu_open = False
+            except Exception:
+                pass
+            self._owner = None
+        if callable(self._on_close):
+            cb = self._on_close
+            self._on_close = None
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def tk_popup(self, x, y, min_width=0, owner=None, on_close=None):
+        if self._win is not None and self._win.winfo_exists():
+            self.close()
+            return
+        if (time.monotonic() - self._last_close_ts) < 0.16:
+            return
+        DarkDropdownMenu.close_active()
+        if not self._items:
+            if callable(on_close):
+                on_close()
+            return
+
+        self._owner = owner
+        self._on_close = on_close
+        if owner is not None:
+            try:
+                owner._menu_open = True
+            except Exception:
+                pass
+
+        try:
+            tw = tk.Toplevel(self._parent)
+            tw.wm_overrideredirect(True)
+            tw.attributes("-topmost", True)
+            tw.config(bg=self._border, padx=1, pady=1)
+            self._win = tw
+            DarkDropdownMenu._active_instance = self
+
+            inner = tk.Frame(tw, bg=self._bg, padx=2, pady=3)
+            inner.pack(fill="both", expand=True)
+
+            def _invoke_item(cmd):
+                self.close()
+                if callable(cmd):
+                    try:
+                        self._parent.after(10, cmd)
+                    except Exception:
+                        cmd()
+
+            for item in self._items:
+                if item.get("type") == "separator":
+                    sep = tk.Frame(inner, bg="#263142", height=1)
+                    sep.pack(fill="x", padx=6, pady=4)
+                    continue
+                lbl_txt = item.get("label", "")
+                cmd = item.get("command")
+                row = tk.Label(
+                    inner,
+                    text=lbl_txt,
+                    font=self._font,
+                    bg=self._bg,
+                    fg=self._fg,
+                    anchor="w",
+                    padx=10,
+                    pady=5,
+                    cursor="hand2",
+                )
+                row.pack(fill="x")
+                row.bind(
+                    "<Enter>",
+                    lambda _e, r=row: r.config(bg=self._active_bg, fg=self._active_fg),
+                )
+                row.bind(
+                    "<Leave>",
+                    lambda _e, r=row: r.config(bg=self._bg, fg=self._fg),
+                )
+                row.bind(
+                    "<Button-1>",
+                    lambda _e, c=cmd: _invoke_item(c),
+                )
+
+            tw.update_idletasks()
+            req_w = max(int(min_width), int(tw.winfo_reqwidth()))
+            req_h = int(tw.winfo_reqheight())
+            pos_x = int(x)
+            pos_y = int(y)
+            tw.wm_geometry(f"{req_w}x{req_h}+{pos_x}+{pos_y}")
+            tw.lift()
+            try:
+                tw.focus_force()
+            except Exception:
+                pass
+
+            tw.bind("<Escape>", self.close)
+            tw.bind("<FocusOut>", self.close)
+
+            def _bind_outside_dismiss():
+                if self._win is None or not self._win.winfo_exists():
+                    return
+                try:
+                    top = self._parent.winfo_toplevel()
+                    for seq in ("<Button-1>", "<Configure>", "<Unmap>"):
+                        bid = top.bind(seq, self.close, add="+")
+                        if bid:
+                            self._top_bind_ids.append((seq, bid))
+                except Exception:
+                    pass
+
+            tw.after(30, _bind_outside_dismiss)
+        except Exception:
+            self.close()
+
+
 class GlassStadiumButton(tk.Canvas):
     """Reusable crisp 6px rounded-rectangle (squircle) button with a one-way
     top-to-bottom linear micro-fade, razor-sharp 1px border (top catch-light),
@@ -1103,22 +1292,34 @@ class GlassStadiumButton(tk.Canvas):
         if self._state != "normal":
             return
         if self._menu is not None:
-            self._menu_open = True
-            try:
+            def _after_menu_close():
+                if callable(hide_fn):
+                    hide_fn()
+                self._hovered = False
+                self._redraw()
+
+            if isinstance(self._menu, DarkDropdownMenu):
                 self._menu.tk_popup(
                     self.winfo_rootx(),
                     self.winfo_rooty() + self.winfo_height() + 2,
+                    min_width=self.winfo_width(),
+                    owner=self,
+                    on_close=_after_menu_close,
                 )
-            finally:
-                self._menu_open = False
-                if callable(hide_fn):
-                    hide_fn()
+            else:
+                self._menu_open = True
                 try:
-                    self._menu.grab_release()
-                except Exception:
-                    pass
-                self._hovered = False
-                self._redraw()
+                    self._menu.tk_popup(
+                        self.winfo_rootx(),
+                        self.winfo_rooty() + self.winfo_height() + 2,
+                    )
+                finally:
+                    self._menu_open = False
+                    _after_menu_close()
+                    try:
+                        self._menu.grab_release()
+                    except Exception:
+                        pass
         elif self._command is not None:
             self._command()
 
@@ -5988,14 +6189,14 @@ def show_preflight_window(parent=None, mute_btn=None):
                 tw.update_idletasks()
                 tip_w = tw.winfo_reqwidth()
                 tip_h = tw.winfo_reqheight()
-                scr_w = tw.winfo_screenwidth()
-                scr_h = tw.winfo_screenheight()
+                pf_right = pf.winfo_rootx() + max(pf.winfo_width(), 900)
+                pf_bottom = pf.winfo_rooty() + max(pf.winfo_height(), 600)
                 x = widget.winfo_rootx() + 16
                 y = widget.winfo_rooty() + widget.winfo_height() + 6
-                if x + tip_w + 12 > scr_w:
-                    x = max(10, scr_w - tip_w - 16)
-                if y + tip_h + 12 > scr_h:
-                    y = max(10, widget.winfo_rooty() - tip_h - 6)
+                if x + tip_w > pf_right + 20:
+                    x = max(pf.winfo_rootx() + 8, pf_right - tip_w - 8)
+                if y + tip_h > pf_bottom + 40:
+                    y = widget.winfo_rooty() - tip_h - 6
                 tw.wm_geometry(f"+{x}+{y}")
                 tip_state["win"] = tw
             except Exception:
@@ -6232,28 +6433,28 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     broker_acct_capsule.pack(side="left", padx=(0, 6))
 
-    broker_dropdown = tk.Menu(
+    broker_dropdown = DarkDropdownMenu(
         pf,
         tearoff=0,
         font=("Arial", 9, "bold"),
-        bg="#18202c",
-        fg="white",
-        activebackground="#1f538d",
-        activeforeground="white",
+        bg="#141820",
+        fg="#e2e8f0",
+        activebackground="#1e293b",
+        activeforeground="#ffffff",
     )
     for b_opt in ("SCHWAB", "WEBULL"):
         broker_dropdown.add_command(
             label=b_opt, command=lambda b=b_opt: var_broker.set(b)
         )
 
-    acct_dropdown = tk.Menu(
+    acct_dropdown = DarkDropdownMenu(
         pf,
         tearoff=0,
         font=("Arial", 9, "bold"),
-        bg="#18202c",
-        fg="white",
-        activebackground="#1f538d",
-        activeforeground="white",
+        bg="#141820",
+        fg="#e2e8f0",
+        activebackground="#1e293b",
+        activeforeground="#ffffff",
     )
 
     _capsule_state = {
@@ -6403,41 +6604,34 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     def _on_capsule_click(event):
         hide_all_tooltips()
-        broker_acct_capsule._menu_open = True
         root_x = broker_acct_capsule.winfo_rootx()
         root_y = (
             broker_acct_capsule.winfo_rooty()
             + broker_acct_capsule.winfo_height()
             + 2
         )
+
+        def _after_capsule_menu_close():
+            hide_all_tooltips()
+            _capsule_state["hover_zone"] = None
+            _redraw_broker_acct_capsule()
+
         if event.x < _capsule_state["divider_x"]:
-            try:
-                broker_dropdown.tk_popup(
-                    root_x + int(_capsule_state["broker_x"]), root_y
-                )
-            finally:
-                broker_acct_capsule._menu_open = False
-                hide_all_tooltips()
-                try:
-                    broker_dropdown.grab_release()
-                except Exception:
-                    pass
-                _capsule_state["hover_zone"] = None
-                _redraw_broker_acct_capsule()
+            broker_dropdown.tk_popup(
+                root_x + int(_capsule_state["broker_x"]),
+                root_y,
+                min_width=92,
+                owner=broker_acct_capsule,
+                on_close=_after_capsule_menu_close,
+            )
         else:
-            try:
-                acct_dropdown.tk_popup(
-                    root_x + int(_capsule_state["acct_x"]), root_y
-                )
-            finally:
-                broker_acct_capsule._menu_open = False
-                hide_all_tooltips()
-                try:
-                    acct_dropdown.grab_release()
-                except Exception:
-                    pass
-                _capsule_state["hover_zone"] = None
-                _redraw_broker_acct_capsule()
+            acct_dropdown.tk_popup(
+                root_x + int(_capsule_state["acct_x"]),
+                root_y,
+                min_width=155,
+                owner=broker_acct_capsule,
+                on_close=_after_capsule_menu_close,
+            )
 
     broker_acct_capsule.bind("<Configure>", _redraw_broker_acct_capsule, add="+")
     broker_acct_capsule.bind("<Motion>", _on_capsule_motion, add="+")
@@ -6855,14 +7049,14 @@ def show_preflight_window(parent=None, mute_btn=None):
                 parent=pf,
             )
 
-    logs_dropdown = tk.Menu(
+    logs_dropdown = DarkDropdownMenu(
         pf,
         tearoff=0,
         font=("Arial", 9, "bold"),
-        bg="#18202c",
-        fg="white",
-        activebackground="#1f538d",
-        activeforeground="white"
+        bg="#141820",
+        fg="#e2e8f0",
+        activebackground="#1e293b",
+        activeforeground="#ffffff"
     )
     logs_dropdown.add_command(
         label="📄 View Today's Log",
@@ -7903,14 +8097,14 @@ def show_preflight_window(parent=None, mute_btn=None):
     lbl_preview_audio.pack(side="left", padx=(0, 5))
 
     voice_choices = [lbl for lbl, _ in TTS_VOICE_CATALOG]
-    voice_dropdown = tk.Menu(
+    voice_dropdown = DarkDropdownMenu(
         pf,
         tearoff=0,
         font=("Arial", 9, "bold"),
-        bg="#18202c",
-        fg="white",
-        activebackground="#1f538d",
-        activeforeground="white",
+        bg="#141820",
+        fg="#e2e8f0",
+        activebackground="#1e293b",
+        activeforeground="#ffffff",
     )
     for v_lbl in voice_choices:
         voice_dropdown.add_command(
@@ -7956,14 +8150,14 @@ def show_preflight_window(parent=None, mute_btn=None):
         "Voice: 30s Warning",
         "Unlock Chime (3-Tone)",
     ]
-    audio_dropdown = tk.Menu(
+    audio_dropdown = DarkDropdownMenu(
         pf,
         tearoff=0,
         font=("Arial", 9, "bold"),
-        bg="#18202c",
-        fg="white",
-        activebackground="#1f538d",
-        activeforeground="white",
+        bg="#141820",
+        fg="#e2e8f0",
+        activebackground="#1e293b",
+        activeforeground="#ffffff",
     )
     for a_lbl in audio_choices:
         audio_dropdown.add_command(
@@ -8606,7 +8800,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 # ==========================================
 # 9. DYNAMIC MULTI-COLUMN HUD SETUP
 # ==========================================
-acct_badge_mode = 0  # 0 = FLAT, 1 = BASE, 2 = W/L
+acct_badge_mode = 0  # 0 = W/L, 1 = FLAT, 2 = BASE
 acct_badge_lbl = None
 hud_root = None
 hud_grid_frame = None
@@ -8621,21 +8815,21 @@ hud_do_move_fn = None
 
 
 def refresh_acct_badge():
-    """Updates the clickable left account badge (FLAT -> BASE -> W/L)."""
+    """Updates the clickable left account badge (W/L -> FLAT -> BASE)."""
     if acct_badge_lbl is None:
         return
 
     if acct_badge_mode == 1:
-        val = start_equity
-        txt = f"BASE: ${val:,.2f}" if (val is not None and val > 0) else "BASE: ---"
-        fg_col = "#aed6f1"
-    elif acct_badge_mode == 2:
-        txt = format_trades_wl_inline(win_trades, loss_trades)
-        fg_col = "#e5e8e8"
-    else:
         val = last_flat_equity if last_flat_equity is not None else start_equity
         txt = f"FLAT: ${val:,.2f}" if (val is not None and val > 0) else "FLAT: ---"
         fg_col = "#ffffff"
+    elif acct_badge_mode == 2:
+        val = start_equity
+        txt = f"BASE: ${val:,.2f}" if (val is not None and val > 0) else "BASE: ---"
+        fg_col = "#aed6f1"
+    else:
+        txt = format_trades_wl_inline(win_trades, loss_trades)
+        fg_col = "#e5e8e8"
 
     acct_badge_lbl.config(text=txt, fg=fg_col)
 
@@ -8899,13 +9093,13 @@ def start_gui():
     bottom_bar = tk.Frame(root, bg="#1a1a1a", pady=1)
     bottom_bar.pack(fill="x", side="bottom")
 
-    # Rounded Stadium Capsule Left Badge (Toggles between FLAT, BASE, and W/L)
+    # Rounded Stadium Capsule Left Badge (Toggles between W/L, FLAT, and BASE)
     acct_badge_lbl = HudCapsulePill(
         bottom_bar,
-        text="FLAT: ---",
+        text=format_trades_wl_inline(win_trades, loss_trades),
         font=("Arial", 8, "bold"),
         bg="#282c31",
-        fg="#ffffff",
+        fg="#e5e8e8",
         rim="#6c757d",
         glow="#343a40",
         width=142,
