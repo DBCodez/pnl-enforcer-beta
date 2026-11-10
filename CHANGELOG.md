@@ -4,6 +4,13 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.30] — 2026-11-10
+### Improved
+- **Options Auto-Flatten BETA Waiver Readability & Typography (`show_options_flatten_beta_waiver`):**
+  - Replaced the flat `Arial 9` wall-of-text label inside the Options Auto-Flatten BETA Risk Waiver modal with a structured, high-legibility 5-section layout (`Arial 10` / `10 bold` / `Consolas 10 bold`) featuring distinct coral section numbers (`1.`–`5.`), bold amber section headers, generous line and paragraph spacing, `1px` `#222d3d` horizontal section dividers, and inline badge highlights on key warning terms (`experimental BETA feature`, `BUY_TO_CLOSE / SELL_TO_CLOSE`, `WIDE BID-ASK SPREADS`, `SEVERE SLIPPAGE`, `Regular Trading Hours (9:30 AM – 4:00 PM ET)`) while preserving the full waiver text and SHA-256 verification hash unchanged.
+
+---
+
 ## [v0.9.29] — 2026-11-10
 ### Added & Changed
 - **Experimental BETA Options Auto-Flatten Toggle & Cryptographic Risk Waiver (`enable_flatten_options`, OFF by Default):**

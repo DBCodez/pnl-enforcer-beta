@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.29"
+APP_VERSION = "0.9.30"
 
 import os
 import sys
@@ -4861,7 +4861,7 @@ def show_options_flatten_beta_waiver(parent=None, force_prompt=True):
             f"⚠️ EXPERIMENTAL BETA FEATURE — OPTIONS AUTO-FLATTEN WAIVER "
             f"(v{OPTIONS_WAIVER_VERSION})"
         ),
-        font=("Arial", 12, "bold"),
+        font=("Arial", 13, "bold"),
         fg="#fbbf24",
         bg="#0d1117",
         anchor="w",
@@ -4874,22 +4874,170 @@ def show_options_flatten_beta_waiver(parent=None, force_prompt=True):
         highlightthickness=1,
         highlightbackground="#5c2836",
     )
-    msg_outer.pack(fill="x", pady=(0, 14))
+    msg_outer.pack(fill="x", pady=(0, 16))
     NeonBarCanvas(
         msg_outer, core_color="#f43f5e", card_bg="#131922", glow_on=True
     ).pack(side="left", fill="y")
-    msg_box = tk.Label(
-        msg_outer,
-        text=OPTIONS_WAIVER_TEXT,
-        font=("Arial", 9),
-        fg="#dce4ee",
-        bg="#131922",
-        justify="left",
-        anchor="w",
-        padx=16,
-        pady=14,
+    msg_card = tk.Frame(msg_outer, bg="#131922", padx=22, pady=16)
+    msg_card.pack(side="left", fill="both", expand=True)
+
+    def _add_waiver_section(num_str, title_txt, lines_of_segments, is_last=False):
+        sec = tk.Frame(msg_card, bg="#131922")
+        sec.pack(fill="x")
+
+        hdr = tk.Frame(sec, bg="#131922")
+        hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(
+            hdr,
+            text=f"{num_str}.",
+            font=("Arial", 10, "bold"),
+            fg="#fb7185",
+            bg="#131922",
+            anchor="w",
+        ).pack(side="left", padx=(0, 6))
+        tk.Label(
+            hdr,
+            text=title_txt,
+            font=("Arial", 10, "bold"),
+            fg="#fbbf24",
+            bg="#131922",
+            anchor="w",
+        ).pack(side="left")
+
+        body = tk.Frame(sec, bg="#131922", padx=20)
+        body.pack(fill="x")
+        for line_idx, seg_list in enumerate(lines_of_segments):
+            l_frame = tk.Frame(body, bg="#131922")
+            l_frame.pack(fill="x", pady=(2 if line_idx > 0 else 0, 1))
+            for seg_txt, seg_fg, seg_font, seg_bg in seg_list:
+                tk.Label(
+                    l_frame,
+                    text=seg_txt,
+                    font=seg_font,
+                    fg=seg_fg,
+                    bg=seg_bg or "#131922",
+                    padx=5 if seg_bg else 0,
+                    pady=1 if seg_bg else 0,
+                    anchor="w",
+                ).pack(side="left")
+
+        if not is_last:
+            tk.Frame(msg_card, bg="#222d3d", height=1).pack(
+                fill="x", pady=(10, 10)
+            )
+
+    _b_txt = "#e2e8f0"
+    _b_fnt = ("Arial", 10)
+    _b_bld = ("Arial", 10, "bold")
+    _c_fnt = ("Consolas", 10, "bold")
+
+    _add_waiver_section(
+        "1",
+        "EXPERIMENTAL BETA FEATURE — USE AT YOUR OWN SOLE RISK:",
+        [
+            [
+                ("Automated Options Flattening is an ", _b_txt, _b_fnt, None),
+                ("experimental BETA feature", "#fbbf24", _b_bld, "#262115"),
+                (" provided strictly ", _b_txt, _b_fnt, None),
+                ("'AS IS'", "#ffffff", _b_bld, None),
+                (" without warranty of any kind.", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("By enabling this toggle, you expressly ", _b_txt, _b_fnt, None),
+                ("release, indemnify, and hold harmless", "#ffffff", _b_bld, None),
+                (" the author(s) and contributors from any", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("and all claims, damages, or financial losses arising from option orders.", _b_txt, _b_fnt, None),
+            ],
+        ],
     )
-    msg_box.pack(side="left", fill="both", expand=True)
+
+    _add_waiver_section(
+        "2",
+        "SEVERE BID-ASK SPREAD & MARKET ORDER SLIPPAGE RISK:",
+        [
+            [
+                ("When an Open PnL Stop or Daily Stop triggers with this toggle enabled, Enforcer submits ", _b_txt, _b_fnt, None),
+                ("RTH Market orders", "#ffffff", _b_bld, None),
+            ],
+            [
+                ("(", _b_txt, _b_fnt, None),
+                ("BUY_TO_CLOSE / SELL_TO_CLOSE", "#7dd3fc", _c_fnt, "#162436"),
+                (") to exit open option contracts immediately. Unlike liquid stocks, options frequently", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("have ", _b_txt, _b_fnt, None),
+                ("WIDE BID-ASK SPREADS", "#fda4af", _b_bld, "#311520"),
+                (", thin order books, or zero bids. Submitting a Market order on an option contract can", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("result in ", _b_txt, _b_fnt, None),
+                ("SEVERE SLIPPAGE", "#fda4af", _b_bld, "#311520"),
+                (" and fills far worse than the displayed mark price.", _b_txt, _b_fnt, None),
+            ],
+        ],
+    )
+
+    _add_waiver_section(
+        "3",
+        "MULTI-LEG SPREADS & MARGIN REJECTION RISK:",
+        [
+            [
+                ("Enforcer liquidates open options ", _b_txt, _b_fnt, None),
+                ("leg-by-leg as individual single-leg Market orders", "#ffffff", _b_bld, None),
+                (" (buying back short option legs", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("first before selling long option legs), ", _b_txt, _b_fnt, None),
+                ("NOT as a single complex net-debit/net-credit spread order", "#fbbf24", _b_bld, None),
+                (". Legging out of", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("spreads, condors, or covered positions via Market orders carries compounding slippage on each leg and may be", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("rejected by your broker's margin or options-approval level.", _b_txt, _b_fnt, None),
+            ],
+        ],
+    )
+
+    _add_waiver_section(
+        "4",
+        "REGULAR TRADING HOURS (9:30 AM – 4:00 PM ET) ONLY:",
+        [
+            [
+                ("Standard US equity options only trade during ", _b_txt, _b_fnt, None),
+                ("Regular Trading Hours (9:30 AM – 4:00 PM ET)", "#69f0ae", _b_bld, "#122b22"),
+                (" and cannot be auto-flattened", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("in Pre-Market or After-Hours. If any option contract fails to close, is rejected, or has no bid, Enforcer will", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("abort Windows OS Lock / App Kill", "#ffffff", _b_bld, None),
+                (" and sound the continuous emergency siren.", _b_txt, _b_fnt, None),
+            ],
+        ],
+    )
+
+    _add_waiver_section(
+        "5",
+        "100% SOLE RESPONSIBILITY FOR ACCOUNT & FILLS:",
+        [
+            [
+                ("You acknowledge that automated option liquidation is a ", _b_txt, _b_fnt, None),
+                ("last-resort mechanical backstop", "#ffffff", _b_bld, None),
+                (", not a substitute for", _b_txt, _b_fnt, None),
+            ],
+            [
+                ("in-broker stop orders or active risk management, and you assume ", _b_txt, _b_fnt, None),
+                ("100% sole responsibility for all fills", "#fbbf24", _b_bld, None),
+                (".", _b_txt, _b_fnt, None),
+            ],
+        ],
+        is_last=True,
+    )
 
     var_opt_agree = tk.BooleanVar(value=False)
     make_glass_checkbutton(
@@ -4899,7 +5047,7 @@ def show_options_flatten_beta_waiver(parent=None, force_prompt=True):
             "option spreads can suffer severe slippage, and I assume 100% sole responsibility for all fills."
         ),
         variable=var_opt_agree,
-        font=("Arial", 9, "bold"),
+        font=("Arial", 10, "bold"),
         fg="#fbbf24",
         bg="#0d1117",
         accent_hex="#d97706",
