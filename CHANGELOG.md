@@ -4,6 +4,21 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.29] — 2026-11-10
+### Added & Changed
+- **Experimental BETA Options Auto-Flatten Toggle & Cryptographic Risk Waiver (`enable_flatten_options`, OFF by Default):**
+  - Added an opt-in **`└─ Include Options in Auto-Flatten (BETA — RTH Market Orders)`** toggle inside **Card 2 (`2. DAILY STOP ACTIONS`)** of the Pre-Flight window (`enable_flatten_options`, default `False`). By default, option contracts remain **Siren-Only**.
+  - **Mandatory BETA Options Risk Waiver & Audit Log (`show_options_flatten_beta_waiver`):** Enabling the toggle displays a dedicated modal assumption-of-risk dialog explicitly warning that Options Auto-Flattening is **BETA**, detailing wide bid-ask spread slippage on unpriced Market orders (`BUY_TO_CLOSE` / `SELL_TO_CLOSE`), single-leg liquidation mechanics on multi-leg option spreads, Regular Trading Hours (`9:30 AM – 4:00 PM ET`) restrictions, and broker API/fill limitations. Acceptance requires checking an explicit acknowledgment box and is logged to `enforcer_log.txt` (`[WAIVER]`) and persisted in `enforcer_config.json` with a timestamp, version tag (`2026.11.10-BETA`), and SHA-256 hash (`options_waiver_sha256`), verified automatically at startup alongside the main Welcome Waiver.
+  - **Two-Way Broker Parity (`SchwabAdapter` & `WebullAdapter`):**
+    - Added `get_open_option_positions()` and `submit_option_liquidation_batch()` across both `SchwabAdapter` (`schwab.orders.options.option_buy_to_close_market` / `option_sell_to_close_market`) and `WebullAdapter` (`order_v3.place_order` single-leg `OPTION` `MARKET` orders with `BUY_TO_CLOSE` / `SELL_TO_CLOSE`, plus `_parse_option_contract_meta()` supporting OCC symbols and `legs` payloads).
+    - **Short-Legs-First Execution (`qty < 0` before `qty > 0`):** Both adapters sort and submit `BUY_TO_CLOSE` orders on short option contracts before `SELL_TO_CLOSE` orders on long option contracts to prevent broker "naked short option" margin rejections when unwinding spreads or covered positions.
+  - **Anti-Wick Re-Verification & Flat-Before-Lock Safeguards:**
+    - Enforces the `0.2s` anti-wick re-verification poll (`not has_options` excluded from the 0s fast-path) before triggering any breach while holding options.
+    - Both `flatten_equities()` and the `2s`/`15s` post-lock watchdog (`_run_post_lock_watchdog()`) double-confirm that 100% of open equities AND option contracts are flat before allowing any Windows OS Lock or trading app termination. If options are held outside RTH (`9:30 AM – 4:00 PM ET`) or fail to close, Enforcer holds off on OS Lock / App Kill and sounds the continuous manual intervention siren.
+  - **HUD & Config Telemetry:** Updated `format_config_summary()` (`OptFlat=ON(BETA)` / `OptFlat=OFF`) and the HUD `ARMED:` status pill (`+ OPT(BETA)`) to clearly indicate when BETA Options Auto-Flatten is armed.
+
+---
+
 ## [v0.9.28] — 2026-11-10
 ### Fixed & Improved
 - **Webull Rate-Limit (`HTTP 429`) Prevention, Backoff & Broker Parity (`WebullAdapter` & `SchwabAdapter`):**

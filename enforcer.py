@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.28"
+APP_VERSION = "0.9.29"
 
 import os
 import sys
@@ -1578,12 +1578,64 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # 2. DEFAULT CONFIGURATION
 # ==========================================
 WAIVER_VERSION = "2026.10.29"
+OPTIONS_WAIVER_VERSION = "2026.11.10-BETA"
+
+OPTIONS_WAIVER_TEXT = (
+    "1. EXPERIMENTAL BETA FEATURE — USE AT YOUR OWN SOLE RISK:\n"
+    "   Automated Options Flattening is an experimental BETA feature provided strictly 'AS IS' without warranty\n"
+    "   of any kind. By enabling this toggle, you expressly release, indemnify, and hold harmless the author(s)\n"
+    "   and contributors from any and all claims, damages, or financial losses arising from option orders.\n\n"
+    "2. SEVERE BID-ASK SPREAD & MARKET ORDER SLIPPAGE RISK:\n"
+    "   When an Open PnL Stop or Daily Stop triggers with this toggle enabled, Enforcer submits RTH Market\n"
+    "   orders (BUY_TO_CLOSE / SELL_TO_CLOSE) to exit open option contracts immediately. Unlike liquid stocks,\n"
+    "   options frequently have WIDE BID-ASK SPREADS, thin order books, or zero bids. Submitting a Market order\n"
+    "   on an option contract can result in SEVERE SLIPPAGE and fills far worse than the displayed mark price.\n\n"
+    "3. MULTI-LEG SPREADS & MARGIN REJECTION RISK:\n"
+    "   Enforcer liquidates open options leg-by-leg as individual single-leg Market orders (buying back short\n"
+    "   option legs first before selling long option legs), NOT as a single complex net-debit/net-credit spread\n"
+    "   order. Legging out of spreads, condors, or covered positions via Market orders carries compounding\n"
+    "   slippage on each leg and may be rejected by your broker's margin or options-approval level.\n\n"
+    "4. REGULAR TRADING HOURS (9:30 AM – 4:00 PM ET) ONLY:\n"
+    "   Standard US equity options only trade during Regular Trading Hours (9:30 AM – 4:00 PM ET) and cannot\n"
+    "   be auto-flattened in Pre-Market or After-Hours. If any option contract fails to close, is rejected,\n"
+    "   or has no bid, Enforcer will abort Windows OS Lock / App Kill and sound the continuous emergency siren.\n\n"
+    "5. 100% SOLE RESPONSIBILITY FOR ACCOUNT & FILLS:\n"
+    "   You acknowledge that automated option liquidation is a last-resort mechanical backstop, not a substitute\n"
+    "   for in-broker stop orders or active risk management, and you assume 100% sole responsibility for all fills."
+)
+
+
+def get_options_waiver_expected_sha():
+    return hashlib.sha256(OPTIONS_WAIVER_TEXT.encode("utf-8")).hexdigest()
+
+
+def is_options_waiver_verified(cfg=None):
+    c = cfg or config
+    return bool(
+        c.get("options_waiver_accepted", False)
+        and c.get("options_waiver_version") == OPTIONS_WAIVER_VERSION
+        and c.get("options_waiver_sha256") == get_options_waiver_expected_sha()
+    )
+
+
+def is_options_flatten_armed(cfg=None):
+    c = cfg or config
+    return bool(
+        not c.get("alarms_only_mode", False)
+        and c.get("enable_flatten_options", False)
+        and is_options_waiver_verified(c)
+    )
+
 
 DEFAULT_CONFIG = {
     "waiver_accepted": False,
     "waiver_accepted_version": "",
     "waiver_accepted_at": "",
     "waiver_sha256": "",
+    "options_waiver_accepted": False,
+    "options_waiver_version": "",
+    "options_waiver_accepted_at": "",
+    "options_waiver_sha256": "",
     "active_broker": "SCHWAB",
     "brokers": {
         "SCHWAB": {
@@ -1601,6 +1653,7 @@ DEFAULT_CONFIG = {
     "user_defaults": {},
     "alarms_only_mode": False,
     "enable_auto_flatten": False,
+    "enable_flatten_options": False,
     "enable_kill_tos": False,
     "enable_kill_webull": False,
     "enable_lock_os": False,
@@ -2399,6 +2452,7 @@ def format_config_summary(cfg):
         f"OpenStop={'ON' if cfg.get('enable_open_flatten') else 'OFF'}"
         f"(-${cfg.get('open_max_loss', 0):,.0f}, CoolDown={cd_str}) | "
         f"DayFlat={'ON' if cfg.get('enable_auto_flatten') else 'OFF'} | "
+        f"OptFlat={'ON(BETA)' if is_options_flatten_armed(cfg) else 'OFF'} | "
         f"KillTOS={'ON' if cfg.get('enable_kill_tos') else 'OFF'} | "
         f"KillWB={'ON' if cfg.get('enable_kill_webull') else 'OFF'} | "
         f"LockOS={dl_str} | "
@@ -3027,6 +3081,7 @@ class SchwabAdapter:
         self.accounts = []
         self._last_good_snapshot = {}
         self._last_open_eq = {}
+        self._last_open_opt = {}
         self._rate_limit_until = 0.0
         self._last_429_log_ts = 0.0
         self.last_error = ""
@@ -3181,24 +3236,33 @@ class SchwabAdapter:
             return False
 
     def get_open_equity_positions(self):
-        """Returns ONLY Equity positions for Auto-Flatten (Never Options), or None on API error."""
+        """Returns ONLY Equity positions for Auto-Flatten, or None on API error."""
         try:
             resp = self.client.get_account(
                 self.account_id, fields=self.client.Account.Fields.POSITIONS
             )
             if resp.status_code == 200:
                 open_eq = []
+                open_opt = []
                 sec_acc = resp.json().get("securitiesAccount", {})
                 for pos in sec_acc.get("positions", []):
                     inst = pos.get("instrument", {})
-                    if inst.get("assetType") == "EQUITY":
-                        qty = (
-                            pos.get("longQuantity", 0)
-                            - pos.get("shortQuantity", 0)
-                        )
-                        if qty != 0:
+                    a_type = inst.get("assetType")
+                    qty = (
+                        pos.get("longQuantity", 0)
+                        - pos.get("shortQuantity", 0)
+                    )
+                    if qty != 0:
+                        if a_type == "EQUITY":
                             open_eq.append((inst["symbol"], qty))
-                self._last_open_eq[self.account_id] = (time.time(), list(open_eq))
+                        elif a_type == "OPTION":
+                            open_opt.append((inst["symbol"], qty))
+                open_opt.sort(
+                    key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
+                )
+                now_t = time.time()
+                self._last_open_eq[self.account_id] = (now_t, list(open_eq))
+                self._last_open_opt[self.account_id] = (now_t, list(open_opt))
                 return open_eq
             log_event(
                 "ERROR",
@@ -3217,6 +3281,113 @@ class SchwabAdapter:
             )
             return list(cached[1])
         return None
+
+    def get_open_option_positions(self):
+        """Returns ONLY Option positions (symbol, qty) sorted with short legs
+        (qty < 0) first for BETA Options Auto-Flatten, or None on API error."""
+        cached = self._last_open_opt.get(self.account_id)
+        if cached and (time.time() - cached[0]) < 0.45:
+            return list(cached[1])
+        try:
+            resp = self.client.get_account(
+                self.account_id, fields=self.client.Account.Fields.POSITIONS
+            )
+            if resp.status_code == 200:
+                open_eq = []
+                open_opt = []
+                sec_acc = resp.json().get("securitiesAccount", {})
+                for pos in sec_acc.get("positions", []):
+                    inst = pos.get("instrument", {})
+                    a_type = inst.get("assetType")
+                    qty = (
+                        pos.get("longQuantity", 0)
+                        - pos.get("shortQuantity", 0)
+                    )
+                    if qty != 0:
+                        if a_type == "EQUITY":
+                            open_eq.append((inst["symbol"], qty))
+                        elif a_type == "OPTION":
+                            open_opt.append((inst["symbol"], qty))
+                open_opt.sort(
+                    key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
+                )
+                now_t = time.time()
+                self._last_open_eq[self.account_id] = (now_t, list(open_eq))
+                self._last_open_opt[self.account_id] = (now_t, list(open_opt))
+                return open_opt
+            log_event(
+                "ERROR",
+                f"Schwab get_open_option_positions HTTP {resp.status_code}"
+            )
+        except Exception as e:
+            log_event(
+                "ERROR",
+                f"Schwab get_open_option_positions exception: {e}"
+            )
+        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+            log_event(
+                "FLATTEN",
+                "Using cached Schwab open option snapshot (<10s) after API error."
+            )
+            return list(cached[1])
+        return None
+
+    def submit_option_liquidation_batch(self, open_opt_positions):
+        """Submits single-leg RTH Market orders to close open option positions
+        (BUY_TO_CLOSE on short legs first, then SELL_TO_CLOSE on long legs)."""
+        if not open_opt_positions:
+            return
+        if not is_market_hours():
+            log_event(
+                "GUARDRAIL",
+                f"Cannot submit Schwab option market flatten outside RTH "
+                f"(9:30 AM – 4:00 PM ET): {open_opt_positions}"
+            )
+            return
+        from schwab.orders.options import (
+            option_buy_to_close_market,
+            option_sell_to_close_market,
+        )
+        sorted_opts = sorted(
+            open_opt_positions,
+            key=lambda item: (0 if item[1] < 0 else 1, str(item[0])),
+        )
+        for item in sorted_opts:
+            symbol = item[0]
+            qty = item[1]
+            abs_q = int(abs(qty))
+            if abs_q <= 0:
+                continue
+            try:
+                if qty < 0:
+                    log_event(
+                        "ORDER_OUT",
+                        f"Submitting Schwab RTH Option Market BUY_TO_CLOSE (BETA): "
+                        f"{abs_q} {symbol}"
+                    )
+                    spec = option_buy_to_close_market(symbol, abs_q).build()
+                    r = self.client.place_order(self.account_id, spec)
+                    log_event(
+                        "ORDER_RESP",
+                        f"Schwab Option Buy-to-Close {symbol} -> HTTP {r.status_code}"
+                    )
+                else:
+                    log_event(
+                        "ORDER_OUT",
+                        f"Submitting Schwab RTH Option Market SELL_TO_CLOSE (BETA): "
+                        f"{abs_q} {symbol}"
+                    )
+                    spec = option_sell_to_close_market(symbol, abs_q).build()
+                    r = self.client.place_order(self.account_id, spec)
+                    log_event(
+                        "ORDER_RESP",
+                        f"Schwab Option Sell-to-Close {symbol} -> HTTP {r.status_code}"
+                    )
+            except Exception as e:
+                log_event(
+                    "ERROR",
+                    f"Schwab option place_order exception ({symbol}): {e}"
+                )
 
     def submit_liquidation_batch(self, open_positions):
         from schwab.orders.common import Session, Duration
@@ -3345,6 +3516,7 @@ class SchwabAdapter:
                 positions = data.get("positions", [])
                 open_assets = []
                 open_eq_cache = []
+                open_opt_cache = []
                 has_options = False
                 for pos in positions:
                     a_type = pos.get("instrument", {}).get("assetType")
@@ -3356,14 +3528,24 @@ class SchwabAdapter:
                         if net_q != 0:
                             if a_type == "OPTION":
                                 has_options = True
+                                open_opt_cache.append(
+                                    (pos["instrument"]["symbol"], net_q)
+                                )
                             else:
                                 open_eq_cache.append(
                                     (pos["instrument"]["symbol"], net_q)
                                 )
                             open_assets.append((pos, net_q, a_type))
 
+                open_opt_cache.sort(
+                    key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
+                )
+                now_snap_t = time.time()
                 self._last_open_eq[self.account_id] = (
-                    time.time(), open_eq_cache
+                    now_snap_t, open_eq_cache
+                )
+                self._last_open_opt[self.account_id] = (
+                    now_snap_t, open_opt_cache
                 )
 
                 if not open_assets:
@@ -3520,6 +3702,7 @@ class WebullAdapter:
         self._last_pos_call_ts = 0.0
         self._last_good_snapshot = {}
         self._last_open_eq = {}
+        self._last_open_opt = {}
         self._rate_limit_until = 0.0
         self._last_429_log_ts = 0.0
         self.last_error = ""
@@ -3675,6 +3858,116 @@ class WebullAdapter:
             log_event("ERROR", f"Webull cancel working orders exception: {e}")
         return False
 
+    @staticmethod
+    def _parse_option_contract_meta(p):
+        """Extracts normalized option contract metadata from a Webull position
+        record (supporting both v2 'legs' arrays, top-level fields, and OCC symbols)."""
+        legs = p.get("legs")
+        leg0 = (
+            legs[0]
+            if isinstance(legs, list) and len(legs) > 0 and isinstance(legs[0], dict)
+            else {}
+        )
+        raw_qty = (
+            p.get("quantity")
+            or p.get("position")
+            or leg0.get("quantity")
+            or leg0.get("position")
+            or 0
+        )
+        try:
+            qty = float(raw_qty)
+        except Exception:
+            qty = 0.0
+        side_hint = str(
+            p.get("side")
+            or p.get("position_side")
+            or leg0.get("side")
+            or leg0.get("position_side")
+            or ""
+        ).upper()
+        if qty > 0 and side_hint in ("SHORT", "SELL"):
+            qty = -abs(qty)
+
+        raw_sym = str(
+            leg0.get("symbol")
+            or p.get("symbol")
+            or p.get("ticker", {}).get("symbol")
+            or ""
+        ).strip()
+        opt_type = str(
+            leg0.get("option_type")
+            or p.get("option_type")
+            or ""
+        ).strip().upper()
+        exp_date = str(
+            leg0.get("option_expire_date")
+            or p.get("option_expire_date")
+            or leg0.get("expire_date")
+            or p.get("expire_date")
+            or ""
+        ).strip()
+        strike_raw = (
+            leg0.get("option_exercise_pricestring")
+            or leg0.get("option_exercise_price")
+            or leg0.get("strike_price")
+            or p.get("option_exercise_pricestring")
+            or p.get("option_exercise_price")
+            or p.get("strike_price")
+            or ""
+        )
+        inst_id = str(
+            leg0.get("instrument_id")
+            or p.get("instrument_id")
+            or p.get("ticker_id")
+            or ""
+        ).strip()
+
+        underlying = raw_sym
+        m_occ = re.match(
+            r"^([A-Za-z]+)\s*(\d{2})(\d{2})(\d{2})([CPcp])(\d{8})$", raw_sym
+        )
+        if m_occ:
+            underlying = m_occ.group(1).upper()
+            if not exp_date:
+                exp_date = f"20{m_occ.group(2)}-{m_occ.group(3)}-{m_occ.group(4)}"
+            if not opt_type:
+                opt_type = "CALL" if m_occ.group(5).upper() == "C" else "PUT"
+            if not strike_raw:
+                strike_val = int(m_occ.group(6)) / 1000.0
+                strike_raw = f"{strike_val:g}"
+
+        if opt_type.startswith("C"):
+            opt_type = "CALL"
+        elif opt_type.startswith("P"):
+            opt_type = "PUT"
+
+        strike_str = str(strike_raw).strip()
+        if strike_str:
+            try:
+                sv = float(strike_str)
+                strike_str = (
+                    f"{int(sv)}" if abs(sv - round(sv)) < 1e-6 else f"{sv:g}"
+                )
+            except Exception:
+                pass
+
+        if underlying and exp_date and strike_str and opt_type:
+            display_sym = f"{underlying} {exp_date} {strike_str}{opt_type[:1]}"
+        else:
+            display_sym = raw_sym or "UNKNOWN_OPT"
+
+        return {
+            "display_sym": display_sym,
+            "qty": qty,
+            "underlying": underlying,
+            "option_type": opt_type,
+            "option_expire_date": exp_date,
+            "strike_price": strike_str,
+            "instrument_id": inst_id,
+            "raw_symbol": raw_sym,
+        }
+
     def get_open_equity_positions(self):
         """Returns (symbol, qty, last_price) for EQUITIES ONLY, or None on API error."""
         cached = self._last_open_eq.get(self.account_id)
@@ -3685,6 +3978,7 @@ class WebullAdapter:
             self._last_pos_call_ts = time.time()
             if res.status_code == 200:
                 open_eq = []
+                open_opt = []
                 payload = res.json()
                 pos_list = (
                     payload if isinstance(payload, list)
@@ -3696,7 +3990,13 @@ class WebullAdapter:
                         or p.get("asset_type")
                         or "EQUITY"
                     ).upper()
-                    if "OPT" in itype:
+                    is_opt = ("OPT" in itype) or bool(p.get("legs"))
+                    if is_opt:
+                        meta = self._parse_option_contract_meta(p)
+                        if meta["qty"] != 0:
+                            open_opt.append(
+                                (meta["display_sym"], meta["qty"], meta)
+                            )
                         continue
                     qty = float(p.get("quantity") or p.get("position") or 0)
                     if qty != 0:
@@ -3713,9 +4013,12 @@ class WebullAdapter:
                         )
                         if sym:
                             open_eq.append((sym, qty, lp))
-                self._last_open_eq[self.account_id] = (
-                    time.time(), list(open_eq)
+                open_opt.sort(
+                    key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
+                now_t = time.time()
+                self._last_open_eq[self.account_id] = (now_t, list(open_eq))
+                self._last_open_opt[self.account_id] = (now_t, list(open_opt))
                 return open_eq
             log_event(
                 "ERROR",
@@ -3733,6 +4036,185 @@ class WebullAdapter:
             )
             return list(cached[1])
         return None
+
+    def get_open_option_positions(self):
+        """Returns (display_sym, qty, meta) for OPTIONS ONLY sorted with short
+        legs (qty < 0) first, or None on API error."""
+        cached = self._last_open_opt.get(self.account_id)
+        if cached and (time.time() - cached[0]) < 2.15:
+            return list(cached[1])
+        try:
+            res = self._call_get_positions()
+            self._last_pos_call_ts = time.time()
+            if res.status_code == 200:
+                open_eq = []
+                open_opt = []
+                payload = res.json()
+                pos_list = (
+                    payload if isinstance(payload, list)
+                    else payload.get("data", payload.get("positions", []))
+                )
+                for p in pos_list:
+                    itype = str(
+                        p.get("instrument_type")
+                        or p.get("asset_type")
+                        or "EQUITY"
+                    ).upper()
+                    is_opt = ("OPT" in itype) or bool(p.get("legs"))
+                    if is_opt:
+                        meta = self._parse_option_contract_meta(p)
+                        if meta["qty"] != 0:
+                            open_opt.append(
+                                (meta["display_sym"], meta["qty"], meta)
+                            )
+                        continue
+                    qty = float(p.get("quantity") or p.get("position") or 0)
+                    if qty != 0:
+                        sym = (
+                            p.get("symbol")
+                            or p.get("ticker", {}).get("symbol")
+                            or ""
+                        )
+                        lp = float(
+                            p.get("last_price")
+                            or p.get("market_price")
+                            or p.get("cost_price")
+                            or 0.0
+                        )
+                        if sym:
+                            open_eq.append((sym, qty, lp))
+                open_opt.sort(
+                    key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
+                )
+                now_t = time.time()
+                self._last_open_eq[self.account_id] = (now_t, list(open_eq))
+                self._last_open_opt[self.account_id] = (now_t, list(open_opt))
+                return open_opt
+            log_event(
+                "ERROR",
+                f"Webull get_open_option_positions HTTP {res.status_code}"
+            )
+        except Exception as e:
+            log_event(
+                "ERROR",
+                f"Webull get_open_option_positions exception: {e}"
+            )
+        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+            log_event(
+                "FLATTEN",
+                "Using cached Webull open option snapshot (<10s) after API error."
+            )
+            return list(cached[1])
+        return None
+
+    def submit_option_liquidation_batch(self, open_opt_positions):
+        """Submits single-leg RTH Market option orders on Webull
+        (BUY_TO_CLOSE on short legs first, then SELL_TO_CLOSE on long legs)."""
+        if not open_opt_positions:
+            return
+        if not is_market_hours():
+            log_event(
+                "GUARDRAIL",
+                f"Cannot submit Webull option market flatten outside RTH "
+                f"(9:30 AM – 4:00 PM ET): {[x[0] for x in open_opt_positions]}"
+            )
+            return
+
+        sorted_opts = sorted(
+            open_opt_positions,
+            key=lambda item: (0 if item[1] < 0 else 1, str(item[0])),
+        )
+        for item in sorted_opts:
+            display_sym = item[0]
+            qty = item[1]
+            meta = item[2] if len(item) > 2 and isinstance(item[2], dict) else {}
+            abs_q = int(abs(qty))
+            if abs_q <= 0:
+                continue
+
+            side = "BUY" if qty < 0 else "SELL"
+            pos_intent = "BUY_TO_CLOSE" if qty < 0 else "SELL_TO_CLOSE"
+            underlying = meta.get("underlying") or display_sym.split()[0]
+            opt_type = meta.get("option_type") or ""
+            exp_date = meta.get("option_expire_date") or ""
+            strike_str = meta.get("strike_price") or ""
+            inst_id = meta.get("instrument_id") or ""
+            client_oid = uuid.uuid4().hex[:24]
+
+            leg_item = {
+                "instrument_type": "OPTION",
+                "market": "US",
+                "symbol": underlying,
+                "side": side,
+                "quantity": str(abs_q),
+                "position_intent": pos_intent,
+            }
+            if opt_type:
+                leg_item["option_type"] = opt_type
+            if exp_date:
+                leg_item["option_expire_date"] = exp_date
+            if strike_str:
+                leg_item["strike_price"] = strike_str
+            if inst_id:
+                leg_item["instrument_id"] = inst_id
+
+            order_item = {
+                "client_order_id": client_oid,
+                "combo_type": "NORMAL",
+                "option_strategy": "SINGLE",
+                "instrument_type": "OPTION",
+                "market": "US",
+                "symbol": underlying,
+                "order_type": "MARKET",
+                "side": side,
+                "position_intent": pos_intent,
+                "quantity": str(abs_q),
+                "time_in_force": "DAY",
+                "support_trading_session": "CORE",
+                "entrust_type": "QTY",
+                "legs": [leg_item],
+            }
+
+            log_event(
+                "ORDER_OUT",
+                f"Submitting Webull RTH Option Market {pos_intent} (BETA): "
+                f"{abs_q} {display_sym}"
+            )
+            try:
+                if hasattr(self.trade_client, "order_v3"):
+                    r = self.trade_client.order_v3.place_order(
+                        self.account_id, [order_item]
+                    )
+                elif hasattr(self.trade_client, "order_v2") and hasattr(
+                    self.trade_client.order_v2, "place_option"
+                ):
+                    r = self.trade_client.order_v2.place_option(
+                        self.account_id, [order_item]
+                    )
+                else:
+                    r = self.trade_client.place_order(
+                        self.account_id, order_item
+                    )
+                code = c_resp_code(r)
+                if (
+                    code not in (200, 201, "OK")
+                    and hasattr(self.trade_client, "order_v2")
+                    and hasattr(self.trade_client.order_v2, "place_option")
+                ):
+                    r2 = self.trade_client.order_v2.place_option(
+                        self.account_id, [order_item]
+                    )
+                    code = c_resp_code(r2)
+                    r = r2
+                log_event(
+                    "ORDER_RESP",
+                    f"Webull Option {pos_intent} {display_sym} -> HTTP {code}"
+                )
+            except Exception as e:
+                log_event(
+                    "ERROR",
+                    f"Webull option place_order exception ({display_sym}): {e}"
+                )
 
     def submit_liquidation_batch(self, open_positions):
         if not open_positions:
@@ -3994,26 +4476,39 @@ class WebullAdapter:
             total_pos_mkt_val = 0.0
             pos_details = {}
             open_eq_cache = []
+            open_opt_cache = []
             has_options = False
 
             for p in pos_list:
-                qty = float(p.get("quantity") or p.get("position") or 0)
-                if qty == 0:
-                    continue
                 itype = str(
                     p.get("instrument_type")
                     or p.get("asset_type")
                     or "EQUITY"
                 ).upper()
-                is_opt = "OPT" in itype
+                is_opt = ("OPT" in itype) or bool(p.get("legs"))
+                opt_meta = self._parse_option_contract_meta(p) if is_opt else None
+                qty = (
+                    opt_meta["qty"]
+                    if opt_meta is not None
+                    else float(p.get("quantity") or p.get("position") or 0)
+                )
+                if qty == 0:
+                    continue
                 if is_opt:
                     has_options = True
+                    open_opt_cache.append(
+                        (opt_meta["display_sym"], qty, opt_meta)
+                    )
                 mult = 100.0 if is_opt else 1.0
 
                 sym = (
-                    p.get("symbol")
-                    or p.get("ticker", {}).get("symbol")
-                    or "UNKNOWN"
+                    opt_meta["display_sym"]
+                    if opt_meta is not None
+                    else (
+                        p.get("symbol")
+                        or p.get("ticker", {}).get("symbol")
+                        or "UNKNOWN"
+                    )
                 )
                 avg_price = float(
                     p.get("cost_price")
@@ -4092,7 +4587,12 @@ class WebullAdapter:
                     "asset_type": "OPTION" if is_opt else "EQUITY"
                 }
 
-            self._last_open_eq[self.account_id] = (time.time(), open_eq_cache)
+            open_opt_cache.sort(
+                key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
+            )
+            now_snap_t = time.time()
+            self._last_open_eq[self.account_id] = (now_snap_t, open_eq_cache)
+            self._last_open_opt[self.account_id] = (now_snap_t, open_opt_cache)
             is_flat = (len(pos_details) == 0)
             self._prev_pos_qty_map[self.account_id] = {
                 s_k.replace(" (OPT)", ""): d_v["qty"]
@@ -4180,6 +4680,23 @@ def show_liability_waiver():
             f"Liability Waiver v{WAIVER_VERSION} verified "
             f"(Accepted at: {acc_at} | SHA256: {expected_sha[:12]}...)"
         )
+        if config.get("enable_flatten_options", False):
+            if is_options_waiver_verified(config):
+                opt_at = config.get("options_waiver_accepted_at", "Unknown")
+                opt_sha = get_options_waiver_expected_sha()
+                log_event(
+                    "WAIVER",
+                    f"Options Auto-Flatten BETA Waiver v{OPTIONS_WAIVER_VERSION} verified "
+                    f"(Accepted at: {opt_at} | SHA256: {opt_sha[:12]}...)"
+                )
+            elif not show_options_flatten_beta_waiver(parent=None, force_prompt=True):
+                config["enable_flatten_options"] = False
+                save_config(config)
+                log_event(
+                    "WAIVER",
+                    "Options Auto-Flatten BETA Waiver not accepted on startup — "
+                    "reverted enable_flatten_options to OFF (Siren-Only)."
+                )
         return True
 
     accepted = {"ok": False}
@@ -4292,6 +4809,168 @@ def show_liability_waiver():
     ).pack(side="right")
 
     w.mainloop()
+    return accepted["ok"]
+
+
+def show_options_flatten_beta_waiver(parent=None, force_prompt=True):
+    """Displays the dedicated Options Auto-Flatten (BETA) Assumption of Risk &
+    Spread Slippage Disclaimer modal, requiring explicit checkbox confirmation
+    and writing a cryptographic [WAIVER] audit record to enforcer_log.txt and
+    enforcer_config.json."""
+    expected_opt_sha = get_options_waiver_expected_sha()
+    if not force_prompt and is_options_waiver_verified(config):
+        acc_at = config.get("options_waiver_accepted_at", "Unknown")
+        log_event(
+            "WAIVER",
+            f"Options Auto-Flatten BETA Waiver v{OPTIONS_WAIVER_VERSION} verified "
+            f"(Accepted at: {acc_at} | SHA256: {expected_opt_sha[:12]}...)"
+        )
+        return True
+
+    accepted = {"ok": False}
+    dlg = tk.Tk() if parent is None else tk.Toplevel(parent)
+    if parent is not None:
+        dlg.grab_set()
+    if os.path.exists(ICON_PATH):
+        try:
+            dlg.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+    apply_dark_title_bar(dlg)
+
+    dlg.title(
+        f"PnL Enforcer — Options Auto-Flatten BETA Risk Waiver (v{OPTIONS_WAIVER_VERSION})"
+    )
+    dlg.config(bg="#0d1117", padx=28, pady=22)
+    dlg.resizable(False, False)
+    dlg.attributes("-topmost", True)
+
+    def on_decline():
+        log_event(
+            "WAIVER",
+            f"User declined Options Auto-Flatten BETA Waiver v{OPTIONS_WAIVER_VERSION} "
+            f"— keeping Options Siren-Only."
+        )
+        dlg.destroy()
+
+    dlg.protocol("WM_DELETE_WINDOW", on_decline)
+
+    tk.Label(
+        dlg,
+        text=(
+            f"⚠️ EXPERIMENTAL BETA FEATURE — OPTIONS AUTO-FLATTEN WAIVER "
+            f"(v{OPTIONS_WAIVER_VERSION})"
+        ),
+        font=("Arial", 12, "bold"),
+        fg="#fbbf24",
+        bg="#0d1117",
+        anchor="w",
+    ).pack(fill="x", pady=(0, 12))
+
+    msg_outer = tk.Frame(
+        dlg,
+        bg="#131922",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#5c2836",
+    )
+    msg_outer.pack(fill="x", pady=(0, 14))
+    NeonBarCanvas(
+        msg_outer, core_color="#f43f5e", card_bg="#131922", glow_on=True
+    ).pack(side="left", fill="y")
+    msg_box = tk.Label(
+        msg_outer,
+        text=OPTIONS_WAIVER_TEXT,
+        font=("Arial", 9),
+        fg="#dce4ee",
+        bg="#131922",
+        justify="left",
+        anchor="w",
+        padx=16,
+        pady=14,
+    )
+    msg_box.pack(side="left", fill="both", expand=True)
+
+    var_opt_agree = tk.BooleanVar(value=False)
+    make_glass_checkbutton(
+        dlg,
+        text=(
+            "I understand that Options Auto-Flatten is an experimental BETA feature, that Market orders on "
+            "option spreads can suffer severe slippage, and I assume 100% sole responsibility for all fills."
+        ),
+        variable=var_opt_agree,
+        font=("Arial", 9, "bold"),
+        fg="#fbbf24",
+        bg="#0d1117",
+        accent_hex="#d97706",
+        check_hex="#fbbf24",
+    ).pack(anchor="w", pady=(0, 14))
+
+    btn_row = tk.Frame(dlg, bg="#0d1117")
+    btn_row.pack(fill="x")
+
+    def on_accept_opt():
+        if not var_opt_agree.get():
+            messagebox.showwarning(
+                "Confirmation Required",
+                "Please check the box confirming you understand the BETA status, "
+                "option spread slippage risks, and assume 100% sole responsibility.",
+                parent=dlg,
+            )
+            return
+        accepted_ts = datetime.now().isoformat(timespec="seconds")
+        config["options_waiver_accepted"] = True
+        config["options_waiver_version"] = OPTIONS_WAIVER_VERSION
+        config["options_waiver_accepted_at"] = accepted_ts
+        config["options_waiver_sha256"] = expected_opt_sha
+        save_config(config)
+        log_event(
+            "WAIVER",
+            f"User accepted Options Auto-Flatten BETA Waiver v{OPTIONS_WAIVER_VERSION} "
+            f"(Accepted at: {accepted_ts} | SHA256: {expected_opt_sha[:12]}...)"
+        )
+        accepted["ok"] = True
+        dlg.destroy()
+
+    make_stadium_button(
+        btn_row,
+        text="Cancel (Keep Options Siren-Only)",
+        font=("Arial", 10, "bold"),
+        fill_color="#3b1520",
+        border_color="#f43f5e",
+        hover_fill="#4f1c2b",
+        hover_border="#fb7185",
+        fg="#ffe4e6",
+        canvas_bg="#0d1117",
+        width=238,
+        height=36,
+        pad_x=28,
+        glow_strength=0.45,
+        command=on_decline,
+    ).pack(side="left")
+
+    make_stadium_button(
+        btn_row,
+        text="I Accept Options BETA Risk >>",
+        font=("Arial", 10, "bold"),
+        fill_color="#105e35",
+        border_color="#22ff88",
+        hover_fill="#157a46",
+        hover_border="#69f0ae",
+        glow_color="#00e676",
+        fg="#ffffff",
+        canvas_bg="#0d1117",
+        width=248,
+        height=36,
+        pad_x=32,
+        glow_strength=0.65,
+        command=on_accept_opt,
+    ).pack(side="right")
+
+    if parent is None:
+        dlg.mainloop()
+    else:
+        parent.wait_window(dlg)
     return accepted["ok"]
 
 
@@ -4786,6 +5465,7 @@ def get_full_idle_button_text():
     b_name = config.get("active_broker", "SCHWAB")
     if config.get("alarms_only_mode", False):
         return f"{b_name} : ALARMS ONLY MODE (OBSERVATION / SIREN ONLY)"
+    opt_armed = is_options_flatten_armed(config)
     pills = [b_name]
     if config.get("enable_open_flatten", False):
         oml = config.get("open_max_loss", 500.0)
@@ -4796,7 +5476,11 @@ def get_full_idle_button_text():
             pills.append(f"OPEN STOP (-${oml:,.0f})")
     daily_parts = []
     if config.get("enable_auto_flatten", False):
-        daily_parts.append("DAY FLATTEN")
+        daily_parts.append(
+            "DAY FLATTEN + OPT(BETA)" if opt_armed else "DAY FLATTEN"
+        )
+    elif opt_armed and config.get("enable_open_flatten", False):
+        daily_parts.append("OPT FLAT(BETA)")
     if config.get("enable_kill_tos", False):
         daily_parts.append("KILL TOS")
     if config.get("enable_kill_webull", False):
@@ -4820,6 +5504,7 @@ def get_medium_idle_button_text():
     b_name = config.get("active_broker", "SCHWAB")
     if config.get("alarms_only_mode", False):
         return f"{b_name} : ALARMS ONLY MODE (SIREN ONLY)"
+    opt_armed = is_options_flatten_armed(config)
     pills = [b_name]
     if config.get("enable_open_flatten", False):
         oml = config.get("open_max_loss", 500.0)
@@ -4830,7 +5515,9 @@ def get_medium_idle_button_text():
             pills.append(f"OPEN (-${oml:,.0f})")
     daily_parts = []
     if config.get("enable_auto_flatten", False):
-        daily_parts.append("DAY FLAT")
+        daily_parts.append("DAY+OPT(BETA)" if opt_armed else "DAY FLAT")
+    elif opt_armed and config.get("enable_open_flatten", False):
+        daily_parts.append("OPT(BETA)")
     if config.get("enable_kill_tos", False) or config.get("enable_kill_webull", False):
         daily_parts.append("KILL APP")
     if config.get("enable_lock_os", False):
@@ -5088,8 +5775,14 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
 
     def _check_or_sweep_stage(stage_num, elapsed_tag):
         global cooldown_active
+        opt_armed = is_options_flatten_armed(config)
         post_pos = adapter.get_open_equity_positions()
-        if post_pos is None:
+        post_opt = (
+            adapter.get_open_option_positions()
+            if opt_armed and hasattr(adapter, "get_open_option_positions")
+            else []
+        )
+        if post_pos is None or (opt_armed and post_opt is None):
             log_event(
                 "WARNING",
                 f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
@@ -5097,13 +5790,22 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
             )
             time.sleep(1.5)
             post_pos = adapter.get_open_equity_positions()
+            post_opt = (
+                adapter.get_open_option_positions()
+                if opt_armed and hasattr(adapter, "get_open_option_positions")
+                else []
+            )
 
-        if post_pos is not None and len(post_pos) == 0:
+        eq_ok = (post_pos is not None and len(post_pos) == 0)
+        opt_ok = (not opt_armed) or (post_opt is not None and len(post_opt) == 0)
+
+        if eq_ok and opt_ok:
             if stage_num == 1:
                 log_event(
                     "GUARDRAIL",
                     f"POST-LOCK WATCHDOG STAGE 1 (2.0s | {lock_context}): "
-                    f"Triple-confirmed 0 open equity shares."
+                    f"Triple-confirmed 0 open equity shares"
+                    + (" and 0 open option contracts." if opt_armed else ".")
                 )
                 if not is_one_shot:
                     time.sleep(1.8)
@@ -5112,19 +5814,27 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
                 log_event(
                     "GUARDRAIL",
                     f"POST-LOCK WATCHDOG STAGE 2 (15.0s | {lock_context}): "
-                    f"15-second sweep clear — confirmed 0 open equity shares."
+                    f"15-second sweep clear — confirmed 0 open equity shares"
+                    + (" and 0 open option contracts." if opt_armed else ".")
                 )
                 speak_async("15 second sweep clear, account confirmed flat.")
             return True
 
+        straggler_desc = (
+            f"Equities={post_pos}, Options={[(x[0], x[1]) for x in (post_opt or [])]}"
+            if opt_armed
+            else f"{post_pos}"
+        )
         log_event(
             "CRITICAL",
             f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
-            f"Straggler equity positions detected after OS lock: {post_pos}! "
+            f"Straggler positions detected after OS lock: {straggler_desc}! "
             f"Initiating emergency sweep..."
         )
         speak_async("Warning, straggler shares detected, flattening now.")
-        swept_flat = flatten_equities(adapter, force_flatten=True)
+        swept_flat = flatten_equities(
+            adapter, force_flatten=True, include_options=opt_armed
+        )
         if swept_flat:
             log_event(
                 "GUARDRAIL",
@@ -5276,87 +5986,201 @@ def start_cooldown_lock(
     threading.Thread(target=cooldown_worker, daemon=True).start()
 
 
-def flatten_equities(adapter, force_flatten=False):
+def flatten_equities(adapter, force_flatten=False, include_options=None):
     """Cancels working orders, submits RTH Market or EXT Limit liquidations
-    for EQUITIES ONLY, and double-confirms (with 0.8s settlement delay) that
-    0 equity shares remain."""
+    for EQUITIES (and RTH Market liquidations for OPTIONS when the BETA Options
+    Auto-Flatten toggle + waiver are active), and double-confirms (with 0.8s
+    settlement delay) that 0 open positions remain."""
     alarms_only = config.get("alarms_only_mode", False)
     should_exec = (not alarms_only) and (
         force_flatten or config.get("enable_auto_flatten", False)
     )
+    if include_options is None:
+        include_options = is_options_flatten_armed(config)
+    else:
+        include_options = bool(include_options and is_options_flatten_armed(config))
+
+    def _fmt_opt_summary(opt_list):
+        if not opt_list:
+            return "[]"
+        return str([(x[0], x[1]) for x in opt_list])
+
     try:
+        if include_options and not is_market_hours():
+            # US equity options only trade during RTH (9:30 AM - 4:00 PM ET).
+            # Check if any options are open; if none are open, proceed with
+            # standard Extended-Hours equity flatten.
+            eh_opt = (
+                adapter.get_open_option_positions()
+                if hasattr(adapter, "get_open_option_positions")
+                else []
+            )
+            if eh_opt is not None and len(eh_opt) == 0:
+                include_options = False
+            else:
+                # Flatten any open equities first, then return False because
+                # options cannot be market-flattened outside RTH.
+                flatten_equities(
+                    adapter, force_flatten=force_flatten, include_options=False
+                )
+                log_event(
+                    "GUARDRAIL",
+                    f"Options Auto-Flatten (BETA) is enabled, but US options "
+                    f"market is closed (outside 9:30 AM – 4:00 PM ET). "
+                    f"Open options require manual action: {_fmt_opt_summary(eh_opt)}"
+                )
+                return False
+
         if should_exec:
-            log_event("FLATTEN", "Starting emergency equity flatten sequence...")
+            log_event(
+                "FLATTEN",
+                "Starting emergency flatten sequence (Equities + Options BETA)..."
+                if include_options
+                else "Starting emergency equity flatten sequence..."
+            )
             adapter.cancel_all_working_orders()
 
             open_pos = adapter.get_open_equity_positions()
-            if open_pos is not None and len(open_pos) == 0:
+            open_opt = (
+                adapter.get_open_option_positions()
+                if include_options and hasattr(adapter, "get_open_option_positions")
+                else []
+            )
+            if (
+                open_pos is not None
+                and len(open_pos) == 0
+                and (not include_options or (open_opt is not None and len(open_opt) == 0))
+            ):
                 log_event(
                     "FLATTEN",
-                    "Initial check shows 0 open equity shares. Running 0.8s "
+                    "Initial check shows 0 open positions. Running 0.8s "
+                    "settlement double-confirm..."
+                    if include_options
+                    else "Initial check shows 0 open equity shares. Running 0.8s "
                     "settlement double-confirm..."
                 )
                 time.sleep(0.8)
                 open_pos = adapter.get_open_equity_positions()
-                if open_pos is not None and len(open_pos) == 0:
+                open_opt = (
+                    adapter.get_open_option_positions()
+                    if include_options and hasattr(adapter, "get_open_option_positions")
+                    else []
+                )
+                if (
+                    open_pos is not None
+                    and len(open_pos) == 0
+                    and (not include_options or (open_opt is not None and len(open_opt) == 0))
+                ):
                     log_event(
                         "FLATTEN",
-                        "Double-confirmed 0 open equity shares (no flatten order needed)."
+                        "Double-confirmed 0 open equities & 0 open options (no flatten order needed)."
+                        if include_options
+                        else "Double-confirmed 0 open equity shares (no flatten order needed)."
                     )
                     return True
 
             if open_pos:
                 log_event("FLATTEN", f"Equity positions to liquidate: {open_pos}")
                 adapter.submit_liquidation_batch(open_pos)
-            elif open_pos is None:
+            if include_options and open_opt:
+                log_event(
+                    "FLATTEN",
+                    f"Option positions to liquidate (BETA): {_fmt_opt_summary(open_opt)}"
+                )
+                adapter.submit_option_liquidation_batch(open_opt)
+            if open_pos is None or (include_options and open_opt is None):
                 log_event(
                     "WARNING",
                     "Initial position query failed (None); entering verification polling loop..."
                 )
         else:
             open_pos = adapter.get_open_equity_positions()
-            if open_pos is not None and len(open_pos) == 0:
+            open_opt = (
+                adapter.get_open_option_positions()
+                if include_options and hasattr(adapter, "get_open_option_positions")
+                else []
+            )
+            if (
+                open_pos is not None
+                and len(open_pos) == 0
+                and (not include_options or (open_opt is not None and len(open_opt) == 0))
+            ):
                 time.sleep(0.8)
                 open_pos = adapter.get_open_equity_positions()
-                if open_pos is not None and len(open_pos) == 0:
+                open_opt = (
+                    adapter.get_open_option_positions()
+                    if include_options and hasattr(adapter, "get_open_option_positions")
+                    else []
+                )
+                if (
+                    open_pos is not None
+                    and len(open_pos) == 0
+                    and (not include_options or (open_opt is not None and len(open_opt) == 0))
+                ):
                     return True
             log_event(
                 "WARNING",
-                f"Auto-Flatten is OFF, and equity shares remain open (or unverified): {open_pos}"
+                f"Auto-Flatten is OFF, and positions remain open (or unverified): "
+                f"Equities={open_pos}"
+                + (f", Options={_fmt_opt_summary(open_opt)}" if include_options else "")
             )
             return False
 
-        log_event("FLATTEN", "Polling broker API to verify 0 open equity shares...")
+        log_event(
+            "FLATTEN",
+            "Polling broker API to verify 0 open equities & 0 open options..."
+            if include_options
+            else "Polling broker API to verify 0 open equity shares..."
+        )
         start_wait = time.time()
         polls = 0
         while time.time() - start_wait < 15:
             time.sleep(0.5 if polls == 0 else 1.5)
             polls += 1
             rem_pos = adapter.get_open_equity_positions()
+            rem_opt = (
+                adapter.get_open_option_positions()
+                if include_options and hasattr(adapter, "get_open_option_positions")
+                else []
+            )
             elapsed = time.time() - start_wait
-            if rem_pos is None:
+            if rem_pos is None or (include_options and rem_opt is None):
                 log_event(
                     "WARNING",
                     f"Check #{polls} ({elapsed:.1f}s): Position query returned None; retrying..."
                 )
                 continue
 
-            if len(rem_pos) == 0:
+            if len(rem_pos) == 0 and (not include_options or len(rem_opt) == 0):
                 log_event(
                     "FLATTEN",
-                    f"Check #{polls} ({elapsed:.1f}s): 0 equity shares reported. "
+                    f"Check #{polls} ({elapsed:.1f}s): 0 open positions reported. "
+                    f"Running 0.8s settlement double-confirm..."
+                    if include_options
+                    else f"Check #{polls} ({elapsed:.1f}s): 0 equity shares reported. "
                     f"Running 0.8s settlement double-confirm..."
                 )
                 time.sleep(0.8)
                 rem_confirm = adapter.get_open_equity_positions()
+                opt_confirm = (
+                    adapter.get_open_option_positions()
+                    if include_options and hasattr(adapter, "get_open_option_positions")
+                    else []
+                )
                 elapsed_confirm = time.time() - start_wait
-                if rem_confirm is not None and len(rem_confirm) == 0:
+                if (
+                    rem_confirm is not None
+                    and len(rem_confirm) == 0
+                    and (not include_options or (opt_confirm is not None and len(opt_confirm) == 0))
+                ):
                     log_event(
                         "FLATTEN",
-                        f"SUCCESS: Double-confirmed 0 equity shares in {elapsed_confirm:.1f}s."
+                        f"SUCCESS: Double-confirmed 0 equities & 0 options in {elapsed_confirm:.1f}s."
+                        if include_options
+                        else f"SUCCESS: Double-confirmed 0 equity shares in {elapsed_confirm:.1f}s."
                     )
                     return True
-                if rem_confirm is None:
+                if rem_confirm is None or (include_options and opt_confirm is None):
                     log_event(
                         "WARNING",
                         "0.8s double-confirm query returned None; continuing verification loop..."
@@ -5364,43 +6188,79 @@ def flatten_equities(adapter, force_flatten=False):
                     continue
                 log_event(
                     "FLATTEN",
-                    f"Straggler equity shares detected on 0.8s double-confirm: "
-                    f"{rem_confirm} — sweeping..."
+                    f"Straggler positions detected on 0.8s double-confirm: "
+                    f"Equities={rem_confirm}"
+                    + (f", Options={_fmt_opt_summary(opt_confirm)}" if include_options else "")
+                    + " — sweeping..."
                 )
                 if should_exec:
                     adapter.cancel_all_working_orders()
-                    adapter.submit_liquidation_batch(rem_confirm)
+                    if rem_confirm:
+                        adapter.submit_liquidation_batch(rem_confirm)
+                    if include_options and opt_confirm:
+                        adapter.submit_option_liquidation_batch(opt_confirm)
                 continue
 
             log_event(
                 "FLATTEN",
-                f"Check #{polls} ({elapsed:.1f}s): Equities still open: {rem_pos}"
+                f"Check #{polls} ({elapsed:.1f}s): Positions still open: "
+                f"Equities={rem_pos}, Options={_fmt_opt_summary(rem_opt)}"
+                if include_options
+                else f"Check #{polls} ({elapsed:.1f}s): Equities still open: {rem_pos}"
             )
 
             if should_exec and polls % 2 == 0:
                 log_event(
                     "FLATTEN",
-                    "Equities still open after 4s — canceling & sweeping..."
+                    "Positions still open after 4s — canceling & sweeping..."
+                    if include_options
+                    else "Equities still open after 4s — canceling & sweeping..."
                 )
                 adapter.cancel_all_working_orders()
                 rem_pos = adapter.get_open_equity_positions()
-                if rem_pos is not None and len(rem_pos) == 0:
+                rem_opt = (
+                    adapter.get_open_option_positions()
+                    if include_options and hasattr(adapter, "get_open_option_positions")
+                    else []
+                )
+                if (
+                    rem_pos is not None
+                    and len(rem_pos) == 0
+                    and (not include_options or (rem_opt is not None and len(rem_opt) == 0))
+                ):
                     time.sleep(0.8)
                     rem_confirm = adapter.get_open_equity_positions()
-                    if rem_confirm is not None and len(rem_confirm) == 0:
+                    opt_confirm = (
+                        adapter.get_open_option_positions()
+                        if include_options and hasattr(adapter, "get_open_option_positions")
+                        else []
+                    )
+                    if (
+                        rem_confirm is not None
+                        and len(rem_confirm) == 0
+                        and (not include_options or (opt_confirm is not None and len(opt_confirm) == 0))
+                    ):
                         log_event(
                             "FLATTEN",
-                            f"SUCCESS: Double-confirmed 0 equity shares after cancel "
+                            f"SUCCESS: Double-confirmed 0 positions after cancel "
+                            f"({time.time() - start_wait:.1f}s)."
+                            if include_options
+                            else f"SUCCESS: Double-confirmed 0 equity shares after cancel "
                             f"({time.time() - start_wait:.1f}s)."
                         )
                         return True
                     rem_pos = rem_confirm
+                    rem_opt = opt_confirm
                 if rem_pos:
                     adapter.submit_liquidation_batch(rem_pos)
+                if include_options and rem_opt:
+                    adapter.submit_option_liquidation_batch(rem_opt)
 
         log_event(
             "CRITICAL",
-            "Equity flatten 15s timeout reached! Shares still open!"
+            "Flatten 15s timeout reached! Positions (Equities/Options) still open!"
+            if include_options
+            else "Equity flatten 15s timeout reached! Shares still open!"
         )
         return False
 
@@ -5414,16 +6274,30 @@ def trigger_open_pnl_flatten(
 ):
     global alarm_active
     cd_on = config.get("enable_open_cooldown", False)
+    opt_armed = is_options_flatten_armed(config)
 
-    if has_options:
+    if has_options and not opt_armed:
         opt_reason = f"{reason} — MANUAL OPTIONS EXIT REQUIRED!"
         trigger_alarm(opt_reason, ui_button, context_str)
         log_event(
             "GUARDRAIL",
             f"Open PnL Stop breached with OPTIONS open ({context_str}). "
-            f"Flattening any equities; waiting for manual options exit."
+            f"Options Auto-Flatten (BETA) is OFF; flattening any equities and "
+            f"waiting for manual options exit."
         )
-        flatten_equities(adapter, force_flatten=True)
+        flatten_equities(adapter, force_flatten=True, include_options=False)
+        return
+
+    if has_options and opt_armed and not is_market_hours():
+        opt_reason = f"{reason} — OPTIONS MARKET CLOSED (EXIT MANUALLY!)"
+        trigger_alarm(opt_reason, ui_button, context_str)
+        log_event(
+            "GUARDRAIL",
+            f"Open PnL Stop breached with OPTIONS open outside RTH ({context_str}). "
+            f"Options cannot be market-flattened outside 9:30–16:00 ET; "
+            f"flattening any equities and sounding siren."
+        )
+        flatten_equities(adapter, force_flatten=True, include_options=False)
         return
 
     if not cd_on:
@@ -5433,11 +6307,21 @@ def trigger_open_pnl_flatten(
 
     log_event(
         "GUARDRAIL",
-        f"OPEN PnL AUTO-FLATTEN INITIATED: {reason} | {context_str}"
+        f"OPEN PnL AUTO-FLATTEN {'(EQUITIES + OPTIONS BETA) ' if (has_options and opt_armed) else ''}INITIATED: "
+        f"{reason} | {context_str}"
     )
-    eq_flat = flatten_equities(adapter, force_flatten=True)
-    if eq_flat:
-        log_event("GUARDRAIL", "Open PnL equity bailout confirmed 100% flat.")
+    all_flat = flatten_equities(
+        adapter,
+        force_flatten=True,
+        include_options=(has_options and opt_armed)
+    )
+    if all_flat:
+        log_event(
+            "GUARDRAIL",
+            "Open PnL bailout (Equities + Options BETA) confirmed 100% flat."
+            if (has_options and opt_armed)
+            else "Open PnL equity bailout confirmed 100% flat."
+        )
         if cd_on:
             alarm_active = False
             cd_mins = config.get("open_cooldown_mins", 1.0)
@@ -5453,7 +6337,12 @@ def trigger_open_pnl_flatten(
             "Open PnL flatten timed out — Cool-Down Lock ABORTED! "
             "Check platform manually!"
         )
-        trigger_alarm(reason, ui_button, context_str)
+        fail_reason = (
+            f"{reason} — CHECK OPTIONS MANUALLY!"
+            if has_options
+            else reason
+        )
+        trigger_alarm(fail_reason, ui_button, context_str)
 
 
 def terminate_selected_apps():
@@ -5487,6 +6376,7 @@ def trigger_lockdown(
 
     alarms_only = config.get("alarms_only_mode", False)
     flat_on = (not alarms_only) and config.get("enable_auto_flatten", False)
+    opt_armed = flat_on and is_options_flatten_armed(config)
     kill_tos = (not alarms_only) and config.get("enable_kill_tos", False)
     kill_wb = (not alarms_only) and config.get("enable_kill_webull", False)
     lock_on = (not alarms_only) and config.get("enable_lock_os", False)
@@ -5510,9 +6400,10 @@ def trigger_lockdown(
         f"DAILY TERMINATION BREACHED: {reason} | {context_str}"
     )
 
-    eq_flat = flatten_equities(adapter)
+    opt_exec_now = bool(has_options and opt_armed and is_market_hours())
+    all_flat = flatten_equities(adapter, include_options=opt_exec_now)
 
-    if has_options:
+    if has_options and not opt_exec_now:
         trigger_alarm(
             f"{reason} (CLOSE OPTIONS MANUALLY!)", ui_button, context_str
         )
@@ -5523,12 +6414,18 @@ def trigger_lockdown(
         )
         return
 
-    if not eq_flat:
+    if not all_flat:
         log_event(
             "CRITICAL",
-            "OS ACTIONS ABORTED: Equity shares still open! Manual action needed!"
+            "OS ACTIONS ABORTED: Positions (Equities/Options) still open! Manual action needed!"
+            if has_options
+            else "OS ACTIONS ABORTED: Equity shares still open! Manual action needed!"
         )
-        trigger_alarm(reason, ui_button, context_str)
+        trigger_alarm(
+            f"{reason} (POSITIONS STILL OPEN!)" if has_options else reason,
+            ui_button,
+            context_str
+        )
         return
 
     is_locked_down = True
@@ -5870,7 +6767,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         f"Open={format_dollar(open_pnl)}, "
                         f"Net={format_dollar(net_pnl)}"
                     )
-                    if (book_confirms_floor or book_confirms_open) and not qty_just_changed:
+                    if (
+                        (book_confirms_floor or book_confirms_open)
+                        and not qty_just_changed
+                        and not has_options
+                    ):
                         log_event(
                             "GUARDRAIL",
                             f"Breach confirmed immediately by NBBO book & "
@@ -6535,6 +7436,13 @@ def show_preflight_window(parent=None, mute_btn=None):
         value=config.get("alarms_only_mode", False)
     )
     var_flatten = tk.BooleanVar(value=config["enable_auto_flatten"])
+    var_flatten_options = tk.BooleanVar(
+        value=bool(
+            config.get("enable_flatten_options", False)
+            and is_options_waiver_verified(config)
+        )
+    )
+    _opt_waiver_guard = {"suppress": False}
     var_kill_tos = tk.BooleanVar(value=config.get("enable_kill_tos", False))
     var_kill_wb = tk.BooleanVar(value=config.get("enable_kill_webull", False))
     var_lock_os = tk.BooleanVar(value=config["enable_lock_os"])
@@ -7705,6 +8613,19 @@ def show_preflight_window(parent=None, mute_btn=None):
         var_flatten.set(
             src.get("enable_auto_flatten", DEFAULT_CONFIG["enable_auto_flatten"])
         )
+        _opt_waiver_guard["suppress"] = True
+        try:
+            var_flatten_options.set(
+                bool(
+                    src.get(
+                        "enable_flatten_options",
+                        DEFAULT_CONFIG["enable_flatten_options"],
+                    )
+                    and is_options_waiver_verified(config)
+                )
+            )
+        finally:
+            _opt_waiver_guard["suppress"] = False
         var_kill_tos.set(
             src.get("enable_kill_tos", DEFAULT_CONFIG["enable_kill_tos"])
         )
@@ -7779,6 +8700,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 "enable_open_cooldown": bool(var_open_cd.get()),
                 "open_cooldown_mins": max(0.1, abs(float(var_cd_mins.get()))),
                 "enable_auto_flatten": bool(var_flatten.get()),
+                "enable_flatten_options": bool(var_flatten_options.get()),
                 "enable_kill_tos": bool(var_kill_tos.get()),
                 "enable_kill_webull": bool(var_kill_wb.get()),
                 "enable_lock_os": bool(var_lock_os.get()),
@@ -7866,6 +8788,18 @@ def show_preflight_window(parent=None, mute_btn=None):
             if not had_saved:
                 force_reanchor = True
 
+            if var_flatten_options.get() and not is_options_waiver_verified(config):
+                if not show_options_flatten_beta_waiver(
+                    parent=pf, force_prompt=True
+                ):
+                    _opt_waiver_guard["suppress"] = True
+                    try:
+                        var_flatten_options.set(False)
+                    finally:
+                        _opt_waiver_guard["suppress"] = False
+                    refresh_smart_dimming()
+                    return
+
             new_cfg["alarms_only_mode"] = bool(var_alarms_only.get())
             new_cfg["enable_open_flatten"] = bool(var_open_flat.get())
             new_cfg["enable_open_cooldown"] = bool(var_open_cd.get())
@@ -7873,6 +8807,14 @@ def show_preflight_window(parent=None, mute_btn=None):
                 0.1, abs(float(var_cd_mins.get()))
             )
             new_cfg["enable_auto_flatten"] = bool(var_flatten.get())
+            new_cfg["enable_flatten_options"] = bool(var_flatten_options.get())
+            for _ow_k in (
+                "options_waiver_accepted",
+                "options_waiver_version",
+                "options_waiver_accepted_at",
+                "options_waiver_sha256",
+            ):
+                new_cfg[_ow_k] = config.get(_ow_k, DEFAULT_CONFIG[_ow_k])
             new_cfg["enable_kill_tos"] = bool(var_kill_tos.get())
             new_cfg["enable_kill_webull"] = bool(var_kill_wb.get())
             new_cfg["enable_lock_os"] = bool(var_lock_os.get())
@@ -8146,8 +9088,8 @@ def show_preflight_window(parent=None, mute_btn=None):
     c1 = make_card(
         left_col,
         "▶  1. SINGLE-TRADE STOP (Open PnL)",
-        "Flattens open Equities on a single trade without ending your day "
-        "(Options = Siren Only).",
+        "Flattens open positions on a single trade without ending your day "
+        "(Options = Siren Only unless BETA toggle enabled in Card 2).",
         accent="#5dade2",
         bar_color="#38bdf8"
     )
@@ -8180,7 +9122,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         "Enforcer cancels working orders and flattens open EQUITY shares immediately\n"
         "(Market order in RTH 9:30–4:00 ET; marketable GTC_EXT limit order in Extended Hours).\n"
         "• Does NOT end your trading day.\n"
-        "• Option contracts are never auto-flattened (sounds siren only)."
+        "• Option contracts are Siren-Only by default unless 'Include Options in Auto-Flatten (BETA)'\n"
+        "  is explicitly enabled in Card 2 (RTH 9:30 AM – 4:00 PM ET Market orders only)."
     )
     attach_tooltip(cb_open_flat, open_stop_tip)
     attach_tooltip(lbl_open_loss, open_stop_tip)
@@ -8247,7 +9190,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         "When your total Net PnL (Realized + Open) hits your active Daily Stop in Rulebook 4 or 5\n"
         "(whether that is your Starting Max Loss, a tightened Tier 2/3 Max Loss, or a green\n"
         "Trailing Profit Lock), Enforcer cancels working orders and liquidates open Equity shares.\n"
-        "• Option contracts are never auto-flattened; if options are open, the siren blares until you close them."
+        "• Option contracts are Siren-Only by default unless 'Include Options in Auto-Flatten (BETA)'\n"
+        "  is enabled below; if options remain open, the siren blares until you close them."
     )
 
     cb_alarms_only = make_glass_checkbutton(
@@ -8272,6 +9216,54 @@ def show_preflight_window(parent=None, mute_btn=None):
         "• NEVER submits flatten orders, closes trading apps, or locks your Windows screen.\n"
         "• Unchecking this box immediately restores your saved Auto-Flatten and OS Lock checkmarks."
     )
+
+    r_opt_flat = tk.Frame(c2, bg="#131922")
+    r_opt_flat.pack(fill="x", pady=2)
+    cb_opt_flat = make_glass_checkbutton(
+        r_opt_flat,
+        text="└─ Include Options in Auto-Flatten (BETA — RTH Market Orders)",
+        variable=var_flatten_options,
+        font=("Arial", 10, "bold"),
+        fg="#f5b041",
+        bg="#131922",
+        accent_hex="#d97706",
+        check_hex="#fbbf24",
+        anchor="w"
+    )
+    cb_opt_flat.pack(side="left", padx=(18, 0))
+    opt_flat_tip = (
+        "EXPERIMENTAL BETA — Options Auto-Flatten (RTH 9:30 AM – 4:00 PM ET Only):\n"
+        "When checked (and after accepting the BETA Options Risk Waiver), Enforcer will also submit\n"
+        "single-leg RTH MARKET orders (BUY_TO_CLOSE for short legs first, SELL_TO_CLOSE for long legs)\n"
+        "to liquidate open equity option contracts during Card 1 Open PnL stops and Card 2 Daily Stops.\n"
+        "• WIDE SPREAD WARNING: Option Market orders fill at the live Bid/Ask and can suffer severe\n"
+        "  slippage far beyond your stop threshold on wide-spread or fast-moving contracts.\n"
+        "• MULTI-LEG SPREADS: Liquidated leg-by-leg as individual Market orders (short legs first).\n"
+        "• RTH ONLY: Options cannot be auto-flattened outside 9:30 AM – 4:00 PM ET (sounds siren instead)."
+    )
+    attach_tooltip(cb_opt_flat, opt_flat_tip)
+
+    def _on_toggle_flatten_options(*_):
+        if _opt_waiver_guard["suppress"]:
+            return
+        if var_flatten_options.get():
+            accepted = show_options_flatten_beta_waiver(
+                parent=pf, force_prompt=True
+            )
+            if not accepted:
+                _opt_waiver_guard["suppress"] = True
+                try:
+                    var_flatten_options.set(False)
+                finally:
+                    _opt_waiver_guard["suppress"] = False
+        else:
+            log_event(
+                "WAIVER",
+                "User unchecked BETA Options Auto-Flatten toggle in Pre-Flight.",
+            )
+        refresh_smart_dimming()
+
+    var_flatten_options.trace_add("write", _on_toggle_flatten_options)
 
     r_kill = tk.Frame(c2, bg="#131922")
     r_kill.pack(fill="x", pady=3)
@@ -8960,6 +9952,7 @@ def show_preflight_window(parent=None, mute_btn=None):
             lbl_cd_mins.config(fg="#526070")
 
             cb_day_flat.config(state="disabled")
+            cb_opt_flat.config(state="disabled")
             lbl_kill.config(fg="#526070")
             cb_kill_tos.config(state="disabled")
             cb_kill_wb.config(state="disabled")
@@ -8967,7 +9960,14 @@ def show_preflight_window(parent=None, mute_btn=None):
             ent_daily_lock_mins.config(state="disabled")
             lbl_daily_lock_mins.config(fg="#526070")
         else:
-            cb_open_flat.config(state="normal")
+            cb_open_flat.config(
+                state="normal",
+                text=(
+                    "Enable Open PnL Auto-Flatten (Eq + Opt BETA)"
+                    if var_flatten_options.get()
+                    else "Enable Open PnL Auto-Flatten (Equities)"
+                ),
+            )
             if var_open_flat.get():
                 ent_open_loss.config(state="normal")
                 lbl_open_loss.config(fg="#dc6d72")
@@ -8986,6 +9986,13 @@ def show_preflight_window(parent=None, mute_btn=None):
                 lbl_cd_mins.config(fg="#526070")
 
             cb_day_flat.config(state="normal")
+            if var_open_flat.get() or var_flatten.get():
+                cb_opt_flat.config(
+                    state="normal",
+                    fg="#f5b041" if var_flatten_options.get() else "#c8d4e0",
+                )
+            else:
+                cb_opt_flat.config(state="disabled")
             lbl_kill.config(fg="#97a7b9")
             cb_kill_tos.config(state="normal")
             cb_kill_wb.config(state="normal")
@@ -9034,7 +10041,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     for trace_var in (
         var_alarms_only,
-        var_open_flat, var_open_cd, var_lock_os,
+        var_open_flat, var_open_cd, var_flatten, var_lock_os,
         var_pm_w1_on, var_pm_w2_on, var_pm_lock_on,
         var_t1_w1_on, var_t1_w2_on, var_t2_on, var_t3_on, var_t4_on
     ):
