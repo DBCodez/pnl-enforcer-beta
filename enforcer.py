@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.26"
+APP_VERSION = "0.9.27"
 
 import os
 import sys
@@ -1002,7 +1002,7 @@ class HudCapsulePill(tk.Canvas):
                 if abs(int(self["width"]) - target_w) > 1:
                     super().configure(width=target_w)
                 w = max(w, target_w) if w <= target_w + 4 else target_w
-            elif text_w > (w - 18) and isinstance(self._font, tuple) and len(self._font) >= 2:
+            elif text_w > (w - 14) and isinstance(self._font, tuple) and len(self._font) >= 2:
                 smaller_pt = max(7, int(self._font[1]) - 1)
                 render_font = (self._font[0], smaller_pt) + tuple(self._font[2:])
                 probe_id2 = self.create_text(
@@ -1011,7 +1011,7 @@ class HudCapsulePill(tk.Canvas):
                 bbox2 = self.bbox(probe_id2)
                 self.delete(probe_id2)
                 text_w2 = (bbox2[2] - bbox2[0]) if bbox2 else 0
-                max_txt_w = max(24, w - 16)
+                max_txt_w = max(24, w - 12)
                 if text_w2 > max_txt_w and len(render_text) > 4:
                     trimmed = render_text
                     while len(trimmed) > 3:
@@ -1845,9 +1845,27 @@ def get_active_hud_columns(cfg=None):
 
 
 def is_compact_hud(cfg=None):
-    """Returns True when the HUD is configured with 4 or fewer columns
-    (such as the 3-column Small HUD), enabling compact status pill text."""
-    return len(get_active_hud_columns(cfg)) <= 4
+    """Returns True when the HUD is configured with 3 or fewer columns
+    (Small HUD mode), enabling compact status pill text."""
+    return len(get_active_hud_columns(cfg)) <= 3
+
+
+def compute_hud_width(n_cols):
+    """Computes HUD pixel width: preserves the classic 480px (3-col) and
+    800px (5-col) layouts while tapering column width for 6–8 columns so the
+    bar does not over-stretch across the screen."""
+    n = max(1, int(n_cols))
+    if n <= 3:
+        return 480
+    if n == 4:
+        return 640
+    if n == 5:
+        return 800
+    if n == 6:
+        return 840
+    if n == 7:
+        return 900
+    return n * 120
 
 
 def format_hud_cols_btn_label(cols):
@@ -4657,12 +4675,47 @@ def get_full_idle_button_text():
     return "ARMED: " + " + ".join(pills)
 
 
+def get_medium_idle_button_text():
+    """Returns a concise summary for 4-column HUD mode (~335px middle pill)
+    that shows the active broker and all armed stops without overflowing."""
+    b_name = config.get("active_broker", "SCHWAB")
+    if config.get("alarms_only_mode", False):
+        return f"{b_name} : ALARMS ONLY MODE (SIREN ONLY)"
+    pills = [b_name]
+    if config.get("enable_open_flatten", False):
+        oml = config.get("open_max_loss", 500.0)
+        if config.get("enable_open_cooldown", False):
+            cd_m = config.get("open_cooldown_mins", 1.0)
+            pills.append(f"OPEN (-${oml:,.0f}/{cd_m:g}m)")
+        else:
+            pills.append(f"OPEN (-${oml:,.0f})")
+    daily_parts = []
+    if config.get("enable_auto_flatten", False):
+        daily_parts.append("DAY FLAT")
+    if config.get("enable_kill_tos", False) or config.get("enable_kill_webull", False):
+        daily_parts.append("KILL APP")
+    if config.get("enable_lock_os", False):
+        dl_m = config.get("daily_lock_mins", 15.0)
+        daily_parts.append(
+            f"LOCK ({dl_m:g}m)" if dl_m > 0 else "LOCK (1x)"
+        )
+    if daily_parts:
+        pills.append(" + ".join(daily_parts))
+
+    if len(pills) == 1:
+        return f"{b_name} : ALARM ONLY (OBSERVATION)"
+    return "ARMED: " + " + ".join(pills)
+
+
 def get_idle_button_text():
+    n_cols = len(get_active_hud_columns(config))
     full_txt = get_full_idle_button_text()
-    if is_compact_hud():
+    if n_cols <= 3:
         if "ALARM" in full_txt and not full_txt.startswith("ARMED:"):
             return "● ALARMS ONLY"
         return "● ARMED"
+    if n_cols == 4:
+        return get_medium_idle_button_text()
     return full_txt
 
 
@@ -9034,8 +9087,8 @@ def _redraw_hud_leash_canvas(event=None):
         h = hud_leash_bar.winfo_height()
         if w <= 4:
             w = 156
-        if h <= 4:
-            h = 10
+        if h <= 3:
+            h = 5
         lp = max(0.0, min(1.0, float(hud_last_leash_pct)))
         bg_c = hud_last_leash_bg
         if lp > 0.50:
@@ -9049,23 +9102,21 @@ def _redraw_hud_leash_canvas(event=None):
             spec_col = "#ff8a80"
 
         bar_w = int(round(w * lp))
-        # Top 5px (y = 0..4): Upward neon glow bloom into the column background
-        for y in range(5):
-            bloom_t = ((y + 1) / 5.0) ** 1.8 * 0.48
-            bloom_col = _blend_hex(bg_c, core_col, bloom_t)
-            if bar_w > 0:
-                hud_leash_bar.create_line(0, y, bar_w, y, fill=bloom_col)
-            if bar_w < w:
-                hud_leash_bar.create_line(bar_w, y, w, y, fill=bg_c)
+        # Top 1px (y = 0): Subtle neon glow bloom into the column background
+        bloom_col = _blend_hex(bg_c, core_col, 0.38)
+        if bar_w > 0:
+            hud_leash_bar.create_line(0, 0, bar_w, 0, fill=bloom_col)
+        if bar_w < w:
+            hud_leash_bar.create_line(bar_w, 0, w, 0, fill=bg_c)
 
-        # Dark recessed trough for the bottom 5px (y = 5..9)
-        hud_leash_bar.create_rectangle(0, 5, w, h, fill="#16181b", outline="")
+        # Dark recessed trough for the bottom 4px (y = 1..4)
+        hud_leash_bar.create_rectangle(0, 1, w, h, fill="#16181b", outline="")
 
         # Filled neon bar with 1px bright specular top highlight
         if bar_w > 0:
-            hud_leash_bar.create_line(0, 5, bar_w, 5, fill=spec_col)
+            hud_leash_bar.create_line(0, 1, bar_w, 1, fill=spec_col)
             hud_leash_bar.create_rectangle(
-                0, 6, bar_w, h, fill=core_col, outline=""
+                0, 2, bar_w, h, fill=core_col, outline=""
             )
 
         if hud_leash_col_frame is not None:
@@ -9085,6 +9136,7 @@ def rebuild_hud_columns():
     for child in hud_grid_frame.winfo_children():
         child.destroy()
 
+    hud_grid_frame.rowconfigure(0, weight=1)
     for c_idx in range(12):
         hud_grid_frame.columnconfigure(c_idx, weight=0, uniform="")
 
@@ -9117,19 +9169,6 @@ def rebuild_hud_columns():
         )
         hdr_lbl.pack(fill="x")
 
-        if col_id == "dist_to_term":
-            hud_leash_idx = i
-            hud_leash_col_frame = col_frame
-            hud_leash_bar = tk.Canvas(
-                col_frame,
-                bg="#262a2e",
-                height=10,
-                bd=0,
-                highlightthickness=0
-            )
-            hud_leash_bar.pack(side="bottom", fill="x")
-            hud_leash_bar.bind("<Configure>", _redraw_hud_leash_canvas)
-
         val_font = (
             ("Arial", 9, "bold")
             if col_id == "trades_wl"
@@ -9145,6 +9184,21 @@ def rebuild_hud_columns():
         )
         val_lbl.pack(fill="both", expand=True)
 
+        if col_id == "dist_to_term":
+            hud_leash_idx = i
+            hud_leash_col_frame = col_frame
+            hud_leash_bar = tk.Canvas(
+                col_frame,
+                bg="#262a2e",
+                height=5,
+                bd=0,
+                highlightthickness=0
+            )
+            hud_leash_bar.place(
+                relx=0.0, rely=1.0, relwidth=1.0, anchor="sw", height=5
+            )
+            hud_leash_bar.bind("<Configure>", _redraw_hud_leash_canvas)
+
         if hud_start_move_fn and hud_do_move_fn:
             bind_list = [col_frame, hdr_lbl, val_lbl]
             if col_id == "dist_to_term" and hud_leash_bar is not None:
@@ -9155,7 +9209,7 @@ def rebuild_hud_columns():
 
         hud_ui_labels.append(val_lbl)
 
-    w_px = max(480, len(active_cols) * 160)
+    w_px = compute_hud_width(len(active_cols))
     try:
         hud_root.update_idletasks()
         cur_x = hud_root.winfo_x()
@@ -9239,6 +9293,7 @@ def attach_hud_mute_tooltip(widget, hud_win):
             tip_state["win"] is not None
             or not widget.winfo_exists()
             or settings_win_open
+            or len(get_active_hud_columns(config)) >= 5
         ):
             return
         try:
@@ -9365,7 +9420,7 @@ def start_gui():
     root.title(f"PnL Enforcer v{APP_VERSION}")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    w_init = max(480, len(get_active_hud_columns(config)) * 160)
+    w_init = compute_hud_width(len(get_active_hud_columns(config)))
     root.geometry(f"{w_init}x88+50+50")
     root.config(bg="#1a1a1a")
 

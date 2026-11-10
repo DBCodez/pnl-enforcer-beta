@@ -4,6 +4,16 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.27] — 2026-11-10
+### Improved & Fixed
+- **HUD `$ TO STOP` Vertical Baseline Alignment & `5px` Leash Bar (`rebuild_hud_columns` / `_redraw_hud_leash_canvas`):**
+  - Aligned `$ TO STOP`'s dollar readout (`val_lbl`) to the exact same full `36px` vertical height and dead-center baseline (`y = 25..61`) as all other HUD columns while placing the `5px` glowing leash bar (`hud_leash_bar`) along the bottom `5px` (`y = 56..61`) with zero digit overlap and zero gap above the bottom bar.
+- **Tapered Multi-Column HUD Widths (`6–8` Columns) & Tiered `ARMED:` Status Pill (`compute_hud_width` / `get_medium_idle_button_text`):**
+  - Tapered column width scaling when adding `6`, `7`, or `8` columns (`6 cols = 840px`, `7 cols = 900px`, `8 cols = 960px` instead of `960 / 1,120 / 1,280`) while preserving `480px` (`3-Col Small`) and `800px` (`5-Col Standard`).
+  - Added a medium-detailed status summary for `4-Column` mode (`ARMED: SCHWAB + OPEN (-$250/2m) + DAY FLAT + LOCK (5m)`) and restricted the hover-over status tooltip to compact (`< 5` column) layouts where the full text is condensed.
+
+---
+
 ## [v0.9.26] — 2026-11-10
 ### Added & Changed
 - **Optional Small 3-Column (Compact) HUD & Live Hover-Over Status Tooltip:**
