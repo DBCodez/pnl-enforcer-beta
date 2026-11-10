@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.25"
+APP_VERSION = "0.9.26"
 
 import os
 import sys
@@ -989,9 +989,10 @@ class HudCapsulePill(tk.Canvas):
             h = int(self["height"])
 
         render_font = self._font
-        if self._text:
+        render_text = self._text
+        if render_text:
             probe_id = self.create_text(
-                0, 0, text=self._text, font=self._font, anchor="nw"
+                0, 0, text=render_text, font=self._font, anchor="nw"
             )
             bbox = self.bbox(probe_id)
             self.delete(probe_id)
@@ -1001,9 +1002,29 @@ class HudCapsulePill(tk.Canvas):
                 if abs(int(self["width"]) - target_w) > 1:
                     super().configure(width=target_w)
                 w = max(w, target_w) if w <= target_w + 4 else target_w
-            elif text_w > (w - 22) and isinstance(self._font, tuple) and len(self._font) >= 2:
+            elif text_w > (w - 18) and isinstance(self._font, tuple) and len(self._font) >= 2:
                 smaller_pt = max(7, int(self._font[1]) - 1)
                 render_font = (self._font[0], smaller_pt) + tuple(self._font[2:])
+                probe_id2 = self.create_text(
+                    0, 0, text=render_text, font=render_font, anchor="nw"
+                )
+                bbox2 = self.bbox(probe_id2)
+                self.delete(probe_id2)
+                text_w2 = (bbox2[2] - bbox2[0]) if bbox2 else 0
+                max_txt_w = max(24, w - 16)
+                if text_w2 > max_txt_w and len(render_text) > 4:
+                    trimmed = render_text
+                    while len(trimmed) > 3:
+                        trimmed = trimmed[:-1].rstrip()
+                        cand = trimmed + "…"
+                        pid = self.create_text(
+                            0, 0, text=cand, font=render_font, anchor="nw"
+                        )
+                        bb = self.bbox(pid)
+                        self.delete(pid)
+                        if not bb or (bb[2] - bb[0]) <= max_txt_w:
+                            render_text = cand
+                            break
 
         self._bg_photo = _get_glass_pill_photo(
             self,
@@ -1023,7 +1044,7 @@ class HudCapsulePill(tk.Canvas):
         self.create_text(
             int(w // 2),
             int(h // 2),
-            text=self._text,
+            text=render_text,
             font=render_font,
             fill=txt_col
         )
@@ -1718,6 +1739,11 @@ DEFAULT_HUD_COLUMNS = [
     "dist_to_term",
     "session_high",
 ]
+COMPACT_HUD_COLUMNS = [
+    "net_pnl",
+    "terminate_lvl",
+    "dist_to_term",
+]
 
 HALF_RISK_DOLLARS = {
     "open_max_loss": 250.0,
@@ -1816,6 +1842,16 @@ def get_active_hud_columns(cfg=None):
     raw_cols = (cfg or config).get("hud_columns") or DEFAULT_HUD_COLUMNS
     valid = [c for c in raw_cols if c in HUD_COL_HEADERS]
     return valid if valid else list(DEFAULT_HUD_COLUMNS)
+
+
+def is_compact_hud(cfg=None):
+    """Returns True when the HUD is configured with 4 or fewer columns
+    (such as the 3-column Small HUD), enabling compact status pill text."""
+    return len(get_active_hud_columns(cfg)) <= 4
+
+
+def format_hud_cols_btn_label(cols):
+    return f"📊 HUD Columns ({len(cols)})"
 
 
 def format_trades_wl_multiline(wins, losses):
@@ -4586,7 +4622,10 @@ def connect_broker_adapter(broker_name, parent=None, force_wizard=False):
 # ==========================================
 # 6. ALARM, COOL-DOWN & FLATTEN ORCHESTRATION
 # ==========================================
-def get_idle_button_text():
+last_alarm_reason = ""
+
+
+def get_full_idle_button_text():
     b_name = config.get("active_broker", "SCHWAB")
     if config.get("alarms_only_mode", False):
         return f"{b_name} : ALARMS ONLY MODE (OBSERVATION / SIREN ONLY)"
@@ -4618,6 +4657,21 @@ def get_idle_button_text():
     return "ARMED: " + " + ".join(pills)
 
 
+def get_idle_button_text():
+    full_txt = get_full_idle_button_text()
+    if is_compact_hud():
+        if "ALARM" in full_txt and not full_txt.startswith("ARMED:"):
+            return "● ALARMS ONLY"
+        return "● ARMED"
+    return full_txt
+
+
+def format_alarm_button_text(reason):
+    if is_compact_hud():
+        return "MUTE ALARM"
+    return f"ACKNOWLEDGE ALARM ({reason})"
+
+
 def sound_alarm_loop():
     global alarm_active
     while alarm_active and not cooldown_active:
@@ -4630,11 +4684,12 @@ def sound_alarm_loop():
 
 
 def trigger_alarm(reason, ui_button, context_str=""):
-    global alarm_active, triggered_alarms
+    global alarm_active, triggered_alarms, last_alarm_reason
     if reason in triggered_alarms:
         return
 
     triggered_alarms[reason] = time.time()
+    last_alarm_reason = reason
     extra = f" | {context_str}" if context_str else ""
 
     if cooldown_active:
@@ -4646,7 +4701,7 @@ def trigger_alarm(reason, ui_button, context_str=""):
 
     log_event("ALARM", f"Triggered: {reason}{extra}")
     alarm_active = True
-    btn_txt = f"ACKNOWLEDGE ALARM ({reason})"
+    btn_txt = format_alarm_button_text(reason)
     ui_button.after(
         0,
         lambda: ui_button.config(
@@ -4675,8 +4730,12 @@ def check_alarm_rearm(reason, current_val, threshold_val):
 
 
 def mute_alarm(ui_button):
-    global alarm_active
+    global alarm_active, last_alarm_reason
     alarm_active = False
+    last_alarm_reason = ""
+    hide_fn = getattr(ui_button, "_hide_tooltip_fn", None)
+    if callable(hide_fn):
+        hide_fn()
     log_event("ALARM", "User acknowledged and muted siren.")
     if not cooldown_active:
         ui_button.config(
@@ -4792,8 +4851,11 @@ def trigger_upside_tier_glow(ui_button, banner_text, log_msg):
             return
         if idx < len(glow_steps):
             bg_c, fg_c = glow_steps[idx]
+            disp_banner = (
+                "★ FLOOR RAISED ★" if is_compact_hud() else banner_text
+            )
             ui_button.config(
-                text=banner_text,
+                text=disp_banner,
                 bg=bg_c,
                 fg=fg_c,
                 disabledforeground=fg_c,
@@ -4974,8 +5036,9 @@ def start_cooldown_lock(
                 cooldown_30s_announced = True
                 speak_async("30 seconds remaining until unlock.")
             txt = (
-                f"{cooldown_label} ACTIVE: {rem}s REMAINING "
-                f"(DO NOT REVENGE TRADE)"
+                f"🔒 LOCKED: {rem}s"
+                if is_compact_hud()
+                else f"{cooldown_label} ACTIVE: {rem}s REMAINING (DO NOT REVENGE TRADE)"
             )
             ui_button.after(
                 0,
@@ -6778,10 +6841,14 @@ def show_preflight_window(parent=None, mute_btn=None):
         ).pack(fill="x")
         tk.Label(
             dlg,
-            text="Check the columns you want on your HUD and use ▲ / ▼ to arrange their left-to-right order.",
+            text=(
+                "Check the columns you want on your HUD and use ▲ / ▼ to arrange their left-to-right order.\n"
+                "• Small HUD Mode: Selecting 3 (or fewer) columns shrinks the HUD and uses a compact hover-over status pill."
+            ),
             font=("Arial", 9),
             fg="#94a3b8",
             bg="#0d1117",
+            justify="left",
             anchor="w"
         ).pack(fill="x", pady=(2, 10))
 
@@ -6895,6 +6962,16 @@ def show_preflight_window(parent=None, mute_btn=None):
                 checked_vars[c].set(c in DEFAULT_HUD_COLUMNS)
             render_rows()
 
+        def apply_small_3():
+            ordered_ids.clear()
+            ordered_ids.extend(
+                list(COMPACT_HUD_COLUMNS)
+                + [c for c in all_ids if c not in COMPACT_HUD_COLUMNS]
+            )
+            for c in all_ids:
+                checked_vars[c].set(c in COMPACT_HUD_COLUMNS)
+            render_rows()
+
         def apply_and_close():
             chosen = [c for c in ordered_ids if checked_vars[c].get()]
             if not chosen:
@@ -6906,14 +6983,14 @@ def show_preflight_window(parent=None, mute_btn=None):
                 return
             selected_hud_columns.clear()
             selected_hud_columns.extend(chosen)
-            hud_cols_btn.config(text=f"📊 HUD Columns ({len(chosen)})")
+            hud_cols_btn.config(text=format_hud_cols_btn_label(chosen))
             dlg.destroy()
 
         b_bar = tk.Frame(dlg, bg="#0d1117", pady=12)
         b_bar.pack(fill="x")
-        make_stadium_button(
+        btn_std_5 = make_stadium_button(
             b_bar,
-            text="Reset Default 5",
+            text="Standard 5-Col",
             font=("Arial", 9, "bold"),
             fill_color="#141820",
             fill_top_color="#1c212b",
@@ -6921,13 +6998,86 @@ def show_preflight_window(parent=None, mute_btn=None):
             hover_fill="#181e28",
             hover_fill_top="#232a36",
             hover_border="#475569",
-            fg="#e2e8f0",
+            fg="#94a3b8",
             canvas_bg="#0d1117",
-            width=142,
+            width=148,
             height=34,
-            pad_x=26,
+            auto_width=False,
             command=reset_standard_5,
-        ).pack(side="left")
+        )
+        btn_std_5.pack(side="left", padx=(0, 8))
+        btn_small_3 = make_stadium_button(
+            b_bar,
+            text="Small 3-Col (Compact)",
+            font=("Arial", 9, "bold"),
+            fill_color="#141820",
+            fill_top_color="#1c212b",
+            border_color="#2e3746",
+            hover_fill="#181e28",
+            hover_fill_top="#232a36",
+            hover_border="#475569",
+            fg="#94a3b8",
+            canvas_bg="#0d1117",
+            width=184,
+            height=34,
+            auto_width=False,
+            command=apply_small_3,
+        )
+        btn_small_3.pack(side="left")
+
+        def refresh_hud_preset_highlight(*_):
+            curr_chosen = [c for c in ordered_ids if checked_vars[c].get()]
+            is_small_active = (len(curr_chosen) == 3)
+            is_std_active = (len(curr_chosen) == 5)
+            if is_std_active:
+                btn_std_5.config(
+                    text="✓ Standard 5-Col",
+                    fill_color="#0f213a",
+                    fill_top_color="#163052",
+                    border_color="#38bdf8",
+                    hover_fill="#132a48",
+                    hover_fill_top="#1c3b63",
+                    hover_border="#7dd3fc",
+                    fg="#ffffff",
+                )
+            else:
+                btn_std_5.config(
+                    text="Standard 5-Col",
+                    fill_color="#141820",
+                    fill_top_color="#1c212b",
+                    border_color="#2e3746",
+                    hover_fill="#181e28",
+                    hover_fill_top="#232a36",
+                    hover_border="#475569",
+                    fg="#94a3b8",
+                )
+            if is_small_active:
+                btn_small_3.config(
+                    text="✓ Small 3-Col (Compact)",
+                    fill_color="#0f213a",
+                    fill_top_color="#163052",
+                    border_color="#38bdf8",
+                    hover_fill="#132a48",
+                    hover_fill_top="#1c3b63",
+                    hover_border="#7dd3fc",
+                    fg="#ffffff",
+                )
+            else:
+                btn_small_3.config(
+                    text="Small 3-Col (Compact)",
+                    fill_color="#141820",
+                    fill_top_color="#1c212b",
+                    border_color="#2e3746",
+                    hover_fill="#181e28",
+                    hover_fill_top="#232a36",
+                    hover_border="#475569",
+                    fg="#94a3b8",
+                )
+
+        for cv in checked_vars.values():
+            cv.trace_add("write", refresh_hud_preset_highlight)
+        refresh_hud_preset_highlight()
+
         make_stadium_button(
             b_bar,
             text="Done ✓",
@@ -6948,7 +7098,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     hud_cols_btn = make_stadium_button(
         top_bar,
-        text=f"📊 HUD Columns ({len(selected_hud_columns)})",
+        text=format_hud_cols_btn_label(selected_hud_columns),
         font=("Arial", 9, "bold"),
         fill_color="#141820",
         fill_top_color="#1c212b",
@@ -6958,16 +7108,16 @@ def show_preflight_window(parent=None, mute_btn=None):
         hover_border="#475569",
         fg="#e2e8f0",
         canvas_bg="#11161f",
-        width=138,
+        width=142,
         height=32,
-        pad_x=22,
+        auto_width=False,
         command=open_hud_columns_dialog,
     )
     hud_cols_btn.pack(side="left", padx=(0, 5))
     attach_tooltip(
         hud_cols_btn,
-        "Choose which metrics appear on your live HUD bar (Realized PnL, Open PnL, Net PnL,\n"
-        "Daily Stop, $ to Stop, Session High, From High, Trades W/L) and reorder them."
+        "Choose which metrics appear on your live HUD bar (or switch between Standard 5-Col\n"
+        "and Small 3-Col Compact HUD mode) and reorder them."
     )
 
     def open_log_file():
@@ -7413,7 +7563,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         selected_hud_columns.clear()
         selected_hud_columns.extend(get_active_hud_columns(src))
         hud_cols_btn.config(
-            text=f"📊 HUD Columns ({len(selected_hud_columns)})"
+            text=format_hud_cols_btn_label(selected_hud_columns)
         )
         var_reanchor.set(False)
         var_poll.set(
@@ -7578,8 +7728,14 @@ def show_preflight_window(parent=None, mute_btn=None):
             log_event("CONFIG", format_config_summary(new_cfg))
             rebuild_hud_columns()
 
-            if not alarm_active and not cooldown_active:
-                if mute_btn is not None:
+            if mute_btn is not None:
+                if alarm_active and not cooldown_active:
+                    mute_btn.config(
+                        text=format_alarm_button_text(
+                            last_alarm_reason or "Active Alarm"
+                        )
+                    )
+                elif not cooldown_active:
                     mute_btn.config(text=get_idle_button_text())
 
             launched["status"] = True
@@ -8999,7 +9155,7 @@ def rebuild_hud_columns():
 
         hud_ui_labels.append(val_lbl)
 
-    w_px = max(800, len(active_cols) * 160)
+    w_px = max(480, len(active_cols) * 160)
     try:
         hud_root.update_idletasks()
         cur_x = hud_root.winfo_x()
@@ -9071,6 +9227,136 @@ def update_gui(
         top.lift()
 
 
+def attach_hud_mute_tooltip(widget, hud_win):
+    """Attaches a live dark-slate hover tooltip to the HUD's middle Armed/Alarm
+    capsule pill so users in Small/Compact HUD mode (or Standard mode) can
+    hover to inspect the full armed configuration and active alarm details."""
+    tip_state = {"win": None, "after_id": None}
+
+    def show_tip():
+        tip_state["after_id"] = None
+        if (
+            tip_state["win"] is not None
+            or not widget.winfo_exists()
+            or settings_win_open
+        ):
+            return
+        try:
+            tw = tk.Toplevel(hud_win)
+            tw.wm_overrideredirect(True)
+            tw.attributes("-topmost", True)
+            tw.config(bg="#334155", padx=1, pady=1)
+            inner = tk.Frame(tw, bg="#141820", padx=12, pady=8)
+            inner.pack(fill="both", expand=True)
+
+            if alarm_active:
+                al_txt = (
+                    f"🔔 ACTIVE ALARM: {last_alarm_reason or 'Warning Siren'} "
+                    f"— Click button to acknowledge & mute"
+                )
+                tk.Label(
+                    inner,
+                    text=al_txt,
+                    font=("Arial", 9, "bold"),
+                    fg="#facc15",
+                    bg="#141820",
+                    justify="left",
+                    anchor="w",
+                ).pack(fill="x", pady=(0, 4))
+            elif cooldown_active:
+                rem_s = max(0, int(round(cooldown_end_time - time.time())))
+                cd_txt = (
+                    f"🔒 {cooldown_label} ACTIVE: {rem_s}s remaining "
+                    f"(Do Not Revenge Trade)"
+                )
+                tk.Label(
+                    inner,
+                    text=cd_txt,
+                    font=("Arial", 9, "bold"),
+                    fg="#fca5a5",
+                    bg="#141820",
+                    justify="left",
+                    anchor="w",
+                ).pack(fill="x", pady=(0, 4))
+
+            tk.Label(
+                inner,
+                text=get_full_idle_button_text(),
+                font=("Arial", 9, "bold"),
+                fg="#ffca58",
+                bg="#141820",
+                justify="left",
+                anchor="w",
+            ).pack(fill="x")
+
+            r_mode = (
+                "Regular Hours (9:30 AM – 4:00 PM ET)"
+                if is_rth()
+                else "Extended Hours (Pre-Market & After-Hours)"
+            )
+            sub_txt = (
+                f"Active Rulebook: {r_mode}   ·   "
+                f"Poll Interval: {config.get('poll_interval', 2)}s"
+            )
+            tk.Label(
+                inner,
+                text=sub_txt,
+                font=("Arial", 8, "bold"),
+                fg="#94a3b8",
+                bg="#141820",
+                justify="left",
+                anchor="w",
+            ).pack(fill="x", pady=(3, 0))
+
+            tw.update_idletasks()
+            tip_w = tw.winfo_reqwidth()
+            tip_h = tw.winfo_reqheight()
+            wx = widget.winfo_rootx()
+            wy = widget.winfo_rooty()
+            ww = widget.winfo_width()
+            wh = widget.winfo_height()
+            x = wx + max(0, (ww - tip_w) // 2)
+            x = max(8, x)
+            y = wy + wh + 5
+            try:
+                v_top = hud_win.winfo_vrooty()
+                v_h = hud_win.winfo_vrootheight()
+                if v_h > 200 and (y + tip_h) > (v_top + v_h - 40):
+                    y = hud_win.winfo_rooty() - tip_h - 5
+            except Exception:
+                pass
+            tw.wm_geometry(f"+{int(x)}+{int(y)}")
+            tip_state["win"] = tw
+        except Exception:
+            pass
+
+    def hide_tip(_event=None):
+        if tip_state["after_id"] is not None:
+            try:
+                widget.after_cancel(tip_state["after_id"])
+            except Exception:
+                pass
+            tip_state["after_id"] = None
+        if tip_state["win"] is not None:
+            try:
+                tip_state["win"].destroy()
+            except Exception:
+                pass
+            tip_state["win"] = None
+
+    def schedule_tip(_event=None):
+        hide_tip()
+        try:
+            tip_state["after_id"] = widget.after(200, show_tip)
+        except Exception:
+            pass
+
+    widget._hide_tooltip_fn = hide_tip
+    widget.bind("<Enter>", schedule_tip, add="+")
+    widget.bind("<Leave>", hide_tip, add="+")
+    widget.bind("<ButtonPress>", hide_tip, add="+")
+
+
 def start_gui():
     global acct_badge_lbl, hud_root, hud_grid_frame
     global hud_ui_labels, hud_start_move_fn, hud_do_move_fn
@@ -9079,7 +9365,7 @@ def start_gui():
     root.title(f"PnL Enforcer v{APP_VERSION}")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    w_init = max(800, len(get_active_hud_columns(config)) * 160)
+    w_init = max(480, len(get_active_hud_columns(config)) * 160)
     root.geometry(f"{w_init}x88+50+50")
     root.config(bg="#1a1a1a")
 
@@ -9130,31 +9416,16 @@ def start_gui():
         fg="#e5e8e8",
         rim="#6c757d",
         glow="#343a40",
-        width=142,
+        width=124,
         height=24,
         state="normal",
         command=toggle_acct_badge,
         cursor="hand2",
         auto_width=True,
-        pad_x=28
+        pad_x=22
     )
     acct_badge_lbl.pack(side="left", padx=(2, 4))
     refresh_acct_badge()
-
-    mute_btn = HudCapsulePill(
-        bottom_bar,
-        text=get_idle_button_text(),
-        font=("Arial", 8, "bold"),
-        bg="#282c31",
-        fg="#ffca58",
-        rim="#6c757d",
-        glow="#343a40",
-        width=480,
-        height=24,
-        state="disabled",
-        command=lambda: mute_alarm(mute_btn)
-    )
-    mute_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
     close_btn = make_stadium_button(
         bottom_bar,
@@ -9176,6 +9447,20 @@ def start_gui():
     )
     close_btn.pack(side="right", padx=(2, 2))
 
+    mute_btn = HudCapsulePill(
+        bottom_bar,
+        text=get_idle_button_text(),
+        font=("Arial", 8, "bold"),
+        bg="#282c31",
+        fg="#ffca58",
+        rim="#6c757d",
+        glow="#343a40",
+        width=80,
+        height=24,
+        state="disabled",
+        command=lambda: mute_alarm(mute_btn)
+    )
+
     settings_btn = make_stadium_button(
         bottom_bar,
         text="⚙ SETTINGS",
@@ -9189,13 +9474,16 @@ def start_gui():
         fg="#e2e8f0",
         hover_fg="#ffffff",
         canvas_bg="#1a1a1a",
-        width=102,
+        width=96,
         height=24,
         auto_width=True,
-        pad_x=22,
+        pad_x=18,
         command=lambda: show_preflight_window(parent=root, mute_btn=mute_btn),
     )
     settings_btn.pack(side="right", padx=(0, 2))
+
+    mute_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+    attach_hud_mute_tooltip(mute_btn, root)
 
     threading.Thread(
         target=data_loop,
@@ -9996,7 +10284,10 @@ if __name__ == "__main__":
         # Always open Pre-Flight even if active_adapter is None so the user
         # is never locked out of the Broker dropdown or API Keys button.
         if show_preflight_window():
-            log_event("SESSION", "Launching 5-Column HUD.")
+            log_event(
+                "SESSION",
+                f"Launching {len(get_active_hud_columns(config))}-Column HUD."
+            )
             start_gui()
         else:
             log_event("SESSION", "Pre-Flight closed without launching. Exiting.")

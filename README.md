@@ -69,7 +69,7 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
   * **Card 5 Profit Ratchet Tiers:** As your realized profit climbs through Tiers 2, 3, and 4 during Regular Hours, your Daily Stop automatically ratchets upward to prevent green-to-red round-trips.
 * **Positioning & Customizing the HUD:**
   * **Move the HUD:** Left-click and drag anywhere on the HUD bar to place it wherever you want on your monitor (coordinates save automatically).
-  * **Customize Columns (`📊 HUD Columns`):** Toggle and reorder up to 8 metrics (`REALIZED PnL`, `OPEN PnL`, `NET PnL`, `DAILY STOP`, `$ TO STOP`, `SESSION HIGH`, `FROM HIGH`, and `WIN / LOSS`).
+  * **Customize Columns & Small 3-Col HUD (`📊 HUD Columns`):** Toggle and reorder up to 8 metrics (`REALIZED PnL`, `OPEN PnL`, `NET PnL`, `DAILY STOP`, `$ TO STOP`, `SESSION HIGH`, `FROM HIGH`, and `WIN / LOSS`), or switch in one click between the **Standard 5-Col HUD** (`800x88`) and the compact **Small 3-Col HUD** (`480x88`, featuring a concise `● ARMED` pill with a hover-over configuration tooltip).
   * **Anti-Tamper Lock (`🔒 IN TRADE`):** Whenever you hold an open position, the HUD **`⚙ SETTINGS`** and **`✕`** buttons automatically lock so you cannot disable your stops mid-trade.
 
 ---
