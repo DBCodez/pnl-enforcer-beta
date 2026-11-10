@@ -4,6 +4,20 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.28] — 2026-11-10
+### Fixed & Improved
+- **Webull Rate-Limit (`HTTP 429`) Prevention, Backoff & Broker Parity (`WebullAdapter` & `SchwabAdapter`):**
+  - Removed the redundant second `_call_get_positions()` call inside `WebullAdapter.fetch_account_data()` when share quantities change (`probe_qty_map != prev_q_map`), keeping the `0.25s` settlement pause before `_call_get_balance()` while cutting `/trading/assets/positions/list` requests in half during entries, scale-outs, and exits.
+  - Added a `2.10s` minimum inter-request spacing guard on Webull's `/trading/assets/positions/list` endpoint so `2s` polling jitter never trips Webull's per-endpoint burst limiter.
+  - Added `2.5s` `HTTP 429` rate-limit backoff, throttled `[WARN]` logging (at most once per 30s), per-account last-known-good snapshot caching (`<= 15s`), and cached open-equity fallback (`<= 10s`) during `get_open_equity_positions()` across both `WebullAdapter` and `SchwabAdapter`.
+  - Prevented `TradeClient` from resetting `webull.core` logger levels to `DEBUG`/`INFO` or creating `webull_trade_sdk.log` in the working directory, removed the redundant `DataClient` startup initialization, and explicitly pinned Webull's token storage to `~/conf`.
+- **Log Scrubber Hardening (`_mask_user_path` & `_scrub_log_line`):**
+  - Extended `_mask_user_path()` to mask JSON-escaped double and quadruple backslash Windows user paths (`C:\\Users\\...` and `C:\\\\Users\\\\...`) as `~`.
+  - Extended `_scrub_log_line()` to redact JSON-serialized SDK auth headers (`x-access-token`, `x-signature`, `x-app-key`, `authorization`).
+  - Added `Cols=N` to `format_config_summary()` so `[CONFIG]` log lines record the active HUD column count.
+
+---
+
 ## [v0.9.27] — 2026-11-10
 ### Improved & Fixed
 - **HUD `$ TO STOP` Vertical Baseline Alignment & `5px` Leash Bar (`rebuild_hud_columns` / `_redraw_hud_leash_canvas`):**

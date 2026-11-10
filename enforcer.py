@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.27"
+APP_VERSION = "0.9.28"
 
 import os
 import sys
@@ -1569,7 +1569,8 @@ CALLBACK_URL = "https://127.0.0.1"
 BUG_REPORT_FORM_URL = "https://tally.so/r/Z98y4V"
 
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("webull").setLevel(logging.ERROR)
+logging.getLogger("webull").setLevel(logging.CRITICAL)
+logging.getLogger("webull.core").setLevel(logging.CRITICAL)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -2005,28 +2006,31 @@ def _mask_last4(val):
 
 def _mask_user_path(text):
     """Replaces the user's home directory path with '~' so Windows usernames
-    are never exposed in log files."""
+    are never exposed in log files (including JSON-escaped double/quadruple
+    backslash paths emitted by third-party SDKs)."""
     out = str(text or "")
     if USER_HOME:
+        norm_home = USER_HOME.replace("/", "\\")
         for variant in (
+            norm_home.replace("\\", "\\\\\\\\"),
+            norm_home.replace("\\", "\\\\"),
             USER_HOME,
             USER_HOME.replace("\\", "/"),
-            USER_HOME.replace("/", "\\"),
+            norm_home,
         ):
             if variant:
                 out = re.sub(
                     re.escape(variant), "~", out, flags=re.IGNORECASE
                 )
-    out = re.sub(r"[A-Za-z]:\\Users\\[^\\/\s]+", "~", out)
-    out = re.sub(r"[A-Za-z]:/Users/[^\\/\s]+", "~", out)
+    out = re.sub(r"[A-Za-z]:(?:\\+Users\\+|/Users/)[^\\/\s'\"]+", "~", out)
     return out
 
 
 def _scrub_log_line(message):
     """Sanitizes a single log message before writing to disk:
-    - Masks USER_HOME paths as '~'
+    - Masks USER_HOME paths as '~' (including JSON-escaped backslashes)
     - Masks any configured account_id (>4 chars) to '...last4'
-    - Masks URL /accounts/<hash> segments and Bearer/OAuth tokens
+    - Masks URL /accounts/<hash> segments, Bearer/OAuth tokens, and SDK JSON headers
     - Masks any long numeric/alphanumeric order IDs in cancel/order lines"""
     msg = _mask_user_path(message)
 
@@ -2060,6 +2064,13 @@ def _scrub_log_line(message):
     msg = re.sub(
         r"((?:access_token|refresh_token|id_token|client_secret|app_secret|code)=)[^&\s'\"]+",
         r"\1[REDACTED]",
+        msg,
+        flags=re.IGNORECASE,
+    )
+    # Scrub JSON/dict serialized SDK auth headers (e.g. Webull x-access-token, x-signature)
+    msg = re.sub(
+        r'(["\'](?:x-access-token|x-signature|x-app-key|access_token|refresh_token|id_token|client_secret|app_secret|authorization)["\']\s*:\s*["\'])[^"\']+(["\'])',
+        r"\1[REDACTED]\2",
         msg,
         flags=re.IGNORECASE,
     )
@@ -2382,7 +2393,8 @@ def format_config_summary(cfg):
     ) if cfg.get("enable_lock_os") else "OFF"
 
     return (
-        f"Broker={broker} | Poll={cfg.get('poll_interval')}s | "
+        f"Broker={broker} | Cols={len(get_active_hud_columns(cfg))} | "
+        f"Poll={cfg.get('poll_interval')}s | "
         f"AlarmsOnly={'ON' if cfg.get('alarms_only_mode') else 'OFF'} | "
         f"OpenStop={'ON' if cfg.get('enable_open_flatten') else 'OFF'}"
         f"(-${cfg.get('open_max_loss', 0):,.0f}, CoolDown={cd_str}) | "
@@ -3013,6 +3025,10 @@ class SchwabAdapter:
         self.client = None
         self.account_id = None
         self.accounts = []
+        self._last_good_snapshot = {}
+        self._last_open_eq = {}
+        self._rate_limit_until = 0.0
+        self._last_429_log_ts = 0.0
         self.last_error = ""
 
     def authenticate(self):
@@ -3182,18 +3198,25 @@ class SchwabAdapter:
                         )
                         if qty != 0:
                             open_eq.append((inst["symbol"], qty))
+                self._last_open_eq[self.account_id] = (time.time(), list(open_eq))
                 return open_eq
             log_event(
                 "ERROR",
                 f"get_open_equity_positions HTTP {resp.status_code}"
             )
-            return None
         except Exception as e:
             log_event(
                 "ERROR",
                 f"Schwab get_open_equity_positions exception: {e}"
             )
-            return None
+        cached = self._last_open_eq.get(self.account_id)
+        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+            log_event(
+                "FLATTEN",
+                "Using cached Schwab open equity snapshot (<10s) after API error."
+            )
+            return list(cached[1])
+        return None
 
     def submit_liquidation_batch(self, open_positions):
         from schwab.orders.common import Session, Duration
@@ -3303,6 +3326,12 @@ class SchwabAdapter:
     def fetch_account_data(self):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         tracking BOTH Equities (1x) and Options (100x)."""
+        now_ts = time.time()
+        if now_ts < self._rate_limit_until:
+            cached_snap = self._last_good_snapshot.get(self.account_id)
+            if cached_snap and (now_ts - cached_snap[0]) <= 15.0:
+                return cached_snap[1]
+
         try:
             resp = self.client.get_account(
                 self.account_id, fields=self.client.Account.Fields.POSITIONS
@@ -3315,6 +3344,7 @@ class SchwabAdapter:
 
                 positions = data.get("positions", [])
                 open_assets = []
+                open_eq_cache = []
                 has_options = False
                 for pos in positions:
                     a_type = pos.get("instrument", {}).get("assetType")
@@ -3326,10 +3356,22 @@ class SchwabAdapter:
                         if net_q != 0:
                             if a_type == "OPTION":
                                 has_options = True
+                            else:
+                                open_eq_cache.append(
+                                    (pos["instrument"]["symbol"], net_q)
+                                )
                             open_assets.append((pos, net_q, a_type))
 
+                self._last_open_eq[self.account_id] = (
+                    time.time(), open_eq_cache
+                )
+
                 if not open_assets:
-                    return raw_eq, True, 0.0, {}, False
+                    flat_res = (raw_eq, True, 0.0, {}, False)
+                    self._last_good_snapshot[self.account_id] = (
+                        time.time(), flat_res
+                    )
+                    return flat_res
 
                 symbols = [
                     p[0]["instrument"]["symbol"] for p in open_assets
@@ -3416,20 +3458,48 @@ class SchwabAdapter:
                         "asset_type": a_type
                     }
 
-                return (
+                open_res = (
                     adj_eq,
                     False,
                     round(total_open_pnl, 2),
                     pos_details,
                     has_options
                 )
+                self._last_good_snapshot[self.account_id] = (
+                    time.time(), open_res
+                )
+                return open_res
+            elif resp.status_code == 429:
+                self._rate_limit_until = time.time() + 2.5
+                if (time.time() - self._last_429_log_ts) >= 30.0:
+                    self._last_429_log_ts = time.time()
+                    log_event(
+                        "WARN",
+                        "Schwab rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
+                    )
+                cached_snap = self._last_good_snapshot.get(self.account_id)
+                if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    return cached_snap[1]
+                self.last_error = "HTTP 429"
             else:
                 self.last_error = f"HTTP {resp.status_code}"
                 log_event(
                     "ERROR", f"Schwab get_account returned HTTP {resp.status_code}"
                 )
         except Exception as e:
-            self.last_error = str(e)
+            err_s = str(e)
+            if "429" in err_s or "too many requests" in err_s.lower():
+                self._rate_limit_until = time.time() + 2.5
+                if (time.time() - self._last_429_log_ts) >= 30.0:
+                    self._last_429_log_ts = time.time()
+                    log_event(
+                        "WARN",
+                        "Schwab rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
+                    )
+                cached_snap = self._last_good_snapshot.get(self.account_id)
+                if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    return cached_snap[1]
+            self.last_error = err_s
             log_event("ERROR", f"Schwab account fetch exception: {e}")
         return None, True, 0.0, {}, False
 
@@ -3447,10 +3517,16 @@ class WebullAdapter:
         self.accounts = []
         self._logged_accounts = set()
         self._prev_pos_qty_map = {}
+        self._last_pos_call_ts = 0.0
+        self._last_good_snapshot = {}
+        self._last_open_eq = {}
+        self._rate_limit_until = 0.0
+        self._last_429_log_ts = 0.0
         self.last_error = ""
 
     def authenticate(self):
-        logging.getLogger("webull").setLevel(logging.ERROR)
+        logging.getLogger("webull").setLevel(logging.CRITICAL)
+        logging.getLogger("webull.core").setLevel(logging.CRITICAL)
         try:
             import six  # noqa: F401
             import jmespath  # noqa: F401
@@ -3477,13 +3553,14 @@ class WebullAdapter:
             from webull.core.client import ApiClient
             from webull.trade.trade_client import TradeClient
         self.api_client = ApiClient(self.app_key, self.app_secret, "us")
+        self.api_client._stream_logger_set = True
+        self.api_client._file_logger_set = True
+        if hasattr(self.api_client, "set_token_dir"):
+            self.api_client.set_token_dir(os.path.join(USER_HOME, "conf"))
         self.api_client.add_endpoint("us", "api.webull.com")
         self.trade_client = TradeClient(self.api_client)
-        try:
-            from webull.data.data_client import DataClient
-            self.data_client = DataClient(self.api_client)
-        except Exception:
-            self.data_client = None
+        logging.getLogger("webull").setLevel(logging.CRITICAL)
+        logging.getLogger("webull.core").setLevel(logging.CRITICAL)
 
         res = self._call_get_account_list()
         if res.status_code == 200:
@@ -3600,8 +3677,12 @@ class WebullAdapter:
 
     def get_open_equity_positions(self):
         """Returns (symbol, qty, last_price) for EQUITIES ONLY, or None on API error."""
+        cached = self._last_open_eq.get(self.account_id)
+        if cached and (time.time() - cached[0]) < 2.15 and cached[1]:
+            return list(cached[1])
         try:
             res = self._call_get_positions()
+            self._last_pos_call_ts = time.time()
             if res.status_code == 200:
                 open_eq = []
                 payload = res.json()
@@ -3632,18 +3713,26 @@ class WebullAdapter:
                         )
                         if sym:
                             open_eq.append((sym, qty, lp))
+                self._last_open_eq[self.account_id] = (
+                    time.time(), list(open_eq)
+                )
                 return open_eq
             log_event(
                 "ERROR",
                 f"Webull get_open_equity_positions HTTP {res.status_code}"
             )
-            return None
         except Exception as e:
             log_event(
                 "ERROR",
                 f"Webull get_open_equity_positions exception: {e}"
             )
-            return None
+        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+            log_event(
+                "FLATTEN",
+                "Using cached Webull open equity snapshot (<10s) after API error."
+            )
+            return list(cached[1])
+        return None
 
     def submit_liquidation_batch(self, open_positions):
         if not open_positions:
@@ -3802,8 +3891,31 @@ class WebullAdapter:
     def fetch_account_data(self):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         for Webull accounts."""
+        now_ts = time.time()
+        if now_ts < self._rate_limit_until:
+            cached_snap = self._last_good_snapshot.get(self.account_id)
+            if cached_snap and (now_ts - cached_snap[0]) <= 15.0:
+                return cached_snap[1]
+
         try:
+            elapsed_pos = time.time() - self._last_pos_call_ts
+            if 0.0 <= elapsed_pos < 2.10:
+                time.sleep(2.10 - elapsed_pos)
             p_res = self._call_get_positions()
+            self._last_pos_call_ts = time.time()
+            if p_res.status_code == 429:
+                self._rate_limit_until = time.time() + 2.5
+                if (time.time() - self._last_429_log_ts) >= 30.0:
+                    self._last_429_log_ts = time.time()
+                    log_event(
+                        "WARN",
+                        "Webull rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
+                    )
+                cached_snap = self._last_good_snapshot.get(self.account_id)
+                if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    return cached_snap[1]
+                self.last_error = "HTTP 429"
+                return None, True, 0.0, {}, False
             if p_res.status_code != 200:
                 self.last_error = (
                     f"HTTP {p_res.status_code}: {getattr(p_res, 'text', '')[:80]}"
@@ -3834,18 +3946,25 @@ class WebullAdapter:
             prev_q_map = self._prev_pos_qty_map.get(self.account_id)
             if prev_q_map is not None and probe_qty_map != prev_q_map:
                 # Share quantity just changed (entry, scale-out, or exit).
-                # Wait briefly and re-fetch positions before balance so Webull's
-                # cash_balance and position quantities settle into sync.
+                # Wait briefly before fetching balance so Webull's cash_balance
+                # settles into sync with the updated position quantities without
+                # firing a duplicate /positions/list call in the same cycle.
                 time.sleep(0.25)
-                p_res2 = self._call_get_positions()
-                if p_res2.status_code == 200:
-                    p_json = p_res2.json()
-                    pos_list = (
-                        p_json if isinstance(p_json, list)
-                        else p_json.get("data", p_json.get("positions", []))
-                    )
 
             b_res = self._call_get_balance()
+            if b_res.status_code == 429:
+                self._rate_limit_until = time.time() + 2.5
+                if (time.time() - self._last_429_log_ts) >= 30.0:
+                    self._last_429_log_ts = time.time()
+                    log_event(
+                        "WARN",
+                        "Webull balance rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
+                    )
+                cached_snap = self._last_good_snapshot.get(self.account_id)
+                if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    return cached_snap[1]
+                self.last_error = "HTTP 429"
+                return None, True, 0.0, {}, False
             if b_res.status_code != 200:
                 self.last_error = (
                     f"HTTP {b_res.status_code}: {getattr(b_res, 'text', '')[:80]}"
@@ -3874,6 +3993,7 @@ class WebullAdapter:
             total_open_pnl = 0.0
             total_pos_mkt_val = 0.0
             pos_details = {}
+            open_eq_cache = []
             has_options = False
 
             for p in pos_list:
@@ -3930,6 +4050,8 @@ class WebullAdapter:
                         acct_lp=acct_lp,
                         net_qty=qty
                     )
+                    if sym and sym != "UNKNOWN":
+                        open_eq_cache.append((sym, qty, lp))
                 else:
                     lp = raw_lp
                     conf_lp = lp
@@ -3970,6 +4092,7 @@ class WebullAdapter:
                     "asset_type": "OPTION" if is_opt else "EQUITY"
                 }
 
+            self._last_open_eq[self.account_id] = (time.time(), open_eq_cache)
             is_flat = (len(pos_details) == 0)
             self._prev_pos_qty_map[self.account_id] = {
                 s_k.replace(" (OPT)", ""): d_v["qty"]
@@ -3982,15 +4105,31 @@ class WebullAdapter:
                 adj_eq = round(raw_eq, 2)
 
             self.last_error = ""
-            return (
+            res_tuple = (
                 adj_eq,
                 is_flat,
                 round(total_open_pnl, 2),
                 pos_details,
                 has_options
             )
+            self._last_good_snapshot[self.account_id] = (
+                time.time(), res_tuple
+            )
+            return res_tuple
         except Exception as e:
-            self.last_error = str(e)
+            err_s = str(e)
+            if "429" in err_s or "too many requests" in err_s.lower():
+                self._rate_limit_until = time.time() + 2.5
+                if (time.time() - self._last_429_log_ts) >= 30.0:
+                    self._last_429_log_ts = time.time()
+                    log_event(
+                        "WARN",
+                        "Webull rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
+                    )
+                cached_snap = self._last_good_snapshot.get(self.account_id)
+                if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    return cached_snap[1]
+            self.last_error = err_s
             log_event("ERROR", f"Webull account fetch exception: {e}")
             return None, True, 0.0, {}, False
 
