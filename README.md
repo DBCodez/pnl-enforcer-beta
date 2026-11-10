@@ -31,11 +31,12 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
 3. Wait for your app status to change from *Approved - Pending* to **`Ready for Use`** (typically takes 2–5 business days).
 4. Once `Ready for Use`, click **View Details** on your app and copy your **App Key** and **Secret**.
 
-### Option B: If Your Broker is Webull
+### Option B: If Your Broker is Webull (Webull US)
 1. Go to [https://developer.webull.com/apis/docs/authentication/IndividualApplicationAPI](https://developer.webull.com/apis/docs/authentication/IndividualApplicationAPI) (or log into your Webull web portal -> **Account Management -> OpenAPI Management**).
 2. Apply for a **Retail Trading API Key** (typically approved in 1–2 business days).
 3. Once approved, generate and copy your **App Key** and **App Secret** in the OpenAPI portal.
 4. *(Note for Live Quotes)*: Webull's OpenAPI uses account position snapshots by default; if you subscribe to Webull OpenAPI real-time quotes (`webullapp.com/quote`), it will also poll live bid/ask quotes during extended-hours liquidations.
+5. *(Note for Webull Canada Users)*: Direct self-serve Retail OpenAPI keys (`App Key` / `App Secret`) are currently only offered by **Webull US** (*Webull Financial LLC*). **Webull Canada** (*Webull Securities (Canada) Limited*) does not currently issue direct individual OpenAPI keys and only supports third-party OAuth aggregators (such as SnapTrade), which are not natively supported out of the box due to aggregator refresh/caching latency.
 
 ---
 
