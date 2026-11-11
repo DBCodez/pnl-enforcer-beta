@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.41"
+APP_VERSION = "0.9.42"
 
 import os
 import sys
@@ -1685,6 +1685,7 @@ DEFAULT_CONFIG = {
         "session_high",
     ],
     "reset_at_925": True,
+    "ignore_preexisting_positions": True,
     "poll_interval": 2,
     "enable_pm_warn_1": True,
     "enable_pm_warn_2": True,
@@ -1872,6 +1873,7 @@ RECOVERY_BUFFER_DOLLARS = 150.0
 settings_win_open = False
 log_lock = threading.Lock()
 prev_pos_snapshot = {}
+ignored_positions = {}
 active_adapter = None
 
 
@@ -2743,6 +2745,7 @@ def format_config_summary(cfg):
         f"LockOS={dl_str} | "
         f"Voice={'ON' if cfg.get('enable_voice_cues', True) else 'OFF'} | "
         f"UpChime={'ON' if cfg.get('enable_upside_chime', True) else 'OFF'} | "
+        f"IgnorePrePos={'ON' if cfg.get('ignore_preexisting_positions', True) else 'OFF'} | "
         f"EH_Max=-${cfg.get('pm_max_loss', 0):,.0f} | "
         f"T1_Max=-${cfg.get('t1_max_loss', 0):,.0f}"
     )
@@ -2757,8 +2760,10 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
     global current_upside_tier, first_poll_of_launch, recent_loss_timestamps
+    global ignored_positions
 
     recent_loss_timestamps.clear()
+    ignored_positions.clear()
     flat_desync_streak = 0
     in_trade_desync_streak = 0
     pending_scale_out_tol = 0.0
@@ -2802,6 +2807,9 @@ def restore_account_session(broker_name, account_id, log_restore=False):
                     if isinstance(t, (int, float))
                     and 0.0 <= (now_ts - float(t)) < win_sec
                 )
+            saved_ig = s_data.get("ignored_positions")
+            if isinstance(saved_ig, dict):
+                ignored_positions.update(json.loads(json.dumps(saved_ig)))
             prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
             settled_realized_pnl = prev_flat_realized_pnl
             if win_trades == 0 and loss_trades == 0:
@@ -2813,13 +2821,18 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             )
             first_poll_of_launch = True
             if log_restore:
+                ig_note = (
+                    f" | IgnoredPreExisting={list(ignored_positions.keys())}"
+                    if ignored_positions
+                    else ""
+                )
                 log_event(
                     "SESSION",
                     f"Restored {broker_name} baseline from memory: "
                     f"Start=${start_equity:,.2f} | "
                     f"LastFlat=${last_flat_equity:,.2f} | "
                     f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
-                    f"{format_trades_wl_inline(win_trades, loss_trades)}"
+                    f"{format_trades_wl_inline(win_trades, loss_trades)}{ig_note}"
                 )
             return True
 
@@ -2971,6 +2984,7 @@ def save_session_state():
         "win_trades": win_trades,
         "loss_trades": loss_trades,
         "loss_timestamps": [round(float(t), 2) for t in recent_loss_timestamps],
+        "ignored_positions": json.loads(json.dumps(ignored_positions)),
     }
 
     old_entry = config["account_sessions"].get(s_key)
@@ -3001,6 +3015,276 @@ def save_session_state():
         config["saved_loss_trades"] = loss_trades
         config["saved_account_id"] = sel_acct
         save_config(config)
+
+
+def is_position_ignored(sym_or_tag, is_opt=False):
+    """Returns True if sym_or_tag is currently registered in ignored_positions
+    and 'ignore_preexisting_positions' is enabled in config."""
+    if not config.get("ignore_preexisting_positions", True) or not ignored_positions:
+        return False
+    s = str(sym_or_tag or "").strip()
+    if not s:
+        return False
+    tag = f"{s} (OPT)" if (is_opt and not s.endswith(" (OPT)")) else s
+    if tag in ignored_positions:
+        return True
+    base_s = s[:-6].strip() if s.endswith(" (OPT)") else s
+    for ig_tag, ig in ignored_positions.items():
+        if not isinstance(ig, dict):
+            continue
+        ig_is_opt = (ig.get("asset_type") == "OPTION") or ig_tag.endswith(" (OPT)")
+        if bool(is_opt) != bool(ig_is_opt):
+            continue
+        if (
+            str(ig.get("symbol", "")).strip() == base_s
+            or str(ig.get("raw_symbol", "")).strip() == base_s
+        ):
+            return True
+    return False
+
+
+def build_ignored_position_entry(tag, d, lock_existing_open_pnl=False):
+    """Builds a fresh ignored_positions entry from a raw position dict d.
+    If lock_existing_open_pnl is True (e.g. a new position opened mid-day while
+    Enforcer was closed and marked Ignored on re-launch without re-zeroing
+    start_equity), initializes locked_impact to d['open_pnl'] so its unrealized
+    gain/loss since purchase is neutralized relative to the morning baseline."""
+    qty = float(d.get("qty", 0.0))
+    lp = float(d.get("last", 0.0))
+    avg = float(d.get("avg", 0.0))
+    opnl = round(float(d.get("open_pnl", 0.0)), 2)
+    a_type = str(d.get("asset_type", "EQUITY")).upper()
+    base_sym = tag[:-6].strip() if str(tag).endswith(" (OPT)") else str(tag)
+    init_locked = opnl if lock_existing_open_pnl else 0.0
+    return {
+        "symbol": str(d.get("symbol") or base_sym),
+        "raw_symbol": str(d.get("raw_symbol") or base_sym),
+        "asset_type": a_type,
+        "init_qty": qty,
+        "init_price": round(lp, 4),
+        "ref_qty": qty,
+        "ref_price": round(lp, 4),
+        "ref_avg": round(avg, 4),
+        "ref_open_pnl": opnl,
+        "last_seen_price": round(lp, 4),
+        "locked_impact": init_locked,
+    }
+
+
+def reanchor_ignored_positions_to_live(raw_pos_details):
+    """Re-anchors all currently tracked ignored_positions entries to their
+    current live price with locked_impact = 0.0 when start_equity is freshly
+    anchored or re-zeroed."""
+    if not ignored_positions or not isinstance(raw_pos_details, dict):
+        return
+    for tag, ig in list(ignored_positions.items()):
+        if not isinstance(ig, dict):
+            continue
+        d = raw_pos_details.get(tag)
+        if d is not None:
+            qty = float(d.get("qty", 0.0))
+            lp = float(d.get("last", 0.0))
+            avg = float(d.get("avg", 0.0))
+            opnl = round(float(d.get("open_pnl", 0.0)), 2)
+            ig["init_qty"] = qty
+            ig["init_price"] = round(lp, 4)
+            ig["ref_qty"] = qty
+            ig["ref_price"] = round(lp, 4)
+            ig["ref_avg"] = round(avg, 4)
+            ig["ref_open_pnl"] = opnl
+            ig["last_seen_price"] = round(lp, 4)
+            ig["locked_impact"] = 0.0
+        else:
+            ig["ref_qty"] = 0.0
+            ig["ref_open_pnl"] = 0.0
+            ig["locked_impact"] = 0.0
+
+
+def _apply_ignored_positions_to_snapshot(
+    raw_adj_eq, raw_pos_details, open_eq_cache, open_opt_cache
+):
+    """Filters out any ignored pre-existing positions (Ticker-Level Ignore) from
+    pos_details, open_pnl, has_options, and flatten caches, and neutralizes
+    their intraday PnL impact (across price moves, adds, partial sells, and
+    full closes) from raw_adj_eq."""
+    if not isinstance(raw_pos_details, dict):
+        raw_pos_details = {}
+    if not config.get("ignore_preexisting_positions", True) or not ignored_positions:
+        tot_open = round(
+            sum(float(d.get("open_pnl", 0.0)) for d in raw_pos_details.values()),
+            2,
+        )
+        has_opt = any(
+            d.get("asset_type") == "OPTION" for d in raw_pos_details.values()
+        )
+        return (
+            raw_adj_eq,
+            (len(raw_pos_details) == 0),
+            tot_open,
+            dict(raw_pos_details),
+            has_opt,
+            list(open_eq_cache or []),
+            list(open_opt_cache or []),
+        )
+
+    sum_ignored_impact = 0.0
+    state_mutated = False
+    transition_notes = []
+
+    for tag, ig in list(ignored_positions.items()):
+        if not isinstance(ig, dict):
+            continue
+        d = raw_pos_details.get(tag)
+        if d is None:
+            base_s = str(ig.get("symbol", "")).strip()
+            for cand_tag, cand_d in raw_pos_details.items():
+                cand_base = (
+                    cand_tag[:-6].strip()
+                    if str(cand_tag).endswith(" (OPT)")
+                    else str(cand_tag)
+                )
+                if cand_base == base_s and (
+                    cand_d.get("asset_type") == ig.get("asset_type")
+                ):
+                    d = cand_d
+                    break
+
+        a_type = str(
+            (d or {}).get("asset_type") or ig.get("asset_type") or "EQUITY"
+        ).upper()
+        mult = 100.0 if a_type == "OPTION" else 1.0
+        ref_qty = float(ig.get("ref_qty", 0.0))
+        ref_price = float(ig.get("ref_price", 0.0))
+        ref_avg = float(ig.get("ref_avg", 0.0))
+        ref_open_pnl = ig.get("ref_open_pnl")
+        last_seen_lp = float(ig.get("last_seen_price") or ref_price)
+        locked_impact = float(ig.get("locked_impact", 0.0))
+
+        if d is None or float(d.get("qty", 0.0)) == 0.0:
+            # Position is currently closed (0 shares/contracts)
+            if abs(ref_qty) > 1e-6:
+                exit_lp = last_seen_lp if last_seen_lp > 0 else ref_price
+                locked_impact = round(
+                    locked_impact + ref_qty * (exit_lp - ref_price) * mult, 2
+                )
+                transition_notes.append(
+                    f"{tag}: {int(ref_qty):+d} -> 0 (Ignored position closed @ ~${exit_lp:.4f})"
+                )
+                ig["ref_qty"] = 0.0
+                ig["ref_price"] = round(exit_lp, 4)
+                ig["ref_avg"] = 0.0
+                ig["ref_open_pnl"] = 0.0
+                ig["locked_impact"] = locked_impact
+                state_mutated = True
+            sum_ignored_impact += locked_impact
+            continue
+
+        curr_qty = float(d.get("qty", 0.0))
+        curr_lp = float(d.get("last", 0.0))
+        curr_avg = float(d.get("avg", 0.0))
+        curr_open_pnl = float(d.get("open_pnl", 0.0))
+
+        if abs(curr_qty - ref_qty) > 1e-6:
+            # Ignored position quantity changed (added, trimmed, re-opened, or flipped)
+            if abs(ref_qty) < 1e-6:
+                # Re-opened from 0 on an ignored ticker
+                locked_impact = round(locked_impact + curr_open_pnl, 2)
+            elif (curr_qty * ref_qty) > 0 and abs(curr_qty) > abs(ref_qty):
+                # Added to ignored position in same direction (0 shares closed,
+                # so exact equity delta since ref is curr_open_pnl - ref_open_pnl)
+                if ref_open_pnl is not None:
+                    locked_impact = round(
+                        locked_impact + (curr_open_pnl - float(ref_open_pnl)), 2
+                    )
+                else:
+                    added_q = curr_qty - ref_qty
+                    old_delta = ref_qty * (curr_lp - ref_price) * mult
+                    new_delta = 0.0
+                    if curr_avg > 0 and ref_avg > 0 and abs(added_q) > 1e-6:
+                        inferred_fill = (
+                            (abs(curr_qty) * curr_avg) - (abs(ref_qty) * ref_avg)
+                        ) / abs(added_q)
+                        if (
+                            curr_lp > 0
+                            and (0.5 * curr_lp) <= inferred_fill <= (1.5 * curr_lp)
+                        ):
+                            new_delta = added_q * (curr_lp - inferred_fill) * mult
+                    locked_impact = round(locked_impact + old_delta + new_delta, 2)
+            elif (curr_qty * ref_qty) > 0 and abs(curr_qty) < abs(ref_qty):
+                # Trimmed / partially sold ignored position
+                locked_impact = round(
+                    locked_impact + ref_qty * (curr_lp - ref_price) * mult, 2
+                )
+            else:
+                # Flipped sign on ignored ticker
+                locked_impact = round(
+                    locked_impact
+                    + ref_qty * (curr_lp - ref_price) * mult
+                    + curr_open_pnl,
+                    2,
+                )
+            transition_notes.append(
+                f"{tag}: {int(ref_qty):+d} -> {int(curr_qty):+d} (Ignored ticker)"
+            )
+            ig["ref_qty"] = curr_qty
+            ig["ref_price"] = round(curr_lp, 4)
+            ig["ref_avg"] = round(curr_avg, 4)
+            ig["ref_open_pnl"] = round(curr_open_pnl, 2)
+            ig["last_seen_price"] = round(curr_lp, 4)
+            ig["locked_impact"] = locked_impact
+            state_mutated = True
+            sum_ignored_impact += locked_impact
+        else:
+            ig["last_seen_price"] = round(curr_lp, 4)
+            open_impact = curr_qty * (curr_lp - ref_price) * mult
+            sum_ignored_impact += locked_impact + open_impact
+
+    if state_mutated:
+        save_session_state()
+        if transition_notes:
+            log_event(
+                "SESSION",
+                f"Ignored pre-existing position activity neutralized: "
+                f"{', '.join(transition_notes)}",
+            )
+
+    adj_eq = (
+        round(float(raw_adj_eq) - sum_ignored_impact, 2)
+        if raw_adj_eq is not None
+        else None
+    )
+    filt_pos_details = {
+        k: v
+        for k, v in raw_pos_details.items()
+        if not is_position_ignored(k, v.get("asset_type") == "OPTION")
+    }
+    filt_eq_cache = [
+        item
+        for item in (open_eq_cache or [])
+        if not is_position_ignored(item[0], is_opt=False)
+    ]
+    filt_opt_cache = [
+        item
+        for item in (open_opt_cache or [])
+        if not is_position_ignored(item[0], is_opt=True)
+    ]
+    tot_open_pnl = round(
+        sum(float(d.get("open_pnl", 0.0)) for d in filt_pos_details.values()),
+        2,
+    )
+    has_options = any(
+        d.get("asset_type") == "OPTION" for d in filt_pos_details.values()
+    )
+    is_flat = (len(filt_pos_details) == 0)
+    return (
+        adj_eq,
+        is_flat,
+        tot_open_pnl,
+        filt_pos_details,
+        has_options,
+        filt_eq_cache,
+        filt_opt_cache,
+    )
 
 
 def is_rth():
@@ -3392,11 +3676,17 @@ class SchwabAdapter:
         self.account_id = None
         self.accounts = []
         self._last_good_snapshot = {}
+        self._last_raw_pos_details = {}
         self._last_open_eq = {}
         self._last_open_opt = {}
         self._rate_limit_until = 0.0
         self._last_429_log_ts = 0.0
         self.last_error = ""
+
+    def get_last_raw_pos_details(self):
+        return json.loads(
+            json.dumps(self._last_raw_pos_details.get(self.account_id, {}))
+        )
 
     def authenticate(self):
         try:
@@ -3583,6 +3873,32 @@ class SchwabAdapter:
                 if status in active_statuses:
                     order_id = order.get("orderId")
                     masked_oid = _mask_last4(order_id)
+                    legs = order.get("orderLegCollection") or []
+                    if legs and all(
+                        is_position_ignored(
+                            (lg.get("instrument") or {}).get("symbol", ""),
+                            is_opt=(
+                                str(
+                                    (lg.get("instrument") or {}).get(
+                                        "assetType", ""
+                                    )
+                                ).upper()
+                                == "OPTION"
+                            ),
+                        )
+                        for lg in legs
+                        if isinstance(lg, dict)
+                    ):
+                        leg_syms = [
+                            (lg.get("instrument") or {}).get("symbol", "")
+                            for lg in legs
+                            if isinstance(lg, dict)
+                        ]
+                        log_event(
+                            "FLATTEN",
+                            f"Skipping working order {masked_oid} on ignored pre-existing ticker(s): {leg_syms}",
+                        )
+                        continue
                     log_event(
                         "FLATTEN",
                         f"Canceling Schwab order ID: {masked_oid} ({status})"
@@ -3624,10 +3940,15 @@ class SchwabAdapter:
                         - pos.get("shortQuantity", 0)
                     )
                     if qty != 0:
-                        if a_type == "EQUITY":
-                            open_eq.append((inst["symbol"], qty))
-                        elif a_type == "OPTION":
-                            open_opt.append((inst["symbol"], qty))
+                        sym = inst.get("symbol", "")
+                        if a_type == "EQUITY" and not is_position_ignored(
+                            sym, is_opt=False
+                        ):
+                            open_eq.append((sym, qty))
+                        elif a_type == "OPTION" and not is_position_ignored(
+                            sym, is_opt=True
+                        ):
+                            open_opt.append((sym, qty))
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
@@ -3650,7 +3971,11 @@ class SchwabAdapter:
                 "FLATTEN",
                 "Using cached Schwab open equity snapshot (<10s) after API error."
             )
-            return list(cached[1])
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=False)
+            ]
         return None
 
     def get_open_option_positions(self):
@@ -3658,7 +3983,11 @@ class SchwabAdapter:
         (qty < 0) first for BETA Options Auto-Flatten, or None on API error."""
         cached = self._last_open_opt.get(self.account_id)
         if cached and (time.time() - cached[0]) < 0.45:
-            return list(cached[1])
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=True)
+            ]
         try:
             resp = self.client.get_account(
                 self.account_id, fields=self.client.Account.Fields.POSITIONS
@@ -3675,9 +4004,14 @@ class SchwabAdapter:
                         - pos.get("shortQuantity", 0)
                     )
                     if qty != 0:
-                        if a_type == "EQUITY":
-                            open_eq.append((inst["symbol"], qty))
-                        elif a_type == "OPTION":
+                        sym = inst.get("symbol", "")
+                        if a_type == "EQUITY" and not is_position_ignored(
+                            sym, is_opt=False
+                        ):
+                            open_eq.append((sym, qty))
+                        elif a_type == "OPTION" and not is_position_ignored(
+                            sym, is_opt=True
+                        ):
                             open_opt.append((inst["symbol"], qty))
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
@@ -3700,7 +4034,11 @@ class SchwabAdapter:
                 "FLATTEN",
                 "Using cached Schwab open option snapshot (<10s) after API error."
             )
-            return list(cached[1])
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=True)
+            ]
         return None
 
     def submit_option_liquidation_batch(self, open_opt_positions):
@@ -3912,15 +4250,26 @@ class SchwabAdapter:
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
                 now_snap_t = time.time()
-                self._last_open_eq[self.account_id] = (
-                    now_snap_t, open_eq_cache
-                )
-                self._last_open_opt[self.account_id] = (
-                    now_snap_t, open_opt_cache
-                )
 
                 if not open_assets:
-                    flat_res = (raw_eq, True, 0.0, {}, False)
+                    self._last_raw_pos_details[self.account_id] = {}
+                    (
+                        adj_eq,
+                        is_flat,
+                        tot_open_pnl,
+                        filt_pos,
+                        has_opt,
+                        filt_eq,
+                        filt_opt,
+                    ) = _apply_ignored_positions_to_snapshot(
+                        raw_eq, {}, [], []
+                    )
+                    self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
+                    self._last_open_opt[self.account_id] = (
+                        now_snap_t,
+                        filt_opt,
+                    )
+                    flat_res = (adj_eq, is_flat, tot_open_pnl, filt_pos, has_opt)
                     self._last_good_snapshot[self.account_id] = (
                         time.time(), flat_res
                     )
@@ -4003,6 +4352,8 @@ class SchwabAdapter:
                     total_open_pnl += pos_open_pnl
                     tag = f"{sym} (OPT)" if a_type == "OPTION" else sym
                     pos_details[tag] = {
+                        "symbol": sym,
+                        "raw_symbol": sym,
                         "qty": int(net_q),
                         "avg": round(avg_price, 4),
                         "last": round(lp, 4),
@@ -4011,12 +4362,29 @@ class SchwabAdapter:
                         "asset_type": a_type
                     }
 
+                self._last_raw_pos_details[self.account_id] = json.loads(
+                    json.dumps(pos_details)
+                )
+                (
+                    adj_eq,
+                    is_flat,
+                    tot_open_pnl,
+                    filt_pos,
+                    has_opt,
+                    filt_eq,
+                    filt_opt,
+                ) = _apply_ignored_positions_to_snapshot(
+                    adj_eq, pos_details, open_eq_cache, open_opt_cache
+                )
+                self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
+                self._last_open_opt[self.account_id] = (now_snap_t, filt_opt)
+
                 open_res = (
                     adj_eq,
-                    False,
-                    round(total_open_pnl, 2),
-                    pos_details,
-                    has_options
+                    is_flat,
+                    tot_open_pnl,
+                    filt_pos,
+                    has_opt
                 )
                 self._last_good_snapshot[self.account_id] = (
                     time.time(), open_res
@@ -4072,11 +4440,17 @@ class WebullAdapter:
         self._prev_pos_qty_map = {}
         self._last_pos_call_ts = 0.0
         self._last_good_snapshot = {}
+        self._last_raw_pos_details = {}
         self._last_open_eq = {}
         self._last_open_opt = {}
         self._rate_limit_until = 0.0
         self._last_429_log_ts = 0.0
         self.last_error = ""
+
+    def get_last_raw_pos_details(self):
+        return json.loads(
+            json.dumps(self._last_raw_pos_details.get(self.account_id, {}))
+        )
 
     def authenticate(self):
         logging.getLogger("webull").setLevel(logging.CRITICAL)
@@ -4239,6 +4613,31 @@ class WebullAdapter:
                     )
                     if cid:
                         masked_cid = _mask_last4(cid)
+                        o_itype = str(
+                            o.get("instrument_type")
+                            or o.get("asset_type")
+                            or "EQUITY"
+                        ).upper()
+                        o_is_opt = ("OPT" in o_itype) or bool(o.get("legs"))
+                        if o_is_opt:
+                            o_meta = self._parse_option_contract_meta(o)
+                            o_sym = o_meta.get("display_sym") or o_meta.get(
+                                "raw_symbol", ""
+                            )
+                        else:
+                            o_sym = (
+                                o.get("symbol")
+                                or (o.get("ticker") or {}).get("symbol")
+                                or ""
+                            )
+                        if o_sym and is_position_ignored(
+                            o_sym, is_opt=o_is_opt
+                        ):
+                            log_event(
+                                "FLATTEN",
+                                f"Skipping working Webull order {masked_cid} on ignored pre-existing ticker: {o_sym}",
+                            )
+                            continue
                         log_event(
                             "FLATTEN", f"Canceling Webull order ID: {masked_cid}"
                         )
@@ -4380,7 +4779,11 @@ class WebullAdapter:
         """Returns (symbol, qty, last_price) for EQUITIES ONLY, or None on API error."""
         cached = self._last_open_eq.get(self.account_id)
         if cached and (time.time() - cached[0]) < 2.15 and cached[1]:
-            return list(cached[1])
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=False)
+            ]
         try:
             res = self._call_get_positions()
             self._last_pos_call_ts = time.time()
@@ -4401,7 +4804,9 @@ class WebullAdapter:
                     is_opt = ("OPT" in itype) or bool(p.get("legs"))
                     if is_opt:
                         meta = self._parse_option_contract_meta(p)
-                        if meta["qty"] != 0:
+                        if meta["qty"] != 0 and not is_position_ignored(
+                            meta["display_sym"], is_opt=True
+                        ):
                             open_opt.append(
                                 (meta["display_sym"], meta["qty"], meta)
                             )
@@ -4419,7 +4824,7 @@ class WebullAdapter:
                             or p.get("cost_price")
                             or 0.0
                         )
-                        if sym:
+                        if sym and not is_position_ignored(sym, is_opt=False):
                             open_eq.append((sym, qty, lp))
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
@@ -4442,7 +4847,11 @@ class WebullAdapter:
                 "FLATTEN",
                 "Using cached Webull open equity snapshot (<10s) after API error."
             )
-            return list(cached[1])
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=False)
+            ]
         return None
 
     def get_open_option_positions(self):
@@ -4450,7 +4859,11 @@ class WebullAdapter:
         legs (qty < 0) first, or None on API error."""
         cached = self._last_open_opt.get(self.account_id)
         if cached and (time.time() - cached[0]) < 2.15:
-            return list(cached[1])
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=True)
+            ]
         try:
             res = self._call_get_positions()
             self._last_pos_call_ts = time.time()
@@ -4471,7 +4884,9 @@ class WebullAdapter:
                     is_opt = ("OPT" in itype) or bool(p.get("legs"))
                     if is_opt:
                         meta = self._parse_option_contract_meta(p)
-                        if meta["qty"] != 0:
+                        if meta["qty"] != 0 and not is_position_ignored(
+                            meta["display_sym"], is_opt=True
+                        ):
                             open_opt.append(
                                 (meta["display_sym"], meta["qty"], meta)
                             )
@@ -4489,7 +4904,7 @@ class WebullAdapter:
                             or p.get("cost_price")
                             or 0.0
                         )
-                        if sym:
+                        if sym and not is_position_ignored(sym, is_opt=False):
                             open_eq.append((sym, qty, lp))
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
@@ -4512,7 +4927,11 @@ class WebullAdapter:
                 "FLATTEN",
                 "Using cached Webull open option snapshot (<10s) after API error."
             )
-            return list(cached[1])
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=True)
+            ]
         return None
 
     def submit_option_liquidation_batch(self, open_opt_positions):
@@ -4969,7 +5388,14 @@ class WebullAdapter:
 
                 total_open_pnl += pos_open_pnl
                 tag = f"{sym} (OPT)" if is_opt else sym
+                raw_sym_val = (
+                    opt_meta.get("raw_symbol", sym)
+                    if opt_meta is not None
+                    else sym
+                )
                 pos_details[tag] = {
+                    "symbol": sym,
+                    "raw_symbol": raw_sym_val,
                     "qty": int(qty),
                     "avg": round(avg_price, 4),
                     "last": round(lp, 4),
@@ -4982,9 +5408,9 @@ class WebullAdapter:
                 key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
             )
             now_snap_t = time.time()
-            self._last_open_eq[self.account_id] = (now_snap_t, open_eq_cache)
-            self._last_open_opt[self.account_id] = (now_snap_t, open_opt_cache)
-            is_flat = (len(pos_details) == 0)
+            self._last_raw_pos_details[self.account_id] = json.loads(
+                json.dumps(pos_details)
+            )
             self._prev_pos_qty_map[self.account_id] = {
                 s_k.replace(" (OPT)", ""): d_v["qty"]
                 for s_k, d_v in pos_details.items()
@@ -5011,13 +5437,27 @@ class WebullAdapter:
                     else round(raw_eq or 0.0, 2)
                 )
 
+            (
+                adj_eq,
+                is_flat,
+                tot_open_pnl,
+                filt_pos,
+                has_opt,
+                filt_eq,
+                filt_opt,
+            ) = _apply_ignored_positions_to_snapshot(
+                adj_eq, pos_details, open_eq_cache, open_opt_cache
+            )
+            self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
+            self._last_open_opt[self.account_id] = (now_snap_t, filt_opt)
+
             self.last_error = ""
             res_tuple = (
                 adj_eq,
                 is_flat,
-                round(total_open_pnl, 2),
-                pos_details,
-                has_options
+                tot_open_pnl,
+                filt_pos,
+                has_opt
             )
             self._last_good_snapshot[self.account_id] = (
                 time.time(), res_tuple
@@ -7344,7 +7784,7 @@ def _stabilize_mid_fill_realized_and_equity(
         150-350ms before /positions reports the shares, or crediting sale
         proceeds during a multi-lot scale-out before /positions reduces qty). """
     global last_flat_equity, max_equity, daily_max_equity
-    global settled_realized_pnl, flat_desync_streak
+    global settled_realized_pnl, prev_flat_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
 
     if first_poll_of_launch or settled_realized_pnl is None:
@@ -7363,6 +7803,8 @@ def _stabilize_mid_fill_realized_and_equity(
         else:
             open_pnl = live_open_pnl
             realized_pnl = round((current_eq - start_equity) - open_pnl, 2)
+            last_flat_equity = round(start_equity + realized_pnl, 2)
+            prev_flat_realized_pnl = realized_pnl
         settled_realized_pnl = realized_pnl
         flat_desync_streak = 0
         in_trade_desync_streak = 0
@@ -7467,8 +7909,16 @@ def _stabilize_mid_fill_realized_and_equity(
         new_d = pos_details.get(sym)
         old_q = float(old_d.get("qty", 0.0)) if old_d else 0.0
         new_q = float(new_d.get("qty", 0.0)) if new_d else 0.0
-        old_avg = float(old_d.get("avg_price", 0.0)) if old_d else 0.0
-        new_avg = float(new_d.get("avg_price", 0.0)) if new_d else 0.0
+        old_avg = (
+            float(old_d.get("avg", old_d.get("avg_price", 0.0)))
+            if old_d
+            else 0.0
+        )
+        new_avg = (
+            float(new_d.get("avg", new_d.get("avg_price", 0.0)))
+            if new_d
+            else 0.0
+        )
         old_open = float(old_d.get("open_pnl", 0.0)) if old_d else 0.0
         old_last = float(old_d.get("last", 0.0)) if old_d else 0.0
         new_last = float(new_d.get("last", old_last)) if new_d else old_last
@@ -7661,10 +8111,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     or start_equity <= 0.0
                     or force_reanchor
                 ):
-                    start_equity = current_eq
-                    max_equity = current_eq
-                    daily_max_equity = current_eq
-                    last_flat_equity = current_eq
+                    anchor_eq = round(current_eq - live_open_pnl, 2)
+                    start_equity = anchor_eq
+                    max_equity = anchor_eq
+                    daily_max_equity = max(anchor_eq, current_eq)
+                    last_flat_equity = anchor_eq
                     has_reset_at_open = is_rth() or is_after_hours()
                     has_reset_at_close = is_after_hours()
                     force_reanchor = False
@@ -7681,10 +8132,15 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     triggered_alarms.clear()
                     prev_pos_snapshot = {}
                     save_session_state()
+                    ig_log_sfx = (
+                        f" | IgnoredPreExisting={list(ignored_positions.keys())}"
+                        if ignored_positions
+                        else ""
+                    )
                     log_event(
                         "SESSION",
                         f"Baseline anchored to: ${start_equity:,.2f} "
-                        f"({active_adapter.name})"
+                        f"({active_adapter.name}){ig_log_sfx}"
                     )
 
                 if daily_max_equity is None:
@@ -8779,6 +9235,20 @@ def show_preflight_window(
     )
 
     var_reset925 = tk.BooleanVar(value=config["reset_at_925"])
+    var_ignore_preexisting = tk.BooleanVar(
+        value=bool(config.get("ignore_preexisting_positions", True))
+    )
+    _ignore_prepos_guard = {"suppress": False}
+    _preexisting_state = {
+        "broker": None,
+        "acct_id": None,
+        "had_saved": False,
+        "initial_ignored_tags": set(),
+        "raw_eq": None,
+        "reviewed": False,
+        "reanchor_reviewed": False,
+    }
+    btn_review_ignored = None
     var_reanchor = tk.BooleanVar(value=False)
     var_auto_share_logs = tk.BooleanVar(
         value=bool(config.get("auto_share_sanitized_logs", False))
@@ -8946,9 +9416,170 @@ def show_preflight_window(
                 )
             else:
                 spans.append((f"Streak: 0/{req_l}", "#94a3b8"))
+        if bool(var_ignore_preexisting.get()) and ignored_positions:
+            spans.append((" | ", "#475569"))
+            spans.append((f"Ignored: {len(ignored_positions)}", "#6ee7b7"))
         if force or spans != _card3_base_cache["last_spans"]:
             _card3_base_cache["last_spans"] = spans
             _render_baseline_telemetry_spans(spans)
+
+    def _refresh_ignored_positions_pill(*_):
+        if btn_review_ignored is None:
+            return
+        try:
+            if not btn_review_ignored.winfo_exists():
+                return
+        except Exception:
+            return
+        raw_pos = (
+            active_adapter.get_last_raw_pos_details()
+            if active_adapter is not None
+            else {}
+        )
+        ig_cnt = len(ignored_positions) if var_ignore_preexisting.get() else 0
+        open_cnt = len(raw_pos)
+        if ig_cnt > 0:
+            btn_review_ignored.config(
+                text=f"🛡️ Ignored ({ig_cnt}) ▸",
+                fill_color="#0d2e22",
+                fill_top_color="#144332",
+                border_color="#10b981",
+                hover_fill="#113b2c",
+                hover_fill_top="#19543f",
+                hover_border="#34d399",
+                fg="#6ee7b7",
+            )
+        elif open_cnt > 0:
+            btn_review_ignored.config(
+                text=f"⚡ Tracked ({open_cnt}) ▸",
+                fill_color="#0f213a",
+                fill_top_color="#163052",
+                border_color="#38bdf8",
+                hover_fill="#132a48",
+                hover_fill_top="#1c3b63",
+                hover_border="#7dd3fc",
+                fg="#7dd3fc",
+            )
+        else:
+            btn_review_ignored.config(
+                text="🛡️ Positions (0)",
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#475569",
+                fg="#94a3b8",
+            )
+
+    def _apply_preexisting_selection(chosen_ignored_tags, mark_reviewed=True):
+        global start_equity, last_flat_equity, max_equity, daily_max_equity
+        global force_reanchor
+        raw_pos = (
+            active_adapter.get_last_raw_pos_details()
+            if active_adapter is not None
+            else {}
+        )
+        is_mid_session = bool(
+            _preexisting_state["had_saved"]
+            and not force_reanchor
+            and not var_reanchor.get()
+            and start_equity is not None
+            and start_equity > 0
+        )
+        if not is_mid_session:
+            ignored_positions.clear()
+            for tag in chosen_ignored_tags:
+                if tag in raw_pos:
+                    ignored_positions[tag] = build_ignored_position_entry(
+                        tag, raw_pos[tag], lock_existing_open_pnl=False
+                    )
+            raw_eq_now = _preexisting_state.get("raw_eq")
+            if raw_eq_now is not None and raw_eq_now > 0:
+                tracked_opnl = round(
+                    sum(
+                        float(d.get("open_pnl", 0.0))
+                        for t, d in raw_pos.items()
+                        if t not in chosen_ignored_tags
+                    ),
+                    2,
+                )
+                start_equity = round(raw_eq_now - tracked_opnl, 2)
+                _card3_base_cache["eq_str"] = f"${start_equity:,.2f} (Live)"
+        else:
+            for tag in list(ignored_positions.keys()):
+                if tag not in chosen_ignored_tags:
+                    old_ig = ignored_positions.pop(tag, None)
+                    if tag in raw_pos and isinstance(old_ig, dict):
+                        d = raw_pos[tag]
+                        mult = (
+                            100.0
+                            if str(old_ig.get("asset_type", "EQUITY")).upper()
+                            == "OPTION"
+                            else 1.0
+                        )
+                        lp = float(d.get("last", 0.0))
+                        qty = float(d.get("qty", 0.0))
+                        ref_p = float(old_ig.get("ref_price", lp))
+                        locked_imp = float(old_ig.get("locked_impact", 0.0))
+                        old_impact = locked_imp + (
+                            (lp - ref_p) * qty * mult if lp > 0 else 0.0
+                        )
+                        d_open = float(d.get("open_pnl", 0.0))
+                        delta_base = round(old_impact - d_open, 2)
+                        if abs(delta_base) >= 0.01:
+                            start_equity = round(start_equity + delta_base, 2)
+                            last_flat_equity = round(
+                                (
+                                    last_flat_equity
+                                    if last_flat_equity is not None
+                                    else start_equity
+                                )
+                                + delta_base,
+                                2,
+                            )
+                            max_equity = round(
+                                (
+                                    max_equity
+                                    if max_equity is not None
+                                    else start_equity
+                                )
+                                + delta_base,
+                                2,
+                            )
+                            daily_max_equity = round(
+                                (
+                                    daily_max_equity
+                                    if daily_max_equity is not None
+                                    else max_equity
+                                )
+                                + delta_base,
+                                2,
+                            )
+                            _card3_base_cache["eq_str"] = (
+                                f"${start_equity:,.2f} (Saved)"
+                            )
+            for tag in chosen_ignored_tags:
+                if tag not in ignored_positions and tag in raw_pos:
+                    ignored_positions[tag] = build_ignored_position_entry(
+                        tag, raw_pos[tag], lock_existing_open_pnl=True
+                    )
+            save_session_state()
+
+        if chosen_ignored_tags and not var_ignore_preexisting.get():
+            _ignore_prepos_guard["suppress"] = True
+            try:
+                var_ignore_preexisting.set(True)
+            finally:
+                _ignore_prepos_guard["suppress"] = False
+        config["ignore_preexisting_positions"] = bool(
+            var_ignore_preexisting.get()
+        )
+        if mark_reviewed:
+            _preexisting_state["reviewed"] = True
+            _preexisting_state["reanchor_reviewed"] = bool(var_reanchor.get())
+        _refresh_ignored_positions_pill()
+        _render_card3_telemetry_live(force=True)
 
     def refresh_baseline_preview():
         """Updates the Active Baseline multi-color telemetry strip in Card 3 to
@@ -8958,20 +9589,40 @@ def show_preflight_window(
             return
         if active_adapter is None or not active_adapter.account_id:
             _card3_base_cache["connected"] = False
+            _refresh_ignored_positions_pill()
             _render_card3_telemetry_live(force=True)
             return
 
         b_name = active_adapter.name
         acct_id = active_adapter.account_id
         had_saved = restore_account_session(b_name, acct_id, log_restore=False)
+        _preexisting_state["broker"] = b_name
+        _preexisting_state["acct_id"] = acct_id
+        _preexisting_state["had_saved"] = had_saved
+        _preexisting_state["initial_ignored_tags"] = set(
+            ignored_positions.keys()
+        )
+        _preexisting_state["reviewed"] = False
+        _preexisting_state["reanchor_reviewed"] = False
 
         if had_saved and start_equity is not None and start_equity > 0:
             force_reanchor = False
+            if parent is None or not active_adapter.get_last_raw_pos_details():
+                active_adapter.fetch_account_data()
             eq_str = f"${start_equity:,.2f} (Saved)"
         else:
-            eq, _, _, _, _ = active_adapter.fetch_account_data()
+            eq, _, live_opnl, _, _ = active_adapter.fetch_account_data()
+            _preexisting_state["raw_eq"] = eq
+            raw_pos = active_adapter.get_last_raw_pos_details()
+            if var_ignore_preexisting.get() and raw_pos:
+                ignored_positions.clear()
+                for tag, d in raw_pos.items():
+                    ignored_positions[tag] = build_ignored_position_entry(
+                        tag, d, lock_existing_open_pnl=False
+                    )
+                live_opnl = 0.0
             if eq is not None and eq > 0:
-                start_equity = eq
+                start_equity = round(eq - live_opnl, 2)
                 force_reanchor = True
                 eq_str = f"${start_equity:,.2f} (Live)"
             else:
@@ -8980,7 +9631,573 @@ def show_preflight_window(
         _card3_base_cache["connected"] = True
         _card3_base_cache["b_name"] = b_name
         _card3_base_cache["eq_str"] = eq_str
+        _refresh_ignored_positions_pill()
         _render_card3_telemetry_live(force=True)
+
+    def _on_toggle_ignore_preexisting(*_):
+        if _ignore_prepos_guard["suppress"]:
+            return
+        raw_pos = (
+            active_adapter.get_last_raw_pos_details()
+            if active_adapter is not None
+            else {}
+        )
+        if var_ignore_preexisting.get():
+            _apply_preexisting_selection(
+                set(raw_pos.keys()), mark_reviewed=False
+            )
+        else:
+            _apply_preexisting_selection(set(), mark_reviewed=True)
+
+    var_ignore_preexisting.trace_add("write", _on_toggle_ignore_preexisting)
+
+    def show_preexisting_positions_dialog(from_launch=False):
+        """Displays a dark-glass modal dialog listing pre-existing / open
+        positions in the account so the trader can keep swing/long-term holdings
+        Ignored (default) or toggle specific positions to Track as Active
+        Daytrades."""
+        if active_adapter is not None and not from_launch:
+            try:
+                active_adapter.fetch_account_data()
+            except Exception:
+                pass
+        raw_pos = (
+            active_adapter.get_last_raw_pos_details()
+            if active_adapter is not None
+            else {}
+        )
+        all_tags = list(raw_pos.keys()) + [
+            t for t in ignored_positions.keys() if t not in raw_pos
+        ]
+        if from_launch and not all_tags:
+            return True
+
+        decision = {"ok": False}
+        dlg = tk.Toplevel(pf)
+        dlg.grab_set()
+        if os.path.exists(ICON_PATH):
+            try:
+                dlg.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+        apply_dark_title_bar(dlg)
+        dlg.title(
+            "PnL Enforcer — Pre-Existing Positions & Daytrade Filter"
+        )
+        dlg.config(bg="#0d1117", padx=24, pady=18)
+        dlg.resizable(False, False)
+        dlg.transient(pf)
+        dlg.attributes("-topmost", True)
+
+        def on_cancel():
+            decision["ok"] = False
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        init_tags = _preexisting_state.get("initial_ignored_tags", set())
+        had_svd = bool(_preexisting_state.get("had_saved", False))
+        is_rezero = bool(var_reanchor.get())
+        new_today_tags = (
+            [t for t in raw_pos.keys() if t not in init_tags]
+            if (had_svd and not is_rezero)
+            else []
+        )
+        # List new intraday positions first when re-opening mid-day
+        if new_today_tags:
+            all_tags = (
+                list(new_today_tags)
+                + [t for t in raw_pos.keys() if t in init_tags]
+                + [t for t in ignored_positions.keys() if t not in raw_pos]
+            )
+
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 4))
+        if new_today_tags:
+            hdr_title = "▶  ⚡ NEW POSITION(S) FOUND TODAY — DAYTRADE OR SWING?"
+            hdr_fg = "#38bdf8"
+        elif all_tags:
+            hdr_title = "▶  🛡️ PRE-EXISTING POSITIONS DETECTED IN ACCOUNT"
+            hdr_fg = "#4ec994"
+        else:
+            hdr_title = "▶  🛡️ PRE-EXISTING & IGNORED POSITIONS MANAGER"
+            hdr_fg = "#4ec994"
+
+        tk.Label(
+            hdr_row,
+            text=hdr_title,
+            font=("Arial", 12, "bold"),
+            fg=hdr_fg,
+            bg="#0d1117",
+            anchor="w",
+        ).pack(side="left")
+
+        b_lbl = (
+            active_adapter.name
+            if active_adapter is not None
+            else config.get("active_broker", "SCHWAB")
+        )
+        badge_hdr_txt = (
+            f"{b_lbl} · {len(new_today_tags)} NEW TODAY / {len(raw_pos)} OPEN"
+            if new_today_tags
+            else f"{b_lbl} · {len(raw_pos)} OPEN POSITION{'S' if len(raw_pos) != 1 else ''}"
+        )
+        tk.Label(
+            hdr_row,
+            text=badge_hdr_txt,
+            font=("Arial", 8, "bold"),
+            fg="#fde68a" if new_today_tags else "#7dd3fc",
+            bg="#33220c" if new_today_tags else "#142334",
+            padx=8,
+            pady=3,
+        ).pack(side="right", padx=(12, 0))
+
+        if new_today_tags:
+            sub_txt = (
+                f"Detected {len(new_today_tags)} new position{'s' if len(new_today_tags) != 1 else ''} "
+                f"({', '.join(new_today_tags[:3])}) opened since your session started today.\n"
+                "New positions default to ⚡ TRACK AS DAYTRADE, while your earlier swing positions stay 🛡️ IGNORED."
+            )
+        else:
+            sub_txt = (
+                "PnL Enforcer regulates intraday trades. Positions marked IGNORED are treated as swing / long-term holdings:\n"
+                "they never lock Settings/Close, never trigger Open or Daily Stops, and are never auto-flattened."
+            )
+        tk.Label(
+            dlg,
+            text=sub_txt,
+            font=("Arial", 9),
+            fg="#94a3b8",
+            bg="#0d1117",
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        list_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        list_outer.pack(fill="both", expand=True, pady=(0, 10))
+        NeonBarCanvas(
+            list_outer,
+            core_color="#38bdf8" if new_today_tags else "#10b981",
+            card_bg="#131922",
+            glow_on=True,
+        ).pack(side="left", fill="y")
+
+        if len(all_tags) > 6:
+            scroll_wrap = tk.Frame(list_outer, bg="#131922")
+            scroll_wrap.pack(side="left", fill="both", expand=True)
+            cvs = tk.Canvas(
+                scroll_wrap,
+                bg="#131922",
+                bd=0,
+                highlightthickness=0,
+                width=740,
+                height=264,
+            )
+            sb = tk.Scrollbar(
+                scroll_wrap, orient="vertical", command=cvs.yview
+            )
+            list_frame = tk.Frame(cvs, bg="#131922", padx=14, pady=10)
+            list_frame.bind(
+                "<Configure>",
+                lambda _e: cvs.configure(scrollregion=cvs.bbox("all")),
+            )
+            cvs.create_window((0, 0), window=list_frame, anchor="nw", width=740)
+            cvs.configure(yscrollcommand=sb.set)
+            cvs.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+        else:
+            list_frame = tk.Frame(list_outer, bg="#131922", padx=14, pady=10)
+            list_frame.pack(side="left", fill="both", expand=True)
+
+        row_vars = {}
+
+        if not all_tags:
+            tk.Label(
+                list_frame,
+                text=(
+                    "✓ Your account is currently 100% flat (0 open positions).\n\n"
+                    "When 'Ignore Pre-Existing Positions on Launch' is checked, any swing or long-term positions\n"
+                    "open in your account when you launch PnL Enforcer will appear here and default to Ignored."
+                ),
+                font=("Arial", 10),
+                fg="#cbd5e1",
+                bg="#131922",
+                justify="left",
+                anchor="w",
+                padx=8,
+                pady=12,
+            ).pack(fill="x")
+        else:
+            for idx, tag in enumerate(all_tags):
+                d = raw_pos.get(tag)
+                ig_saved = ignored_positions.get(tag, {})
+                is_closed_today = d is None
+                if _preexisting_state["reviewed"]:
+                    default_ig = tag in ignored_positions
+                elif not var_ignore_preexisting.get():
+                    default_ig = tag in ignored_positions
+                elif had_svd and not is_rezero:
+                    # Mid-day relaunch: keep earlier swing positions Ignored,
+                    # default brand-new intraday positions to Track as Daytrade
+                    default_ig = (tag in init_tags) or is_closed_today
+                else:
+                    default_ig = True
+                rv = tk.BooleanVar(value=bool(default_ig))
+                row_vars[tag] = rv
+
+                if idx > 0:
+                    tk.Frame(list_frame, bg="#1f2937", height=1).pack(
+                        fill="x", pady=5
+                    )
+
+                r_f = tk.Frame(list_frame, bg="#131922")
+                r_f.pack(fill="x", pady=2)
+
+                left_info = tk.Frame(r_f, bg="#131922")
+                left_info.pack(side="left", fill="x", expand=True)
+
+                top_line = tk.Frame(left_info, bg="#131922")
+                top_line.pack(fill="x")
+
+                a_type = str(
+                    (d or ig_saved).get("asset_type", "EQUITY")
+                ).upper()
+                tk.Label(
+                    top_line,
+                    text=tag,
+                    font=("Consolas", 11, "bold"),
+                    fg="#f8fafc",
+                    bg="#131922",
+                ).pack(side="left", padx=(0, 8))
+
+                tk.Label(
+                    top_line,
+                    text=a_type,
+                    font=("Arial", 8, "bold"),
+                    fg="#fbbf24" if a_type == "OPTION" else "#38bdf8",
+                    bg="#33220c" if a_type == "OPTION" else "#142334",
+                    padx=6,
+                    pady=1,
+                ).pack(side="left", padx=(0, 8))
+
+                if is_closed_today:
+                    b_txt, b_fg, b_bg = (
+                        "CLOSED TODAY — LOCKED AT $0 IMPACT",
+                        "#94a3b8",
+                        "#1e293b",
+                    )
+                elif tag in init_tags and not is_rezero:
+                    b_txt, b_fg, b_bg = (
+                        "🛡️ ALREADY IGNORED (SWING)",
+                        "#6ee7b7",
+                        "#132a22",
+                    )
+                elif had_svd and not is_rezero:
+                    b_txt, b_fg, b_bg = (
+                        "⚡ NEW POSITION TODAY",
+                        "#fde68a",
+                        "#33220c",
+                    )
+                else:
+                    b_txt, b_fg, b_bg = (
+                        "PRE-EXISTING AT LAUNCH",
+                        "#7dd3fc",
+                        "#1a2636",
+                    )
+
+                tk.Label(
+                    top_line,
+                    text=b_txt,
+                    font=("Arial", 8, "bold"),
+                    fg=b_fg,
+                    bg=b_bg,
+                    padx=6,
+                    pady=1,
+                ).pack(side="left")
+
+                bot_line = tk.Frame(left_info, bg="#131922")
+                bot_line.pack(fill="x", pady=(2, 0))
+                if is_closed_today:
+                    init_q = float(ig_saved.get("init_qty", 0.0))
+                    init_p = float(ig_saved.get("init_price", 0.0))
+                    tk.Label(
+                        bot_line,
+                        text=f"Started at Qty: {init_q:+g}  ·  Ref Price: ${init_p:,.2f}  ·  Closed earlier today",
+                        font=("Consolas", 9),
+                        fg="#94a3b8",
+                        bg="#131922",
+                    ).pack(side="left")
+                else:
+                    qty = float(d.get("qty", 0.0))
+                    avg = float(d.get("avg", 0.0))
+                    last = float(d.get("last", 0.0))
+                    opnl = float(d.get("open_pnl", 0.0))
+                    tk.Label(
+                        bot_line,
+                        text=f"Qty: {qty:+g}   ·   Avg: ${avg:,.2f}   ·   Last: ${last:,.2f}   ·   Open PnL: ",
+                        font=("Consolas", 9),
+                        fg="#cbd5e1",
+                        bg="#131922",
+                    ).pack(side="left")
+                    opnl_col = (
+                        "#4ade80"
+                        if opnl > 0.005
+                        else ("#f87171" if opnl < -0.005 else "#94a3b8")
+                    )
+                    tk.Label(
+                        bot_line,
+                        text=format_dollar(opnl),
+                        font=("Consolas", 9, "bold"),
+                        fg=opnl_col,
+                        bg="#131922",
+                    ).pack(side="left")
+
+                def _make_row_toggle(t_var):
+                    btn = make_stadium_button(
+                        r_f,
+                        text="🛡️ IGNORE (Swing / Hold)",
+                        font=("Arial", 9, "bold"),
+                        fill_color="#0d2e22",
+                        fill_top_color="#144332",
+                        border_color="#10b981",
+                        hover_fill="#113b2c",
+                        hover_fill_top="#19543f",
+                        hover_border="#34d399",
+                        fg="#6ee7b7",
+                        canvas_bg="#131922",
+                        width=226,
+                        height=30,
+                        auto_width=False,
+                        command=lambda: t_var.set(not bool(t_var.get())),
+                    )
+                    btn.pack(side="right", padx=(14, 0))
+
+                    def _sync_btn(*_):
+                        if t_var.get():
+                            btn.config(
+                                text="🛡️ IGNORE (Swing / Hold)",
+                                fill_color="#0d2e22",
+                                fill_top_color="#144332",
+                                border_color="#10b981",
+                                hover_fill="#113b2c",
+                                hover_fill_top="#19543f",
+                                hover_border="#34d399",
+                                fg="#6ee7b7",
+                            )
+                        else:
+                            btn.config(
+                                text="⚡ TRACK AS DAYTRADE",
+                                fill_color="#0f213a",
+                                fill_top_color="#163052",
+                                border_color="#38bdf8",
+                                hover_fill="#132a48",
+                                hover_fill_top="#1c3b63",
+                                hover_border="#7dd3fc",
+                                fg="#ffffff",
+                            )
+                        _update_summary_strip()
+
+                    t_var.trace_add("write", _sync_btn)
+                    return _sync_btn
+
+                row_sync = _make_row_toggle(rv)
+                r_f._sync_fn = row_sync
+
+        summary_lbl = tk.Label(
+            dlg,
+            text="",
+            font=("Arial", 9, "bold"),
+            fg="#6ee7b7",
+            bg="#111822",
+            padx=12,
+            pady=6,
+            anchor="w",
+        )
+        summary_lbl.pack(fill="x", pady=(0, 8))
+
+        def _update_summary_strip():
+            if not row_vars:
+                summary_lbl.config(
+                    text="🛡️ 0 Pre-Existing Positions Currently Open",
+                    fg="#94a3b8",
+                )
+                return
+            ig_c = sum(1 for v in row_vars.values() if v.get())
+            tr_c = len(row_vars) - ig_c
+            summary_lbl.config(
+                text=(
+                    f"Selection Summary:   🛡️ {ig_c} Ignored ($0.00 Daytrade Impact, Never Auto-Flattened)   ·   "
+                    f"⚡ {tr_c} Tracked as Active Daytrade{'s' if tr_c != 1 else ''}"
+                ),
+                fg="#6ee7b7" if ig_c > 0 else "#7dd3fc",
+            )
+
+        for w_child in list_frame.winfo_children():
+            if hasattr(w_child, "_sync_fn"):
+                w_child._sync_fn()
+        _update_summary_strip()
+
+        rules_box = tk.Frame(
+            dlg,
+            bg="#11161f",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#1e293b",
+            padx=14,
+            pady=8,
+        )
+        rules_box.pack(fill="x", pady=(0, 12))
+        tk.Label(
+            rules_box,
+            text=(
+                "• 🛡️ Ignored Ticker Rule: Price swings, adding shares, trimming, or closing an Ignored ticker has $0.00 impact on your\n"
+                "  daytrade Realized/Open/Net PnL, never locks Settings/Close, and is skipped by Auto-Flatten & Order Cancellation.\n"
+                "• ⚡ Tracked Daytrade Rule: Monitored live for Open PnL, Daily Stop, and Auto-Flatten (starting at $0.00 Realized PnL)."
+            ),
+            font=("Arial", 8),
+            fg="#94a3b8",
+            bg="#11161f",
+            justify="left",
+            anchor="w",
+        ).pack(fill="x")
+
+        btn_bar = tk.Frame(dlg, bg="#0d1117")
+        btn_bar.pack(fill="x")
+
+        if row_vars:
+            def _set_all_rows(val):
+                for v in row_vars.values():
+                    v.set(val)
+
+            if new_today_tags and init_tags:
+                def _set_new_daytrade_swings_ignored():
+                    for t, v in row_vars.items():
+                        v.set((t in init_tags) or (t not in raw_pos))
+
+                make_stadium_button(
+                    btn_bar,
+                    text="Track New & Ignore Swings (Default)",
+                    font=("Arial", 9, "bold"),
+                    fill_color="#141820",
+                    fill_top_color="#1c212b",
+                    border_color="#2e3746",
+                    hover_fill="#181e28",
+                    hover_fill_top="#232a36",
+                    hover_border="#38bdf8",
+                    fg="#7dd3fc",
+                    canvas_bg="#0d1117",
+                    width=226,
+                    height=34,
+                    auto_width=False,
+                    command=_set_new_daytrade_swings_ignored,
+                ).pack(side="left", padx=(0, 8))
+
+            make_stadium_button(
+                btn_bar,
+                text="Ignore All" if new_today_tags else "Ignore All (Default)",
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#10b981",
+                fg="#6ee7b7",
+                canvas_bg="#0d1117",
+                width=112 if new_today_tags else 148,
+                height=34,
+                auto_width=False,
+                command=lambda: _set_all_rows(True),
+            ).pack(side="left", padx=(0, 8))
+
+            make_stadium_button(
+                btn_bar,
+                text="Track All" if new_today_tags else "Track All as Daytrades",
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#38bdf8",
+                fg="#7dd3fc",
+                canvas_bg="#0d1117",
+                width=108 if new_today_tags else 168,
+                height=34,
+                auto_width=False,
+                command=lambda: _set_all_rows(False),
+            ).pack(side="left")
+
+        def on_apply():
+            chosen_ig = {t for t, v in row_vars.items() if v.get()}
+            _apply_preexisting_selection(chosen_ig, mark_reviewed=True)
+            log_event(
+                "SESSION",
+                f"Pre-Existing Position Filter applied: "
+                f"Ignored={sorted(chosen_ig)} | "
+                f"Tracked={sorted(t for t in row_vars if t not in chosen_ig)}",
+            )
+            decision["ok"] = True
+            dlg.destroy()
+
+        confirm_lbl = (
+            "✔ Apply & Launch Enforcer >>"
+            if (from_launch and parent is None)
+            else (
+                "✔ Apply & Save >>"
+                if from_launch
+                else "✔ Apply Selection"
+            )
+        )
+        make_stadium_button(
+            btn_bar,
+            text=confirm_lbl,
+            font=("Arial", 10, "bold"),
+            fill_color="#0d3b20",
+            fill_top_color="#14532d",
+            border_color="#10b981",
+            hover_fill="#114b29",
+            hover_fill_top="#196638",
+            hover_border="#34d399",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=236 if from_launch else 174,
+            height=36,
+            auto_width=False,
+            command=on_apply,
+        ).pack(side="right")
+
+        make_stadium_button(
+            btn_bar,
+            text="Cancel",
+            font=("Arial", 10, "bold"),
+            fill_color="#181e26",
+            border_color="#4a5568",
+            hover_fill="#232c38",
+            hover_border="#718096",
+            fg="#d1d5db",
+            canvas_bg="#0d1117",
+            width=104,
+            height=36,
+            auto_width=False,
+            command=on_cancel,
+        ).pack(side="right", padx=(0, 8))
+
+        dlg.update_idletasks()
+        w_req = max(760, dlg.winfo_reqwidth())
+        h_req = dlg.winfo_reqheight()
+        x = pf.winfo_rootx() + max(20, (pf.winfo_width() - w_req) // 2)
+        y = pf.winfo_rooty() + max(20, (pf.winfo_height() - h_req) // 2)
+        dlg.geometry(f"{w_req}x{h_req}+{x}+{y}")
+
+        pf.wait_window(dlg)
+        return decision["ok"]
 
     # --- TOP BAR: UNIFIED BROKER/ACCOUNT CAPSULE, UTILITY PILLS & PRESETS ---
     top_bar = tk.Frame(
@@ -10451,6 +11668,14 @@ def show_preflight_window(
         var_reset925.set(
             src.get("reset_at_925", DEFAULT_CONFIG["reset_at_925"])
         )
+        var_ignore_preexisting.set(
+            bool(
+                src.get(
+                    "ignore_preexisting_positions",
+                    DEFAULT_CONFIG["ignore_preexisting_positions"],
+                )
+            )
+        )
         _auto_share_guard["suppress"] = True
         try:
             restored_auto_share = bool(
@@ -10538,6 +11763,7 @@ def show_preflight_window(
                 "enable_lock_os": bool(var_lock_os.get()),
                 "daily_lock_mins": max(0.0, abs(float(var_daily_lock_mins.get()))),
                 "reset_at_925": bool(var_reset925.get()),
+                "ignore_preexisting_positions": bool(var_ignore_preexisting.get()),
                 "auto_share_sanitized_logs": bool(var_auto_share_logs.get()),
                 "enable_voice_cues": bool(var_voice_cues.get()),
                 "tts_voice": TTS_LABEL_TO_ID.get(var_tts_voice.get(), "Zira"),
@@ -10615,9 +11841,12 @@ def show_preflight_window(
                 active_adapter.account_id = chosen_id
                 new_cfg["brokers"][chosen_b]["selected_account_id"] = chosen_id
 
-            had_saved = restore_account_session(
-                chosen_b, active_adapter.account_id, log_restore=False
-            )
+            if (chosen_b, active_adapter.account_id) != (
+                _preexisting_state.get("broker"),
+                _preexisting_state.get("acct_id"),
+            ):
+                refresh_baseline_preview()
+            had_saved = bool(_preexisting_state.get("had_saved", False))
             if not had_saved:
                 force_reanchor = True
 
@@ -10632,6 +11861,40 @@ def show_preflight_window(
                         _opt_waiver_guard["suppress"] = False
                     refresh_smart_dimming()
                     return
+
+            if var_ignore_preexisting.get():
+                raw_pos_now = (
+                    active_adapter.get_last_raw_pos_details()
+                    if active_adapter is not None
+                    else {}
+                )
+                needs_prepos_prompt = False
+                if raw_pos_now:
+                    init_ig_tags = _preexisting_state.get(
+                        "initial_ignored_tags", set()
+                    )
+                    has_new_today = any(
+                        t not in init_ig_tags for t in raw_pos_now.keys()
+                    )
+                    if (
+                        var_reanchor.get()
+                        and not is_tilt_streak_tamper_locked()
+                        and not _preexisting_state["reanchor_reviewed"]
+                    ):
+                        needs_prepos_prompt = True
+                    elif not had_saved and not _preexisting_state["reviewed"]:
+                        needs_prepos_prompt = True
+                    elif (
+                        had_saved
+                        and has_new_today
+                        and not _preexisting_state["reviewed"]
+                    ):
+                        needs_prepos_prompt = True
+                if needs_prepos_prompt:
+                    if not show_preexisting_positions_dialog(from_launch=True):
+                        return
+            else:
+                _apply_preexisting_selection(set(), mark_reviewed=True)
 
             new_cfg["alarms_only_mode"] = bool(var_alarms_only.get())
             new_cfg["enable_open_flatten"] = bool(var_open_flat.get())
@@ -10683,6 +11946,9 @@ def show_preflight_window(
                 0.0, abs(float(var_daily_lock_mins.get()))
             )
             new_cfg["reset_at_925"] = bool(var_reset925.get())
+            new_cfg["ignore_preexisting_positions"] = bool(
+                var_ignore_preexisting.get()
+            )
             new_cfg["auto_share_sanitized_logs"] = bool(
                 var_auto_share_logs.get()
             )
@@ -10730,6 +11996,10 @@ def show_preflight_window(
                 daily_breach_settings_prompted = False
                 recent_loss_timestamps.clear()
                 triggered_alarms.clear()
+                if active_adapter is not None:
+                    reanchor_ignored_positions_to_live(
+                        active_adapter.get_last_raw_pos_details()
+                    )
                 s_key = get_session_key(chosen_b, active_adapter.account_id)
                 if s_key and s_key in new_cfg.get("account_sessions", {}):
                     del new_cfg["account_sessions"][s_key]
@@ -10737,6 +12007,20 @@ def show_preflight_window(
                 new_cfg["saved_daily_max_equity"] = None
                 log_event("CONFIG", "User checked Force Re-Anchor Baseline.")
             else:
+                s_key = get_session_key(chosen_b, active_adapter.account_id)
+                if (
+                    s_key
+                    and isinstance(new_cfg.get("account_sessions"), dict)
+                    and s_key in new_cfg["account_sessions"]
+                ):
+                    s_entry = new_cfg["account_sessions"][s_key]
+                    s_entry["start_equity"] = start_equity
+                    s_entry["max_equity"] = max_equity
+                    s_entry["daily_max_equity"] = daily_max_equity
+                    s_entry["last_flat_equity"] = last_flat_equity
+                    s_entry["ignored_positions"] = json.loads(
+                        json.dumps(ignored_positions)
+                    )
                 ref_eq = (
                     last_flat_equity
                     if last_flat_equity is not None
@@ -11782,6 +13066,51 @@ def show_preflight_window(
         "starts fresh from current flat equity so an earlier session's profit peak won't immediately\n"
         "trigger a tier ratchet or trailing stop. (Your SESSION HIGH column still preserves your full-day peak.)"
     )
+
+    r_prepos = tk.Frame(c3, bg="#131922")
+    r_prepos.pack(fill="x", pady=2)
+    cb_ignore_prepos = make_glass_checkbutton(
+        r_prepos,
+        text="Ignore Pre-Existing Positions on Launch",
+        variable=var_ignore_preexisting,
+        font=("Arial", 10, "bold"),
+        fg="#dce4ee",
+        bg="#131922",
+        anchor="w",
+    )
+    cb_ignore_prepos.pack(side="left")
+    prepos_tip = (
+        "Pre-Existing Swing / Long-Term Position Filter (ON by Default):\n"
+        "When enabled, any positions already open in your account when PnL Enforcer starts\n"
+        "are prompted for review and default to IGNORED:\n"
+        "• Never locks Settings or Close as '🔒 IN TRADE'.\n"
+        "• Excluded from Open PnL, Realized PnL, Net PnL, and Daily Stop calculations.\n"
+        "• Never auto-flattened and its working GTC orders are never canceled.\n"
+        "• Adding to, trimming, or closing an ignored ticker has $0.00 impact on daytrade PnL.\n"
+        "Click the pill button on the right anytime to review or toggle Ignored vs. Tracked positions."
+    )
+    attach_tooltip(cb_ignore_prepos, prepos_tip)
+
+    btn_review_ignored = make_stadium_button(
+        r_prepos,
+        text="🛡️ Positions (0)",
+        font=("Arial", 8, "bold"),
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#475569",
+        fg="#94a3b8",
+        canvas_bg="#131922",
+        width=136,
+        height=22,
+        pad_x=14,
+        command=lambda: show_preexisting_positions_dialog(from_launch=False),
+    )
+    btn_review_ignored.pack(side="right")
+    attach_tooltip(btn_review_ignored, prepos_tip)
+    _refresh_ignored_positions_pill()
 
     r_audio = tk.Frame(c3, bg="#131922")
     r_audio.pack(fill="x", pady=2)

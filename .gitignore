@@ -14,5 +14,7 @@ __pycache__/
 build/
 dist/
 
-# Local AI Instructions (Kept private on local machine)
+# Local AI Instructions & Beta Tester Log Sync (Kept private on local machine)
 AGENTS.md
+beta_logs/
+PnL_Enforcer_Beta_Logs/

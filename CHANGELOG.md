@@ -4,6 +4,23 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.42] — 2026-11-11
+### ⚡ Quick Summary
+- **Ignore Pre-Existing Positions on Launch (`Swing / Hold` vs. `Daytrade` Filter):** New Card 3 setting (ON by default) that isolates pre-existing swing or long-term holdings at launch so they have `$0.00` impact on daytrade `Realized PnL`, `Open PnL`, `Net PnL`, and `Daily Stop` (across price swings, adds, trims, or closes), never lock `⚙ SETTINGS` / `✕` Close as `🔒 IN TRADE`, and are never auto-flattened or canceled.
+- **Smart Mid-Day Re-Launch Detection (`⚡ NEW POSITION(S) FOUND TODAY`):** If you close the app briefly mid-day, enter a new intraday position, and re-open the app, Enforcer automatically detects and prompts only for the newly opened position (defaulting it to `⚡ TRACK AS DAYTRADE` while keeping your earlier morning swing positions `🛡️ IGNORED`).
+- **Exact Partial Scale-Out Realized PnL Fix:** Fixed a key-name lookup in `_stabilize_mid_fill_realized_and_equity` (`"avg"` vs. `"avg_price"`) so partial trims/scale-outs on active daytrades credit realized PnL immediately without waiting until the final share is closed.
+
+### 🔍 Detailed Breakdown
+- **Pre-Existing Swing / Long-Term Position Isolation (`_apply_ignored_positions_to_snapshot`, `SchwabAdapter`, `WebullAdapter`):**
+  - Added **`Ignore Pre-Existing Positions on Launch`** (`ignore_preexisting_positions`, default `True`) in **Card 3 (`3. SESSION & SYSTEM`)** alongside a live **`🛡️ Ignored (N) ▸` / `⚡ Tracked (N) ▸`** pill button.
+  - **Morning Launch Prompt (`▶ 🛡️ PRE-EXISTING POSITIONS DETECTED IN ACCOUNT`):** When launching into an account with open positions for the first time today, prompts a per-ticker review modal where pre-existing holdings default to **`🛡️ IGNORE (Swing / Hold)`** (with 1-click toggle to **`⚡ TRACK AS DAYTRADE`**).
+  - **Mid-Day Re-Launch Prompt (`▶ ⚡ NEW POSITION(S) FOUND TODAY — DAYTRADE OR SWING?`):** When today's session already exists (`had_saved == True`) and a brand-new position is found on re-launch, lists the new position at the top with a **`⚡ NEW POSITION TODAY`** badge defaulting to **`⚡ TRACK AS DAYTRADE`**, while keeping earlier morning holdings on **`🛡️ ALREADY IGNORED (SWING)`** (plus a 1-click **`Track New & Ignore Swings (Default)`** button).
+  - **Zero-Impact Accounting & Execution Guardrails:** Ignored tickers are neutralized in `SchwabAdapter` and `WebullAdapter` across unrealized price moves, share/contract additions, partial trims, and full closes (`$0.00` daytrade PnL impact), excluded from `is_flat` / `🔒 IN TRADE` locks, and skipped during both `cancel_all_open_orders` and equity/option `flatten_equities`.
+- **Partial Scale-Out Realized PnL Stabilization (`_stabilize_mid_fill_realized_and_equity`):**
+  - Updated the scale-out average-cost lookup in `_stabilize_mid_fill_realized_and_equity` to read `"avg"` from `prev_pos_details`, ensuring partial trims on active daytrades update `Realized PnL` and `last_flat_equity` on the exact poll the trim occurs.
+
+---
+
 ## [v0.9.41] — 2026-11-11
 ### ⚡ Quick Summary
 - **Post-Daily-Breach Auto-Open Settings & Disarmed Protection:** Automatically opens Pre-Flight Settings after a Daily Stop lockout finishes with a friendly reminder to raise your Daily Max Loss or Re-Zero Baseline — or keep trading as-is with your old Daily Stop held in `DAY STOP: BREACHED (DISARMED)` mode so new entries never immediately stop you out.
