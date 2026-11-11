@@ -6,12 +6,13 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ## [v0.9.42] — 2026-11-11
 ### ⚡ Quick Summary
+- **🙌 Community Shoutout (`/u/InvWithRed`):** Huge thanks to Reddit beta tester **`/u/InvWithRed`** for catching the pre-existing swing/long-term position edge case and prompting the upgrades and position-scaling fixes in this release!
 - **Ignore Pre-Existing Positions on Launch (`Swing / Hold` vs. `Daytrade` Filter):** New Card 3 setting (ON by default) that isolates pre-existing swing or long-term holdings at launch so they have `$0.00` impact on daytrade `Realized PnL`, `Open PnL`, `Net PnL`, and `Daily Stop` (across price swings, adds, trims, or closes), never lock `⚙ SETTINGS` / `✕` Close as `🔒 IN TRADE`, and are never auto-flattened or canceled.
 - **Smart Mid-Day Re-Launch Detection (`⚡ NEW POSITION(S) FOUND TODAY`):** If you close the app briefly mid-day, enter a new intraday position, and re-open the app, Enforcer automatically detects and prompts only for the newly opened position (defaulting it to `⚡ TRACK AS DAYTRADE` while keeping your earlier morning swing positions `🛡️ IGNORED`).
 - **Exact Partial Scale-Out Realized PnL Fix:** Fixed a key-name lookup in `_stabilize_mid_fill_realized_and_equity` (`"avg"` vs. `"avg_price"`) so partial trims/scale-outs on active daytrades credit realized PnL immediately without waiting until the final share is closed.
 
 ### 🔍 Detailed Breakdown
-- **Pre-Existing Swing / Long-Term Position Isolation (`_apply_ignored_positions_to_snapshot`, `SchwabAdapter`, `WebullAdapter`):**
+- **Pre-Existing Swing / Long-Term Position Isolation (`_apply_ignored_positions_to_snapshot`, `SchwabAdapter`, `WebullAdapter` — prompted by `/u/InvWithRed`):**
   - Added **`Ignore Pre-Existing Positions on Launch`** (`ignore_preexisting_positions`, default `True`) in **Card 3 (`3. SESSION & SYSTEM`)** alongside a live **`🛡️ Ignored (N) ▸` / `⚡ Tracked (N) ▸`** pill button.
   - **Morning Launch Prompt (`▶ 🛡️ PRE-EXISTING POSITIONS DETECTED IN ACCOUNT`):** When launching into an account with open positions for the first time today, prompts a per-ticker review modal where pre-existing holdings default to **`🛡️ IGNORE (Swing / Hold)`** (with 1-click toggle to **`⚡ TRACK AS DAYTRADE`**).
   - **Mid-Day Re-Launch Prompt (`▶ ⚡ NEW POSITION(S) FOUND TODAY — DAYTRADE OR SWING?`):** When today's session already exists (`had_saved == True`) and a brand-new position is found on re-launch, lists the new position at the top with a **`⚡ NEW POSITION TODAY`** badge defaulting to **`⚡ TRACK AS DAYTRADE`**, while keeping earlier morning holdings on **`🛡️ ALREADY IGNORED (SWING)`** (plus a 1-click **`Track New & Ignore Swings (Default)`** button).
