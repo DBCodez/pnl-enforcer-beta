@@ -4,6 +4,26 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.41] — 2026-11-11
+### ⚡ Quick Summary
+- **Post-Daily-Breach Auto-Open Settings & Disarmed Protection:** Automatically opens Pre-Flight Settings after a Daily Stop lockout finishes with a friendly reminder to raise your Daily Max Loss or Re-Zero Baseline — or keep trading as-is with your old Daily Stop held in `DAY STOP: BREACHED (DISARMED)` mode so new entries never immediately stop you out.
+- **Clear `BREACHED` HUD Display (`$ TO STOP` & Status Pill):** Replaced negative numbers like `$-449.91` in the `$ TO STOP` column with a two-line `BREACHED` / `-$449.91 OVER` readout and updated the HUD status pill to show `DAY STOP: BREACHED` when trading past a breached Daily Stop.
+- **Loss Streak Reset on Daily Breach & Active Card 1 Guardrails:** Resets the Consecutive Loss Streak (`0/X`) when a Daily Breach Lockout occurs and keeps Card 1 (`Open PnL Auto-Flatten` & `Consecutive Loss Cooldown`) active even when the Daily Stop is disarmed.
+- **Wider Default Release Notes & Update Prompt Windows:** Expanded both the Release Notes viewer and Update Available dialog to `1040 x 690` (resizable) so full summaries fit comfortably without scrolling.
+
+### 🔍 Detailed Breakdown
+- **Post-Daily-Breach Return Workflow (`_prompt_daily_breach_settings_on_unlock`, `show_daily_breach_return_notice`, `save_and_launch`):**
+  - When a Daily Stop OS Lock countdown finishes (or a Daily Breach siren is muted), Pre-Flight Settings opens automatically with a dark-glass notice (`Review & Edit Limits ✓`, `↺ Arm Re-Zero Baseline ($0.00)`, or `Keep As-Is (Close Settings)`).
+  - If you close Settings or click Save without raising your Daily Stop below your current Net PnL, the Daily Stop remains in `BREACHED (DISARMED)` mode (`is_locked_down = True`) so entering a new trade will not immediately flatten/lock you on a small tick, while Card 1 (`Open PnL Stop` & `Consecutive Loss Cooldown`) stays 100% active.
+  - Automatically re-arms the Daily Stop if you raise your Daily Max Loss below your current balance, check `↺ Re-Zero Baseline`, or recover while flat above `floor + $150` buffer.
+- **HUD `$ TO STOP` & Status Pill Clarity (`format_dist_to_stop_hud`, `get_medium_idle_button_text`, `get_full_idle_button_text`):**
+  - Displays `BREACHED` on line 1 and `-$X.XX OVER` (or `+$X.XX BUF` inside the recovery buffer) on line 2 of the `$ TO STOP` column on a crimson (`#b03a2e`) background.
+  - Updates the HUD status pill to `DAY STOP: BREACHED` (4-col) / `DAY STOP: BREACHED (DISARMED)` (5-col) / `⚠️ DAY BREACHED` (3-col).
+- **Wider Release Notes & Update Dialogs (`show_release_notes_dialog`, `show_update_available_dialog`):**
+  - Default window size increased to `1040 x 690` (`minsize(780, 500)`) and centered over Pre-Flight Settings.
+
+---
+
 ## [v0.9.40] — 2026-11-11
 ### ⚡ Quick Summary
 - **Consecutive Loss Cooldown ("Tilt Streak Stop") & Anti-Tilt Tamper Lock:** New opt-in Card 1 guardrail that flattens open positions and triggers a Penalty Box OS Lock after `X` consecutive losses (`>= -Min Loss $`) within `Y` minutes — with a friendly heads-up popup on arming and automatic tamper-locking (`🔒 STREAK X/Y — LOCKED`) whenever an active loss streak (`>= 1`) is underway.

@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.40"
+APP_VERSION = "0.9.41"
 
 import os
 import sys
@@ -2035,6 +2035,56 @@ def format_loss_streak_inline(now_ts=None):
     return f"STREAK: 0/{req_l} (OFF)"
 
 
+def format_dist_to_stop_hud(distance_to_terminate, locked_down=None):
+    """Formats the HUD '$ TO STOP' ('dist_to_term') column value.
+    When the Daily Stop is breached/disarmed (is_locked_down) or distance <= 0,
+    displays a clear two-line 'BREACHED\\n-$X.XX OVER' readout instead of a
+    raw negative dollar string like '$-449.91'."""
+    is_ld = is_locked_down if locked_down is None else bool(locked_down)
+    dist_val = round(float(distance_to_terminate), 2)
+    if is_ld or dist_val <= 0.0:
+        if dist_val <= 0.0:
+            return f"BREACHED\n-${abs(dist_val):,.2f} OVER"
+        return f"BREACHED\n+${dist_val:,.2f} BUF"
+    return f"${dist_val:,.2f}"
+
+
+def compute_active_floor_equity(cfg=None, rth_mode=None):
+    """Computes the active Daily Stop floor equity for the given config and
+    session state (or returns None if start_equity is not yet initialized)."""
+    if start_equity is None or start_equity <= 0.0:
+        return None
+    c = cfg or config
+    rth_now = is_rth() if rth_mode is None else bool(rth_mode)
+    hwm_eq = max_equity if max_equity is not None else start_equity
+    max_realized_profit = round(hwm_eq - start_equity, 2)
+    if not rth_now:
+        pm_lock_on = bool(c.get("enable_pm_lock", True))
+        pm_trig = float(c.get("pm_lock_trigger", 500.0))
+        pm_trail = float(c.get("pm_trail_cushion", 500.0))
+        pm_max = float(c.get("pm_max_loss", 1500.0))
+        if pm_lock_on and max_realized_profit >= pm_trig:
+            return hwm_eq - pm_trail
+        return start_equity - pm_max
+    t4_on = bool(c.get("enable_t4", True))
+    t3_on = bool(c.get("enable_t3", True))
+    t2_on = bool(c.get("enable_t2", True))
+    t4_trig = float(c.get("t4_trigger", 1000.0))
+    t4_trail = float(c.get("t4_trail", 500.0))
+    t3_trig = float(c.get("t3_trigger", 500.0))
+    t3_max = float(c.get("t3_max_loss", -500.0))
+    t2_trig = float(c.get("t2_trigger", 250.0))
+    t2_max = float(c.get("t2_max_loss", -1000.0))
+    t1_max = float(c.get("t1_max_loss", 2000.0))
+    if t4_on and max_realized_profit >= t4_trig:
+        return hwm_eq - t4_trail
+    if t3_on and max_realized_profit >= t3_trig:
+        return start_equity + t3_max
+    if t2_on and max_realized_profit >= t2_trig:
+        return start_equity + t2_max
+    return start_equity - t1_max
+
+
 def backfill_trades_from_today_log(target_broker=None):
     """If today's log has completed round-trip trades and win/loss counters
     are at 0 (e.g. upgrading mid-day), reconstructs W/L from today's log
@@ -2543,9 +2593,6 @@ def _custom_showwarning(message, category, filename, lineno, file=None, line=Non
     log_event("PY_WARN", f"{cat_name} ({short_file}:{lineno}): {msg_clean}")
 
 
-warnings.showwarning = _custom_showwarning
-
-
 class _EnforcerFileLogHandler(logging.Handler):
     def __init__(self):
         super().__init__(level=logging.WARNING)
@@ -2563,9 +2610,6 @@ class _EnforcerFileLogHandler(logging.Handler):
             pass
         finally:
             self._in_emit = False
-
-
-logging.getLogger().addHandler(_EnforcerFileLogHandler())
 
 
 class _StderrToLogTee:
@@ -2620,6 +2664,8 @@ class _StderrToLogTee:
 def _install_global_error_hooks():
     """Routes all uncaught main-thread, background-thread, Tkinter callback,
     and Tcl/stderr errors into enforcer_log.txt."""
+    warnings.showwarning = _custom_showwarning
+    logging.getLogger().addHandler(_EnforcerFileLogHandler())
     if not isinstance(sys.stderr, _StderrToLogTee):
         sys.stderr = _StderrToLogTee(sys.stderr)
 
@@ -2661,7 +2707,8 @@ def _install_global_error_hooks():
     tk.Tk.report_callback_exception = _handle_tk_callback_exc
 
 
-_install_global_error_hooks()
+if __name__ == "__main__":
+    _install_global_error_hooks()
 
 
 def format_config_summary(cfg):
@@ -5967,6 +6014,7 @@ def connect_broker_adapter(broker_name, parent=None, force_wizard=False):
 # 6. ALARM, COOL-DOWN & FLATTEN ORCHESTRATION
 # ==========================================
 last_alarm_reason = ""
+daily_breach_settings_prompted = False
 
 
 def get_full_idle_button_text():
@@ -5991,24 +6039,27 @@ def get_full_idle_button_text():
             )
         else:
             pills.append(f"TILT STOP (0/{c_cnt} · {c_win:g}m)")
-    daily_parts = []
-    if config.get("enable_auto_flatten", False):
-        daily_parts.append(
-            "DAY FLATTEN + OPT(BETA)" if opt_armed else "DAY FLATTEN"
-        )
-    elif opt_armed and config.get("enable_open_flatten", False):
-        daily_parts.append("OPT FLAT(BETA)")
-    if config.get("enable_kill_tos", False):
-        daily_parts.append("KILL TOS")
-    if config.get("enable_kill_webull", False):
-        daily_parts.append("KILL WEBULL")
-    if config.get("enable_lock_os", False):
-        dl_m = config.get("daily_lock_mins", 15.0)
-        daily_parts.append(
-            f"LOCK OS ({dl_m:g}m)" if dl_m > 0 else "LOCK OS (1x)"
-        )
-    if daily_parts:
-        pills.append(" + ".join(daily_parts))
+    if is_locked_down:
+        pills.append("DAY STOP: BREACHED (DISARMED)")
+    else:
+        daily_parts = []
+        if config.get("enable_auto_flatten", False):
+            daily_parts.append(
+                "DAY FLATTEN + OPT(BETA)" if opt_armed else "DAY FLATTEN"
+            )
+        elif opt_armed and config.get("enable_open_flatten", False):
+            daily_parts.append("OPT FLAT(BETA)")
+        if config.get("enable_kill_tos", False):
+            daily_parts.append("KILL TOS")
+        if config.get("enable_kill_webull", False):
+            daily_parts.append("KILL WEBULL")
+        if config.get("enable_lock_os", False):
+            dl_m = config.get("daily_lock_mins", 15.0)
+            daily_parts.append(
+                f"LOCK OS ({dl_m:g}m)" if dl_m > 0 else "LOCK OS (1x)"
+            )
+        if daily_parts:
+            pills.append(" + ".join(daily_parts))
 
     if len(pills) == 1:
         return f"{b_name} : ALARM ONLY (OBSERVATION MODE)"
@@ -6039,20 +6090,23 @@ def get_medium_idle_button_text():
             )
         else:
             pills.append(f"TILT(0/{c_cnt} {c_win:g}m)")
-    daily_parts = []
-    if config.get("enable_auto_flatten", False):
-        daily_parts.append("DAY+OPT(BETA)" if opt_armed else "DAY FLAT")
-    elif opt_armed and config.get("enable_open_flatten", False):
-        daily_parts.append("OPT(BETA)")
-    if config.get("enable_kill_tos", False) or config.get("enable_kill_webull", False):
-        daily_parts.append("KILL APP")
-    if config.get("enable_lock_os", False):
-        dl_m = config.get("daily_lock_mins", 15.0)
-        daily_parts.append(
-            f"LOCK({dl_m:g}m)" if dl_m > 0 else "LOCK(1x)"
-        )
-    if daily_parts:
-        pills.extend(daily_parts)
+    if is_locked_down:
+        pills.append("DAY STOP: BREACHED")
+    else:
+        daily_parts = []
+        if config.get("enable_auto_flatten", False):
+            daily_parts.append("DAY+OPT(BETA)" if opt_armed else "DAY FLAT")
+        elif opt_armed and config.get("enable_open_flatten", False):
+            daily_parts.append("OPT(BETA)")
+        if config.get("enable_kill_tos", False) or config.get("enable_kill_webull", False):
+            daily_parts.append("KILL APP")
+        if config.get("enable_lock_os", False):
+            dl_m = config.get("daily_lock_mins", 15.0)
+            daily_parts.append(
+                f"LOCK({dl_m:g}m)" if dl_m > 0 else "LOCK(1x)"
+            )
+        if daily_parts:
+            pills.extend(daily_parts)
 
     if len(pills) == 1:
         return f"{b_name} : ALARM ONLY (OBSERVATION)"
@@ -6065,6 +6119,8 @@ def get_idle_button_text():
     if n_cols <= 3:
         if "ALARM" in full_txt and not full_txt.startswith("ARMED:"):
             return "● ALARMS ONLY"
+        if is_locked_down:
+            return "⚠️ DAY BREACHED"
         return "● ARMED"
     if n_cols == 4:
         return get_medium_idle_button_text()
@@ -6134,6 +6190,30 @@ def check_alarm_rearm(reason, current_val, threshold_val):
             )
 
 
+def _prompt_daily_breach_settings_on_unlock(ui_button=None):
+    """Automatically opens Pre-Flight Settings with the Post-Daily-Breach
+    Review prompt once a Daily Stop lockout finishes, so the trader can either
+    raise their Daily Max Loss / Re-Zero Baseline or leave it disarmed."""
+    global daily_breach_settings_prompted
+    if daily_breach_settings_prompted:
+        return
+    if not is_locked_down or not current_is_flat or settings_win_open:
+        return
+    if hud_root is None or not hud_root.winfo_exists():
+        return
+    daily_breach_settings_prompted = True
+    log_event(
+        "SESSION",
+        "Auto-opening Pre-Flight Settings after Daily Stop Breach lockout "
+        "for limit review."
+    )
+    show_preflight_window(
+        parent=hud_root,
+        mute_btn=ui_button,
+        post_daily_breach_prompt=True,
+    )
+
+
 def mute_alarm(ui_button):
     global alarm_active, last_alarm_reason
     alarm_active = False
@@ -6165,6 +6245,11 @@ def mute_alarm(ui_button):
                 disabledforeground="#f5b041",
                 state="disabled"
             )
+            if is_locked_down and not daily_breach_settings_prompted:
+                ui_button.after(
+                    250,
+                    lambda: _prompt_daily_breach_settings_on_unlock(ui_button),
+                )
 
 
 def play_unlock_chimes():
@@ -6513,6 +6598,7 @@ def start_cooldown_lock(
             )
             return
 
+        was_daily_breach_lock = "DAILY" in str(cooldown_label).upper()
         cooldown_active = False
         alarm_active = False
         log_event(
@@ -6530,6 +6616,11 @@ def start_cooldown_lock(
             )
         )
         play_unlock_chimes()
+        if was_daily_breach_lock and is_locked_down:
+            ui_button.after(
+                350,
+                lambda: _prompt_daily_breach_settings_on_unlock(ui_button),
+            )
 
     threading.Thread(target=cooldown_worker, daemon=True).start()
 
@@ -7007,6 +7098,7 @@ def trigger_lockdown(
     adapter, reason, ui_button, has_options=False, context_str=""
 ):
     global is_locked_down, alarm_active
+    global daily_breach_settings_prompted, recent_loss_timestamps
     if is_locked_down:
         return
 
@@ -7065,6 +7157,9 @@ def trigger_lockdown(
         return
 
     is_locked_down = True
+    daily_breach_settings_prompted = False
+    recent_loss_timestamps.clear()
+    save_session_state()
     if not lock_on:
         trigger_alarm(reason, ui_button, context_str)
 
@@ -7093,6 +7188,10 @@ def trigger_lockdown(
             ctypes.windll.user32.LockWorkStation()
             _run_post_lock_watchdog(
                 adapter, ui_button, "ONE-SHOT DAILY OS LOCK"
+            )
+            ui_button.after(
+                2500,
+                lambda: _prompt_daily_breach_settings_on_unlock(ui_button),
             )
 
 
@@ -7184,7 +7283,14 @@ def log_position_transitions(
         elif delta < 0.0:
             loss_trades += 1
             if not first_poll_of_launch:
-                if abs(delta) >= min_loss_mag:
+                if cooldown_active and "DAILY" in str(cooldown_label).upper():
+                    recent_loss_timestamps.clear()
+                    if config.get("enable_consec_loss_cooldown", False):
+                        streak_note = (
+                            f" | TiltStreak: 0/{req_losses} "
+                            f"(Reset by Daily Breach Lockout)"
+                        )
+                elif abs(delta) >= min_loss_mag:
                     recent_loss_timestamps.append(now_ts)
                     cur_streak = len(recent_loss_timestamps)
                     if config.get("enable_consec_loss_cooldown", False):
@@ -7194,10 +7300,16 @@ def log_position_transitions(
                         )
                         if cur_streak >= req_losses:
                             recent_loss_timestamps.clear()
-                            consec_trigger_reason = (
-                                f"Consecutive Loss Stop ({req_losses} Losses "
-                                f"<= -${min_loss_mag:,.0f} in {win_mins:g}m)"
-                            )
+                            if cooldown_active:
+                                streak_note = (
+                                    f" | TiltStreak: {cur_streak}/{req_losses} -> "
+                                    f"0/{req_losses} (Penalty Box Lock active)"
+                                )
+                            else:
+                                consec_trigger_reason = (
+                                    f"Consecutive Loss Stop ({req_losses} Losses "
+                                    f"<= -${min_loss_mag:,.0f} in {win_mins:g}m)"
+                                )
                 elif config.get("enable_consec_loss_cooldown", False):
                     streak_note = (
                         f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
@@ -7470,7 +7582,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
     global consecutive_api_failures, api_disconnect_alerted
-    global alarm_active, last_alarm_reason
+    global alarm_active, last_alarm_reason, daily_breach_settings_prompted
 
     consecutive_api_failures = 0
     api_disconnect_alerted = False
@@ -7557,6 +7669,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     has_reset_at_close = is_after_hours()
                     force_reanchor = False
                     is_locked_down = False
+                    daily_breach_settings_prompted = False
                     win_trades = 0
                     loss_trades = 0
                     prev_flat_realized_pnl = 0.0
@@ -7594,6 +7707,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         max_equity = max(start_equity, last_flat_equity)
                         new_hwm = max_equity - start_equity
                         is_locked_down = False
+                        daily_breach_settings_prompted = False
                         recent_loss_timestamps.clear()
                         triggered_alarms.clear()
                         save_session_state()
@@ -7629,6 +7743,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         max_equity = max(start_equity, last_flat_equity)
                         new_hwm = max_equity - start_equity
                         is_locked_down = False
+                        daily_breach_settings_prompted = False
                         recent_loss_timestamps.clear()
                         triggered_alarms.clear()
                         save_session_state()
@@ -7996,10 +8111,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         trigger_open_pnl_flatten(
                             active_adapter, r_open, mute_btn, has_options, ctx
                         )
-                    elif pm_w2_on and net_pnl <= -pm_w2:
+                    elif not is_locked_down and pm_w2_on and net_pnl <= -pm_w2:
                         triggered_alarms.setdefault(r_pm_w1, time.time())
                         trigger_alarm(r_pm_w2, mute_btn, ctx)
-                    elif pm_w1_on and net_pnl <= -pm_w1:
+                    elif not is_locked_down and pm_w1_on and net_pnl <= -pm_w1:
                         trigger_alarm(r_pm_w1, mute_btn, ctx)
 
                 else:
@@ -8049,7 +8164,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 has_options,
                                 ctx
                             )
-                        elif t3_max < 0 and current_eq <= start_equity:
+                        elif (
+                            not is_locked_down
+                            and t3_max < 0
+                            and current_eq <= start_equity
+                        ):
                             trigger_alarm(r_t3, mute_btn, ctx)
 
                     elif t2_on and max_realized_profit >= t2_trig:
@@ -8077,7 +8196,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 has_options,
                                 ctx
                             )
-                        elif t2_max < 0 and current_eq <= start_equity:
+                        elif (
+                            not is_locked_down
+                            and t2_max < 0
+                            and current_eq <= start_equity
+                        ):
                             trigger_alarm(r_t2, mute_btn, ctx)
 
                     else:
@@ -8120,18 +8243,46 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 has_options,
                                 ctx
                             )
-                        elif t1_w2_on and current_eq <= (start_equity - t1_w2):
+                        elif (
+                            not is_locked_down
+                            and t1_w2_on
+                            and current_eq <= (start_equity - t1_w2)
+                        ):
                             triggered_alarms.setdefault(
                                 r_t1_w1, time.time()
                             )
                             trigger_alarm(r_t1_w2, mute_btn, ctx)
-                        elif t1_w1_on and current_eq <= (start_equity - t1_w1):
+                        elif (
+                            not is_locked_down
+                            and t1_w1_on
+                            and current_eq <= (start_equity - t1_w1)
+                        ):
                             trigger_alarm(r_t1_w1, mute_btn, ctx)
 
-                if consec_reason and not is_locked_down:
+                if consec_reason and not cooldown_active:
                     trigger_consec_loss_cooldown(
                         active_adapter, consec_reason, mute_btn, has_options, ctx
                     )
+
+                if (
+                    is_locked_down
+                    and is_flat
+                    and current_eq >= (floor_equity + RECOVERY_BUFFER_DOLLARS)
+                ):
+                    is_locked_down = False
+                    daily_breach_settings_prompted = False
+                    log_event(
+                        "SESSION",
+                        f"Daily Stop RE-ARMED after flat recovery above floor + "
+                        f"${RECOVERY_BUFFER_DOLLARS:,.0f} buffer "
+                        f"(Net PnL: {format_dollar(net_pnl)} vs "
+                        f"Daily Stop: {format_dollar(round(floor_equity - start_equity, 2))})."
+                    )
+                    if not alarm_active and not cooldown_active:
+                        mute_btn.after(
+                            0,
+                            lambda: mute_btn.config(text=get_idle_button_text())
+                        )
 
                 terminate_pnl_level = round(floor_equity - start_equity, 2)
                 distance_to_terminate = round(current_eq - floor_equity, 2)
@@ -8159,8 +8310,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         )
                     else:
                         full_leash = max(1.0, float(t1_max))
-                leash_pct = max(
-                    0.0, min(1.0, distance_to_terminate / full_leash)
+                leash_pct = (
+                    0.0
+                    if is_locked_down
+                    else max(0.0, min(1.0, distance_to_terminate / full_leash))
                 )
 
                 new_upside_tier = compute_upside_tier(
@@ -8205,7 +8358,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 )
                 c3_bg = "#1e8449" if terminate_pnl_level > 0 else "#1f538d"
                 c4_bg = (
-                    "#b03a2e" if distance_to_terminate <= 0
+                    "#b03a2e" if (is_locked_down or distance_to_terminate <= 0)
                     else ("#d35400" if distance_to_terminate <= 500 else "#2c3e50")
                 )
                 c5_bg = "#1e8449" if session_high_pnl > 0 else "#2c3e50"
@@ -8228,7 +8381,12 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     "open_pnl": (format_dollar(open_pnl), c2_bg),
                     "net_pnl": (format_dollar(net_pnl), net_bg),
                     "terminate_lvl": (format_dollar(terminate_pnl_level), c3_bg),
-                    "dist_to_term": (f"${distance_to_terminate:,.2f}", c4_bg),
+                    "dist_to_term": (
+                        format_dist_to_stop_hud(
+                            distance_to_terminate, is_locked_down
+                        ),
+                        c4_bg,
+                    ),
                     "session_high": (format_dollar(session_high_pnl), c5_bg),
                     "from_high": (format_dollar(giveback_val), fh_bg),
                     "trades_wl": (
@@ -8398,10 +8556,12 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 # ==========================================
 # 8. SPACIOUS WIDESCREEN PRE-FLIGHT WINDOW
 # ==========================================
-def show_preflight_window(parent=None, mute_btn=None):
+def show_preflight_window(
+    parent=None, mute_btn=None, post_daily_breach_prompt=False
+):
     global settings_win_open, triggered_alarms
     global force_reanchor, is_locked_down, current_is_flat
-    global active_adapter, start_equity
+    global active_adapter, start_equity, daily_breach_settings_prompted
 
     if parent is not None:
         if settings_win_open:
@@ -10562,11 +10722,12 @@ def show_preflight_window(parent=None, mute_btn=None):
                 )
             new_cfg["signed_tier_stops"] = True
 
-            is_locked_down = False
             first_poll_of_launch = True
 
             if var_reanchor.get() and not is_tilt_streak_tamper_locked():
                 force_reanchor = True
+                is_locked_down = False
+                daily_breach_settings_prompted = False
                 recent_loss_timestamps.clear()
                 triggered_alarms.clear()
                 s_key = get_session_key(chosen_b, active_adapter.account_id)
@@ -10575,6 +10736,41 @@ def show_preflight_window(parent=None, mute_btn=None):
                 new_cfg["saved_start_equity"] = None
                 new_cfg["saved_daily_max_equity"] = None
                 log_event("CONFIG", "User checked Force Re-Anchor Baseline.")
+            else:
+                ref_eq = (
+                    last_flat_equity
+                    if last_flat_equity is not None
+                    else start_equity
+                )
+                new_floor = compute_active_floor_equity(new_cfg)
+                if (
+                    ref_eq is not None
+                    and new_floor is not None
+                    and ref_eq <= new_floor
+                ):
+                    is_locked_down = True
+                    log_event(
+                        "GUARDRAIL",
+                        f"Daily Stop remains BREACHED / DISARMED after Settings save "
+                        f"(Net PnL {format_dollar(round(ref_eq - start_equity, 2))} <= "
+                        f"Daily Stop {format_dollar(round(new_floor - start_equity, 2))}). "
+                        f"Card 1 Trade/Tilt Stops remain active."
+                    )
+                else:
+                    was_ld = is_locked_down
+                    is_locked_down = False
+                    daily_breach_settings_prompted = False
+                    if (
+                        was_ld
+                        and ref_eq is not None
+                        and new_floor is not None
+                    ):
+                        log_event(
+                            "SESSION",
+                            f"Daily Stop RE-ARMED at "
+                            f"{format_dollar(round(new_floor - start_equity, 2))} "
+                            f"({format_dollar(round(ref_eq - new_floor, 2))} buffer to stop)."
+                        )
 
             save_config(new_cfg)
             log_event("CONFIG", format_config_summary(new_cfg))
@@ -12560,6 +12756,314 @@ def show_preflight_window(parent=None, mute_btn=None):
         "View the PnL Enforcer Beta Changelog and version release history."
     )
 
+    def show_daily_breach_return_notice():
+        """Displays a friendly dark-glass notice after a Daily Stop breach
+        lockout finishes (or siren is muted), reminding the trader to raise
+        their Daily Stop or Re-Zero Baseline if they want an active Daily Stop,
+        or leave it as-is in BREACHED (DISARMED) mode so a new trade does not
+        immediately stop them out on entry."""
+        if not pf.winfo_exists():
+            return
+        ref_eq = (
+            last_flat_equity if last_flat_equity is not None else start_equity
+        )
+        act_fl = compute_active_floor_equity(config)
+        if (
+            ref_eq is not None
+            and start_equity is not None
+            and act_fl is not None
+        ):
+            cur_net_str = format_dollar(round(ref_eq - start_equity, 2))
+            stop_lvl_str = format_dollar(round(act_fl - start_equity, 2))
+            over_val = abs(round(ref_eq - act_fl, 2))
+            over_str = f"-${over_val:,.2f} OVER"
+        else:
+            cur_net_str = "below floor"
+            stop_lvl_str = "Daily Stop"
+            over_str = "BREACHED"
+
+        dlg = tk.Toplevel(pf)
+        dlg.title("PnL Enforcer — Daily Stop Breached")
+        dlg.configure(bg="#0d1117", padx=24, pady=20)
+        dlg.resizable(False, False)
+        dlg.transient(pf)
+        dlg.grab_set()
+
+        def on_keep_watching():
+            dlg.destroy()
+
+        def on_close_keep_as_is():
+            dlg.destroy()
+            on_close()
+
+        def on_arm_rezero():
+            if not is_tilt_streak_tamper_locked():
+                var_reanchor.set(True)
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_keep_watching)
+
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 4))
+
+        tk.Label(
+            hdr_row,
+            text="▶  DAILY STOP BREACHED — REVIEW OR ADJUST YOUR LIMITS",
+            font=("Arial", 12, "bold"),
+            fg="#f87171",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(side="left")
+
+        tk.Label(
+            hdr_row,
+            text="⚠️ DAILY STOP DISARMED",
+            font=("Arial", 8, "bold"),
+            fg="#fecdd3",
+            bg="#4c0519",
+            padx=8,
+            pady=3,
+        ).pack(side="right", padx=(12, 0))
+
+        tk.Label(
+            dlg,
+            text="Your Daily Stop lockout has finished. Before placing another trade, please review your Daily Stop:",
+            font=("Arial", 9),
+            fg="#94a3b8",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        card_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        card_outer.pack(fill="x", pady=(0, 16))
+        NeonBarCanvas(
+            card_outer, core_color="#ef4444", card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+
+        txt_box = tk.Text(
+            card_outer,
+            width=88,
+            height=19,
+            bg="#131922",
+            fg="#dce4ee",
+            font=("Segoe UI", 10),
+            wrap="none",
+            bd=0,
+            highlightthickness=0,
+            padx=18,
+            pady=14,
+            cursor="arrow",
+        )
+        txt_box.pack(side="left", fill="both", expand=True)
+
+        txt_box.tag_configure(
+            "hdr_red",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#f87171",
+            spacing1=0,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "hdr_green",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#4ade80",
+            spacing1=2,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "hdr_amber",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#fbbf24",
+            spacing1=2,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "body",
+            font=("Segoe UI", 10),
+            foreground="#dce4ee",
+            spacing1=1,
+            spacing3=2,
+        )
+        txt_box.tag_configure(
+            "pill_blue",
+            font=("Consolas", 9, "bold"),
+            foreground="#7dd3fc",
+            background="#1a2636",
+        )
+        txt_box.tag_configure(
+            "pill_red",
+            font=("Consolas", 9, "bold"),
+            foreground="#fca5a5",
+            background="#311820",
+        )
+        txt_box.tag_configure(
+            "pill_green",
+            font=("Consolas", 9, "bold"),
+            foreground="#6ee7b7",
+            background="#132a22",
+        )
+        txt_box.tag_configure(
+            "pill_amber",
+            font=("Consolas", 9, "bold"),
+            foreground="#fde68a",
+            background="#33220c",
+        )
+        txt_box.tag_configure(
+            "div_line",
+            font=("Consolas", 8),
+            foreground="#223042",
+            spacing1=5,
+            spacing3=5,
+        )
+
+        txt_box.insert(
+            "end",
+            "⚠️  1. YOUR DAILY STOP WAS BREACHED\n",
+            "hdr_red",
+        )
+        s1_spans = [
+            ("    Your Net PnL (", ("body",)),
+            (f" {cur_net_str} ", ("body", "pill_red")),
+            (") is past your active Daily Stop (", ("body",)),
+            (f" {stop_lvl_str} ", ("body", "pill_blue")),
+            (", ", ("body",)),
+            (f" {over_str} ", ("body", "pill_red")),
+            (").\n", ("body",)),
+            ("    To prevent an instant stop-out on your next entry, your Daily Stop is held in\n", ("body",)),
+            ("    ", ("body",)),
+            (" DAY STOP: BREACHED (DISARMED) ", ("body", "pill_red")),
+            (" mode until you adjust it or recover above the floor.\n", ("body",)),
+        ]
+        for s_txt, s_tags in s1_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.insert("end", "─" * 78 + "\n", "div_line")
+
+        txt_box.insert(
+            "end",
+            "✔  2. TO RE-ARM YOUR DAILY STOP FOR THE REST OF TODAY\n",
+            "hdr_green",
+        )
+        s2_spans = [
+            ("    • Raise ", ("body",)),
+            (" Starting Max Loss ($) ", ("body", "pill_red")),
+            (" in your active Rulebook (Card 4 or Card 5) to give\n", ("body",)),
+            ("      yourself room below ", ("body",)),
+            (f" {cur_net_str} ", ("body", "pill_red")),
+            (" and click ", ("body",)),
+            (" SAVE & APPLY CHANGES >> ", ("body", "pill_green")),
+            (", OR\n", ("body",)),
+            ("    • Click ", ("body",)),
+            (" ↺ Arm Re-Zero Baseline ($0.00) ", ("body", "pill_amber")),
+            (" below to start a fresh $0.00 session baseline.\n", ("body",)),
+        ]
+        for s_txt, s_tags in s2_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.insert("end", "─" * 78 + "\n", "div_line")
+
+        txt_box.insert(
+            "end",
+            "🛡️  3. IF YOU KEEP TRADING WITHOUT CHANGING IT\n",
+            "hdr_amber",
+        )
+        s3_spans = [
+            ("    • If you close Settings or save without raising your limit, the HUD displays ", ("body",)),
+            (" BREACHED ", ("body", "pill_red")),
+            ("\n", ("body",)),
+            ("      in ", ("body",)),
+            (" $ TO STOP ", ("body", "pill_blue")),
+            (" and ", ("body",)),
+            (" DAY STOP: BREACHED ", ("body", "pill_amber")),
+            (" in the status pill.\n", ("body",)),
+            ("    • New trades will NOT immediately flatten on the old Daily Stop, while Card 1\n", ("body",)),
+            ("      (", ("body",)),
+            (" Open PnL Auto-Flatten ", ("body", "pill_blue")),
+            (" & ", ("body",)),
+            (" Consecutive Loss Cooldown ", ("body", "pill_blue")),
+            (") stays 100% active.", ("body",)),
+        ]
+        for s_txt, s_tags in s3_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.config(state="disabled")
+
+        btn_row = tk.Frame(dlg, bg="#0d1117")
+        btn_row.pack(fill="x")
+
+        make_stadium_button(
+            btn_row,
+            text="Keep As-Is (Close Settings)",
+            font=("Arial", 10, "bold"),
+            fill_color="#141820",
+            fill_top_color="#1c212b",
+            border_color="#2e3746",
+            hover_fill="#181e28",
+            hover_fill_top="#232a36",
+            hover_border="#475569",
+            fg="#cbd5e1",
+            canvas_bg="#0d1117",
+            width=214,
+            height=34,
+            auto_width=False,
+            command=on_close_keep_as_is,
+        ).pack(side="left")
+
+        make_stadium_button(
+            btn_row,
+            text="Review & Edit Limits ✓",
+            font=("Arial", 10, "bold"),
+            fill_color="#0d3b20",
+            fill_top_color="#14532d",
+            border_color="#10b981",
+            hover_fill="#114b29",
+            hover_fill_top="#196638",
+            hover_border="#34d399",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=200,
+            height=34,
+            auto_width=False,
+            command=on_keep_watching,
+        ).pack(side="right")
+
+        if not is_tilt_streak_tamper_locked():
+            make_stadium_button(
+                btn_row,
+                text="↺ Arm Re-Zero Baseline ($0.00)",
+                font=("Arial", 10, "bold"),
+                fill_color="#33220c",
+                fill_top_color="#473010",
+                border_color="#f59e0b",
+                hover_fill="#3f2a0f",
+                hover_fill_top="#543813",
+                hover_border="#fbbf24",
+                fg="#fde68a",
+                canvas_bg="#0d1117",
+                width=236,
+                height=34,
+                auto_width=False,
+                command=on_arm_rezero,
+            ).pack(side="right", padx=(0, 8))
+
+        dlg.update_idletasks()
+        w_req = dlg.winfo_reqwidth()
+        h_req = dlg.winfo_reqheight()
+        x = pf.winfo_rootx() + max(20, (pf.winfo_width() - w_req) // 2)
+        y = pf.winfo_rooty() + max(20, (pf.winfo_height() - h_req) // 2)
+        dlg.geometry(f"+{x}+{y}")
+
+        pf.wait_window(dlg)
+
+    if post_daily_breach_prompt:
+        pf.after(150, show_daily_breach_return_notice)
+
     if parent is None:
         pf.mainloop()
         return launched["status"]
@@ -12776,11 +13280,19 @@ def update_gui(
             text_val, bg_col = format_loss_streak_multiline()
         disp_bg = "#262a2e" if bg_col in ("#2c3e50", "#1f538d") else bg_col
         if i < len(ui_labels):
+            target_font = (
+                ("Arial", 9, "bold")
+                if "\n" in str(text_val)
+                else ("Arial", 12, "bold")
+            )
             if (
                 ui_labels[i].cget("text") != text_val
                 or ui_labels[i].cget("bg") != disp_bg
+                or ui_labels[i].cget("font") != target_font
             ):
-                ui_labels[i].config(text=text_val, bg=disp_bg)
+                ui_labels[i].config(
+                    text=text_val, bg=disp_bg, font=target_font
+                )
         if i == hud_leash_idx:
             hud_last_leash_bg = disp_bg
 
@@ -12897,6 +13409,21 @@ def attach_hud_mute_tooltip(widget, hud_win):
                 tk.Label(
                     inner,
                     text=cd_txt,
+                    font=("Arial", 9, "bold"),
+                    fg="#fca5a5",
+                    bg="#141820",
+                    justify="left",
+                    anchor="w",
+                ).pack(fill="x", pady=(0, 4))
+
+            if is_locked_down:
+                ld_txt = (
+                    "⚠️ DAILY STOP BREACHED (DISARMED): Open Settings to raise your "
+                    "Daily Max Loss or Re-Zero Baseline (Card 1 Trade/Tilt Stops remain active)."
+                )
+                tk.Label(
+                    inner,
+                    text=ld_txt,
                     font=("Arial", 9, "bold"),
                     fg="#fca5a5",
                     bg="#141820",
@@ -13167,16 +13694,12 @@ def start_gui():
                                 hud_ui_labels[idx].config(text=st_txt, bg=disp_bg)
                     if acct_badge_mode == 1:
                         refresh_acct_badge()
-                    if (
-                        not alarm_active
-                        and not cooldown_active
-                        and config.get("enable_consec_loss_cooldown", False)
-                    ):
-                        new_idle = get_idle_button_text()
-                        if getattr(mute_btn, "_text", "") != new_idle:
-                            mute_btn.config(text=new_idle)
                     if len(recent_loss_timestamps) != prev_cnt:
                         save_session_state()
+                if not alarm_active and not cooldown_active:
+                    new_idle = get_idle_button_text()
+                    if getattr(mute_btn, "_text", "") != new_idle:
+                        mute_btn.config(text=new_idle)
         except Exception:
             pass
         try:
@@ -13505,7 +14028,7 @@ def _insert_formatted_changelog(txt_box, markdown_text):
             in_quick_summary = False
             in_detailed_breakdown = False
             scope_t = (f"ver_body_{curr_ver_idx}",) if curr_ver_idx is not None else ()
-            txt_box.insert("end", "─" * 82 + "\n", ("hr_div",) + scope_t)
+            txt_box.insert("end", "─" * 102 + "\n", ("hr_div",) + scope_t)
         elif raw_ln.startswith("  - ") or raw_ln.startswith("    - "):
             txt_box.insert("end", "◦  ", ("bullet_2", "bold_inline") + _active_scope_tags())
             _insert_rich_spans(stripped[2:].strip(), "bullet_2")
@@ -13928,12 +14451,14 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
                 pass
         win.title(f"PnL Enforcer Beta — Update Available (v{new_ver})")
         win.config(bg="#0d1117", padx=24, pady=18)
-        win.resizable(False, False)
+        win.resizable(True, True)
+        win.minsize(780, 500)
         win.attributes("-topmost", True)
 
-        w, h = 720, 480
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
+        w = min(1040, max(780, sw - 80))
+        h = min(690, max(500, sh - 80))
         x = max(20, (sw - w) // 2)
         y = max(20, (sh - h) // 2)
         win.geometry(f"{w}x{h}+{x}+{y}")
@@ -14137,13 +14662,30 @@ def show_release_notes_dialog(parent=None):
     win.title(f"PnL Enforcer Beta — Release Notes (v{APP_VERSION})")
     win.config(bg="#0d1117", padx=24, pady=18)
     win.resizable(True, True)
+    win.minsize(780, 500)
     win.attributes("-topmost", True)
 
-    w, h = 820, 600
     sw = win.winfo_screenwidth()
     sh = win.winfo_screenheight()
-    x = max(20, (sw - w) // 2)
-    y = max(20, (sh - h) // 2)
+    w = min(1040, max(780, sw - 80))
+    h = min(690, max(500, sh - 80))
+    if parent is not None:
+        try:
+            parent.update_idletasks()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            if pw > 200 and ph > 200:
+                x = max(20, parent.winfo_rootx() + (pw - w) // 2)
+                y = max(20, parent.winfo_rooty() + (ph - h) // 2)
+            else:
+                x = max(20, (sw - w) // 2)
+                y = max(20, (sh - h) // 2)
+        except Exception:
+            x = max(20, (sw - w) // 2)
+            y = max(20, (sh - h) // 2)
+    else:
+        x = max(20, (sw - w) // 2)
+        y = max(20, (sh - h) // 2)
     win.geometry(f"{w}x{h}+{x}+{y}")
 
     hdr_row = tk.Frame(win, bg="#0d1117")
