@@ -77,8 +77,9 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
 
 ---
 
-## Step 4: How to Report a Bug or Share Logs Safely (`🐞 Report Bug`)
-* Click **`🐞 Report Bug`** in the top bar of the Pre-Flight window anytime.
+## Step 4: How to Report a Bug or Share Logs Safely (`🐞 Report Bug` & `📜 Logs ▾`)
+* **1-Click Direct Safe Log Upload (`📜 Logs ▾ -> 📤 Send Today's Safe Log Now`):** Uploads today's balance-redacted session log directly to the beta diagnostic drive tagged only with an anonymous 6-character Tester ID (`$[REDACTED]` balances, `~` user paths, and masked order IDs). You can also opt into **`Auto-Share Daily Safe Logs (Beta Opt-In)`** in `📜 Logs ▾` or Card 3 to automatically share yesterday's redacted log in the background on startup (with a one-click **`Preview Safe Log`** button before enabling).
+* **Bug Report Form (`🐞 Report Bug`):** Click **`🐞 Report Bug`** in the top bar of the Pre-Flight window anytime.
 * The app automatically generates a privacy-scrubbed copy of your log (`enforcer_log_sanitized.txt`) with **all total account balances (`$[REDACTED]`), Windows usernames, and order IDs redacted** while keeping relative PnL and guardrail events intact.
 * It automatically copies the redacted log to your clipboard, highlights the file in Windows Explorer, and opens the **[Private Beta Bug Report Form](https://tally.so/r/Z98y4V)**.
 

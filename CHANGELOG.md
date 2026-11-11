@@ -4,6 +4,16 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.31] — 2026-11-10
+### Added
+- **Google Drive Beta Telemetry Uploader (`_upload_sanitized_log_to_drive` & `_maybe_upload_prior_day_sanitized_log`):**
+  - **Anonymous 6-Character Tester ID (`anonymous_tester_id`):** Automatically generates and persists a random 6-character hex identifier (`uuid.uuid4().hex[:6]`) in `~/enforcer_config.json` on startup so balance-redacted diagnostic logs from the same beta tester share a consistent anonymous prefix without collecting any personal or identifiable data.
+  - **1-Click Manual Safe Log Upload (`📤 Send Today's Safe Log Now`):** Added at the top of the **`📜 Logs ▾`** menu in Pre-Flight to scrub today's session log in memory (`sanitize_log_for_export`) and upload it asynchronously in a background daemon thread with a dark-glass status popup on completion.
+  - **Strictly Opt-In Daily Auto-Share (`Auto-Share Daily Safe Logs (Beta Opt-In)`):** Added a synchronized checkable toggle in both **`📜 Logs ▾`** and **Card 3 (`3. SESSION & SYSTEM SETTINGS`)** (`auto_share_sanitized_logs`, `False` by default). Enabling it displays a dark-glass confirmation modal with a **`Preview Safe Log`** button (opening the latest sanitized log in Notepad), **`Enable Auto-Share`**, and **`Cancel`**.
+  - **Non-Blocking Startup Auto-Uploader:** When opted in, checks `~/enforcer_logs/sanitized/` on startup for the most recent prior-day redacted log (`YYYY-MM-DD < today`) and uploads it once in a background daemon thread (`last_uploaded_sanitized_log`), handling Google Apps Script `HTTP 302`/`405` `googleusercontent.com` redirects cleanly and failing silently if offline.
+
+---
+
 ## [v0.9.30] — 2026-11-10
 ### Improved
 - **Options Auto-Flatten BETA Waiver Readability & Typography (`show_options_flatten_beta_waiver`):**

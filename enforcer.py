@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.30"
+APP_VERSION = "0.9.31"
 
 import os
 import sys
@@ -1567,6 +1567,10 @@ SANITIZED_ARCHIVE_DIR = os.path.join(LOG_ARCHIVE_DIR, "sanitized")
 LOG_RETENTION_DAYS = 90
 CALLBACK_URL = "https://127.0.0.1"
 BUG_REPORT_FORM_URL = "https://tally.so/r/Z98y4V"
+BETA_TELEMETRY_WEBHOOK_URL = (
+    "https://script.google.com/macros/s/"
+    "AKfycbwNR51toSgE4izajaN1hvX0R84Z6m169JNTD-54CTzu9sAVvOz0Ripk3BU-u59bZJ_W/exec"
+)
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("webull").setLevel(logging.CRITICAL)
@@ -1636,6 +1640,9 @@ DEFAULT_CONFIG = {
     "options_waiver_version": "",
     "options_waiver_accepted_at": "",
     "options_waiver_sha256": "",
+    "auto_share_sanitized_logs": False,
+    "last_uploaded_sanitized_log": "",
+    "anonymous_tester_id": "",
     "active_broker": "SCHWAB",
     "brokers": {
         "SCHWAB": {
@@ -2239,6 +2246,143 @@ def _sync_sanitized_log_archive():
     return backfilled
 
 
+_telemetry_auto_upload_in_flight = False
+
+
+def _upload_sanitized_log_to_drive(
+    filename, sanitized_text, active_broker, anonymous_id
+) -> bool:
+    """Uploads a balance-redacted session log to the Google Apps Script Drive
+    webhook. Treats HTTP 200 or Google Apps Script's post-write 302/405 redirect
+    to googleusercontent.com as True; returns False on network timeouts or
+    400/403/413/500 errors without raising."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        payload_bytes = json.dumps(
+            {
+                "filename": str(filename),
+                "version": APP_VERSION,
+                "broker": str(active_broker or "SCHWAB"),
+                "tester_id": str(anonymous_id or ""),
+                "content": str(sanitized_text or ""),
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            BETA_TELEMETRY_WEBHOOK_URL,
+            data=payload_bytes,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            code = getattr(resp, "status", None) or resp.getcode()
+            return code == 200 or (200 <= int(code or 0) < 300)
+    except urllib.error.HTTPError as he:
+        code = int(getattr(he, "code", 0) or 0)
+        err_url = str(getattr(he, "url", "") or "").lower()
+        loc_hdr = ""
+        try:
+            if getattr(he, "headers", None) is not None:
+                loc_hdr = str(he.headers.get("Location", "") or "").lower()
+        except Exception:
+            pass
+        if code == 200:
+            return True
+        if code in (302, 405) and (
+            "googleusercontent.com" in err_url
+            or "googleusercontent.com" in loc_hdr
+        ):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _find_most_recent_prior_sanitized_log():
+    """Returns (filename, full_path) for the most recent prior-day sanitized log
+    in ~/enforcer_logs/sanitized/ (where YYYY-MM-DD < get_today_str()), or
+    (None, None) if none exists."""
+    today_str = get_today_str()
+    best_date = ""
+    best_fname = None
+    best_path = None
+    try:
+        if not os.path.isdir(SANITIZED_ARCHIVE_DIR):
+            return None, None
+        for s_fname in os.listdir(SANITIZED_ARCHIVE_DIR):
+            m_s = re.match(
+                r"^enforcer_log_(\d{4}-\d{2}-\d{2})_sanitized\.txt$", s_fname
+            )
+            if not m_s:
+                continue
+            d_part = m_s.group(1)
+            if d_part < today_str and d_part > best_date:
+                cand_path = os.path.join(SANITIZED_ARCHIVE_DIR, s_fname)
+                try:
+                    if os.path.isfile(cand_path) and os.path.getsize(cand_path) > 0:
+                        best_date = d_part
+                        best_fname = s_fname
+                        best_path = cand_path
+                except OSError:
+                    pass
+    except Exception:
+        return None, None
+    return best_fname, best_path
+
+
+def _maybe_upload_prior_day_sanitized_log():
+    """Non-blocking startup auto-uploader: if auto_share_sanitized_logs is True,
+    checks for the most recent prior-day sanitized log in ~/enforcer_logs/sanitized/
+    and uploads it in a background daemon thread if not already uploaded."""
+    global _telemetry_auto_upload_in_flight
+    try:
+        if _telemetry_auto_upload_in_flight:
+            return
+        if not config.get("auto_share_sanitized_logs", False):
+            return
+        fname, fpath = _find_most_recent_prior_sanitized_log()
+        if not fname or not fpath:
+            return
+        if fname == config.get("last_uploaded_sanitized_log", ""):
+            return
+        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+            san_text = f.read()
+        if not san_text.strip():
+            return
+
+        tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
+        if not tester_id:
+            tester_id = uuid.uuid4().hex[:6]
+            config["anonymous_tester_id"] = tester_id
+            save_config(config)
+        active_b = str(config.get("active_broker", "SCHWAB") or "SCHWAB")
+        _telemetry_auto_upload_in_flight = True
+
+        def _bg_upload():
+            global _telemetry_auto_upload_in_flight
+            try:
+                ok = _upload_sanitized_log_to_drive(
+                    fname, san_text, active_b, tester_id
+                )
+                if ok:
+                    config["last_uploaded_sanitized_log"] = fname
+                    save_config(config)
+                    log_event(
+                        "TELEMETRY",
+                        f"Auto-shared prior-day sanitized log "
+                        f"({fname}, Tester ID: {tester_id})",
+                    )
+            except Exception:
+                pass
+            finally:
+                _telemetry_auto_upload_in_flight = False
+
+        threading.Thread(target=_bg_upload, daemon=True).start()
+    except Exception:
+        _telemetry_auto_upload_in_flight = False
+
+
 def init_daily_log():
     today_str = get_today_str()
     header_line = (
@@ -2287,6 +2431,8 @@ def init_daily_log():
                 "SESSION",
                 f"--- APPLICATION LAUNCHED / RESUMED (v{APP_VERSION}) ---"
             )
+        load_config(log_restore=False)
+        _maybe_upload_prior_day_sanitized_log()
     except Exception as e:
         print(f"Could not initialize log file: {e}")
 
@@ -2611,6 +2757,11 @@ def load_config(log_restore=False):
                     save_config(config)
         except Exception as e:
             print(f"Could not load saved config: {e}")
+
+    tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
+    if not tester_id:
+        config["anonymous_tester_id"] = uuid.uuid4().hex[:6]
+        save_config(config)
 
     active_b = config.get("active_broker", "SCHWAB")
     sel_acct = (
@@ -7600,6 +7751,10 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     var_reset925 = tk.BooleanVar(value=config["reset_at_925"])
     var_reanchor = tk.BooleanVar(value=False)
+    var_auto_share_logs = tk.BooleanVar(
+        value=bool(config.get("auto_share_sanitized_logs", False))
+    )
+    _auto_share_guard = {"suppress": False}
     var_voice_cues = tk.BooleanVar(
         value=config.get("enable_voice_cues", True)
     )
@@ -8475,6 +8630,322 @@ def show_preflight_window(parent=None, mute_btn=None):
                 parent=pf,
             )
 
+    def preview_most_recent_safe_log():
+        try:
+            _sync_sanitized_log_archive()
+            _, prior_path = _find_most_recent_prior_sanitized_log()
+            target_path = prior_path if prior_path else _prepare_sanitized_log()
+            os.startfile(target_path)
+        except Exception as e:
+            messagebox.showerror(
+                "Preview Safe Log Error",
+                f"Could not open sanitized log preview:\n{e}",
+                parent=pf,
+            )
+
+    def show_telemetry_upload_result_dialog(ok, tester_id):
+        try:
+            if not pf.winfo_exists():
+                return
+        except Exception:
+            return
+        dlg = tk.Toplevel(pf)
+        dlg.grab_set()
+        if os.path.exists(ICON_PATH):
+            try:
+                dlg.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+        apply_dark_title_bar(dlg)
+        dlg.title(
+            "PnL Enforcer — Safe Log Uploaded"
+            if ok
+            else "PnL Enforcer — Safe Log Upload Failed"
+        )
+        dlg.config(bg="#0d1117", padx=24, pady=18)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+
+        bar_col = "#10b981" if ok else "#f59e0b"
+        rim_col = "#1f4d3a" if ok else "#5c3d1e"
+        hdr_txt = (
+            "✅ Safe Log Sent!"
+            if ok
+            else "⚠️ Upload Failed"
+        )
+        body_txt = (
+            f"✅ Safe Log Sent! Your balance-redacted session log "
+            f"(Tester ID: {tester_id}) was uploaded directly to the beta diagnostic drive."
+            if ok
+            else "⚠️ Upload Failed: Could not reach the telemetry endpoint. "
+            "You can still use Export Safe Log or Report Bug."
+        )
+
+        tk.Label(
+            dlg,
+            text=hdr_txt,
+            font=("Arial", 12, "bold"),
+            fg="#69f0ae" if ok else "#fbbf24",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        card_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=rim_col,
+        )
+        card_outer.pack(fill="x", pady=(0, 14))
+        NeonBarCanvas(
+            card_outer, core_color=bar_col, card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+        tk.Label(
+            card_outer,
+            text=body_txt,
+            font=("Arial", 10),
+            fg="#e2e8f0",
+            bg="#131922",
+            justify="left",
+            anchor="w",
+            wraplength=480,
+            padx=18,
+            pady=14,
+        ).pack(side="left", fill="both", expand=True)
+
+        btn_row = tk.Frame(dlg, bg="#0d1117")
+        btn_row.pack(fill="x")
+        make_stadium_button(
+            btn_row,
+            text="OK",
+            font=("Arial", 10, "bold"),
+            fill_color="#0d3b20" if ok else "#141820",
+            fill_top_color="#14532d" if ok else "#1c212b",
+            border_color="#10b981" if ok else "#475569",
+            hover_fill="#114b29" if ok else "#181e28",
+            hover_fill_top="#196638" if ok else "#232a36",
+            hover_border="#34d399" if ok else "#64748b",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=110,
+            height=34,
+            auto_width=False,
+            command=dlg.destroy,
+        ).pack(side="right")
+
+        dlg.update_idletasks()
+        w_req = dlg.winfo_reqwidth()
+        h_req = dlg.winfo_reqheight()
+        x = pf.winfo_rootx() + max(20, (pf.winfo_width() - w_req) // 2)
+        y = pf.winfo_rooty() + max(20, (pf.winfo_height() - h_req) // 2)
+        dlg.geometry(f"+{x}+{y}")
+
+    def send_today_safe_log_now():
+        try:
+            if not os.path.exists(LOG_PATH):
+                init_daily_log()
+            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                raw_txt = f.read()
+            sanitized_txt = sanitize_log_for_export(raw_txt)
+            tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
+            if not tester_id:
+                tester_id = uuid.uuid4().hex[:6]
+                config["anonymous_tester_id"] = tester_id
+                save_config(config)
+            active_b = str(
+                var_broker.get() or config.get("active_broker", "SCHWAB")
+            )
+            upload_fname = f"enforcer_log_{get_today_str()}_manual_sanitized.txt"
+
+            if default_status_lbl is not None:
+                default_status_lbl.config(
+                    text=(
+                        f"⏳ Uploading today's Safe Log (Tester ID: {tester_id}) "
+                        "to beta diagnostic drive..."
+                    ),
+                    fg="#38bdf8",
+                )
+
+            def _worker():
+                ok = _upload_sanitized_log_to_drive(
+                    upload_fname, sanitized_txt, active_b, tester_id
+                )
+
+                def _finish():
+                    if ok:
+                        log_event(
+                            "TELEMETRY",
+                            f"Manually uploaded today's sanitized log "
+                            f"({upload_fname}, Tester ID: {tester_id})",
+                        )
+                        if default_status_lbl is not None:
+                            default_status_lbl.config(
+                                text=(
+                                    f"✓ Safe Log Sent! Uploaded {upload_fname} "
+                                    f"(Tester ID: {tester_id})."
+                                ),
+                                fg="#58d68d",
+                            )
+                    else:
+                        if default_status_lbl is not None:
+                            default_status_lbl.config(
+                                text="⚠️ Safe Log upload failed (telemetry endpoint unreachable).",
+                                fg="#f5b041",
+                            )
+                    show_telemetry_upload_result_dialog(ok, tester_id)
+
+                try:
+                    pf.after(0, _finish)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as e:
+            messagebox.showerror(
+                "Safe Log Upload Error",
+                f"Could not prepare today's sanitized log for upload:\n{e}",
+                parent=pf,
+            )
+
+    def show_auto_share_consent_dialog():
+        tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
+        if not tester_id:
+            tester_id = uuid.uuid4().hex[:6]
+            config["anonymous_tester_id"] = tester_id
+            save_config(config)
+
+        decision = {"ok": False}
+        dlg = tk.Toplevel(pf)
+        dlg.grab_set()
+        if os.path.exists(ICON_PATH):
+            try:
+                dlg.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+        apply_dark_title_bar(dlg)
+        dlg.title("PnL Enforcer — Auto-Share Daily Safe Logs (Beta Opt-In)")
+        dlg.config(bg="#0d1117", padx=26, pady=20)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+
+        def on_cancel():
+            decision["ok"] = False
+            dlg.destroy()
+
+        def on_enable():
+            decision["ok"] = True
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        tk.Label(
+            dlg,
+            text="▶  📤 AUTO-SHARE DAILY SAFE LOGS (BETA OPT-IN)",
+            font=("Arial", 12, "bold"),
+            fg="#38bdf8",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 12))
+
+        card_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        card_outer.pack(fill="x", pady=(0, 16))
+        NeonBarCanvas(
+            card_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+
+        msg_txt = (
+            "When enabled, PnL Enforcer will automatically upload yesterday's "
+            "balance-redacted log (enforcer_log_YYYY-MM-DD_sanitized.txt) in the "
+            "background when you launch the app. All account balances ($[REDACTED]), "
+            "Windows usernames (~), and order IDs are scrubbed, and your log is "
+            f"tagged only with an anonymous 6-character Tester ID ({tester_id}). "
+            "You can turn this off anytime."
+        )
+        tk.Label(
+            card_outer,
+            text=msg_txt,
+            font=("Arial", 10),
+            fg="#e2e8f0",
+            bg="#131922",
+            justify="left",
+            anchor="w",
+            wraplength=560,
+            padx=20,
+            pady=16,
+        ).pack(side="left", fill="both", expand=True)
+
+        btn_row = tk.Frame(dlg, bg="#0d1117")
+        btn_row.pack(fill="x")
+
+        make_stadium_button(
+            btn_row,
+            text="Preview Safe Log",
+            font=("Arial", 9, "bold"),
+            fill_color="#141820",
+            fill_top_color="#1c212b",
+            border_color="#2e3746",
+            hover_fill="#181e28",
+            hover_fill_top="#232a36",
+            hover_border="#38bdf8",
+            fg="#7dd3fc",
+            canvas_bg="#0d1117",
+            width=154,
+            height=34,
+            auto_width=False,
+            command=preview_most_recent_safe_log,
+        ).pack(side="left")
+
+        make_stadium_button(
+            btn_row,
+            text="Enable Auto-Share",
+            font=("Arial", 10, "bold"),
+            fill_color="#0d3b20",
+            fill_top_color="#14532d",
+            border_color="#10b981",
+            hover_fill="#114b29",
+            hover_fill_top="#196638",
+            hover_border="#34d399",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=174,
+            height=34,
+            auto_width=False,
+            command=on_enable,
+        ).pack(side="right")
+
+        make_stadium_button(
+            btn_row,
+            text="Cancel",
+            font=("Arial", 10, "bold"),
+            fill_color="#3b1520",
+            border_color="#f43f5e",
+            hover_fill="#4f1c2b",
+            hover_border="#fb7185",
+            fg="#ffe4e6",
+            canvas_bg="#0d1117",
+            width=108,
+            height=34,
+            auto_width=False,
+            command=on_cancel,
+        ).pack(side="right", padx=(0, 8))
+
+        dlg.update_idletasks()
+        w_req = dlg.winfo_reqwidth()
+        h_req = dlg.winfo_reqheight()
+        x = pf.winfo_rootx() + max(20, (pf.winfo_width() - w_req) // 2)
+        y = pf.winfo_rooty() + max(20, (pf.winfo_height() - h_req) // 2)
+        dlg.geometry(f"+{x}+{y}")
+
+        pf.wait_window(dlg)
+        return decision["ok"]
+
     logs_dropdown = DarkDropdownMenu(
         pf,
         tearoff=0,
@@ -8484,23 +8955,73 @@ def show_preflight_window(parent=None, mute_btn=None):
         activebackground="#1e293b",
         activeforeground="#ffffff"
     )
-    logs_dropdown.add_command(
-        label="📄 View Today's Log",
-        command=open_log_file
-    )
-    logs_dropdown.add_command(
-        label="🔒 Export Today's Safe Log (Balances Redacted)",
-        command=export_sanitized_log_action
-    )
-    logs_dropdown.add_separator()
-    logs_dropdown.add_command(
-        label=f"🔒 Open Safe Archived Logs ({LOG_RETENTION_DAYS}-Day Redacted)",
-        command=open_sanitized_archive_folder
-    )
-    logs_dropdown.add_command(
-        label=f"📁 Open Raw Archived Logs ({LOG_RETENTION_DAYS}-Day Full)",
-        command=open_log_archive_folder
-    )
+
+    def _toggle_auto_share_from_menu():
+        var_auto_share_logs.set(not bool(var_auto_share_logs.get()))
+
+    def rebuild_logs_dropdown():
+        logs_dropdown.delete(0, "end")
+        logs_dropdown.add_command(
+            label="📤 Send Today's Safe Log Now",
+            command=send_today_safe_log_now,
+        )
+        chk_mark = "☑" if var_auto_share_logs.get() else "☐"
+        logs_dropdown.add_command(
+            label=f"{chk_mark} Auto-Share Daily Safe Logs (Beta Opt-In)",
+            command=_toggle_auto_share_from_menu,
+        )
+        logs_dropdown.add_separator()
+        logs_dropdown.add_command(
+            label="📄 View Today's Log",
+            command=open_log_file,
+        )
+        logs_dropdown.add_command(
+            label="🔒 Export Today's Safe Log (Balances Redacted)",
+            command=export_sanitized_log_action,
+        )
+        logs_dropdown.add_separator()
+        logs_dropdown.add_command(
+            label=f"🔒 Open Safe Archived Logs ({LOG_RETENTION_DAYS}-Day Redacted)",
+            command=open_sanitized_archive_folder,
+        )
+        logs_dropdown.add_command(
+            label=f"📁 Open Raw Archived Logs ({LOG_RETENTION_DAYS}-Day Full)",
+            command=open_log_archive_folder,
+        )
+
+    def _on_toggle_auto_share_logs(*_):
+        if _auto_share_guard["suppress"]:
+            return
+        if var_auto_share_logs.get():
+            if not show_auto_share_consent_dialog():
+                _auto_share_guard["suppress"] = True
+                try:
+                    var_auto_share_logs.set(False)
+                finally:
+                    _auto_share_guard["suppress"] = False
+                rebuild_logs_dropdown()
+                return
+            config["auto_share_sanitized_logs"] = True
+            save_config(config)
+            tester_id = config.get("anonymous_tester_id", "")
+            log_event(
+                "TELEMETRY",
+                f"User enabled Auto-Share Daily Safe Logs (Tester ID: {tester_id}).",
+            )
+            rebuild_logs_dropdown()
+            _maybe_upload_prior_day_sanitized_log()
+        else:
+            config["auto_share_sanitized_logs"] = False
+            save_config(config)
+            log_event(
+                "TELEMETRY",
+                "User disabled Auto-Share Daily Safe Logs in Pre-Flight.",
+            )
+            rebuild_logs_dropdown()
+
+    var_auto_share_logs.trace_add("write", _on_toggle_auto_share_logs)
+    rebuild_logs_dropdown()
+
     btn_logs_menu = make_stadium_button(
         top_bar,
         text="📜 Logs ▾",
@@ -8522,6 +9043,8 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(
         btn_logs_menu,
         "Session & Audit Logs Menu:\n"
+        "• Send Today's Safe Log Now: Uploads today's balance-redacted log directly to the beta diagnostic drive\n"
+        "• Auto-Share Daily Safe Logs (Beta Opt-In): Automatically uploads yesterday's redacted log on startup\n"
         f"• View Today's Log: Opens your local audit log in Notepad ({_mask_user_path(LOG_PATH)})\n"
         "• Export Today's Safe Log: Creates a privacy-scrubbed copy with total account balances redacted ($[REDACTED]) and copies it to clipboard\n"
         f"• Open Safe Archived Logs: Opens your {LOG_RETENTION_DAYS}-day redacted log archive ({_mask_user_path(SANITIZED_ARCHIVE_DIR)})\n"
@@ -8789,6 +9312,20 @@ def show_preflight_window(parent=None, mute_btn=None):
         var_reset925.set(
             src.get("reset_at_925", DEFAULT_CONFIG["reset_at_925"])
         )
+        _auto_share_guard["suppress"] = True
+        try:
+            restored_auto_share = bool(
+                src.get(
+                    "auto_share_sanitized_logs",
+                    DEFAULT_CONFIG["auto_share_sanitized_logs"],
+                )
+                and config.get("auto_share_sanitized_logs", False)
+            )
+            var_auto_share_logs.set(restored_auto_share)
+            config["auto_share_sanitized_logs"] = restored_auto_share
+        finally:
+            _auto_share_guard["suppress"] = False
+        rebuild_logs_dropdown()
         var_voice_cues.set(
             src.get("enable_voice_cues", DEFAULT_CONFIG["enable_voice_cues"])
         )
@@ -8854,6 +9391,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 "enable_lock_os": bool(var_lock_os.get()),
                 "daily_lock_mins": max(0.0, abs(float(var_daily_lock_mins.get()))),
                 "reset_at_925": bool(var_reset925.get()),
+                "auto_share_sanitized_logs": bool(var_auto_share_logs.get()),
                 "enable_voice_cues": bool(var_voice_cues.get()),
                 "tts_voice": TTS_LABEL_TO_ID.get(var_tts_voice.get(), "Zira"),
                 "enable_upside_chime": bool(var_upside_chime.get()),
@@ -8970,6 +9508,15 @@ def show_preflight_window(parent=None, mute_btn=None):
                 0.0, abs(float(var_daily_lock_mins.get()))
             )
             new_cfg["reset_at_925"] = bool(var_reset925.get())
+            new_cfg["auto_share_sanitized_logs"] = bool(
+                var_auto_share_logs.get()
+            )
+            new_cfg["last_uploaded_sanitized_log"] = config.get(
+                "last_uploaded_sanitized_log", ""
+            )
+            new_cfg["anonymous_tester_id"] = config.get(
+                "anonymous_tester_id", ""
+            )
             new_cfg["enable_voice_cues"] = bool(var_voice_cues.get())
             new_cfg["tts_voice"] = TTS_LABEL_TO_ID.get(
                 var_tts_voice.get(), "Zira"
@@ -9789,6 +10336,27 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     attach_tooltip(lbl_poll, poll_tip)
     attach_tooltip(ent_poll, poll_tip)
+
+    cb_auto_share = make_glass_checkbutton(
+        c3,
+        text="Auto-Share Daily Safe Logs (Beta Opt-In)",
+        variable=var_auto_share_logs,
+        font=("Arial", 10, "bold"),
+        fg="#7dd3fc",
+        bg="#131922",
+        accent_hex="#0284c7",
+        check_hex="#38bdf8",
+        anchor="w",
+    )
+    cb_auto_share.pack(fill="x", pady=(2, 0))
+    attach_tooltip(
+        cb_auto_share,
+        "Beta Diagnostic Telemetry (Strictly Opt-In — OFF by Default):\n"
+        "When enabled, PnL Enforcer automatically uploads yesterday's balance-redacted log\n"
+        "(enforcer_log_YYYY-MM-DD_sanitized.txt) in the background when you launch the app.\n"
+        "• All total account balances ($[REDACTED]), Windows usernames (~), and order IDs are scrubbed.\n"
+        f"• Tagged only with your anonymous 6-character Tester ID ({config.get('anonymous_tester_id', '')})."
+    )
 
     # ==========================================================
     # RIGHT COLUMN: 4. EXTENDED HOURS RULEBOOK, 5. REGULAR HOURS RULEBOOK
