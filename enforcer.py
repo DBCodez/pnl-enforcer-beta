@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.31"
+APP_VERSION = "0.9.40"
 
 import os
 import sys
@@ -1667,6 +1667,11 @@ DEFAULT_CONFIG = {
     "daily_lock_mins": 15.0,
     "enable_open_flatten": False,
     "open_max_loss": 500.0,
+    "enable_consec_loss_cooldown": False,
+    "consec_loss_count": 3,
+    "consec_loss_min_dollars": 25.0,
+    "consec_win_reset_dollars": 10.0,
+    "consec_loss_window_mins": 15.0,
     "enable_open_cooldown": False,
     "open_cooldown_mins": 1.0,
     "enable_voice_cues": True,
@@ -1791,6 +1796,7 @@ HUD_COLUMN_CATALOG = [
     ("session_high", "SESSION HIGH", "Highest flat realized PnL of the day"),
     ("from_high", "FROM HIGH", "Current drawdown/giveback from Session High"),
     ("trades_wl", "TRADES (W/L)", "Completed round-trip Wins & Losses (%)"),
+    ("loss_streak", "LOSS STREAK", "Consecutive qualifying losses (e.g. 3/5) & live reset timer"),
 ]
 HUD_COL_HEADERS = {col_id: hdr for col_id, hdr, _ in HUD_COLUMN_CATALOG}
 DEFAULT_HUD_COLUMNS = [
@@ -1808,6 +1814,7 @@ COMPACT_HUD_COLUMNS = [
 
 HALF_RISK_DOLLARS = {
     "open_max_loss": 250.0,
+    "consec_loss_min_dollars": 12.5,
     "pm_warn_1": 250.0,
     "pm_warn_2": 500.0,
     "pm_max_loss": 750.0,
@@ -1842,6 +1849,8 @@ first_poll_of_launch = True
 
 alarm_active = False
 cooldown_active = False
+consecutive_api_failures = 0
+api_disconnect_alerted = False
 cooldown_end_time = 0.0
 cooldown_label = "COOL-DOWN LOCK"
 cooldown_30s_announced = False
@@ -1851,6 +1860,11 @@ last_rth_mode = None
 win_trades = 0
 loss_trades = 0
 prev_flat_realized_pnl = 0.0
+settled_realized_pnl = None
+flat_desync_streak = 0
+in_trade_desync_streak = 0
+pending_scale_out_tol = 0.0
+recent_loss_timestamps = []
 triggered_alarms = {}
 ALARM_COOLDOWN_SEC = 180
 RECOVERY_BUFFER_DOLLARS = 150.0
@@ -1949,6 +1963,76 @@ def format_trades_wl_inline(wins, losses):
     w_pct = (wins / total) * 100.0
     l_pct = (losses / total) * 100.0
     return f"W: {wins} ({w_pct:.1f}%) | L: {losses} ({l_pct:.1f}%)"
+
+
+def _format_countdown_mm_ss(seconds):
+    """Formats a positive second count as MM:SS (or H:MM:SS if >= 60 mins)."""
+    s = max(0, int(seconds))
+    m, sec = divmod(s, 60)
+    if m >= 60:
+        h, rem_m = divmod(m, 60)
+        return f"{h:d}:{rem_m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+
+def get_loss_streak_status(now_ts=None):
+    """Prunes expired timestamps from recent_loss_timestamps against the active
+    rolling window and returns:
+      (cur_streak, req_losses, next_drop_sec, full_clear_sec, is_enabled)
+    where next_drop_sec is seconds until the oldest loss ages out (-1 to streak)
+    and full_clear_sec is seconds until the newest loss ages out (0/X clear)."""
+    global recent_loss_timestamps
+    if now_ts is None:
+        now_ts = time.time()
+    req_losses = max(2, int(round(float(config.get("consec_loss_count", 3)))))
+    win_mins = max(0.5, float(config.get("consec_loss_window_mins", 15.0)))
+    win_sec = win_mins * 60.0
+    is_enabled = (
+        not config.get("alarms_only_mode", False)
+        and bool(config.get("enable_consec_loss_cooldown", False))
+    )
+    if recent_loss_timestamps:
+        recent_loss_timestamps[:] = [
+            float(ts)
+            for ts in recent_loss_timestamps
+            if 0.0 <= (now_ts - float(ts)) < win_sec
+        ]
+    cur_streak = len(recent_loss_timestamps)
+    if cur_streak > 0:
+        oldest_rem = (recent_loss_timestamps[0] + win_sec) - now_ts
+        newest_rem = (recent_loss_timestamps[-1] + win_sec) - now_ts
+        next_drop_sec = max(1, int(math.ceil(oldest_rem)))
+        full_clear_sec = max(1, int(math.ceil(newest_rem)))
+    else:
+        next_drop_sec = 0
+        full_clear_sec = 0
+    return cur_streak, req_losses, next_drop_sec, full_clear_sec, is_enabled
+
+
+def format_loss_streak_multiline(now_ts=None):
+    """Returns (two_line_text, bg_hex) for the HUD 'LOSS STREAK' column."""
+    cur_s, req_l, next_s, _full_s, is_en = get_loss_streak_status(now_ts)
+    if cur_s <= 0:
+        top_ln = f"0 / {req_l}" if is_en else f"0 / {req_l} (OFF)"
+        return f"{top_ln}\nCLEAR", "#2c3e50"
+    timer_str = _format_countdown_mm_ss(next_s)
+    if not is_en:
+        bg_c = "#2c3e50"
+    elif cur_s >= (req_l - 1):
+        bg_c = "#b03a2e"
+    else:
+        bg_c = "#d35400"
+    return f"{cur_s} / {req_l}\nRST {timer_str}", bg_c
+
+
+def format_loss_streak_inline(now_ts=None):
+    """Returns a single-line streak summary for the HUD bottom-left badge."""
+    cur_s, req_l, next_s, _full_s, is_en = get_loss_streak_status(now_ts)
+    if cur_s > 0:
+        return f"STREAK: {cur_s}/{req_l} ({_format_countdown_mm_ss(next_s)})"
+    if is_en:
+        return f"STREAK: 0/{req_l} (CLEAR)"
+    return f"STREAK: 0/{req_l} (OFF)"
 
 
 def backfill_trades_from_today_log(target_broker=None):
@@ -2586,6 +2670,13 @@ def format_config_summary(cfg):
         f"ON({cfg.get('open_cooldown_mins', 1):g}m)"
         if cfg.get("enable_open_cooldown") else "OFF"
     )
+    tilt_str = (
+        f"ON({int(cfg.get('consec_loss_count', 3))}L/"
+        f"{cfg.get('consec_loss_window_mins', 15):g}m, "
+        f"Loss<=-${abs(float(cfg.get('consec_loss_min_dollars', 25))):,.0f}, "
+        f"WinRst>=+${abs(float(cfg.get('consec_win_reset_dollars', 10))):,.0f})"
+        if cfg.get("enable_consec_loss_cooldown") else "OFF"
+    )
     dl_mins = cfg.get("daily_lock_mins", 15.0)
     dl_str = (
         f"ON({dl_mins:g}m)" if dl_mins > 0 else "ON(Once)"
@@ -2597,6 +2688,7 @@ def format_config_summary(cfg):
         f"AlarmsOnly={'ON' if cfg.get('alarms_only_mode') else 'OFF'} | "
         f"OpenStop={'ON' if cfg.get('enable_open_flatten') else 'OFF'}"
         f"(-${cfg.get('open_max_loss', 0):,.0f}, CoolDown={cd_str}) | "
+        f"TiltStop={tilt_str} | "
         f"DayFlat={'ON' if cfg.get('enable_auto_flatten') else 'OFF'} | "
         f"OptFlat={'ON(BETA)' if is_options_flatten_armed(cfg) else 'OFF'} | "
         f"KillTOS={'ON' if cfg.get('enable_kill_tos') else 'OFF'} | "
@@ -2615,8 +2707,14 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     global start_equity, max_equity, daily_max_equity
     global last_flat_equity, has_reset_at_open, has_reset_at_close
     global win_trades, loss_trades, prev_flat_realized_pnl
-    global current_upside_tier, first_poll_of_launch
+    global settled_realized_pnl, flat_desync_streak
+    global in_trade_desync_streak, pending_scale_out_tol
+    global current_upside_tier, first_poll_of_launch, recent_loss_timestamps
 
+    recent_loss_timestamps.clear()
+    flat_desync_streak = 0
+    in_trade_desync_streak = 0
+    pending_scale_out_tol = 0.0
     today_str = get_today_str()
     s_key = get_session_key(broker_name, account_id)
     acct_sessions = config.get("account_sessions", {})
@@ -2645,7 +2743,20 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             )
             win_trades = int(s_data.get("win_trades", 0) or 0)
             loss_trades = int(s_data.get("loss_trades", 0) or 0)
+            saved_lts = s_data.get("loss_timestamps")
+            if isinstance(saved_lts, list):
+                now_ts = time.time()
+                win_sec = max(
+                    0.5, float(config.get("consec_loss_window_mins", 15.0))
+                ) * 60.0
+                recent_loss_timestamps.extend(
+                    float(t)
+                    for t in saved_lts
+                    if isinstance(t, (int, float))
+                    and 0.0 <= (now_ts - float(t)) < win_sec
+                )
             prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
+            settled_realized_pnl = prev_flat_realized_pnl
             if win_trades == 0 and loss_trades == 0:
                 bw, bl, _ = backfill_trades_from_today_log(broker_name)
                 if bw > 0 or bl > 0:
@@ -2687,6 +2798,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
         win_trades = int(config.get("saved_win_trades", 0) or 0)
         loss_trades = int(config.get("saved_loss_trades", 0) or 0)
         prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
+        settled_realized_pnl = prev_flat_realized_pnl
         if win_trades == 0 and loss_trades == 0:
             bw, bl, _ = backfill_trades_from_today_log(broker_name)
             if bw > 0 or bl > 0:
@@ -2715,6 +2827,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     win_trades = 0
     loss_trades = 0
     prev_flat_realized_pnl = 0.0
+    settled_realized_pnl = None
     current_upside_tier = 1
     first_poll_of_launch = True
     return False
@@ -2810,6 +2923,7 @@ def save_session_state():
         "has_reset_at_close": has_reset_at_close,
         "win_trades": win_trades,
         "loss_trades": loss_trades,
+        "loss_timestamps": [round(float(t), 2) for t in recent_loss_timestamps],
     }
 
     old_entry = config["account_sessions"].get(s_key)
@@ -3258,11 +3372,47 @@ class SchwabAdapter:
                 self.client = client_from_token_file(
                     SCHWAB_TOKEN_PATH, self.app_key, self.app_secret
                 )
+                try:
+                    self.client.set_timeout(4.5)
+                except Exception:
+                    pass
                 resp = self.client.get_account_numbers()
                 if resp.status_code == 200:
                     self._parse_accounts(resp.json())
                     return True
+                if resp.status_code in (400, 401, 403):
+                    raise RuntimeError(
+                        f"Schwab token rejected (HTTP {resp.status_code})"
+                    )
+                raise ConnectionError(
+                    f"Schwab API temporary HTTP {resp.status_code}"
+                )
         except Exception as e:
+            err_l = str(e).lower()
+            is_token_invalid = any(
+                k in err_l
+                for k in (
+                    "safety buffer",
+                    "invalid_grant",
+                    "unsupported_token_type",
+                    "token rejected",
+                    "expired",
+                    "unauthorized",
+                    "http 401",
+                    "http 400",
+                    "jsondecodeerror",
+                )
+            )
+            if not is_token_invalid:
+                log_event(
+                    "WARN",
+                    f"Schwab network/connection error during startup ({e}). "
+                    f"Preserving saved token file.",
+                )
+                raise RuntimeError(
+                    f"Network connection failed while reaching Schwab API ({e}).\n"
+                    f"Your saved 7-day token was preserved — please check your internet connection and retry."
+                ) from e
             log_event(
                 "SESSION",
                 f"Saved Schwab token expired or invalid ({e}). "
@@ -3316,6 +3466,10 @@ class SchwabAdapter:
             self.client = client_from_manual_flow(
                 self.app_key, self.app_secret, CALLBACK_URL, SCHWAB_TOKEN_PATH
             )
+            try:
+                self.client.set_timeout(4.5)
+            except Exception:
+                pass
         finally:
             builtins.print = orig_print
             builtins.input = orig_input
@@ -3328,6 +3482,25 @@ class SchwabAdapter:
         raise RuntimeError(
             f"Schwab get_account_numbers failed: HTTP {resp.status_code}"
         )
+
+    def reconnect_session(self):
+        """Rebuilds the underlying Schwab HTTP client from SCHWAB_TOKEN_PATH
+        with a 4.5s timeout to flush stale TCP sockets after an internet drop."""
+        try:
+            if os.path.exists(SCHWAB_TOKEN_PATH):
+                from schwab.auth import client_from_token_file
+                new_client = client_from_token_file(
+                    SCHWAB_TOKEN_PATH, self.app_key, self.app_secret
+                )
+                try:
+                    new_client.set_timeout(4.5)
+                except Exception:
+                    pass
+                self.client = new_client
+                return True
+        except Exception as e:
+            self.last_error = str(e)
+        return False
 
     def _parse_accounts(self, acct_list):
         self.accounts = []
@@ -3886,7 +4059,16 @@ class WebullAdapter:
             )
             from webull.core.client import ApiClient
             from webull.trade.trade_client import TradeClient
-        self.api_client = ApiClient(self.app_key, self.app_secret, "us")
+        try:
+            self.api_client = ApiClient(
+                self.app_key,
+                self.app_secret,
+                "us",
+                connect_timeout=3.5,
+                timeout=4.5,
+            )
+        except TypeError:
+            self.api_client = ApiClient(self.app_key, self.app_secret, "us")
         self.api_client._stream_logger_set = True
         self.api_client._file_logger_set = True
         if hasattr(self.api_client, "set_token_dir"):
@@ -3930,6 +4112,34 @@ class WebullAdapter:
         raise RuntimeError(
             f"Webull authentication failed (HTTP {res.status_code}): {res.text}"
         )
+
+    def reconnect_session(self):
+        """Rebuilds the Webull ApiClient and TradeClient with a 4.5s timeout
+        to flush stale TCP sockets after an internet connection drop."""
+        try:
+            from webull.core.client import ApiClient
+            from webull.trade.trade_client import TradeClient
+            try:
+                new_api = ApiClient(
+                    self.app_key,
+                    self.app_secret,
+                    "us",
+                    connect_timeout=3.5,
+                    timeout=4.5,
+                )
+            except TypeError:
+                new_api = ApiClient(self.app_key, self.app_secret, "us")
+            new_api._stream_logger_set = True
+            new_api._file_logger_set = True
+            if hasattr(new_api, "set_token_dir"):
+                new_api.set_token_dir(os.path.join(USER_HOME, "conf"))
+            new_api.add_endpoint("us", "api.webull.com")
+            self.api_client = new_api
+            self.trade_client = TradeClient(self.api_client)
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            return False
 
     def _call_get_account_list(self):
         if hasattr(self.trade_client, "account_v2"):
@@ -4565,25 +4775,6 @@ class WebullAdapter:
                 else p_json.get("data", p_json.get("positions", []))
             )
 
-            probe_qty_map = {}
-            for p_item in pos_list:
-                q_val = int(float(p_item.get("quantity") or p_item.get("position") or 0))
-                if q_val != 0:
-                    s_val = (
-                        p_item.get("symbol")
-                        or p_item.get("ticker", {}).get("symbol")
-                        or "UNKNOWN"
-                    )
-                    probe_qty_map[s_val] = q_val
-
-            prev_q_map = self._prev_pos_qty_map.get(self.account_id)
-            if prev_q_map is not None and probe_qty_map != prev_q_map:
-                # Share quantity just changed (entry, scale-out, or exit).
-                # Wait briefly before fetching balance so Webull's cash_balance
-                # settles into sync with the updated position quantities without
-                # firing a duplicate /positions/list call in the same cycle.
-                time.sleep(0.25)
-
             b_res = self._call_get_balance()
             if b_res.status_code == 429:
                 self._rate_limit_until = time.time() + 2.5
@@ -4625,6 +4816,7 @@ class WebullAdapter:
 
             total_open_pnl = 0.0
             total_pos_mkt_val = 0.0
+            total_raw_pos_mkt_val = 0.0
             pos_details = {}
             open_eq_cache = []
             open_opt_cache = []
@@ -4725,6 +4917,7 @@ class WebullAdapter:
                     (conf_lp - avg_price) * qty * mult
                     if avg_price > 0 else pos_open_pnl
                 )
+                total_raw_pos_mkt_val += raw_mkt_val
                 total_pos_mkt_val += pos_mkt_val
 
                 total_open_pnl += pos_open_pnl
@@ -4750,10 +4943,26 @@ class WebullAdapter:
                 for s_k, d_v in pos_details.items()
             }
 
+            raw_adj_eq = (
+                round(raw_eq + (total_pos_mkt_val - total_raw_pos_mkt_val), 2)
+                if (raw_eq is not None and raw_eq > 0)
+                else None
+            )
             if cash_bal is not None and cash_bal > 0:
-                adj_eq = round(cash_bal + total_pos_mkt_val, 2)
+                cash_plus_pos = round(cash_bal + total_pos_mkt_val, 2)
+                if (
+                    raw_adj_eq is not None
+                    and abs(cash_plus_pos - raw_adj_eq) > 15.0
+                ):
+                    adj_eq = raw_adj_eq
+                else:
+                    adj_eq = cash_plus_pos
             else:
-                adj_eq = round(raw_eq, 2)
+                adj_eq = (
+                    raw_adj_eq
+                    if raw_adj_eq is not None
+                    else round(raw_eq or 0.0, 2)
+                )
 
             self.last_error = ""
             res_tuple = (
@@ -5773,6 +5982,15 @@ def get_full_idle_button_text():
             pills.append(f"OPEN STOP (-${oml:,.0f} + {cd_m:g}m LOCK)")
         else:
             pills.append(f"OPEN STOP (-${oml:,.0f})")
+    if config.get("enable_consec_loss_cooldown", False):
+        cur_s, c_cnt, next_s, _full_s, _is_en = get_loss_streak_status()
+        c_win = float(config.get("consec_loss_window_mins", 15.0))
+        if cur_s > 0:
+            pills.append(
+                f"TILT STOP ({cur_s}/{c_cnt} · {_format_countdown_mm_ss(next_s)})"
+            )
+        else:
+            pills.append(f"TILT STOP (0/{c_cnt} · {c_win:g}m)")
     daily_parts = []
     if config.get("enable_auto_flatten", False):
         daily_parts.append(
@@ -5809,9 +6027,18 @@ def get_medium_idle_button_text():
         oml = config.get("open_max_loss", 500.0)
         if config.get("enable_open_cooldown", False):
             cd_m = config.get("open_cooldown_mins", 1.0)
-            pills.append(f"OPEN (-${oml:,.0f}/{cd_m:g}m)")
+            pills.append(f"OPEN(-${oml:,.0f}/{cd_m:g}m)")
         else:
-            pills.append(f"OPEN (-${oml:,.0f})")
+            pills.append(f"OPEN(-${oml:,.0f})")
+    if config.get("enable_consec_loss_cooldown", False):
+        cur_s, c_cnt, next_s, _full_s, _is_en = get_loss_streak_status()
+        c_win = float(config.get("consec_loss_window_mins", 15.0))
+        if cur_s > 0:
+            pills.append(
+                f"TILT({cur_s}/{c_cnt} {_format_countdown_mm_ss(next_s)})"
+            )
+        else:
+            pills.append(f"TILT(0/{c_cnt} {c_win:g}m)")
     daily_parts = []
     if config.get("enable_auto_flatten", False):
         daily_parts.append("DAY+OPT(BETA)" if opt_armed else "DAY FLAT")
@@ -5822,14 +6049,14 @@ def get_medium_idle_button_text():
     if config.get("enable_lock_os", False):
         dl_m = config.get("daily_lock_mins", 15.0)
         daily_parts.append(
-            f"LOCK ({dl_m:g}m)" if dl_m > 0 else "LOCK (1x)"
+            f"LOCK({dl_m:g}m)" if dl_m > 0 else "LOCK(1x)"
         )
     if daily_parts:
-        pills.append(" + ".join(daily_parts))
+        pills.extend(daily_parts)
 
     if len(pills) == 1:
         return f"{b_name} : ALARM ONLY (OBSERVATION)"
-    return "ARMED: " + " + ".join(pills)
+    return "ARMED: " + " · ".join(pills)
 
 
 def get_idle_button_text():
@@ -5916,13 +6143,28 @@ def mute_alarm(ui_button):
         hide_fn()
     log_event("ALARM", "User acknowledged and muted siren.")
     if not cooldown_active:
-        ui_button.config(
-            text=get_idle_button_text(),
-            bg="#222629",
-            fg="#f5b041",
-            disabledforeground="#f5b041",
-            state="disabled"
-        )
+        if api_disconnect_alerted or consecutive_api_failures >= 2:
+            att = max(1, consecutive_api_failures)
+            re_txt = (
+                f"🔄 RECONNECTING (#{att})..."
+                if is_compact_hud()
+                else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
+            )
+            ui_button.config(
+                text=re_txt,
+                bg="#78350f",
+                fg="#fde68a",
+                disabledforeground="#fde68a",
+                state="disabled",
+            )
+        else:
+            ui_button.config(
+                text=get_idle_button_text(),
+                bg="#222629",
+                fg="#f5b041",
+                disabledforeground="#f5b041",
+                state="disabled"
+            )
 
 
 def play_unlock_chimes():
@@ -6056,11 +6298,18 @@ def trigger_upside_tier_glow(ui_button, banner_text, log_msg):
 def _format_lock_voice_msg(duration_mins, label_prefix, upgraded=False):
     mins_val = float(duration_mins)
     dur_words = "1 minute" if mins_val == 1.0 else f"{mins_val:g} minutes"
-    is_daily = "DAILY" in str(label_prefix).upper()
+    lp_upper = str(label_prefix).upper()
+    is_daily = "DAILY" in lp_upper
+    is_tilt = "TILT" in lp_upper or "STREAK" in lp_upper
     if upgraded:
         reason_words = "Upgraded to daily floor breach" if is_daily else "Lockout extended"
     else:
-        reason_words = "Daily floor breached" if is_daily else "Open P and L stop triggered"
+        if is_daily:
+            reason_words = "Daily floor breached"
+        elif is_tilt:
+            reason_words = "Consecutive loss cooldown triggered"
+        else:
+            reason_words = "Open P and L stop triggered"
     return f"{reason_words}. Locked out for {dur_words}."
 
 
@@ -6644,6 +6893,94 @@ def trigger_open_pnl_flatten(
         trigger_alarm(fail_reason, ui_button, context_str)
 
 
+def trigger_consec_loss_cooldown(
+    adapter, reason, ui_button, has_options=False, context_str=""
+):
+    """Executes the Card 1 Consecutive Loss Cooldown ('Tilt Streak Stop'):
+    cancels working orders, flattens any open positions (if the trader flipped
+    rather than closing flat), verifies 100% flat, and engages the Penalty Box
+    OS Lock for open_cooldown_mins."""
+    global alarm_active, recent_loss_timestamps
+    recent_loss_timestamps.clear()
+    save_session_state()
+    if config.get("alarms_only_mode", False):
+        trigger_alarm(reason, ui_button, context_str)
+        log_event(
+            "GUARDRAIL",
+            f"Consecutive Loss Stop reached ({reason}), but Alarms Only Mode is ON "
+            f"(Observation Mode — Siren Only)."
+        )
+        return
+
+    cd_on = config.get("enable_open_cooldown", True)
+    opt_armed = is_options_flatten_armed(config)
+
+    if has_options and not opt_armed:
+        opt_reason = f"{reason} — MANUAL OPTIONS EXIT REQUIRED!"
+        trigger_alarm(opt_reason, ui_button, context_str)
+        log_event(
+            "GUARDRAIL",
+            f"Consecutive Loss Cooldown triggered with OPTIONS open ({context_str}). "
+            f"Options Auto-Flatten (BETA) is OFF; flattening any equities and "
+            f"waiting for manual options exit."
+        )
+        flatten_equities(adapter, force_flatten=True, include_options=False)
+        return
+
+    if has_options and opt_armed and not is_market_hours():
+        opt_reason = f"{reason} — OPTIONS MARKET CLOSED (EXIT MANUALLY!)"
+        trigger_alarm(opt_reason, ui_button, context_str)
+        log_event(
+            "GUARDRAIL",
+            f"Consecutive Loss Cooldown triggered with OPTIONS open outside RTH ({context_str}). "
+            f"Options cannot be market-flattened outside 9:30–16:00 ET; "
+            f"flattening any equities and sounding siren."
+        )
+        flatten_equities(adapter, force_flatten=True, include_options=False)
+        return
+
+    if not cd_on:
+        trigger_alarm(reason, ui_button, context_str)
+    else:
+        alarm_active = False
+
+    log_event(
+        "GUARDRAIL",
+        f"CONSECUTIVE LOSS COOLDOWN TRIGGERED: {reason} | {context_str}"
+    )
+    all_flat = flatten_equities(
+        adapter,
+        force_flatten=True,
+        include_options=(has_options and opt_armed)
+    )
+    if all_flat:
+        log_event(
+            "GUARDRAIL",
+            "Consecutive Loss Cooldown confirmed 100% flat."
+        )
+        if cd_on:
+            alarm_active = False
+            cd_mins = float(config.get("open_cooldown_mins", 1.0))
+            start_cooldown_lock(
+                cd_mins,
+                ui_button,
+                label_prefix="TILT STREAK LOCK",
+                adapter=adapter
+            )
+    else:
+        log_event(
+            "CRITICAL",
+            "Consecutive Loss Cooldown flatten timed out — OS Lock ABORTED! "
+            "Check platform manually!"
+        )
+        fail_reason = (
+            f"{reason} — CHECK OPTIONS MANUALLY!"
+            if has_options
+            else reason
+        )
+        trigger_alarm(fail_reason, ui_button, context_str)
+
+
 def terminate_selected_apps():
     if config.get("enable_kill_tos", False):
         log_event(
@@ -6766,6 +7103,7 @@ def log_position_transitions(
     pos_details, realized_pnl, open_pnl, net_pnl, session_high_pnl
 ):
     global prev_pos_snapshot, win_trades, loss_trades, prev_flat_realized_pnl
+    global recent_loss_timestamps
     curr_sig_map = {
         s: (d["qty"], round(float(d.get("avg", 0.0)), 4))
         for s, d in pos_details.items()
@@ -6776,7 +7114,7 @@ def log_position_transitions(
     }
 
     if curr_sig_map == prev_sig_map:
-        return
+        return None
 
     all_syms = sorted(set(curr_sig_map.keys()) | set(prev_sig_map.keys()))
     changes = []
@@ -6804,14 +7142,73 @@ def log_position_transitions(
             completed_round_trip = True
 
     if not changes:
-        return
+        return None
 
+    consec_trigger_reason = None
+    streak_note = ""
     if completed_round_trip and (len(pos_details) == 0 or any("Re-entry Avg:" in c for c in changes)):
         delta = round(realized_pnl - prev_flat_realized_pnl, 2)
+        req_losses = max(
+            2, int(round(float(config.get("consec_loss_count", 3))))
+        )
+        min_loss_mag = abs(
+            float(config.get("consec_loss_min_dollars", 25.0))
+        )
+        win_mins = max(
+            0.5, float(config.get("consec_loss_window_mins", 15.0))
+        )
+        now_ts = time.time()
+        recent_loss_timestamps[:] = [
+            ts
+            for ts in recent_loss_timestamps
+            if (now_ts - ts) <= (win_mins * 60.0)
+        ]
         if delta > 0.0:
             win_trades += 1
+            if recent_loss_timestamps:
+                min_win_to_reset = abs(
+                    float(config.get("consec_win_reset_dollars", 10.0))
+                )
+                if delta >= min_win_to_reset:
+                    recent_loss_timestamps.clear()
+                    if config.get("enable_consec_loss_cooldown", False):
+                        streak_note = (
+                            f" | TiltStreak: 0/{req_losses} "
+                            f"(Reset by {format_dollar(delta)} qualifying win)"
+                        )
+                elif config.get("enable_consec_loss_cooldown", False):
+                    streak_note = (
+                        f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
+                        f"(Scratch win {format_dollar(delta)} < +${min_win_to_reset:,.0f} did not reset streak)"
+                    )
         elif delta < 0.0:
             loss_trades += 1
+            if not first_poll_of_launch:
+                if abs(delta) >= min_loss_mag:
+                    recent_loss_timestamps.append(now_ts)
+                    cur_streak = len(recent_loss_timestamps)
+                    if config.get("enable_consec_loss_cooldown", False):
+                        streak_note = (
+                            f" | TiltStreak: {cur_streak}/{req_losses} "
+                            f"(in {win_mins:g}m)"
+                        )
+                        if cur_streak >= req_losses:
+                            recent_loss_timestamps.clear()
+                            consec_trigger_reason = (
+                                f"Consecutive Loss Stop ({req_losses} Losses "
+                                f"<= -${min_loss_mag:,.0f} in {win_mins:g}m)"
+                            )
+                elif config.get("enable_consec_loss_cooldown", False):
+                    streak_note = (
+                        f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
+                        f"(Scratch {format_dollar(delta)} < -${min_loss_mag:,.0f} ignored)"
+                    )
+        else:
+            if not first_poll_of_launch and config.get("enable_consec_loss_cooldown", False):
+                streak_note = (
+                    f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
+                    f"($0.00 flat scratch ignored)"
+                )
         prev_flat_realized_pnl = realized_pnl
         save_session_state()
 
@@ -6822,8 +7219,245 @@ def log_position_transitions(
         f"{change_str} | Realized: {format_dollar(realized_pnl)} | "
         f"Open: {format_dollar(open_pnl)} | "
         f"Net: {format_dollar(net_pnl)} | "
-        f"High: {format_dollar(session_high_pnl)}"
+        f"High: {format_dollar(session_high_pnl)}{streak_note}"
     )
+    return consec_trigger_reason
+
+
+def _stabilize_mid_fill_realized_and_equity(
+    current_eq, is_flat, live_open_pnl, pos_details, is_reverify=False
+):
+    """ Guard against 1-to-2 poll cross-endpoint cash vs. position fill
+        desynchronization (e.g. Webull/Schwab deducting cash for a buy fill
+        150-350ms before /positions reports the shares, or crediting sale
+        proceeds during a multi-lot scale-out before /positions reduces qty). """
+    global last_flat_equity, max_equity, daily_max_equity
+    global settled_realized_pnl, flat_desync_streak
+    global in_trade_desync_streak, pending_scale_out_tol
+
+    if first_poll_of_launch or settled_realized_pnl is None:
+        if is_flat:
+            last_flat_equity = current_eq
+            if current_eq > max_equity:
+                max_equity = current_eq
+            if current_eq > daily_max_equity:
+                daily_max_equity = current_eq
+            save_session_state()
+            realized_pnl = round(last_flat_equity - start_equity, 2)
+            open_pnl = 0.0
+            for k in list(triggered_alarms.keys()):
+                if k.startswith("Open PnL -"):
+                    del triggered_alarms[k]
+        else:
+            open_pnl = live_open_pnl
+            realized_pnl = round((current_eq - start_equity) - open_pnl, 2)
+        settled_realized_pnl = realized_pnl
+        flat_desync_streak = 0
+        in_trade_desync_streak = 0
+        pending_scale_out_tol = 0.0
+        return current_eq, realized_pnl, open_pnl
+
+    if is_flat:
+        open_pnl = 0.0
+        raw_flat_realized = round(current_eq - start_equity, 2)
+        was_flat_before = (len(prev_pos_snapshot) == 0)
+
+        if was_flat_before:
+            if (
+                last_flat_equity is not None
+                and abs(raw_flat_realized - settled_realized_pnl) > 25.0
+                and flat_desync_streak < 2
+            ):
+                if not is_reverify:
+                    flat_desync_streak += 1
+                    log_event(
+                        "GUARDRAIL",
+                        f"Filtered transient pre-position cash desync while flat "
+                        f"(Raw Realized: {format_dollar(raw_flat_realized)} vs "
+                        f"Settled: {format_dollar(settled_realized_pnl)} | "
+                        f"Streak: {flat_desync_streak}/2)."
+                    )
+                current_eq = last_flat_equity
+                realized_pnl = settled_realized_pnl
+            else:
+                flat_desync_streak = 0
+                in_trade_desync_streak = 0
+                pending_scale_out_tol = 0.0
+                last_flat_equity = current_eq
+                if current_eq > max_equity:
+                    max_equity = current_eq
+                if current_eq > daily_max_equity:
+                    daily_max_equity = current_eq
+                save_session_state()
+                realized_pnl = round(last_flat_equity - start_equity, 2)
+                settled_realized_pnl = realized_pnl
+        else:
+            est_open_sum = sum(
+                float(d.get("open_pnl", 0.0))
+                for d in prev_pos_snapshot.values()
+            )
+            expected_flat_realized = round(
+                settled_realized_pnl + est_open_sum, 2
+            )
+            closed_notional = sum(
+                abs(float(d.get("qty", 0.0)))
+                * float(d.get("last", 0.0))
+                * (100.0 if d.get("asset_type") == "OPTION" else 1.0)
+                for d in prev_pos_snapshot.values()
+            )
+            tol = max(100.0, closed_notional * 0.35, pending_scale_out_tol)
+            if (
+                abs(raw_flat_realized - expected_flat_realized) > tol
+                and flat_desync_streak < 1
+            ):
+                if not is_reverify:
+                    flat_desync_streak += 1
+                    log_event(
+                        "GUARDRAIL",
+                        f"Filtered transient exit-settlement cash desync on flat "
+                        f"transition (Raw Realized: {format_dollar(raw_flat_realized)} "
+                        f"vs Expected: {format_dollar(expected_flat_realized)})."
+                    )
+                realized_pnl = expected_flat_realized
+                settled_realized_pnl = realized_pnl
+                current_eq = round(start_equity + realized_pnl, 2)
+                last_flat_equity = current_eq
+                save_session_state()
+            else:
+                flat_desync_streak = 0
+                in_trade_desync_streak = 0
+                pending_scale_out_tol = 0.0
+                last_flat_equity = current_eq
+                if current_eq > max_equity:
+                    max_equity = current_eq
+                if current_eq > daily_max_equity:
+                    daily_max_equity = current_eq
+                save_session_state()
+                realized_pnl = round(last_flat_equity - start_equity, 2)
+                settled_realized_pnl = realized_pnl
+
+        for k in list(triggered_alarms.keys()):
+            if k.startswith("Open PnL -"):
+                del triggered_alarms[k]
+        return current_eq, realized_pnl, open_pnl
+
+    # Not flat (holding 1 or more open positions)
+    flat_desync_streak = 0
+    open_pnl = live_open_pnl
+    raw_realized_pnl = round((current_eq - start_equity) - open_pnl, 2)
+
+    any_closed_or_reduced = False
+    est_closed_delta = 0.0
+    closed_notional = 0.0
+    all_syms = set(prev_pos_snapshot.keys()) | set(pos_details.keys())
+    for sym in all_syms:
+        old_d = prev_pos_snapshot.get(sym)
+        new_d = pos_details.get(sym)
+        old_q = float(old_d.get("qty", 0.0)) if old_d else 0.0
+        new_q = float(new_d.get("qty", 0.0)) if new_d else 0.0
+        old_avg = float(old_d.get("avg_price", 0.0)) if old_d else 0.0
+        new_avg = float(new_d.get("avg_price", 0.0)) if new_d else 0.0
+        old_open = float(old_d.get("open_pnl", 0.0)) if old_d else 0.0
+        old_last = float(old_d.get("last", 0.0)) if old_d else 0.0
+        new_last = float(new_d.get("last", old_last)) if new_d else old_last
+        mult = (
+            100.0
+            if ((old_d or new_d or {}).get("asset_type") == "OPTION")
+            else 1.0
+        )
+        if old_q != 0.0 and new_q == 0.0:
+            any_closed_or_reduced = True
+            est_closed_delta += old_open
+            closed_notional += abs(old_q) * (new_last or old_last) * mult
+        elif old_q != 0.0 and (old_q * new_q < 0):
+            any_closed_or_reduced = True
+            est_closed_delta += old_open
+            closed_notional += abs(old_q) * (new_last or old_last) * mult
+        elif old_q != 0.0 and abs(new_q) < abs(old_q):
+            any_closed_or_reduced = True
+            closed_shares = abs(old_q) - abs(new_q)
+            frac = closed_shares / abs(old_q)
+            if new_last > 0 and old_avg > 0:
+                if old_q > 0:
+                    est_closed_delta += (
+                        (new_last - old_avg) * closed_shares * mult
+                    )
+                else:
+                    est_closed_delta += (
+                        (old_avg - new_last) * closed_shares * mult
+                    )
+            else:
+                est_closed_delta += old_open * frac
+            closed_notional += closed_shares * (new_last or old_last) * mult
+        elif (
+            old_q != 0.0
+            and new_q == old_q
+            and abs(new_avg - old_avg) >= 0.0001
+        ):
+            any_closed_or_reduced = True
+            est_closed_delta += old_open
+            closed_notional += abs(old_q) * (new_last or old_last) * mult
+
+    qty_changed_now = (
+        {k: v.get("qty") for k, v in pos_details.items()}
+        != {k: v.get("qty") for k, v in prev_pos_snapshot.items()}
+    )
+
+    if not any_closed_or_reduced:
+        allowed_drift = max(25.0, pending_scale_out_tol)
+        if (
+            abs(raw_realized_pnl - settled_realized_pnl) > allowed_drift
+            and (qty_changed_now or in_trade_desync_streak < 2)
+        ):
+            if not is_reverify:
+                if qty_changed_now:
+                    in_trade_desync_streak = 0
+                else:
+                    in_trade_desync_streak += 1
+                log_event(
+                    "GUARDRAIL",
+                    f"Filtered mid-fill cash/position desync on entry/add "
+                    f"(Raw Realized: {format_dollar(raw_realized_pnl)} vs "
+                    f"Settled: {format_dollar(settled_realized_pnl)} | "
+                    f"Open: {format_dollar(open_pnl)})."
+                )
+            realized_pnl = settled_realized_pnl
+            current_eq = round(start_equity + realized_pnl + open_pnl, 2)
+        else:
+            in_trade_desync_streak = 0
+            pending_scale_out_tol = 0.0
+            realized_pnl = raw_realized_pnl
+            settled_realized_pnl = realized_pnl
+    else:
+        expected_realized = round(settled_realized_pnl + est_closed_delta, 2)
+        tol = max(60.0, closed_notional * 0.30)
+        if (
+            abs(raw_realized_pnl - expected_realized) > tol
+            and (qty_changed_now or in_trade_desync_streak < 2)
+        ):
+            if not is_reverify:
+                if qty_changed_now:
+                    in_trade_desync_streak = 0
+                else:
+                    in_trade_desync_streak += 1
+                log_event(
+                    "GUARDRAIL",
+                    f"Filtered mid-scale-out cash/position desync "
+                    f"(Raw Realized: {format_dollar(raw_realized_pnl)} vs "
+                    f"Expected: {format_dollar(expected_realized)} | "
+                    f"Open: {format_dollar(open_pnl)})."
+                )
+            pending_scale_out_tol = tol
+            realized_pnl = expected_realized
+            settled_realized_pnl = realized_pnl
+            current_eq = round(start_equity + realized_pnl + open_pnl, 2)
+        else:
+            in_trade_desync_streak = 0
+            pending_scale_out_tol = 0.0
+            realized_pnl = raw_realized_pnl
+            settled_realized_pnl = realized_pnl
+
+    return current_eq, realized_pnl, open_pnl
 
 
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
@@ -6833,6 +7467,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global active_adapter, first_poll_of_launch
     global current_upside_tier, last_rth_mode
     global win_trades, loss_trades, prev_flat_realized_pnl
+    global settled_realized_pnl, flat_desync_streak
+    global in_trade_desync_streak, pending_scale_out_tol
+    global consecutive_api_failures, api_disconnect_alerted
+    global alarm_active, last_alarm_reason
 
     consecutive_api_failures = 0
     api_disconnect_alerted = False
@@ -6850,10 +7488,49 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
             if current_eq is not None and current_eq > 0:
                 if consecutive_api_failures > 0 or api_disconnect_alerted:
+                    recovered_attempts = max(1, consecutive_api_failures)
+                    was_alerted = api_disconnect_alerted
                     consecutive_api_failures = 0
-                    if api_disconnect_alerted:
-                        api_disconnect_alerted = False
-                        log_event("SESSION", "Broker API connection restored.")
+                    api_disconnect_alerted = False
+                    if was_alerted:
+                        if alarm_active and any(
+                            k in last_alarm_reason.upper()
+                            for k in (
+                                "CONNECTION LOST",
+                                "DISCONNECTED",
+                                "TOKEN EXPIRED",
+                            )
+                        ):
+                            alarm_active = False
+                            last_alarm_reason = ""
+                        speak_async("Connection restored. Enforcer is back online.")
+                        if config.get("enable_upside_chime", True):
+                            trigger_upside_tier_glow(
+                                mute_btn,
+                                "✓ CONNECTION RESTORED — BACK ONLINE",
+                                f"Broker API connection restored after {recovered_attempts} attempt(s).",
+                            )
+                        else:
+                            log_event(
+                                "SESSION",
+                                f"Broker API connection restored after {recovered_attempts} attempt(s).",
+                            )
+                            if not alarm_active and not cooldown_active:
+                                mute_btn.after(
+                                    0,
+                                    lambda: mute_btn.config(
+                                        text=get_idle_button_text(),
+                                        bg="#222629",
+                                        fg="#f5b041",
+                                        disabledforeground="#f5b041",
+                                        state="disabled",
+                                    ),
+                                )
+                    else:
+                        log_event(
+                            "SESSION",
+                            "Broker API poll recovered after 1 retry.",
+                        )
                         if not alarm_active and not cooldown_active:
                             mute_btn.after(
                                 0,
@@ -6862,8 +7539,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                     bg="#222629",
                                     fg="#f5b041",
                                     disabledforeground="#f5b041",
-                                    state="disabled"
-                                )
+                                    state="disabled",
+                                ),
                             )
                 current_is_flat = is_flat
 
@@ -6883,6 +7560,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     win_trades = 0
                     loss_trades = 0
                     prev_flat_realized_pnl = 0.0
+                    settled_realized_pnl = 0.0
+                    flat_desync_streak = 0
+                    in_trade_desync_streak = 0
+                    pending_scale_out_tol = 0.0
+                    recent_loss_timestamps.clear()
                     triggered_alarms.clear()
                     prev_pos_snapshot = {}
                     save_session_state()
@@ -6899,11 +7581,20 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 if is_rth() and not has_reset_at_open:
                     has_reset_at_open = True
                     first_poll_of_launch = True
+                    settled_realized_pnl = (
+                        round(last_flat_equity - start_equity, 2)
+                        if last_flat_equity is not None
+                        else 0.0
+                    )
+                    flat_desync_streak = 0
+                    in_trade_desync_streak = 0
+                    pending_scale_out_tol = 0.0
                     if reset_925:
                         old_hwm = max_equity - start_equity
                         max_equity = max(start_equity, last_flat_equity)
                         new_hwm = max_equity - start_equity
                         is_locked_down = False
+                        recent_loss_timestamps.clear()
                         triggered_alarms.clear()
                         save_session_state()
                         log_event(
@@ -6925,11 +7616,20 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     has_reset_at_open = True
                     has_reset_at_close = True
                     first_poll_of_launch = True
+                    settled_realized_pnl = (
+                        round(last_flat_equity - start_equity, 2)
+                        if last_flat_equity is not None
+                        else 0.0
+                    )
+                    flat_desync_streak = 0
+                    in_trade_desync_streak = 0
+                    pending_scale_out_tol = 0.0
                     if reset_925:
                         old_hwm = max_equity - start_equity
                         max_equity = max(start_equity, last_flat_equity)
                         new_hwm = max_equity - start_equity
                         is_locked_down = False
+                        recent_loss_timestamps.clear()
                         triggered_alarms.clear()
                         save_session_state()
                         log_event(
@@ -6947,23 +7647,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             "Rulebook to Extended-Hours Rulebook."
                         )
 
-                if is_flat:
-                    last_flat_equity = current_eq
-                    if current_eq > max_equity:
-                        max_equity = current_eq
-                    if current_eq > daily_max_equity:
-                        daily_max_equity = current_eq
-                    save_session_state()
-                    realized_pnl = round(last_flat_equity - start_equity, 2)
-                    open_pnl = 0.0
-                    for k in list(triggered_alarms.keys()):
-                        if k.startswith("Open PnL -"):
-                            del triggered_alarms[k]
-                else:
-                    open_pnl = live_open_pnl
-                    realized_pnl = round(
-                        (current_eq - start_equity) - open_pnl, 2
+                current_eq, realized_pnl, open_pnl = (
+                    _stabilize_mid_fill_realized_and_equity(
+                        current_eq, is_flat, live_open_pnl, pos_details
                     )
+                )
 
                 net_pnl = round(current_eq - start_equity, 2)
                 max_realized_profit = round(max_equity - start_equity, 2)
@@ -7030,16 +7718,68 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         else start_equity - t1_max
                     )
                 )
+                warn_floors = []
+                if not rth_now:
+                    if (
+                        pm_w1_on
+                        and f"Ext-Hours -${pm_w1:,.0f} Warn 1"
+                        not in triggered_alarms
+                    ):
+                        warn_floors.append(start_equity - pm_w1)
+                    if (
+                        pm_w2_on
+                        and f"Ext-Hours -${pm_w2:,.0f} Warn 2"
+                        not in triggered_alarms
+                    ):
+                        warn_floors.append(start_equity - pm_w2)
+                else:
+                    if t4_on and max_realized_profit >= t4_trig:
+                        pass
+                    elif t3_on and max_realized_profit >= t3_trig:
+                        if (
+                            t3_max < 0
+                            and "Hit $0 (Tier 3)" not in triggered_alarms
+                        ):
+                            warn_floors.append(start_equity)
+                    elif t2_on and max_realized_profit >= t2_trig:
+                        if (
+                            t2_max < 0
+                            and "Hit $0 (Tier 2)" not in triggered_alarms
+                        ):
+                            warn_floors.append(start_equity)
+                    else:
+                        if (
+                            t1_w1_on
+                            and f"Hit -${t1_w1:,.0f} (Tier 1)"
+                            not in triggered_alarms
+                        ):
+                            warn_floors.append(start_equity - t1_w1)
+                        if (
+                            t1_w2_on
+                            and f"Hit -${t1_w2:,.0f} (Tier 1)"
+                            not in triggered_alarms
+                        ):
+                            warn_floors.append(start_equity - t1_w2)
+                active_warn_floor_now = (
+                    max(warn_floors) if warn_floors else None
+                )
                 floor_breach_cand = (
                     not is_locked_down and current_eq <= active_floor_now
                 )
                 open_breach_cand = (
                     open_flat_on and not is_flat and open_pnl <= -open_max
                 )
+                warn_breach_cand = (
+                    active_warn_floor_now is not None
+                    and current_eq <= active_warn_floor_now
+                )
                 if (
                     not first_poll_of_launch
-                    and not is_flat
-                    and (floor_breach_cand or open_breach_cand)
+                    and (
+                        floor_breach_cand
+                        or open_breach_cand
+                        or warn_breach_cand
+                    )
                 ):
                     conf_open_pnl = round(
                         sum(
@@ -7052,10 +7792,20 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         current_eq + (conf_open_pnl - open_pnl), 2
                     )
                     book_confirms_floor = (
-                        floor_breach_cand and conf_eq <= active_floor_now
+                        floor_breach_cand
+                        and not is_flat
+                        and conf_eq <= active_floor_now
                     )
                     book_confirms_open = (
-                        open_breach_cand and conf_open_pnl <= -open_max
+                        open_breach_cand
+                        and not is_flat
+                        and conf_open_pnl <= -open_max
+                    )
+                    book_confirms_warn = (
+                        warn_breach_cand
+                        and not is_flat
+                        and active_warn_floor_now is not None
+                        and conf_eq <= active_warn_floor_now
                     )
                     qty_just_changed = (
                         {k: v.get("qty") for k, v in pos_details.items()}
@@ -7067,17 +7817,25 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         f"Net={format_dollar(net_pnl)}"
                     )
                     if (
-                        (book_confirms_floor or book_confirms_open)
+                        (
+                            book_confirms_floor
+                            or book_confirms_open
+                            or book_confirms_warn
+                        )
+                        and not is_flat
                         and not qty_just_changed
                         and not has_options
                     ):
-                        log_event(
-                            "GUARDRAIL",
-                            f"Breach confirmed immediately by NBBO book & "
-                            f"account snapshot (0s delay | {spike_ctx})."
-                        )
+                        if floor_breach_cand or open_breach_cand:
+                            log_event(
+                                "GUARDRAIL",
+                                f"Breach confirmed immediately by NBBO book & "
+                                f"account snapshot (0s delay | {spike_ctx})."
+                            )
                     else:
-                        time.sleep(0.35 if qty_just_changed else 0.2)
+                        time.sleep(
+                            0.35 if (qty_just_changed or is_flat) else 0.2
+                        )
                         v_eq, v_flat, v_open, v_pos, v_opt = (
                             active_adapter.fetch_account_data()
                         )
@@ -7088,22 +7846,15 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             live_open_pnl = v_open
                             pos_details = v_pos
                             has_options = v_opt
-                            if is_flat:
-                                last_flat_equity = current_eq
-                                if current_eq > max_equity:
-                                    max_equity = current_eq
-                                if current_eq > daily_max_equity:
-                                    daily_max_equity = current_eq
-                                save_session_state()
-                                realized_pnl = round(
-                                    last_flat_equity - start_equity, 2
+                            current_eq, realized_pnl, open_pnl = (
+                                _stabilize_mid_fill_realized_and_equity(
+                                    current_eq,
+                                    is_flat,
+                                    live_open_pnl,
+                                    pos_details,
+                                    is_reverify=True,
                                 )
-                                open_pnl = 0.0
-                            else:
-                                open_pnl = live_open_pnl
-                                realized_pnl = round(
-                                    (current_eq - start_equity) - open_pnl, 2
-                                )
+                            )
                             net_pnl = round(current_eq - start_equity, 2)
                             max_realized_profit = round(
                                 max_equity - start_equity, 2
@@ -7125,21 +7876,29 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 and not is_flat
                                 and open_pnl <= -open_max
                             )
-                            if not still_floor and not still_open:
+                            still_warn = (
+                                active_warn_floor_now is not None
+                                and current_eq <= active_warn_floor_now
+                            )
+                            if (
+                                not still_floor
+                                and not still_open
+                                and not still_warn
+                            ):
                                 log_event(
                                     "GUARDRAIL",
                                     f"Filtered transient single-order wick "
                                     f"(Spike: {spike_ctx} -> Re-verified 0.2s later: "
                                     f"{v_ctx}). No flatten triggered."
                                 )
-                            else:
+                            elif floor_breach_cand or open_breach_cand:
                                 log_event(
                                     "GUARDRAIL",
                                     f"Breach confirmed after 0.2s anti-wick check "
                                     f"(Initial: {spike_ctx} -> Verified: {v_ctx})."
                                 )
 
-                log_position_transitions(
+                consec_reason = log_position_transitions(
                     pos_details,
                     realized_pnl,
                     open_pnl,
@@ -7369,6 +8128,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         elif t1_w1_on and current_eq <= (start_equity - t1_w1):
                             trigger_alarm(r_t1_w1, mute_btn, ctx)
 
+                if consec_reason and not is_locked_down:
+                    trigger_consec_loss_cooldown(
+                        active_adapter, consec_reason, mute_btn, has_options, ctx
+                    )
+
                 terminate_pnl_level = round(floor_equity - start_equity, 2)
                 distance_to_terminate = round(current_eq - floor_equity, 2)
 
@@ -7471,6 +8235,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         format_trades_wl_multiline(win_trades, loss_trades),
                         wl_bg
                     ),
+                    "loss_streak": format_loss_streak_multiline(),
                 }
                 active_cols = get_active_hud_columns(config)
                 col_data = [
@@ -7486,7 +8251,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 )
             else:
                 consecutive_api_failures += 1
-                err_lower = getattr(active_adapter, "last_error", "").lower()
+                raw_err = str(
+                    getattr(active_adapter, "last_error", "")
+                    or "Network / socket timeout"
+                ).strip()
+                err_lower = raw_err.lower()
                 is_tok_exp = any(
                     k in err_lower
                     for k in (
@@ -7497,17 +8266,53 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         "http 401",
                     )
                 )
-                if is_tok_exp or consecutive_api_failures >= 3:
+                if consecutive_api_failures == 1 and not is_tok_exp:
+                    log_event(
+                        "WARN",
+                        f"Broker API poll failed (Attempt #1: {raw_err[:90]}) — "
+                        f"retrying automatically...",
+                    )
+                    if not alarm_active and not cooldown_active:
+                        retry_1_txt = (
+                            "⚠️ RETRYING API (#1)..."
+                            if is_compact_hud()
+                            else "⚠️ CONNECTION HICCUP — RETRYING BROKER API (ATTEMPT #1)..."
+                        )
+                        mute_btn.after(
+                            0,
+                            lambda t=retry_1_txt: mute_btn.config(
+                                text=t,
+                                bg="#78350f",
+                                fg="#fde68a",
+                                disabledforeground="#fde68a",
+                                state="disabled",
+                            ),
+                        )
+                elif is_tok_exp or consecutive_api_failures >= 2:
                     current_is_flat = True
-                    lbl_1 = "TOKEN" if is_tok_exp else "API"
-                    lbl_2 = "EXPIRED" if is_tok_exp else "LOST"
+                    if not is_tok_exp and hasattr(active_adapter, "reconnect_session"):
+                        if (
+                            consecutive_api_failures == 2
+                            or consecutive_api_failures % 3 == 0
+                        ):
+                            try:
+                                active_adapter.reconnect_session()
+                            except Exception:
+                                pass
+                    lbl_1 = "TOKEN" if is_tok_exp else "OFFLINE"
+                    lbl_2 = (
+                        "EXPIRED"
+                        if is_tok_exp
+                        else f"RETRY #{consecutive_api_failures}"
+                    )
+                    col_2_bg = "#7b241c" if is_tok_exp else "#92400e"
                     n_cols = max(1, len(get_active_hud_columns(config)))
                     err_cols = []
                     for idx in range(n_cols):
                         if idx == 0:
                             err_cols.append((lbl_1, "#7b241c"))
                         elif idx == 1:
-                            err_cols.append((lbl_2, "#7b241c"))
+                            err_cols.append((lbl_2, col_2_bg))
                         else:
                             err_cols.append(("---", "#444444"))
                     root.after(
@@ -7521,19 +8326,68 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         r_msg = (
                             "BROKER TOKEN EXPIRED — RESTART APP TO RE-LOGIN"
                             if is_tok_exp
-                            else "BROKER API DISCONNECTED — CHECK CONNECTION"
+                            else f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{consecutive_api_failures})"
                         )
                         v_msg = (
                             "Warning. Broker token expired. Please restart Enforcer to log in."
                             if is_tok_exp
-                            else "Warning. Broker A P I connection lost."
+                            else "Warning. Connection lost. Attempting to reconnect automatically."
+                        )
+                        log_event(
+                            "WARN",
+                            f"Connection lost ({active_adapter.name}: {raw_err[:90]}). "
+                            f"Auto-reconnecting (Attempt #{consecutive_api_failures})...",
                         )
                         speak_async(v_msg)
                         trigger_alarm(
                             r_msg,
                             mute_btn,
-                            getattr(active_adapter, "last_error", "")[:80],
+                            raw_err[:80],
                         )
+                    else:
+                        att = consecutive_api_failures
+                        if att % 5 == 0:
+                            log_event(
+                                "WARN",
+                                f"Still offline — auto-reconnect attempt #{att} "
+                                f"({raw_err[:80]})...",
+                            )
+                        if not is_tok_exp:
+                            if alarm_active:
+                                last_alarm_reason = (
+                                    f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})"
+                                )
+                                al_btn_txt = (
+                                    f"🔔 RECONNECTING (#{att}) (MUTE)"
+                                    if is_compact_hud()
+                                    else f"🔔 CONNECTION LOST — RECONNECTING (ATTEMPT #{att}) (CLICK TO MUTE)"
+                                )
+                                mute_btn.after(
+                                    0,
+                                    lambda t=al_btn_txt: mute_btn.config(
+                                        text=t,
+                                        bg="#eab308",
+                                        fg="#090d16",
+                                        disabledforeground="#090d16",
+                                        state="normal",
+                                    ),
+                                )
+                            elif not cooldown_active:
+                                re_btn_txt = (
+                                    f"🔄 RECONNECTING (#{att})..."
+                                    if is_compact_hud()
+                                    else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
+                                )
+                                mute_btn.after(
+                                    0,
+                                    lambda t=re_btn_txt: mute_btn.config(
+                                        text=t,
+                                        bg="#78350f",
+                                        fg="#fde68a",
+                                        disabledforeground="#fde68a",
+                                        state="disabled",
+                                    ),
+                                )
 
         except Exception as e:
             log_event("ERROR", f"Main data_loop error: {e}")
@@ -7561,7 +8415,11 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     load_config()
     launched = {"status": False}
-    pf_timer_state = {"rulebook_after_id": None, "closing": False}
+    pf_timer_state = {
+        "rulebook_after_id": None,
+        "streak_after_id": None,
+        "closing": False,
+    }
 
     if parent is None:
         pf = tk.Tk()
@@ -7577,13 +8435,14 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     def _cancel_pf_timers():
         pf_timer_state["closing"] = True
-        aid = pf_timer_state.get("rulebook_after_id")
-        if aid is not None:
-            pf_timer_state["rulebook_after_id"] = None
-            try:
-                pf.after_cancel(aid)
-            except Exception:
-                pass
+        for k_id in ("rulebook_after_id", "streak_after_id"):
+            aid = pf_timer_state.get(k_id)
+            if aid is not None:
+                pf_timer_state[k_id] = None
+                try:
+                    pf.after_cancel(aid)
+                except Exception:
+                    pass
 
     def on_close():
         global settings_win_open, first_poll_of_launch
@@ -7724,6 +8583,16 @@ def show_preflight_window(parent=None, mute_btn=None):
     var_open_flat = tk.BooleanVar(
         value=config.get("enable_open_flatten", False)
     )
+    var_tilt_cd = tk.BooleanVar(
+        value=config.get("enable_consec_loss_cooldown", False)
+    )
+    var_tilt_count = tk.StringVar(
+        value=str(max(2, int(round(float(config.get("consec_loss_count", 3))))))
+    )
+    var_tilt_window = tk.StringVar(
+        value=f"{config.get('consec_loss_window_mins', 15.0):g}"
+    )
+    _tilt_cd_popup_guard = {"suppress": False}
     var_open_cd = tk.BooleanVar(
         value=config.get("enable_open_cooldown", False)
     )
@@ -7790,6 +8659,8 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     dollar_keys = [
         "open_max_loss",
+        "consec_loss_min_dollars",
+        "consec_win_reset_dollars",
         "pm_warn_1", "pm_warn_2", "pm_max_loss",
         "pm_lock_trigger", "pm_trail_cushion",
         "t1_warn_1", "t1_warn_2", "t1_max_loss",
@@ -7799,6 +8670,7 @@ def show_preflight_window(parent=None, mute_btn=None):
     ]
     loss_display_keys = {
         "open_max_loss",
+        "consec_loss_min_dollars",
         "pm_warn_1", "pm_warn_2", "pm_max_loss",
         "t1_warn_1", "t1_warn_2", "t1_max_loss",
     }
@@ -7849,6 +8721,75 @@ def show_preflight_window(parent=None, mute_btn=None):
             lbl.pack(side="left")
             attach_tooltip(lbl, base_tip)
 
+    _card3_base_cache = {
+        "connected": False,
+        "b_name": "SCHWAB",
+        "eq_str": "Will anchor on first API poll",
+        "last_spans": None,
+    }
+
+    def is_tilt_streak_tamper_locked():
+        """Returns True if the trader currently has an active Consecutive Loss
+        Streak (> 0 losses on the rolling clock) with Consecutive Loss Cooldown
+        enabled in config, locking those settings against mid-streak tampering."""
+        cur_s, _req_l, _next_s, _full_s, _is_en = get_loss_streak_status()
+        return bool(
+            cur_s > 0 and config.get("enable_consec_loss_cooldown", False)
+        )
+
+    def _render_card3_telemetry_live(force=False):
+        if base_sub_lbl is None:
+            return
+        if not _card3_base_cache["connected"]:
+            spans = [
+                (
+                    "No broker connected — click API Keys or select broker above.",
+                    "#f5b041",
+                )
+            ]
+            if force or spans != _card3_base_cache["last_spans"]:
+                _card3_base_cache["last_spans"] = spans
+                _render_baseline_telemetry_spans(spans)
+            return
+
+        b_name = _card3_base_cache["b_name"]
+        eq_str = _card3_base_cache["eq_str"]
+        spans = [
+            (f"Baseline ({b_name}): ", "#94a3b8"),
+            (eq_str, "#7dd3fc"),
+        ]
+        if b_name == "SCHWAB":
+            rem_h = get_schwab_token_remaining_hours()
+            if rem_h is not None and rem_h > 0:
+                rem_d = rem_h / 24.0
+                tok_col = "#fbbf24" if rem_d < 1.5 else "#4ade80"
+                spans.append((" | ", "#475569"))
+                spans.append((f"Token: {rem_d:.1f}d", tok_col))
+
+        tot_t = int(win_trades) + int(loss_trades)
+        w_pct = (win_trades / tot_t * 100.0) if tot_t > 0 else 0.0
+        l_pct = (loss_trades / tot_t * 100.0) if tot_t > 0 else 0.0
+        spans.append((" | ", "#475569"))
+        spans.append((f"W: {win_trades} ({w_pct:.1f}%)", "#58d68d"))
+        spans.append((" | ", "#475569"))
+        spans.append((f"L: {loss_trades} ({l_pct:.1f}%)", "#e07a7a"))
+        cur_s, req_l, next_s, _full_s, is_en = get_loss_streak_status()
+        if is_en or cur_s > 0 or bool(var_tilt_cd.get()):
+            spans.append((" | ", "#475569"))
+            if cur_s > 0:
+                s_col = "#f87171" if cur_s >= (req_l - 1) else "#fbbf24"
+                spans.append(
+                    (
+                        f"Streak: {cur_s}/{req_l} ({_format_countdown_mm_ss(next_s)})",
+                        s_col,
+                    )
+                )
+            else:
+                spans.append((f"Streak: 0/{req_l}", "#94a3b8"))
+        if force or spans != _card3_base_cache["last_spans"]:
+            _card3_base_cache["last_spans"] = spans
+            _render_baseline_telemetry_spans(spans)
+
     def refresh_baseline_preview():
         """Updates the Active Baseline multi-color telemetry strip in Card 3 to
         match the currently selected Broker + Account."""
@@ -7856,14 +8797,8 @@ def show_preflight_window(parent=None, mute_btn=None):
         if base_sub_lbl is None:
             return
         if active_adapter is None or not active_adapter.account_id:
-            _render_baseline_telemetry_spans(
-                [
-                    (
-                        "No broker connected — click API Keys or select broker above.",
-                        "#f5b041",
-                    )
-                ]
-            )
+            _card3_base_cache["connected"] = False
+            _render_card3_telemetry_live(force=True)
             return
 
         b_name = active_adapter.name
@@ -7872,36 +8807,20 @@ def show_preflight_window(parent=None, mute_btn=None):
 
         if had_saved and start_equity is not None and start_equity > 0:
             force_reanchor = False
-            eq_str = f"${start_equity:,.2f} (Preserved)"
+            eq_str = f"${start_equity:,.2f} (Saved)"
         else:
             eq, _, _, _, _ = active_adapter.fetch_account_data()
             if eq is not None and eq > 0:
                 start_equity = eq
                 force_reanchor = True
-                eq_str = f"${start_equity:,.2f} (Live equity)"
+                eq_str = f"${start_equity:,.2f} (Live)"
             else:
                 eq_str = "Will anchor on first API poll"
 
-        spans = [
-            (f"Active Baseline ({b_name}): ", "#94a3b8"),
-            (eq_str, "#7dd3fc"),
-        ]
-        if b_name == "SCHWAB":
-            rem_h = get_schwab_token_remaining_hours()
-            if rem_h is not None and rem_h > 0:
-                rem_d = rem_h / 24.0
-                tok_col = "#fbbf24" if rem_d < 1.5 else "#4ade80"
-                spans.append(("  |  ", "#475569"))
-                spans.append((f"Token: {rem_d:.1f}d left", tok_col))
-
-        tot_t = int(win_trades) + int(loss_trades)
-        w_pct = (win_trades / tot_t * 100.0) if tot_t > 0 else 0.0
-        l_pct = (loss_trades / tot_t * 100.0) if tot_t > 0 else 0.0
-        spans.append(("  |  ", "#475569"))
-        spans.append((f"W: {win_trades} ({w_pct:.1f}%)", "#58d68d"))
-        spans.append(("  |  ", "#475569"))
-        spans.append((f"L: {loss_trades} ({l_pct:.1f}%)", "#e07a7a"))
-        _render_baseline_telemetry_spans(spans)
+        _card3_base_cache["connected"] = True
+        _card3_base_cache["b_name"] = b_name
+        _card3_base_cache["eq_str"] = eq_str
+        _render_card3_telemetry_live(force=True)
 
     # --- TOP BAR: UNIFIED BROKER/ACCOUNT CAPSULE, UTILITY PILLS & PRESETS ---
     top_bar = tk.Frame(
@@ -9105,10 +10024,20 @@ def show_preflight_window(parent=None, mute_btn=None):
                     if k in SIGNED_DOLLAR_KEYS
                     else round(abs(raw_v))
                 )
-            is_full = all(abs(curr_d[k] - full_d[k]) < 0.5 for k in dollar_keys)
+            tamper_lk = is_tilt_streak_tamper_locked()
+            cmp_keys = [
+                k
+                for k in dollar_keys
+                if not (
+                    tamper_lk
+                    and k
+                    in ("consec_loss_min_dollars", "consec_win_reset_dollars")
+                )
+            ]
+            is_full = all(abs(curr_d[k] - full_d[k]) < 0.5 for k in cmp_keys)
             is_half = (
                 not is_full
-                and all(abs(curr_d[k] - half_d[k]) < 0.5 for k in dollar_keys)
+                and all(abs(curr_d[k] - half_d[k]) < 0.5 for k in cmp_keys)
             )
         except Exception:
             is_full = False
@@ -9179,8 +10108,14 @@ def show_preflight_window(parent=None, mute_btn=None):
             )
 
     def apply_dollar_preset(preset_dict):
+        tamper_lk = is_tilt_streak_tamper_locked()
         for k, val in preset_dict.items():
             if k in dollar_vars:
+                if tamper_lk and k in (
+                    "consec_loss_min_dollars",
+                    "consec_win_reset_dollars",
+                ):
+                    continue
                 dollar_vars[k].set(_fmt_ui_dollar(k, val))
         refresh_preset_buttons_highlight()
 
@@ -9189,8 +10124,13 @@ def show_preflight_window(parent=None, mute_btn=None):
         apply_dollar_preset(half_dict)
         if default_status_lbl is not None:
             src_name = "your saved Default" if config.get("user_defaults") else "Factory Default"
+            lk_note = (
+                " (🔒 Active Loss Streak settings stayed locked)"
+                if is_tilt_streak_tamper_locked()
+                else ""
+            )
             default_status_lbl.config(
-                text=f"⚡ Applied 50% Low Energy preset (50% of {src_name} dollar thresholds).",
+                text=f"⚡ Applied 50% Low Energy preset (50% of {src_name}){lk_note}.",
                 fg="#f5b041"
             )
 
@@ -9199,8 +10139,13 @@ def show_preflight_window(parent=None, mute_btn=None):
         apply_dollar_preset(base_src)
         if default_status_lbl is not None:
             src_name = "your saved Default" if config.get("user_defaults") else "Factory Default"
+            lk_note = (
+                " (🔒 Active Loss Streak settings stayed locked)"
+                if is_tilt_streak_tamper_locked()
+                else ""
+            )
             default_status_lbl.config(
-                text=f"✓ Applied Standard Full Risk preset (100% of {src_name} dollar thresholds).",
+                text=f"✓ Applied Standard Full Risk preset (100% of {src_name}){lk_note}.",
                 fg="#5dade2"
             )
 
@@ -9269,18 +10214,52 @@ def show_preflight_window(parent=None, mute_btn=None):
 
     def restore_factory_defaults():
         src = config.get("user_defaults") or DEFAULT_CONFIG
+        tamper_lk = is_tilt_streak_tamper_locked()
         var_open_flat.set(
             src.get("enable_open_flatten", DEFAULT_CONFIG["enable_open_flatten"])
         )
-        var_open_cd.set(
-            src.get("enable_open_cooldown", DEFAULT_CONFIG["enable_open_cooldown"])
-        )
-        var_cd_mins.set(
-            f"{src.get('open_cooldown_mins', DEFAULT_CONFIG['open_cooldown_mins']):g}"
-        )
-        var_alarms_only.set(
-            src.get("alarms_only_mode", DEFAULT_CONFIG["alarms_only_mode"])
-        )
+        if not tamper_lk:
+            _tilt_cd_popup_guard["suppress"] = True
+            try:
+                var_tilt_cd.set(
+                    src.get(
+                        "enable_consec_loss_cooldown",
+                        DEFAULT_CONFIG["enable_consec_loss_cooldown"],
+                    )
+                )
+            finally:
+                _tilt_cd_popup_guard["suppress"] = False
+            var_tilt_count.set(
+                str(
+                    max(
+                        2,
+                        int(
+                            round(
+                                float(
+                                    src.get(
+                                        "consec_loss_count",
+                                        DEFAULT_CONFIG["consec_loss_count"],
+                                    )
+                                )
+                            )
+                        ),
+                    )
+                )
+            )
+            var_tilt_window.set(
+                f"{src.get('consec_loss_window_mins', DEFAULT_CONFIG['consec_loss_window_mins']):g}"
+            )
+        if not (tamper_lk and config.get("enable_open_cooldown", False)):
+            var_open_cd.set(
+                src.get("enable_open_cooldown", DEFAULT_CONFIG["enable_open_cooldown"])
+            )
+            var_cd_mins.set(
+                f"{src.get('open_cooldown_mins', DEFAULT_CONFIG['open_cooldown_mins']):g}"
+            )
+        if not tamper_lk:
+            var_alarms_only.set(
+                src.get("alarms_only_mode", DEFAULT_CONFIG["alarms_only_mode"])
+            )
         var_flatten.set(
             src.get("enable_auto_flatten", DEFAULT_CONFIG["enable_auto_flatten"])
         )
@@ -9370,10 +10349,15 @@ def show_preflight_window(parent=None, mute_btn=None):
         apply_dollar_preset(src)
         refresh_smart_dimming()
         if default_status_lbl is not None:
+            lk_note = (
+                " (🔒 Active Loss Streak settings stayed locked)"
+                if tamper_lk
+                else ""
+            )
             msg = (
-                "↺ Restored your saved defaults."
+                f"↺ Restored your saved defaults{lk_note}."
                 if config.get("user_defaults")
-                else "↺ Restored factory defaults."
+                else f"↺ Restored factory defaults{lk_note}."
             )
             default_status_lbl.config(text=msg, fg="#5dade2")
 
@@ -9382,6 +10366,9 @@ def show_preflight_window(parent=None, mute_btn=None):
             custom_def = {
                 "alarms_only_mode": bool(var_alarms_only.get()),
                 "enable_open_flatten": bool(var_open_flat.get()),
+                "enable_consec_loss_cooldown": bool(var_tilt_cd.get()),
+                "consec_loss_count": max(2, int(round(abs(float(var_tilt_count.get()))))),
+                "consec_loss_window_mins": max(0.5, abs(float(var_tilt_window.get()))),
                 "enable_open_cooldown": bool(var_open_cd.get()),
                 "open_cooldown_mins": max(0.1, abs(float(var_cd_mins.get()))),
                 "enable_auto_flatten": bool(var_flatten.get()),
@@ -9488,10 +10475,38 @@ def show_preflight_window(parent=None, mute_btn=None):
 
             new_cfg["alarms_only_mode"] = bool(var_alarms_only.get())
             new_cfg["enable_open_flatten"] = bool(var_open_flat.get())
-            new_cfg["enable_open_cooldown"] = bool(var_open_cd.get())
-            new_cfg["open_cooldown_mins"] = max(
-                0.1, abs(float(var_cd_mins.get()))
-            )
+            if is_tilt_streak_tamper_locked():
+                new_cfg["enable_consec_loss_cooldown"] = True
+                new_cfg["consec_loss_count"] = max(
+                    2, int(round(float(config.get("consec_loss_count", 3))))
+                )
+                new_cfg["consec_loss_window_mins"] = max(
+                    0.5, float(config.get("consec_loss_window_mins", 15.0))
+                )
+                if config.get("enable_open_cooldown", False):
+                    new_cfg["enable_open_cooldown"] = True
+                    new_cfg["open_cooldown_mins"] = max(
+                        0.1, float(config.get("open_cooldown_mins", 1.0))
+                    )
+                else:
+                    new_cfg["enable_open_cooldown"] = bool(var_open_cd.get())
+                    new_cfg["open_cooldown_mins"] = max(
+                        0.1, abs(float(var_cd_mins.get()))
+                    )
+                if not config.get("alarms_only_mode", False):
+                    new_cfg["alarms_only_mode"] = False
+            else:
+                new_cfg["enable_consec_loss_cooldown"] = bool(var_tilt_cd.get())
+                new_cfg["consec_loss_count"] = max(
+                    2, int(round(abs(float(var_tilt_count.get()))))
+                )
+                new_cfg["consec_loss_window_mins"] = max(
+                    0.5, abs(float(var_tilt_window.get()))
+                )
+                new_cfg["enable_open_cooldown"] = bool(var_open_cd.get())
+                new_cfg["open_cooldown_mins"] = max(
+                    0.1, abs(float(var_cd_mins.get()))
+                )
             new_cfg["enable_auto_flatten"] = bool(var_flatten.get())
             new_cfg["enable_flatten_options"] = bool(var_flatten_options.get())
             for _ow_k in (
@@ -9538,13 +10553,21 @@ def show_preflight_window(parent=None, mute_btn=None):
                 new_cfg[k] = (
                     raw_v if k in SIGNED_DOLLAR_KEYS else abs(raw_v)
                 )
+            if is_tilt_streak_tamper_locked():
+                new_cfg["consec_loss_min_dollars"] = abs(
+                    float(config.get("consec_loss_min_dollars", 25.0))
+                )
+                new_cfg["consec_win_reset_dollars"] = abs(
+                    float(config.get("consec_win_reset_dollars", 10.0))
+                )
             new_cfg["signed_tier_stops"] = True
 
             is_locked_down = False
             first_poll_of_launch = True
 
-            if var_reanchor.get():
+            if var_reanchor.get() and not is_tilt_streak_tamper_locked():
                 force_reanchor = True
+                recent_loss_timestamps.clear()
                 triggered_alarms.clear()
                 s_key = get_session_key(chosen_b, active_adapter.account_id)
                 if s_key and s_key in new_cfg.get("account_sessions", {}):
@@ -9625,6 +10648,7 @@ def show_preflight_window(parent=None, mute_btn=None):
         card.pack(side="left", fill="both", expand=True)
         hdr_row = tk.Frame(card, bg="#131922")
         hdr_row.pack(fill="x")
+        card._hdr_row = hdr_row
         title_lbl = tk.Label(
             hdr_row,
             text=title,
@@ -9661,7 +10685,13 @@ def show_preflight_window(parent=None, mute_btn=None):
     loss_var_ids = {id(dollar_vars[k]) for k in loss_display_keys}
     green_var_ids = {
         id(dollar_vars[k])
-        for k in ("pm_lock_trigger", "pm_trail_cushion", "t4_trigger", "t4_trail")
+        for k in (
+            "consec_win_reset_dollars",
+            "pm_lock_trigger",
+            "pm_trail_cushion",
+            "t4_trigger",
+            "t4_trail",
+        )
         if k in dollar_vars
     }
 
@@ -9778,19 +10808,39 @@ def show_preflight_window(parent=None, mute_btn=None):
         return w1, e1, w2, e2
 
     # ==========================================================
-    # LEFT COLUMN: 1. SINGLE-TRADE STOP, 2. DAILY ACTIONS, 3. SYSTEM
+    # LEFT COLUMN: 1. TRADE & TILT STOPS, 2. DAILY ACTIONS, 3. SYSTEM
     # ==========================================================
     c1 = make_card(
         left_col,
-        "▶  1. SINGLE-TRADE STOP (Open PnL)",
-        "Flattens open positions on a single trade without ending your day "
-        "(Options = Siren Only unless BETA toggle enabled in Card 2).",
+        "▶  1. TRADE & TILT STOPS (Intraday Penalty Box)",
+        "Stops single-trade blowups and rapid loss streaks without ending your trading day.",
         accent="#5dade2",
         bar_color="#38bdf8"
     )
+    c1_tamper_lbl = tk.Label(
+        c1._hdr_row,
+        text="🔒 Locks on active streak",
+        font=("Arial", 8, "bold"),
+        fg="#7dd3fc",
+        bg="#142334",
+        padx=7,
+        pady=2,
+    )
+    c1_tamper_lbl.pack(side="right", padx=(6, 0))
+    c1_tamper_tip = (
+        "Anti-Tilt Tamper Lock (Consecutive Loss Cooldown):\n"
+        "• Transparent Upfront Rule: While your Loss Streak is 0/X (CLEAR), you can freely adjust\n"
+        "  your Consecutive Loss Cooldown settings (Losses, Min Loss $, Win Reset $, In Mins, and Lock Duration).\n"
+        "• Locked During Active Streak: As soon as you have at least 1 qualifying loss on the rolling\n"
+        "  clock (e.g. Streak 1/5 or 3/5), these controls LOCK automatically so you cannot raise your limit,\n"
+        "  lower your Win Reset threshold, or disable the cooldown mid-streak.\n"
+        "• How It Unlocks: Unlocks automatically when the rolling countdown timer reaches 00:00 or when\n"
+        "  you close a qualifying winning trade (>= +Win Reset $)."
+    )
+    attach_tooltip(c1_tamper_lbl, c1_tamper_tip)
 
     r_open1 = tk.Frame(c1, bg="#131922")
-    r_open1.pack(fill="x", pady=4)
+    r_open1.pack(fill="x", pady=3)
     cb_open_flat = make_glass_checkbutton(
         r_open1,
         text="Enable Open PnL Auto-Flatten (Equities)",
@@ -9824,11 +10874,388 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(lbl_open_loss, open_stop_tip)
     attach_tooltip(ent_open_loss, open_stop_tip)
 
+    r_tilt = tk.Frame(c1, bg="#131922")
+    r_tilt.pack(fill="x", pady=3)
+    cb_tilt_cd = make_glass_checkbutton(
+        r_tilt,
+        text="Consecutive Loss Cooldown",
+        variable=var_tilt_cd,
+        font=("Arial", 10, "bold"),
+        fg="#dce4ee",
+        bg="#131922",
+        anchor="w"
+    )
+    cb_tilt_cd.pack(side="left")
+
+    ent_tilt_window = make_entry(r_tilt, var_tilt_window, width=5)
+    ent_tilt_window.pack(side="right")
+    lbl_tilt_window = tk.Label(
+        r_tilt,
+        text="In (Mins):",
+        font=("Arial", 10, "bold"),
+        fg="#97a7b9",
+        bg="#131922"
+    )
+    lbl_tilt_window.pack(side="right", padx=(14, 6))
+
+    lbl_tilt_losses = tk.Label(
+        r_tilt,
+        text="Losses",
+        font=("Arial", 10, "bold"),
+        fg="#97a7b9",
+        bg="#131922"
+    )
+    lbl_tilt_losses.pack(side="right", padx=(6, 0))
+    ent_tilt_count = make_entry(r_tilt, var_tilt_count, width=4)
+    ent_tilt_count.pack(side="right")
+
+    r_tilt_sub = tk.Frame(c1, bg="#131922")
+    r_tilt_sub.pack(fill="x", pady=2)
+    lbl_tilt_filter = tk.Label(
+        r_tilt_sub,
+        text="└─ Qualifying Trade Filter:",
+        font=("Arial", 9, "bold"),
+        fg="#97a7b9",
+        bg="#131922",
+        anchor="w",
+    )
+    lbl_tilt_filter.pack(side="left", padx=(18, 0))
+
+    ent_tilt_win_reset = make_entry(
+        r_tilt_sub, dollar_vars["consec_win_reset_dollars"], width=5
+    )
+    ent_tilt_win_reset.pack(side="right")
+    lbl_tilt_win_reset = tk.Label(
+        r_tilt_sub,
+        text="Win Reset ($):",
+        font=("Arial", 9, "bold"),
+        fg="#4ec994",
+        bg="#131922",
+    )
+    lbl_tilt_win_reset.pack(side="right", padx=(12, 5))
+
+    ent_tilt_min_loss = make_entry(
+        r_tilt_sub, dollar_vars["consec_loss_min_dollars"], width=5
+    )
+    ent_tilt_min_loss.pack(side="right")
+    lbl_tilt_min_loss = tk.Label(
+        r_tilt_sub,
+        text="Min Loss ($):",
+        font=("Arial", 9, "bold"),
+        fg="#dc6d72",
+        bg="#131922",
+    )
+    lbl_tilt_min_loss.pack(side="right", padx=(8, 5))
+
+    tilt_tip = (
+        "Consecutive Loss Cooldown ('Tilt Streak Stop'):\n"
+        "Tracks completed losing round-trip trades inside a rolling time window.\n"
+        "If you close X consecutive losing trades (each at least 'Min Loss ($)') within 'In (Mins)' minutes,\n"
+        "Enforcer cancels working orders and triggers the Penalty Box OS Lock Cooldown below.\n"
+        "• Min Loss ($): Ignores tiny scratch losses smaller than '-Min Loss ($)' (e.g. -$5 when Min Loss is -$25)\n"
+        "  so disciplined micro-scratches are never penalized toward a loss streak.\n"
+        "• Win Reset ($): Sets the minimum green trade required to reset an active loss streak early\n"
+        "  (e.g. +$10 means a +$0.30 scratch 'win' will NOT wipe out a 4/5 loss streak, while a +$10+ win resets it to 0).\n"
+        "• Anti-Tilt Tamper Lock: While you have an active loss streak (> 0 losses on the clock), these settings\n"
+        "  lock automatically and cannot be disabled or loosened in Settings until the streak clears."
+    )
+    for _tw in (
+        cb_tilt_cd,
+        ent_tilt_count,
+        lbl_tilt_losses,
+        lbl_tilt_filter,
+        lbl_tilt_min_loss,
+        ent_tilt_min_loss,
+        lbl_tilt_win_reset,
+        ent_tilt_win_reset,
+        lbl_tilt_window,
+        ent_tilt_window,
+    ):
+        attach_tooltip(_tw, tilt_tip)
+
+    def show_tilt_cooldown_lock_notice():
+        """Displays a friendly dark-glass reminder popup when the user enables
+        Consecutive Loss Cooldown so they know upfront that the settings lock
+        automatically during an active loss streak."""
+        decision = {"ok": False}
+        dlg = tk.Toplevel(pf)
+        dlg.title("PnL Enforcer — Consecutive Loss Cooldown")
+        dlg.configure(bg="#0d1117", padx=24, pady=20)
+        dlg.resizable(False, False)
+        dlg.transient(pf)
+        dlg.grab_set()
+
+        def on_cancel():
+            decision["ok"] = False
+            dlg.destroy()
+
+        def on_confirm():
+            decision["ok"] = True
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 4))
+
+        tk.Label(
+            hdr_row,
+            text="▶  CONSECUTIVE LOSS COOLDOWN — ANTI-TILT LOCK",
+            font=("Arial", 12, "bold"),
+            fg="#38bdf8",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(side="left")
+
+        tk.Label(
+            hdr_row,
+            text="🔒 LOCKS ON ACTIVE STREAK",
+            font=("Arial", 8, "bold"),
+            fg="#fde68a",
+            bg="#451a03",
+            padx=8,
+            pady=3,
+        ).pack(side="right", padx=(12, 0))
+
+        tk.Label(
+            dlg,
+            text="Friendly heads-up on how your streak settings behave once a losing streak starts:",
+            font=("Arial", 9),
+            fg="#94a3b8",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        card_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        card_outer.pack(fill="x", pady=(0, 16))
+        NeonBarCanvas(
+            card_outer, core_color="#f59e0b", card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+
+        txt_box = tk.Text(
+            card_outer,
+            width=86,
+            height=15,
+            bg="#131922",
+            fg="#dce4ee",
+            font=("Segoe UI", 10),
+            wrap="none",
+            bd=0,
+            highlightthickness=0,
+            padx=18,
+            pady=14,
+            cursor="arrow",
+        )
+        txt_box.pack(side="left", fill="both", expand=True)
+
+        txt_box.tag_configure(
+            "hdr_green",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#4ade80",
+            spacing1=0,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "hdr_amber",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#fbbf24",
+            spacing1=2,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "hdr_blue",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#38bdf8",
+            spacing1=2,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "body",
+            font=("Segoe UI", 10),
+            foreground="#dce4ee",
+            spacing1=1,
+            spacing3=2,
+        )
+        txt_box.tag_configure(
+            "pill_blue",
+            font=("Consolas", 9, "bold"),
+            foreground="#7dd3fc",
+            background="#1a2636",
+        )
+        txt_box.tag_configure(
+            "pill_red",
+            font=("Consolas", 9, "bold"),
+            foreground="#fda4af",
+            background="#2c151d",
+        )
+        txt_box.tag_configure(
+            "pill_green",
+            font=("Consolas", 9, "bold"),
+            foreground="#6ee7b7",
+            background="#112a20",
+        )
+        txt_box.tag_configure(
+            "pill_amber",
+            font=("Consolas", 9, "bold"),
+            foreground="#fde68a",
+            background="#3b2106",
+        )
+        txt_box.tag_configure(
+            "div_line",
+            font=("Consolas", 8),
+            foreground="#222d3d",
+            spacing1=5,
+            spacing3=5,
+        )
+
+        # Section 1: Clear state
+        txt_box.insert(
+            "end",
+            "✓  1. FREELY ADJUSTABLE WHEN CLEAR  (Streak: 0 / X)\n",
+            "hdr_green",
+        )
+        s1_spans = [
+            ("    While your Loss Streak is ", ("body",)),
+            (" 0 / X ", ("body", "pill_green")),
+            (", you can freely tune your ", ("body",)),
+            (" Losses ", ("body", "pill_blue")),
+            (" count,\n", ("body",)),
+            ("    ", ("body",)),
+            (" Min Loss ($) ", ("body", "pill_red")),
+            (", ", ("body",)),
+            (" Win Reset ($) ", ("body", "pill_green")),
+            (", ", ("body",)),
+            (" In (Mins) ", ("body", "pill_blue")),
+            (" window, and ", ("body",)),
+            (" Penalty Box Lock Duration ", ("body", "pill_blue")),
+            (".\n", ("body",)),
+        ]
+        for s_txt, s_tags in s1_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+        # Section 2: Active streak lock
+        txt_box.insert(
+            "end",
+            "🔒  2. LOCKED DURING AN ACTIVE STREAK  (Streak: 1 / X or Higher)\n",
+            "hdr_amber",
+        )
+        s2_spans = [
+            ("    Once you have ", ("body",)),
+            (" 1 qualifying loss ", ("body", "pill_amber")),
+            (" on the rolling clock, these controls switch to ", ("body",)),
+            (" 🔒 LOCKED ", ("body", "pill_amber")),
+            ("\n", ("body",)),
+            ("    (and ignore ", ("body",)),
+            (" Restore Defaults ", ("body", "pill_blue")),
+            (", ", ("body",)),
+            (" Standard Full Risk ", ("body", "pill_blue")),
+            (", and ", ("body",)),
+            (" 50% Low Energy ", ("body", "pill_blue")),
+            (") so you\n", ("body",)),
+            ("    cannot raise your limit, lower ", ("body",)),
+            (" Win Reset ($) ", ("body", "pill_green")),
+            (", or turn off the cooldown mid-streak.\n", ("body",)),
+        ]
+        for s_txt, s_tags in s2_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+        # Section 3: Unlock conditions
+        txt_box.insert(
+            "end",
+            "⏱  3. AUTOMATIC UNLOCK CONDITIONS\n",
+            "hdr_blue",
+        )
+        s3_spans = [
+            ("    The lock clears automatically as soon as your rolling streak countdown reaches ", ("body",)),
+            (" 00:00 ", ("body", "pill_blue")),
+            ("\n", ("body",)),
+            ("    or when you close a qualifying winning trade (", ("body",)),
+            (" >= +Win Reset ($) ", ("body", "pill_green")),
+            (").", ("body",)),
+        ]
+        for s_txt, s_tags in s3_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.config(state="disabled")
+
+        btn_row = tk.Frame(dlg, bg="#0d1117")
+        btn_row.pack(fill="x")
+
+        make_stadium_button(
+            btn_row,
+            text="Got It — Arm Cooldown ✓",
+            font=("Arial", 10, "bold"),
+            fill_color="#0d3b20",
+            fill_top_color="#14532d",
+            border_color="#10b981",
+            hover_fill="#114b29",
+            hover_fill_top="#196638",
+            hover_border="#34d399",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=210,
+            height=34,
+            auto_width=False,
+            command=on_confirm,
+        ).pack(side="right")
+
+        make_stadium_button(
+            btn_row,
+            text="Cancel",
+            font=("Arial", 10, "bold"),
+            fill_color="#3b1520",
+            border_color="#f43f5e",
+            hover_fill="#4f1c2b",
+            hover_border="#fb7185",
+            fg="#ffe4e6",
+            canvas_bg="#0d1117",
+            width=104,
+            height=34,
+            auto_width=False,
+            command=on_cancel,
+        ).pack(side="right", padx=(0, 8))
+
+        dlg.update_idletasks()
+        w_req = dlg.winfo_reqwidth()
+        h_req = dlg.winfo_reqheight()
+        x = pf.winfo_rootx() + max(20, (pf.winfo_width() - w_req) // 2)
+        y = pf.winfo_rooty() + max(20, (pf.winfo_height() - h_req) // 2)
+        dlg.geometry(f"+{x}+{y}")
+
+        pf.wait_window(dlg)
+        return decision["ok"]
+
+    def _on_toggle_tilt_cd(*_):
+        if _tilt_cd_popup_guard["suppress"] or _tamper_sync_guard["busy"]:
+            return
+        if var_tilt_cd.get():
+            if not show_tilt_cooldown_lock_notice():
+                _tilt_cd_popup_guard["suppress"] = True
+                try:
+                    var_tilt_cd.set(False)
+                finally:
+                    _tilt_cd_popup_guard["suppress"] = False
+                refresh_smart_dimming()
+                return
+            if not var_open_cd.get():
+                var_open_cd.set(True)
+        refresh_smart_dimming()
+
     r_open2 = tk.Frame(c1, bg="#131922")
-    r_open2.pack(fill="x", pady=4)
+    r_open2.pack(fill="x", pady=3)
     cb_open_cd = make_glass_checkbutton(
         r_open2,
-        text="└─ Penalty Box OS Lock After Open Stop",
+        text="└─ Penalty Box OS Lock Cooldown",
         variable=var_open_cd,
         font=("Arial", 10, "bold"),
         fg="#c8d4e0",
@@ -9847,9 +11274,9 @@ def show_preflight_window(parent=None, mute_btn=None):
     )
     lbl_cd_mins.pack(side="right", padx=(16, 8))
     open_cd_tip = (
-        "Penalty Box Cooldown Lock:\n"
+        "Penalty Box Cooldown Lock (Shared by Open PnL Stop & Consecutive Loss Cooldown):\n"
         "Locks your Windows screen for the set duration (supports decimals like 0.5 for 30s)\n"
-        "so you cannot immediately revenge-enter the same trade.\n"
+        "after an Open PnL Stop or Consecutive Loss Cooldown triggers so you cannot revenge-trade.\n"
         "• SAFETY GUARANTEE: The app ALWAYS confirms with the broker API that 100% of open\n"
         "  positions are closed (flat) before locking your computer — it will never lock you\n"
         "  out while a position is still open."
@@ -10055,14 +11482,83 @@ def show_preflight_window(parent=None, mute_btn=None):
     c3_bar.pack(side="left", fill="y")
     c3 = tk.Frame(c3_outer, bg="#131922", padx=14, pady=11)
     c3.pack(side="left", fill="both", expand=True)
+    c3_hdr_row = tk.Frame(c3, bg="#131922")
+    c3_hdr_row.pack(fill="x")
     tk.Label(
-        c3,
+        c3_hdr_row,
         text="▶  3. SESSION & SYSTEM SETTINGS",
         font=("Arial", 11, "bold"),
         fg="#4ec994",
         bg="#131922",
         anchor="w"
-    ).pack(fill="x")
+    ).pack(side="left")
+
+    def _on_click_reanchor_pill():
+        if is_tilt_streak_tamper_locked():
+            cur_s, req_l, next_s, _full_s, _is_en = get_loss_streak_status()
+            messagebox.showwarning(
+                "Locked During Active Loss Streak",
+                f"Baseline Re-Zero is locked while an active Consecutive Loss Streak "
+                f"({cur_s}/{req_l} — resets in {_format_countdown_mm_ss(next_s)}) is running.\n\n"
+                f"Wait for the streak countdown to reach 00:00 or close a qualifying win to unlock.",
+                parent=pf,
+            )
+            var_reanchor.set(False)
+            return
+        var_reanchor.set(not bool(var_reanchor.get()))
+
+    btn_reanchor_pill = make_stadium_button(
+        c3_hdr_row,
+        text="↺ Re-Zero Baseline",
+        font=("Arial", 8, "bold"),
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#3b2f1e",
+        hover_fill="#1e1b16",
+        hover_fill_top="#29231a",
+        hover_border="#f59e0b",
+        fg="#f5b041",
+        canvas_bg="#131922",
+        width=124,
+        height=22,
+        pad_x=16,
+        command=_on_click_reanchor_pill,
+    )
+    btn_reanchor_pill.pack(side="right")
+    attach_tooltip(
+        btn_reanchor_pill,
+        "One-Time Baseline Reset (Re-Zero):\n"
+        "Click to arm a one-time baseline reset, then click 'SAVE & APPLY CHANGES'.\n"
+        "Re-anchors today's starting baseline equity to your current account balance right now\n"
+        "(resetting today's Realized PnL, Session High, Consecutive Loss Streak, and W/L counter to 0).\n"
+        "Useful after a deposit/withdrawal or if starting a fresh afternoon session."
+    )
+
+    def _refresh_reanchor_pill(*_):
+        if var_reanchor.get():
+            btn_reanchor_pill.config(
+                text="✓ Re-Zero Armed",
+                fill_color="#33220c",
+                fill_top_color="#473010",
+                border_color="#f59e0b",
+                hover_fill="#3f2a0f",
+                hover_fill_top="#543813",
+                hover_border="#fbbf24",
+                fg="#fde68a",
+            )
+        else:
+            btn_reanchor_pill.config(
+                text="↺ Re-Zero Baseline",
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#3b2f1e",
+                hover_fill="#1e1b16",
+                hover_fill_top="#29231a",
+                hover_border="#f59e0b",
+                fg="#f5b041",
+            )
+
+    var_reanchor.trace_add("write", _refresh_reanchor_pill)
 
     base_sub_lbl = tk.Frame(c3, bg="#131922")
     base_sub_lbl.pack(fill="x", pady=(2, 6))
@@ -10089,26 +11585,6 @@ def show_preflight_window(parent=None, mute_btn=None):
         "If checked, at 9:30 AM ET (RTH Open) and 4:00 PM ET (After-Hours Open) your active Rulebook\n"
         "starts fresh from current flat equity so an earlier session's profit peak won't immediately\n"
         "trigger a tier ratchet or trailing stop. (Your SESSION HIGH column still preserves your full-day peak.)"
-    )
-
-    cb_reanchor = make_glass_checkbutton(
-        c3,
-        text="Re-Zero Today's Starting Baseline to Current Equity",
-        variable=var_reanchor,
-        font=("Arial", 10, "bold"),
-        fg="#f5b041",
-        bg="#131922",
-        accent_hex="#d97706",
-        check_hex="#fbbf24",
-        anchor="w"
-    )
-    cb_reanchor.pack(fill="x", pady=2)
-    attach_tooltip(
-        cb_reanchor,
-        "One-Time Reset:\n"
-        "Re-anchors today's starting baseline equity to your current account balance right now\n"
-        "(resetting today's Realized PnL, Session High, and W/L counter to 0).\n"
-        "Useful after a deposit/withdrawal or if starting a fresh afternoon session."
     )
 
     r_audio = tk.Frame(c3, bg="#131922")
@@ -10321,14 +11797,14 @@ def show_preflight_window(parent=None, mute_btn=None):
     r_poll.pack(fill="x", pady=(4, 2))
     lbl_poll = tk.Label(
         r_poll,
-        text="Broker API Poll Interval (Seconds):",
+        text="API Poll Interval (s):",
         font=("Arial", 10, "bold"),
         fg="#97a7b9",
         bg="#131922",
         anchor="w"
     )
-    lbl_poll.pack(side="left", padx=(0, 10))
-    ent_poll = make_entry(r_poll, var_poll, width=8)
+    lbl_poll.pack(side="left", padx=(0, 8))
+    ent_poll = make_entry(r_poll, var_poll, width=5)
     ent_poll.pack(side="left")
     poll_tip = (
         "How often (in seconds) Enforcer polls your broker API for live equity and positions.\n"
@@ -10338,17 +11814,17 @@ def show_preflight_window(parent=None, mute_btn=None):
     attach_tooltip(ent_poll, poll_tip)
 
     cb_auto_share = make_glass_checkbutton(
-        c3,
-        text="Auto-Share Daily Safe Logs (Beta Opt-In)",
+        r_poll,
+        text="Auto-Share Safe Logs (Beta Opt-In)",
         variable=var_auto_share_logs,
         font=("Arial", 10, "bold"),
         fg="#7dd3fc",
         bg="#131922",
         accent_hex="#0284c7",
         check_hex="#38bdf8",
-        anchor="w",
+        anchor="e",
     )
-    cb_auto_share.pack(fill="x", pady=(2, 0))
+    cb_auto_share.pack(side="right")
     attach_tooltip(
         cb_auto_share,
         "Beta Diagnostic Telemetry (Strictly Opt-In — OFF by Default):\n"
@@ -10658,11 +12134,86 @@ def show_preflight_window(parent=None, mute_btn=None):
         )
 
     # --- INTERACTIVE SMART DIMMING LOGIC ---
+    _tamper_sync_guard = {"busy": False}
+
+    def _refresh_c1_tamper_badge():
+        cur_s, req_l, next_s, _full_s, _is_en = get_loss_streak_status()
+        if cur_s > 0 and config.get("enable_consec_loss_cooldown", False):
+            t_str = f"🔒 STREAK {cur_s}/{req_l} ({_format_countdown_mm_ss(next_s)}) — LOCKED"
+            fg_c = "#fecaca" if cur_s >= (req_l - 1) else "#fde68a"
+            bg_c = "#5c1919" if cur_s >= (req_l - 1) else "#451a03"
+        elif var_tilt_cd.get():
+            t_str = "🔒 Locks on active streak"
+            fg_c = "#7dd3fc"
+            bg_c = "#142334"
+        else:
+            t_str = "🔒 Locks on active streak"
+            fg_c = "#64748b"
+            bg_c = "#131922"
+        if (
+            c1_tamper_lbl.cget("text") != t_str
+            or c1_tamper_lbl.cget("fg") != fg_c
+            or c1_tamper_lbl.cget("bg") != bg_c
+        ):
+            c1_tamper_lbl.config(text=t_str, fg=fg_c, bg=bg_c)
+
     def refresh_smart_dimming(*_):
+        if _tamper_sync_guard["busy"]:
+            return
+        tamper_locked = is_tilt_streak_tamper_locked()
+        if tamper_locked:
+            _tamper_sync_guard["busy"] = True
+            try:
+                if not config.get("alarms_only_mode", False) and var_alarms_only.get():
+                    var_alarms_only.set(False)
+                if not var_tilt_cd.get():
+                    var_tilt_cd.set(True)
+                var_tilt_count.set(
+                    str(max(2, int(round(float(config.get("consec_loss_count", 3))))))
+                )
+                dollar_vars["consec_loss_min_dollars"].set(
+                    _fmt_ui_dollar(
+                        "consec_loss_min_dollars",
+                        config.get("consec_loss_min_dollars", 25.0),
+                    )
+                )
+                dollar_vars["consec_win_reset_dollars"].set(
+                    _fmt_ui_dollar(
+                        "consec_win_reset_dollars",
+                        config.get("consec_win_reset_dollars", 10.0),
+                    )
+                )
+                var_tilt_window.set(
+                    f"{config.get('consec_loss_window_mins', 15.0):g}"
+                )
+                if config.get("enable_open_cooldown", False):
+                    if not var_open_cd.get():
+                        var_open_cd.set(True)
+                    var_cd_mins.set(
+                        f"{config.get('open_cooldown_mins', 1.0):g}"
+                    )
+                if var_reanchor.get():
+                    var_reanchor.set(False)
+            finally:
+                _tamper_sync_guard["busy"] = False
+
+        _refresh_c1_tamper_badge()
+        _render_card3_telemetry_live()
+
         if var_alarms_only.get():
             cb_open_flat.config(state="disabled")
             ent_open_loss.config(state="disabled")
             lbl_open_loss.config(fg="#526070")
+            cb_tilt_cd.config(state="disabled")
+            ent_tilt_count.config(state="disabled")
+            lbl_tilt_losses.config(fg="#526070")
+            lbl_tilt_filter.config(fg="#526070")
+            lbl_tilt_min_loss.config(fg="#526070")
+            ent_tilt_min_loss.config(state="disabled")
+            lbl_tilt_win_reset.config(fg="#526070")
+            ent_tilt_win_reset.config(state="disabled")
+            lbl_tilt_window.config(fg="#526070")
+            ent_tilt_window.config(state="disabled")
             cb_open_cd.config(state="disabled")
             ent_cd_mins.config(state="disabled")
             lbl_cd_mins.config(fg="#526070")
@@ -10676,6 +12227,9 @@ def show_preflight_window(parent=None, mute_btn=None):
             ent_daily_lock_mins.config(state="disabled")
             lbl_daily_lock_mins.config(fg="#526070")
         else:
+            cb_alarms_only.config(
+                state="disabled" if tamper_locked else "normal"
+            )
             cb_open_flat.config(
                 state="normal",
                 text=(
@@ -10687,22 +12241,105 @@ def show_preflight_window(parent=None, mute_btn=None):
             if var_open_flat.get():
                 ent_open_loss.config(state="normal")
                 lbl_open_loss.config(fg="#dc6d72")
-                cb_open_cd.config(state="normal")
-                if var_open_cd.get():
-                    ent_cd_mins.config(state="normal")
-                    lbl_cd_mins.config(fg="#97a7b9")
-                else:
-                    ent_cd_mins.config(state="disabled")
-                    lbl_cd_mins.config(fg="#526070")
             else:
                 ent_open_loss.config(state="disabled")
                 lbl_open_loss.config(fg="#526070")
-                cb_open_cd.config(state="disabled")
-                ent_cd_mins.config(state="disabled")
-                lbl_cd_mins.config(fg="#526070")
+
+            if tamper_locked:
+                cb_tilt_cd.config(state="disabled", fg="#fde68a")
+                ent_tilt_count.config(
+                    state="disabled",
+                    disabledforeground="#fde68a",
+                    highlightbackground="#b45309",
+                )
+                lbl_tilt_losses.config(fg="#fbbf24")
+                lbl_tilt_filter.config(fg="#fbbf24")
+                lbl_tilt_min_loss.config(fg="#fbbf24")
+                ent_tilt_min_loss.config(
+                    state="disabled",
+                    disabledforeground="#fde68a",
+                    highlightbackground="#b45309",
+                )
+                lbl_tilt_win_reset.config(fg="#fbbf24")
+                ent_tilt_win_reset.config(
+                    state="disabled",
+                    disabledforeground="#fde68a",
+                    highlightbackground="#b45309",
+                )
+                lbl_tilt_window.config(fg="#fbbf24")
+                ent_tilt_window.config(
+                    state="disabled",
+                    disabledforeground="#fde68a",
+                    highlightbackground="#b45309",
+                )
+            else:
+                cb_tilt_cd.config(state="normal", fg="#dce4ee")
+                ent_tilt_count.config(
+                    disabledforeground="#475569",
+                    highlightbackground="#2e526e",
+                )
+                ent_tilt_min_loss.config(
+                    disabledforeground="#475569",
+                    highlightbackground="#632d3b",
+                )
+                ent_tilt_win_reset.config(
+                    disabledforeground="#475569",
+                    highlightbackground="#266149",
+                )
+                ent_tilt_window.config(
+                    disabledforeground="#475569",
+                    highlightbackground="#2e526e",
+                )
+                if var_tilt_cd.get():
+                    ent_tilt_count.config(state="normal")
+                    lbl_tilt_losses.config(fg="#97a7b9")
+                    lbl_tilt_filter.config(fg="#97a7b9")
+                    lbl_tilt_min_loss.config(fg="#dc6d72")
+                    ent_tilt_min_loss.config(state="normal")
+                    lbl_tilt_win_reset.config(fg="#4ec994")
+                    ent_tilt_win_reset.config(state="normal")
+                    lbl_tilt_window.config(fg="#97a7b9")
+                    ent_tilt_window.config(state="normal")
+                else:
+                    ent_tilt_count.config(state="disabled")
+                    lbl_tilt_losses.config(fg="#526070")
+                    lbl_tilt_filter.config(fg="#526070")
+                    lbl_tilt_min_loss.config(fg="#526070")
+                    ent_tilt_min_loss.config(state="disabled")
+                    lbl_tilt_win_reset.config(fg="#526070")
+                    ent_tilt_win_reset.config(state="disabled")
+                    lbl_tilt_window.config(fg="#526070")
+                    ent_tilt_window.config(state="disabled")
+
+            if tamper_locked and config.get("enable_open_cooldown", False):
+                cb_open_cd.config(state="disabled", fg="#fde68a")
+                ent_cd_mins.config(
+                    state="disabled",
+                    disabledforeground="#fde68a",
+                    highlightbackground="#b45309",
+                )
+                lbl_cd_mins.config(fg="#fbbf24")
+            else:
+                cb_open_cd.config(fg="#c8d4e0")
+                ent_cd_mins.config(
+                    disabledforeground="#475569",
+                    highlightbackground="#2e526e",
+                )
+                if var_open_flat.get() or var_tilt_cd.get():
+                    cb_open_cd.config(state="normal")
+                    if var_open_cd.get():
+                        ent_cd_mins.config(state="normal")
+                        lbl_cd_mins.config(fg="#97a7b9")
+                    else:
+                        ent_cd_mins.config(state="disabled")
+                        lbl_cd_mins.config(fg="#526070")
+                else:
+                    cb_open_cd.config(state="disabled")
+                    ent_cd_mins.config(state="disabled")
+                    lbl_cd_mins.config(fg="#526070")
 
             cb_day_flat.config(state="normal")
-            if var_open_flat.get() or var_flatten.get():
+            if var_open_flat.get() or var_tilt_cd.get() or var_flatten.get():
                 cb_opt_flat.config(
                     state="normal",
                     fg="#f5b041" if var_flatten_options.get() else "#c8d4e0",
@@ -10755,6 +12392,7 @@ def show_preflight_window(parent=None, mute_btn=None):
                 lbl_fl.config(fg="#526070")
                 ent_fl.config(state="disabled")
 
+    var_tilt_cd.trace_add("write", _on_toggle_tilt_cd)
     for trace_var in (
         var_alarms_only,
         var_open_flat, var_open_cd, var_flatten, var_lock_os,
@@ -10763,6 +12401,38 @@ def show_preflight_window(parent=None, mute_btn=None):
     ):
         trace_var.trace_add("write", refresh_smart_dimming)
     refresh_smart_dimming()
+
+    _pf_streak_prev_locked = {"val": is_tilt_streak_tamper_locked()}
+
+    def _tick_preflight_streak():
+        pf_timer_state["streak_after_id"] = None
+        if pf_timer_state["closing"]:
+            return
+        try:
+            if not pf.winfo_exists():
+                return
+            prev_cnt = len(recent_loss_timestamps)
+            now_locked = is_tilt_streak_tamper_locked()
+            if now_locked != _pf_streak_prev_locked["val"]:
+                _pf_streak_prev_locked["val"] = now_locked
+                refresh_smart_dimming()
+            else:
+                _refresh_c1_tamper_badge()
+                _render_card3_telemetry_live()
+            if len(recent_loss_timestamps) != prev_cnt:
+                save_session_state()
+        except Exception:
+            pass
+        if not pf_timer_state["closing"]:
+            delay_ms = 200 if len(recent_loss_timestamps) > 0 else 1000
+            try:
+                pf_timer_state["streak_after_id"] = pf.after(
+                    delay_ms, _tick_preflight_streak
+                )
+            except Exception:
+                pass
+
+    _tick_preflight_streak()
 
     # --- BOTTOM ACTION BAR (GLASSMORPHIC STADIUMS) ---
     btn_frame = tk.Frame(pf, bg="#0d1117")
@@ -10899,7 +12569,7 @@ def show_preflight_window(parent=None, mute_btn=None):
 # ==========================================
 # 9. DYNAMIC MULTI-COLUMN HUD SETUP
 # ==========================================
-acct_badge_mode = 0  # 0 = W/L, 1 = FLAT, 2 = BASE
+acct_badge_mode = 0  # 0 = W/L, 1 = STREAK, 2 = FLAT, 3 = BASE
 acct_badge_lbl = None
 hud_root = None
 hud_grid_frame = None
@@ -10914,15 +12584,24 @@ hud_do_move_fn = None
 
 
 def refresh_acct_badge():
-    """Updates the clickable left account badge (W/L -> FLAT -> BASE)."""
+    """Updates the clickable left account badge (W/L -> STREAK -> FLAT -> BASE)."""
     if acct_badge_lbl is None:
         return
 
     if acct_badge_mode == 1:
+        cur_s, req_l, _next_s, _full_s, is_en = get_loss_streak_status()
+        txt = format_loss_streak_inline()
+        if cur_s > 0 and is_en and cur_s >= (req_l - 1):
+            fg_col = "#fca5a5"
+        elif cur_s > 0:
+            fg_col = "#fbbf24"
+        else:
+            fg_col = "#a3e4d7" if is_en else "#94a3b8"
+    elif acct_badge_mode == 2:
         val = last_flat_equity if last_flat_equity is not None else start_equity
         txt = f"FLAT: ${val:,.2f}" if (val is not None and val > 0) else "FLAT: ---"
         fg_col = "#ffffff"
-    elif acct_badge_mode == 2:
+    elif acct_badge_mode == 3:
         val = start_equity
         txt = f"BASE: ${val:,.2f}" if (val is not None and val > 0) else "BASE: ---"
         fg_col = "#aed6f1"
@@ -10930,12 +12609,16 @@ def refresh_acct_badge():
         txt = format_trades_wl_inline(win_trades, loss_trades)
         fg_col = "#e5e8e8"
 
-    acct_badge_lbl.config(text=txt, fg=fg_col)
+    if (
+        getattr(acct_badge_lbl, "_text", "") != txt
+        or getattr(acct_badge_lbl, "_fg", "") != fg_col
+    ):
+        acct_badge_lbl.config(text=txt, fg=fg_col)
 
 
 def toggle_acct_badge(event=None):
     global acct_badge_mode
-    acct_badge_mode = (acct_badge_mode + 1) % 3
+    acct_badge_mode = (acct_badge_mode + 1) % 4
     refresh_acct_badge()
 
 
@@ -11033,7 +12716,7 @@ def rebuild_hud_columns():
 
         val_font = (
             ("Arial", 9, "bold")
-            if col_id == "trades_wl"
+            if col_id in ("trades_wl", "loss_streak")
             else ("Arial", 12, "bold")
         )
         val_lbl = tk.Label(
@@ -11087,10 +12770,17 @@ def update_gui(
     ui_labels, col_data, is_flat, settings_btn, close_btn, leash_pct=None
 ):
     global hud_last_leash_pct, hud_last_leash_bg
+    active_cols = get_active_hud_columns(config)
     for i, (text_val, bg_col) in enumerate(col_data):
+        if i < len(active_cols) and active_cols[i] == "loss_streak":
+            text_val, bg_col = format_loss_streak_multiline()
         disp_bg = "#262a2e" if bg_col in ("#2c3e50", "#1f538d") else bg_col
         if i < len(ui_labels):
-            ui_labels[i].config(text=text_val, bg=disp_bg)
+            if (
+                ui_labels[i].cget("text") != text_val
+                or ui_labels[i].cget("bg") != disp_bg
+            ):
+                ui_labels[i].config(text=text_val, bg=disp_bg)
         if i == hud_leash_idx:
             hud_last_leash_bg = disp_bg
 
@@ -11155,7 +12845,6 @@ def attach_hud_mute_tooltip(widget, hud_win):
             tip_state["win"] is not None
             or not widget.winfo_exists()
             or settings_win_open
-            or len(get_active_hud_columns(config)) >= 5
         ):
             return
         try:
@@ -11165,6 +12854,25 @@ def attach_hud_mute_tooltip(widget, hud_win):
             tw.config(bg="#334155", padx=1, pady=1)
             inner = tk.Frame(tw, bg="#141820", padx=12, pady=8)
             inner.pack(fill="both", expand=True)
+
+            if consecutive_api_failures > 0 or api_disconnect_alerted:
+                err_snip = str(
+                    getattr(active_adapter, "last_error", "")
+                    or "Network / socket timeout"
+                )[:70]
+                conn_txt = (
+                    f"📡 CONNECTION LOST: Auto-reconnecting (Attempt #{max(1, consecutive_api_failures)})  ·  "
+                    f"Last Error: {err_snip}"
+                )
+                tk.Label(
+                    inner,
+                    text=conn_txt,
+                    font=("Arial", 9, "bold"),
+                    fg="#fca5a5" if consecutive_api_failures >= 2 else "#fde68a",
+                    bg="#141820",
+                    justify="left",
+                    anchor="w",
+                ).pack(fill="x", pady=(0, 4))
 
             if alarm_active:
                 al_txt = (
@@ -11205,6 +12913,37 @@ def attach_hud_mute_tooltip(widget, hud_win):
                 justify="left",
                 anchor="w",
             ).pack(fill="x")
+
+            cur_s, req_l, next_s, full_s, is_en = get_loss_streak_status()
+            if is_en or cur_s > 0:
+                min_mag = abs(float(config.get("consec_loss_min_dollars", 25.0)))
+                min_win_rst = abs(
+                    float(config.get("consec_win_reset_dollars", 10.0))
+                )
+                win_m = float(config.get("consec_loss_window_mins", 15.0))
+                if cur_s > 0:
+                    st_txt = (
+                        f"⏱ Loss Streak: {cur_s} / {req_l}  "
+                        f"(Next -1 in {_format_countdown_mm_ss(next_s)}  ·  "
+                        f"Full clear in {_format_countdown_mm_ss(full_s)}  ·  "
+                        f"Min loss -${min_mag:,.0f} / Win reset +${min_win_rst:,.0f}  ·  🔒 Tamper-Locked)"
+                    )
+                    st_col = "#fca5a5" if cur_s >= (req_l - 1) else "#fbbf24"
+                else:
+                    st_txt = (
+                        f"⏱ Loss Streak: 0 / {req_l} (CLEAR)  ·  "
+                        f"Window: {win_m:g}m  ·  Min Loss: -${min_mag:,.0f} (Win Reset: +${min_win_rst:,.0f})"
+                    )
+                    st_col = "#a3e4d7"
+                tk.Label(
+                    inner,
+                    text=st_txt,
+                    font=("Arial", 8, "bold"),
+                    fg=st_col,
+                    bg="#141820",
+                    justify="left",
+                    anchor="w",
+                ).pack(fill="x", pady=(3, 0))
 
             r_mode = (
                 "Regular Hours (9:30 AM – 4:00 PM ET)"
@@ -11402,6 +13141,52 @@ def start_gui():
     mute_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
     attach_hud_mute_tooltip(mute_btn, root)
 
+    def _tick_loss_streak_hud():
+        """Updates the live Loss Streak countdown timer on the HUD at 200ms
+        resolution when a streak is active (eliminating 1s phase-drift jitter)
+        and saves session state if a loss timestamp ages out."""
+        try:
+            if not root.winfo_exists():
+                return
+            if consecutive_api_failures == 0 and not api_disconnect_alerted:
+                prev_cnt = len(recent_loss_timestamps)
+                active_cols = get_active_hud_columns(config)
+                if (
+                    prev_cnt > 0
+                    or "loss_streak" in active_cols
+                    or acct_badge_mode == 1
+                ):
+                    st_txt, st_bg = format_loss_streak_multiline()
+                    disp_bg = "#262a2e" if st_bg in ("#2c3e50", "#1f538d") else st_bg
+                    for idx, cid in enumerate(active_cols):
+                        if cid == "loss_streak" and idx < len(hud_ui_labels):
+                            if (
+                                hud_ui_labels[idx].cget("text") != st_txt
+                                or hud_ui_labels[idx].cget("bg") != disp_bg
+                            ):
+                                hud_ui_labels[idx].config(text=st_txt, bg=disp_bg)
+                    if acct_badge_mode == 1:
+                        refresh_acct_badge()
+                    if (
+                        not alarm_active
+                        and not cooldown_active
+                        and config.get("enable_consec_loss_cooldown", False)
+                    ):
+                        new_idle = get_idle_button_text()
+                        if getattr(mute_btn, "_text", "") != new_idle:
+                            mute_btn.config(text=new_idle)
+                    if len(recent_loss_timestamps) != prev_cnt:
+                        save_session_state()
+        except Exception:
+            pass
+        try:
+            next_ms = 200 if len(recent_loss_timestamps) > 0 else 1000
+            root.after(next_ms, _tick_loss_streak_hud)
+        except Exception:
+            pass
+
+    root.after(200, _tick_loss_streak_hud)
+
     threading.Thread(
         target=data_loop,
         args=(ui_labels, mute_btn, settings_btn, close_btn, root),
@@ -11475,66 +13260,102 @@ def _fetch_remote_doc_bytes(doc_name, ts=None):
 
 def _insert_formatted_changelog(txt_box, markdown_text):
     """Renders Markdown release notes into a tk.Text widget with rich typography,
-    comfortable line spacing, hanging bullet indents, and color-coded highlights."""
+    comfortable line spacing, highlighted Quick Summary blocks, clickable
+    collapsible version headers & Detailed Breakdown sections, and version marks."""
     txt_box.config(
-        font=("Arial", 10),
+        font=("Segoe UI", 10),
         fg="#e5e8e8",
         bg="#0e131a",
-        padx=16,
-        pady=12,
+        padx=18,
+        pady=14,
     )
     txt_box.tag_configure(
         "doc_title",
-        font=("Arial", 13, "bold"),
+        font=("Segoe UI", 13, "bold"),
         foreground="#ffffff",
         spacing1=2,
         spacing3=4,
     )
     txt_box.tag_configure(
         "doc_sub",
-        font=("Arial", 10),
+        font=("Segoe UI", 10),
         foreground="#94a3b8",
         spacing1=0,
-        spacing3=8,
+        spacing3=10,
     )
     txt_box.tag_configure(
         "ver_hdr",
-        font=("Arial", 11, "bold"),
+        font=("Segoe UI", 11, "bold"),
         foreground="#00e676",
         background="#142b23",
         spacing1=10,
         spacing3=6,
     )
     txt_box.tag_configure(
-        "sec_hdr",
-        font=("Arial", 10, "bold"),
-        foreground="#38bdf8",
+        "ver_hdr_hint",
+        font=("Segoe UI", 9, "bold"),
+        foreground="#6ee7b7",
+        background="#142b23",
+    )
+    txt_box.tag_configure(
+        "qsum_hdr",
+        font=("Segoe UI", 10, "bold"),
+        foreground="#fbbf24",
         spacing1=6,
-        spacing3=3,
+        spacing3=4,
+    )
+    txt_box.tag_configure(
+        "qsum_bullet",
+        font=("Segoe UI", 10),
+        foreground="#f8fafc",
+        background="#131d2b",
+        lmargin1=10,
+        lmargin2=28,
+        rmargin=10,
+        spacing1=4,
+        spacing2=2,
+        spacing3=4,
+    )
+    txt_box.tag_configure(
+        "qsum_marker",
+        font=("Segoe UI", 10, "bold"),
+        foreground="#34d399",
+    )
+    txt_box.tag_configure(
+        "sec_hdr",
+        font=("Segoe UI", 10, "bold"),
+        foreground="#38bdf8",
+        spacing1=10,
+        spacing3=4,
+    )
+    txt_box.tag_configure(
+        "sec_hdr_hint",
+        font=("Segoe UI", 8, "bold"),
+        foreground="#64748b",
     )
     txt_box.tag_configure(
         "bullet_1",
-        font=("Arial", 10),
+        font=("Segoe UI", 10),
         foreground="#e5e8e8",
-        lmargin1=8,
-        lmargin2=24,
-        spacing1=5,
+        lmargin1=10,
+        lmargin2=26,
+        spacing1=6,
         spacing2=3,
-        spacing3=3,
+        spacing3=4,
     )
     txt_box.tag_configure(
         "bullet_2",
-        font=("Arial", 10),
-        foreground="#d0d7de",
-        lmargin1=28,
-        lmargin2=44,
+        font=("Segoe UI", 10),
+        foreground="#cbd5e1",
+        lmargin1=30,
+        lmargin2=46,
         spacing1=3,
         spacing2=2,
         spacing3=3,
     )
     txt_box.tag_configure(
         "body_line",
-        font=("Arial", 10),
+        font=("Segoe UI", 10),
         foreground="#e5e8e8",
         spacing1=3,
         spacing2=2,
@@ -11542,12 +13363,12 @@ def _insert_formatted_changelog(txt_box, markdown_text):
     )
     txt_box.tag_configure(
         "bold_lead",
-        font=("Arial", 10, "bold"),
+        font=("Segoe UI", 10, "bold"),
         foreground="#ffd166",
     )
     txt_box.tag_configure(
         "bold_inline",
-        font=("Arial", 10, "bold"),
+        font=("Segoe UI", 10, "bold"),
         foreground="#ffffff",
     )
     txt_box.tag_configure(
@@ -11557,18 +13378,32 @@ def _insert_formatted_changelog(txt_box, markdown_text):
     )
     txt_box.tag_configure(
         "italic_span",
-        font=("Arial", 10, "italic"),
+        font=("Segoe UI", 10, "italic"),
         foreground="#a3e4d7",
     )
     txt_box.tag_configure(
         "hr_div",
-        font=("Arial", 7),
+        font=("Segoe UI", 8),
         foreground="#243040",
-        spacing1=6,
-        spacing3=4,
+        spacing1=8,
+        spacing3=6,
     )
 
+    versions = []
+    curr_ver_idx = None
+    in_quick_summary = False
+    in_detailed_breakdown = False
+
+    def _active_scope_tags():
+        tags = []
+        if curr_ver_idx is not None:
+            tags.append(f"ver_body_{curr_ver_idx}")
+            if in_detailed_breakdown:
+                tags.append(f"det_body_{curr_ver_idx}")
+        return tuple(tags)
+
     def _insert_rich_spans(text_line, base_tag):
+        scope_tags = _active_scope_tags()
         parts = re.split(r"(\*\*.*?\*\*|`[^`]+`|\*\"[^\"]+\"\*)", text_line)
         first_bold_seen = False
         for part in parts:
@@ -11578,39 +13413,506 @@ def _insert_formatted_changelog(txt_box, markdown_text):
                 inner = part[2:-2].replace("`", "")
                 b_tag = "bold_lead" if not first_bold_seen else "bold_inline"
                 first_bold_seen = True
-                txt_box.insert("end", inner, (base_tag, b_tag))
+                txt_box.insert("end", inner, (base_tag, b_tag) + scope_tags)
             elif part.startswith("`") and part.endswith("`") and len(part) > 2:
-                txt_box.insert("end", part[1:-1], (base_tag, "code_span"))
+                txt_box.insert("end", part[1:-1], (base_tag, "code_span") + scope_tags)
             elif part.startswith('*"') and part.endswith('"*') and len(part) > 4:
-                txt_box.insert("end", part[1:-1], (base_tag, "italic_span"))
+                txt_box.insert("end", part[1:-1], (base_tag, "italic_span") + scope_tags)
             else:
-                txt_box.insert("end", part, (base_tag,))
-        txt_box.insert("end", "\n", (base_tag,))
+                txt_box.insert("end", part, (base_tag,) + scope_tags)
+        txt_box.insert("end", "\n", (base_tag,) + scope_tags)
+
+    def _format_ver_hdr_line(ver_label, collapsed):
+        arrow = "▶" if collapsed else "▼"
+        hint = "[Click to Expand]" if collapsed else "[Click to Collapse]"
+        pad_len = max(4, 62 - len(ver_label))
+        return f"  {arrow}  {ver_label}" + (" " * pad_len), f"{hint}  \n"
+
+    def _format_det_hdr_line(sec_title, collapsed):
+        arrow = "▸" if collapsed else "▼"
+        hint = "  [Click to Show Details]" if collapsed else "  [Click to Hide Details]"
+        return f"{arrow} {sec_title}", f"{hint}\n"
 
     for raw_ln in str(markdown_text or "").splitlines():
         stripped = raw_ln.strip()
         if not stripped:
             continue
         if stripped.startswith("# "):
-            txt_box.insert("end", stripped[2:].strip() + "\n", ("doc_title",))
+            in_quick_summary = False
+            in_detailed_breakdown = False
+            txt_box.insert(
+                "end",
+                stripped[2:].strip() + "\n",
+                ("doc_title",) + _active_scope_tags(),
+            )
         elif stripped.startswith("## "):
+            in_quick_summary = False
+            in_detailed_breakdown = False
             ver_txt = stripped[3:].strip().replace("[", "").replace("]", "")
-            txt_box.insert("end", f"  {ver_txt}  \n", ("ver_hdr",))
+            v_idx = len(versions)
+            curr_ver_idx = v_idx
+            mark_name = f"ver_mark_{v_idx}"
+            hdr_tag = f"ver_hdr_{v_idx}"
+            body_tag = f"ver_body_{v_idx}"
+            det_tag = f"det_body_{v_idx}"
+            txt_box.mark_set(mark_name, "end-1c")
+            txt_box.mark_gravity(mark_name, "left")
+            main_part, hint_part = _format_ver_hdr_line(ver_txt, False)
+            txt_box.insert("end", main_part, ("ver_hdr", hdr_tag))
+            txt_box.insert("end", hint_part, ("ver_hdr", "ver_hdr_hint", hdr_tag))
+            short_m = re.match(r"^(v?\d+\.\d+(?:\.\d+)?)", ver_txt)
+            short_ver = short_m.group(1) if short_m else ver_txt[:12]
+            versions.append({
+                "idx": v_idx,
+                "label": ver_txt,
+                "short": short_ver,
+                "mark": mark_name,
+                "hdr_tag": hdr_tag,
+                "body_tag": body_tag,
+                "det_hdr_tag": f"det_hdr_{v_idx}",
+                "det_tag": det_tag,
+                "det_title": "🔍 DETAILED BREAKDOWN",
+                "collapsed": False,
+                "details_collapsed": False,
+            })
         elif stripped.startswith("### "):
-            sec_txt = stripped[4:].strip().upper()
-            txt_box.insert("end", f"▸ {sec_txt}\n", ("sec_hdr",))
+            sec_raw = stripped[4:].strip()
+            sec_upper = sec_raw.upper()
+            if "SUMMARY" in sec_upper or "HIGHLIGHT" in sec_upper:
+                in_quick_summary = True
+                in_detailed_breakdown = False
+                scope_t = (f"ver_body_{curr_ver_idx}",) if curr_ver_idx is not None else ()
+                txt_box.insert(
+                    "end",
+                    f"⚡ {sec_upper.lstrip('⚡').strip()}\n",
+                    ("qsum_hdr",) + scope_t,
+                )
+            else:
+                in_quick_summary = False
+                in_detailed_breakdown = True
+                clean_title = sec_upper
+                if curr_ver_idx is not None:
+                    v_info = versions[curr_ver_idx]
+                    v_info["det_title"] = clean_title
+                    d_hdr_tag = v_info["det_hdr_tag"]
+                    scope_t = (v_info["body_tag"],)
+                    m_part, h_part = _format_det_hdr_line(clean_title, False)
+                    txt_box.insert("end", m_part, ("sec_hdr", d_hdr_tag) + scope_t)
+                    txt_box.insert("end", h_part, ("sec_hdr", "sec_hdr_hint", d_hdr_tag) + scope_t)
+                else:
+                    txt_box.insert("end", f"▸ {clean_title}\n", ("sec_hdr",))
         elif stripped.startswith("---"):
-            txt_box.insert("end", "─" * 78 + "\n", ("hr_div",))
+            in_quick_summary = False
+            in_detailed_breakdown = False
+            scope_t = (f"ver_body_{curr_ver_idx}",) if curr_ver_idx is not None else ()
+            txt_box.insert("end", "─" * 82 + "\n", ("hr_div",) + scope_t)
         elif raw_ln.startswith("  - ") or raw_ln.startswith("    - "):
-            txt_box.insert("end", "◦  ", ("bullet_2", "bold_inline"))
+            txt_box.insert("end", "◦  ", ("bullet_2", "bold_inline") + _active_scope_tags())
             _insert_rich_spans(stripped[2:].strip(), "bullet_2")
         elif stripped.startswith("- "):
-            txt_box.insert("end", "•  ", ("bullet_1", "bold_lead"))
-            _insert_rich_spans(stripped[2:].strip(), "bullet_1")
+            if in_quick_summary:
+                txt_box.insert("end", "✦  ", ("qsum_bullet", "qsum_marker") + _active_scope_tags())
+                _insert_rich_spans(stripped[2:].strip(), "qsum_bullet")
+            else:
+                txt_box.insert("end", "•  ", ("bullet_1", "bold_lead") + _active_scope_tags())
+                _insert_rich_spans(stripped[2:].strip(), "bullet_1")
         elif stripped.startswith("All notable updates"):
             txt_box.insert("end", stripped + "\n", ("doc_sub",))
         else:
             _insert_rich_spans(stripped, "body_line")
+
+    def _set_version_collapsed(v_idx, collapsed_state):
+        if v_idx < 0 or v_idx >= len(versions):
+            return
+        v_info = versions[v_idx]
+        v_info["collapsed"] = bool(collapsed_state)
+        hdr_tag = v_info["hdr_tag"]
+        ranges = txt_box.tag_ranges(hdr_tag)
+        if len(ranges) >= 2:
+            prev_state = str(txt_box.cget("state"))
+            txt_box.config(state="normal")
+            start_pos = ranges[0]
+            end_pos = ranges[-1]
+            txt_box.delete(start_pos, end_pos)
+            m_part, h_part = _format_ver_hdr_line(v_info["label"], v_info["collapsed"])
+            txt_box.insert(start_pos, m_part, ("ver_hdr", hdr_tag))
+            txt_box.insert(
+                f"{start_pos} + {len(m_part)}c",
+                h_part,
+                ("ver_hdr", "ver_hdr_hint", hdr_tag),
+            )
+            txt_box.config(state=prev_state)
+        txt_box.tag_configure(v_info["body_tag"], elide=bool(v_info["collapsed"]))
+        if v_info["collapsed"]:
+            txt_box.tag_configure(v_info["det_tag"], elide=True)
+        else:
+            txt_box.tag_configure(
+                v_info["det_tag"], elide=bool(v_info["details_collapsed"])
+            )
+
+    def _set_details_collapsed(v_idx, det_collapsed_state):
+        if v_idx < 0 or v_idx >= len(versions):
+            return
+        v_info = versions[v_idx]
+        v_info["details_collapsed"] = bool(det_collapsed_state)
+        d_hdr_tag = v_info["det_hdr_tag"]
+        ranges = txt_box.tag_ranges(d_hdr_tag)
+        if len(ranges) >= 2:
+            prev_state = str(txt_box.cget("state"))
+            txt_box.config(state="normal")
+            start_pos = ranges[0]
+            end_pos = ranges[-1]
+            txt_box.delete(start_pos, end_pos)
+            m_part, h_part = _format_det_hdr_line(
+                v_info["det_title"], v_info["details_collapsed"]
+            )
+            scope_t = (v_info["body_tag"],)
+            txt_box.insert(start_pos, m_part, ("sec_hdr", d_hdr_tag) + scope_t)
+            txt_box.insert(
+                f"{start_pos} + {len(m_part)}c",
+                h_part,
+                ("sec_hdr", "sec_hdr_hint", d_hdr_tag) + scope_t,
+            )
+            txt_box.config(state=prev_state)
+        if not v_info["collapsed"]:
+            txt_box.tag_configure(
+                v_info["det_tag"], elide=bool(v_info["details_collapsed"])
+            )
+
+    for v_info in versions:
+        idx_val = v_info["idx"]
+        h_tag = v_info["hdr_tag"]
+        d_tag = v_info["det_hdr_tag"]
+        txt_box.tag_bind(
+            h_tag,
+            "<Button-1>",
+            lambda _e, i=idx_val: _set_version_collapsed(
+                i, not versions[i]["collapsed"]
+            ),
+        )
+        txt_box.tag_bind(
+            h_tag, "<Enter>", lambda _e: txt_box.config(cursor="hand2")
+        )
+        txt_box.tag_bind(
+            h_tag, "<Leave>", lambda _e: txt_box.config(cursor="")
+        )
+        txt_box.tag_bind(
+            d_tag,
+            "<Button-1>",
+            lambda _e, i=idx_val: _set_details_collapsed(
+                i, not versions[i]["details_collapsed"]
+            ),
+        )
+        txt_box.tag_bind(
+            d_tag, "<Enter>", lambda _e: txt_box.config(cursor="hand2")
+        )
+        txt_box.tag_bind(
+            d_tag, "<Leave>", lambda _e: txt_box.config(cursor="")
+        )
+
+    def _jump_to_index(v_idx):
+        if not versions:
+            return 0
+        v_idx = max(0, min(len(versions) - 1, int(v_idx)))
+        if versions[v_idx]["collapsed"]:
+            _set_version_collapsed(v_idx, False)
+        ranges = txt_box.tag_ranges(versions[v_idx]["hdr_tag"])
+        if ranges:
+            txt_box.see(ranges[0])
+            txt_box.yview(ranges[0])
+        else:
+            txt_box.yview(versions[v_idx]["mark"])
+        return v_idx
+
+    def _set_all_versions_collapsed(collapsed_bool):
+        for i in range(len(versions)):
+            _set_version_collapsed(i, collapsed_bool)
+
+    def _set_all_details_collapsed(collapsed_bool):
+        for i in range(len(versions)):
+            if collapsed_bool and versions[i]["collapsed"]:
+                _set_version_collapsed(i, False)
+            _set_details_collapsed(i, collapsed_bool)
+
+    return {
+        "versions": versions,
+        "jump_to_index": _jump_to_index,
+        "set_version_collapsed": _set_version_collapsed,
+        "set_details_collapsed": _set_details_collapsed,
+        "set_all_versions_collapsed": _set_all_versions_collapsed,
+        "set_all_details_collapsed": _set_all_details_collapsed,
+    }
+
+
+def _build_changelog_nav_bar(parent_card, txt_box, nav_ctrl):
+    """Builds a compact interactive version-jumping and collapse/expand toolbar
+    above the Release Notes text box."""
+    versions = nav_ctrl.get("versions", []) if isinstance(nav_ctrl, dict) else []
+    if not versions:
+        return None
+
+    nav_state = {
+        "cur_idx": 0,
+        "summaries_only": False,
+        "all_collapsed": False,
+        "popup": None,
+    }
+
+    nav_bar = tk.Frame(
+        parent_card,
+        bg="#0f151e",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#222d3d",
+        padx=8,
+        pady=5,
+    )
+    nav_bar.pack(fill="x", pady=(0, 6))
+
+    tk.Label(
+        nav_bar,
+        text="Release:",
+        font=("Arial", 8, "bold"),
+        fg="#94a3b8",
+        bg="#0f151e",
+    ).pack(side="left", padx=(2, 4))
+
+    def _close_ver_popup():
+        pop = nav_state.get("popup")
+        nav_state["popup"] = None
+        if pop is not None:
+            try:
+                pop.destroy()
+            except Exception:
+                pass
+
+    def _select_version(idx):
+        _close_ver_popup()
+        actual_idx = nav_ctrl["jump_to_index"](idx)
+        nav_state["cur_idx"] = actual_idx
+        ver_pick_btn.config(text=f"{versions[actual_idx]['label']}  ▾")
+
+    def _open_version_picker():
+        if nav_state.get("popup") is not None:
+            _close_ver_popup()
+            return
+        pop = tk.Toplevel(parent_card.winfo_toplevel())
+        pop.wm_overrideredirect(True)
+        pop.attributes("-topmost", True)
+        pop.config(bg="#38bdf8", padx=1, pady=1)
+        nav_state["popup"] = pop
+
+        list_frame = tk.Frame(pop, bg="#111722")
+        list_frame.pack(fill="both", expand=True)
+
+        vis_rows = min(12, len(versions))
+        lb_sb = tk.Scrollbar(list_frame)
+        lb_sb.pack(side="right", fill="y")
+        lb = tk.Listbox(
+            list_frame,
+            height=vis_rows,
+            width=26,
+            bg="#111722",
+            fg="#e2e8f0",
+            selectbackground="#1e3a5f",
+            selectforeground="#38bdf8",
+            font=("Segoe UI", 9, "bold"),
+            bd=0,
+            highlightthickness=0,
+            activestyle="none",
+            yscrollcommand=lb_sb.set,
+            cursor="hand2",
+        )
+        lb.pack(side="left", fill="both", expand=True, padx=2, pady=2)
+        lb_sb.config(command=lb.yview)
+
+        for v_item in versions:
+            lb.insert("end", f"  {v_item['label']}")
+        lb.selection_set(nav_state["cur_idx"])
+        lb.see(nav_state["cur_idx"])
+
+        def _on_lb_click(_evt=None):
+            sel = lb.curselection()
+            if sel:
+                _select_version(int(sel[0]))
+
+        lb.bind("<ButtonRelease-1>", _on_lb_click)
+        lb.bind("<Return>", _on_lb_click)
+        pop.bind("<Escape>", lambda _e: _close_ver_popup())
+        pop.bind("<FocusOut>", lambda _e: _close_ver_popup())
+
+        pop.update_idletasks()
+        bx = ver_pick_btn.winfo_rootx()
+        by = ver_pick_btn.winfo_rooty() + ver_pick_btn.winfo_height() + 2
+        pop.wm_geometry(f"+{int(bx)}+{int(by)}")
+        pop.lift()
+        try:
+            lb.focus_set()
+        except Exception:
+            pass
+
+    ver_pick_btn = make_stadium_button(
+        nav_bar,
+        text=f"{versions[0]['label']}  ▾",
+        font=("Arial", 8, "bold"),
+        fill_color="#141e2c",
+        fill_top_color="#1c2a3d",
+        border_color="#2e4766",
+        hover_fill="#1b2b3f",
+        hover_fill_top="#243852",
+        hover_border="#38bdf8",
+        fg="#7dd3fc",
+        hover_fg="#ffffff",
+        canvas_bg="#0f151e",
+        width=174,
+        height=24,
+        auto_width=True,
+        pad_x=14,
+        command=_open_version_picker,
+    )
+    ver_pick_btn.pack(side="left", padx=(0, 4))
+
+    def _detect_visible_version_index():
+        """Finds whichever version header is currently at or just above the top
+        of the viewport so Prev/Next works naturally even after manual scrolling."""
+        try:
+            top_idx = txt_box.index("@0,8")
+            best_i = 0
+            for v_item in versions:
+                ranges = txt_box.tag_ranges(v_item["hdr_tag"])
+                if ranges and txt_box.compare(ranges[0], "<=", top_idx):
+                    best_i = v_item["idx"]
+            return best_i
+        except Exception:
+            return nav_state["cur_idx"]
+
+    def _step_version(delta):
+        base_i = _detect_visible_version_index()
+        if base_i != nav_state["cur_idx"] and delta > 0:
+            target_i = max(0, min(len(versions) - 1, base_i + delta))
+        else:
+            target_i = max(0, min(len(versions) - 1, nav_state["cur_idx"] + delta))
+        _select_version(target_i)
+
+    make_stadium_button(
+        nav_bar,
+        text="▲ Newer",
+        font=("Arial", 8, "bold"),
+        fill_color="#141820",
+        border_color="#334155",
+        hover_fill="#1e2633",
+        hover_border="#64748b",
+        fg="#cbd5e1",
+        hover_fg="#ffffff",
+        canvas_bg="#0f151e",
+        width=68,
+        height=24,
+        auto_width=True,
+        pad_x=12,
+        command=lambda: _step_version(-1),
+    ).pack(side="left", padx=(0, 3))
+
+    make_stadium_button(
+        nav_bar,
+        text="▼ Older",
+        font=("Arial", 8, "bold"),
+        fill_color="#141820",
+        border_color="#334155",
+        hover_fill="#1e2633",
+        hover_border="#64748b",
+        fg="#cbd5e1",
+        hover_fg="#ffffff",
+        canvas_bg="#0f151e",
+        width=68,
+        height=24,
+        auto_width=True,
+        pad_x=12,
+        command=lambda: _step_version(1),
+    ).pack(side="left", padx=(0, 6))
+
+    def _toggle_collapse_all():
+        _close_ver_popup()
+        nav_state["all_collapsed"] = not nav_state["all_collapsed"]
+        nav_ctrl["set_all_versions_collapsed"](nav_state["all_collapsed"])
+        if nav_state["all_collapsed"]:
+            collapse_all_btn.config(
+                text="▼ Expand All Releases",
+                fg="#6ee7b7",
+                border_color="#059669",
+            )
+            txt_box.see("1.0")
+        else:
+            collapse_all_btn.config(
+                text="▶ Collapse All Releases",
+                fg="#cbd5e1",
+                border_color="#334155",
+            )
+
+    collapse_all_btn = make_stadium_button(
+        nav_bar,
+        text="▶ Collapse All Releases",
+        font=("Arial", 8, "bold"),
+        fill_color="#141820",
+        border_color="#334155",
+        hover_fill="#1e2633",
+        hover_border="#64748b",
+        fg="#cbd5e1",
+        hover_fg="#ffffff",
+        canvas_bg="#0f151e",
+        width=136,
+        height=24,
+        auto_width=True,
+        pad_x=12,
+        command=_toggle_collapse_all,
+    )
+    collapse_all_btn.pack(side="right", padx=(3, 0))
+
+    def _toggle_summaries_only():
+        _close_ver_popup()
+        nav_state["summaries_only"] = not nav_state["summaries_only"]
+        if nav_state["summaries_only"] and nav_state["all_collapsed"]:
+            nav_state["all_collapsed"] = False
+            collapse_all_btn.config(
+                text="▶ Collapse All Releases",
+                fg="#cbd5e1",
+                border_color="#334155",
+            )
+        nav_ctrl["set_all_details_collapsed"](nav_state["summaries_only"])
+        if nav_state["summaries_only"]:
+            sum_only_btn.config(
+                text="⚡ Summaries Only: ON",
+                fill_color="#2a2110",
+                border_color="#f59e0b",
+                fg="#fde68a",
+            )
+        else:
+            sum_only_btn.config(
+                text="⚡ Summaries Only",
+                fill_color="#141820",
+                border_color="#334155",
+                fg="#fbbf24",
+            )
+
+    sum_only_btn = make_stadium_button(
+        nav_bar,
+        text="⚡ Summaries Only",
+        font=("Arial", 8, "bold"),
+        fill_color="#141820",
+        border_color="#334155",
+        hover_fill="#262014",
+        hover_border="#fbbf24",
+        fg="#fbbf24",
+        hover_fg="#fde68a",
+        canvas_bg="#0f151e",
+        width=118,
+        height=24,
+        auto_width=True,
+        pad_x=12,
+        command=_toggle_summaries_only,
+    )
+    sum_only_btn.pack(side="right", padx=(0, 3))
+
+    return nav_bar
 
 
 def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
@@ -11747,6 +14049,9 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
             anchor="w",
         ).pack(fill="x", pady=(0, 6))
 
+        nav_holder = tk.Frame(card, bg="#131922")
+        nav_holder.pack(fill="x")
+
         txt_frame = tk.Frame(
             card,
             bg="#0e131a",
@@ -11780,7 +14085,9 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
                 f"PnL Enforcer Beta v{new_ver} is ready to install.\n\n"
                 f"Click 'Open Full Changelog ↗' above to view full release notes."
             )
-        _insert_formatted_changelog(txt_box, display_notes)
+        nav_ctrl = _insert_formatted_changelog(txt_box, display_notes)
+        if len(nav_ctrl.get("versions", [])) > 1:
+            _build_changelog_nav_bar(nav_holder, txt_box, nav_ctrl)
         txt_box.see("1.0")
         txt_box.config(state="disabled")
 
@@ -11832,7 +14139,7 @@ def show_release_notes_dialog(parent=None):
     win.resizable(True, True)
     win.attributes("-topmost", True)
 
-    w, h = 790, 570
+    w, h = 820, 600
     sw = win.winfo_screenwidth()
     sh = win.winfo_screenheight()
     x = max(20, (sw - w) // 2)
@@ -11870,6 +14177,15 @@ def show_release_notes_dialog(parent=None):
     btn_bar = tk.Frame(win, bg="#0d1117", pady=10)
     btn_bar.pack(fill="x", side="bottom")
 
+    tk.Label(
+        btn_bar,
+        text="💡 Click any green version header or 'Detailed Breakdown' to collapse/expand, or jump via the Release bar above.",
+        font=("Arial", 8),
+        fg="#64748b",
+        bg="#0d1117",
+        anchor="w",
+    ).pack(side="left")
+
     make_stadium_button(
         btn_bar,
         text="Close",
@@ -11901,6 +14217,9 @@ def show_release_notes_dialog(parent=None):
     card = tk.Frame(card_outer, bg="#131922", padx=12, pady=10)
     card.pack(side="left", fill="both", expand=True)
 
+    nav_holder = tk.Frame(card, bg="#131922")
+    nav_holder.pack(fill="x")
+
     txt_frame = tk.Frame(
         card,
         bg="#0e131a",
@@ -11928,7 +14247,8 @@ def show_release_notes_dialog(parent=None):
     txt_box.pack(side="left", fill="both", expand=True)
     sb.config(command=txt_box.yview)
 
-    _insert_formatted_changelog(txt_box, cl_text.strip())
+    nav_ctrl = _insert_formatted_changelog(txt_box, cl_text.strip())
+    _build_changelog_nav_bar(nav_holder, txt_box, nav_ctrl)
     txt_box.see("1.0")
     txt_box.config(state="disabled")
 

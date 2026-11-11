@@ -60,11 +60,13 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
 ---
 
 ## Step 3: Quick Guide to Pre-Flight Settings & the Live HUD
-* **Card 1 — Single-Trade Stop (`Open PnL`):** Flattens open equity shares (and RTH option contracts if the **BETA Options Auto-Flatten** toggle in Card 2 is enabled) if a single trade goes against you by your configured dollar limit, with an optional short **Penalty Box OS Lock** cooldown, without ending your trading day.
+* **Card 1 — Trade & Tilt Stops (`Intraday Penalty Box`):**
+  * **Single-Trade Stop (`Open PnL`):** Flattens open equity shares (and RTH option contracts if the **BETA Options Auto-Flatten** toggle in Card 2 is enabled) if a single trade goes against you by your configured dollar limit, without ending your trading day.
+  * **Consecutive Loss Cooldown (`Tilt Streak Stop`):** If you close **`X` consecutive losing trades** (each at or beyond your **`Min Loss ($)`** micro-scratch threshold, e.g. `-$25`) within **`Y` minutes** (`In (Mins)`), Enforcer cancels working orders, confirms flat, and triggers the **Penalty Box OS Lock Cooldown** so you can reset mentally before revenge-trading. While an active streak is underway (`1/X` or higher), your cooldown settings automatically switch to **`🔒 LOCKED`** so they cannot be weakened mid-streak. Closing a qualifying winning trade (`>= +Win Reset $`, e.g. `+$10`) or letting the rolling window expire automatically resets your streak to `0`.
 * **Card 2 — Daily Stop Actions (`Max Loss & Profit Lock`):** Controls what happens when your Net PnL hits your active Daily Stop in Card 4 or Card 5 (Auto-Flatten Equities, optional **`└─ Include Options in Auto-Flatten (BETA — RTH Market Orders)`**, Kill Thinkorswim / Webull Desktop once confirmed 100% flat, and Lock Windows OS for your cooldown timer).
   * **💡 `Alarms Only Mode`:** Check **`Alarms Only Mode`** in Card 2 to disable all automated flattening (both Equities and Options), app kills, and OS locks while keeping all HUD tracking and warning sirens active.
 * **Card 3 — Session Baselines & Audio Preview:**
-  * **Daily Baseline Persistence:** Your starting baseline is saved per account for the entire trading day (marked `(Preserved)` in Card 3 if you close and relaunch the app mid-day). You can also check **Re-Zero Today's Starting Baseline to Current Equity** if you ever intentionally want to reset your daily PnL to `$0.00` mid-session.
+  * **Daily Baseline Persistence & `↺ Re-Zero Baseline` Pill:** Your starting baseline is saved per account for the entire trading day (marked `(Preserved)` in Card 3 if you close and relaunch the app mid-day). Click the **`↺ Re-Zero Baseline`** pill button in the top-right of Card 3 (changing to **`✓ Re-Zero Armed`**) if you ever intentionally want to reset your daily PnL and W/L counter to `$0.00` mid-session.
   * **Start Fresh on Rulebook Switch:** Automatically snapshots a fresh starting baseline at **9:30 AM ET** (Regular Hours) and **4:00 PM ET** (After-Hours) if you are flat. Uncheck this if you want Pre-Market PnL to carry into your Regular Hours total.
   * **Audio Tester (`🔊 Test`):** Preview your Warning Siren, Chimes, and Lockout Voice cues at your current speaker volume.
 * **Cards 4 & 5 — Extended Hours vs. Regular Hours (`9:30 AM – 4:00 PM ET`) Rulebooks:**
@@ -72,7 +74,7 @@ Your API keys stay 100% local on your computer inside `C:\Users\<YourUsername>\e
   * **Card 5 Profit Ratchet Tiers:** As your realized profit climbs through Tiers 2, 3, and 4 during Regular Hours, your Daily Stop automatically ratchets upward to prevent green-to-red round-trips.
 * **Positioning & Customizing the HUD:**
   * **Move the HUD:** Left-click and drag anywhere on the HUD bar to place it wherever you want on your monitor (coordinates save automatically).
-  * **Customize Columns & Small 3-Col HUD (`📊 HUD Columns`):** Toggle and reorder up to 8 metrics (`REALIZED PnL`, `OPEN PnL`, `NET PnL`, `DAILY STOP`, `$ TO STOP`, `SESSION HIGH`, `FROM HIGH`, and `WIN / LOSS`), or switch in one click between the **Standard 5-Col HUD** (`800x88`) and the compact **Small 3-Col HUD** (`480x88`, featuring a concise `● ARMED` pill with a hover-over configuration tooltip).
+  * **Customize Columns & Small 3-Col HUD (`📊 HUD Columns`):** Toggle and reorder up to 9 metrics (`REALIZED PnL`, `OPEN PnL`, `NET PnL`, `DAILY STOP`, `$ TO STOP`, `SESSION HIGH`, `FROM HIGH`, `TRADES (W/L)`, and `LOSS STREAK` showing e.g. `3 / 5` + live `RST 06:42` countdown), or switch in one click between the **Standard 5-Col HUD** (`800x88`) and the compact **Small 3-Col HUD** (`480x88`, featuring a concise `● ARMED` pill with a hover-over configuration tooltip). Clicking the bottom-left HUD capsule also cycles through `W/L -> STREAK -> FLAT -> BASE`.
   * **Anti-Tamper Lock (`🔒 IN TRADE`):** Whenever you hold an open position, the HUD **`⚙ SETTINGS`** and **`✕`** buttons automatically lock so you cannot disable your stops mid-trade.
 
 ---
