@@ -2859,7 +2859,11 @@ def restore_account_session(broker_name, account_id, log_restore=False):
                 ignored_positions.update(json.loads(json.dumps(saved_ig)))
             prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
             settled_realized_pnl = prev_flat_realized_pnl
-            if win_trades == 0 and loss_trades == 0:
+            if (
+                "win_trades" not in s_data
+                and win_trades == 0
+                and loss_trades == 0
+            ):
                 bw, bl, _ = backfill_trades_from_today_log(broker_name)
                 if bw > 0 or bl > 0:
                     win_trades, loss_trades = bw, bl
@@ -16037,137 +16041,157 @@ def _insert_formatted_changelog(txt_box, markdown_text):
     """Renders Markdown release notes into a tk.Text widget with rich typography,
     comfortable line spacing, highlighted Quick Summary blocks, clickable
     collapsible version headers & Detailed Breakdown sections, and version marks."""
+    body_fam = "Arial"
+    bold_fam = "Arial"
     txt_box.config(
-        font=("Segoe UI", 10),
-        fg="#e5e8e8",
-        bg="#0e131a",
+        font=(body_fam, 10, "bold"),
+        fg="#dce4ee",
+        bg="#151d28",
         padx=18,
         pady=14,
     )
     txt_box.tag_configure(
         "doc_title",
-        font=("Segoe UI", 13, "bold"),
+        font=(bold_fam, 13, "bold"),
         foreground="#ffffff",
         spacing1=2,
         spacing3=4,
     )
     txt_box.tag_configure(
         "doc_sub",
-        font=("Segoe UI", 10),
+        font=(body_fam, 10, "bold"),
         foreground="#94a3b8",
         spacing1=0,
         spacing3=10,
     )
     txt_box.tag_configure(
         "ver_hdr",
-        font=("Segoe UI", 11, "bold"),
+        font=(bold_fam, 11, "bold"),
         foreground="#00e676",
-        background="#142b23",
-        spacing1=10,
-        spacing3=6,
+        background="#142e24",
+        spacing1=12,
+        spacing3=8,
     )
     txt_box.tag_configure(
         "ver_hdr_hint",
-        font=("Segoe UI", 9, "bold"),
+        font=(bold_fam, 9, "bold"),
         foreground="#6ee7b7",
-        background="#142b23",
+        background="#142e24",
     )
     txt_box.tag_configure(
         "qsum_hdr",
-        font=("Segoe UI", 10, "bold"),
+        font=(bold_fam, 10, "bold"),
         foreground="#fbbf24",
-        spacing1=6,
+        spacing1=8,
         spacing3=4,
     )
     txt_box.tag_configure(
         "qsum_bullet",
-        font=("Segoe UI", 10),
-        foreground="#f8fafc",
-        background="#131d2b",
-        lmargin1=10,
+        font=(body_fam, 10, "bold"),
+        foreground="#dce4ee",
+        lmargin1=12,
         lmargin2=28,
-        rmargin=10,
-        spacing1=4,
-        spacing2=2,
-        spacing3=4,
+        rmargin=12,
+        spacing1=6,
+        spacing2=5,
+        spacing3=6,
     )
     txt_box.tag_configure(
         "qsum_marker",
-        font=("Segoe UI", 10, "bold"),
+        font=(bold_fam, 10, "bold"),
         foreground="#34d399",
     )
     txt_box.tag_configure(
         "sec_hdr",
-        font=("Segoe UI", 10, "bold"),
+        font=(bold_fam, 10, "bold"),
         foreground="#38bdf8",
-        spacing1=10,
-        spacing3=4,
+        spacing1=12,
+        spacing3=6,
     )
     txt_box.tag_configure(
         "sec_hdr_hint",
-        font=("Segoe UI", 8, "bold"),
-        foreground="#64748b",
+        font=(bold_fam, 9, "bold"),
+        foreground="#94a3b8",
     )
     txt_box.tag_configure(
         "bullet_1",
-        font=("Segoe UI", 10),
-        foreground="#e5e8e8",
-        lmargin1=10,
-        lmargin2=26,
-        spacing1=6,
-        spacing2=3,
-        spacing3=4,
+        font=(body_fam, 10, "bold"),
+        foreground="#dce4ee",
+        lmargin1=12,
+        lmargin2=28,
+        rmargin=12,
+        spacing1=8,
+        spacing2=5,
+        spacing3=5,
     )
     txt_box.tag_configure(
         "bullet_2",
-        font=("Segoe UI", 10),
+        font=(body_fam, 10, "bold"),
         foreground="#cbd5e1",
         lmargin1=30,
         lmargin2=46,
-        spacing1=3,
-        spacing2=2,
-        spacing3=3,
+        rmargin=12,
+        spacing1=4,
+        spacing2=5,
+        spacing3=5,
     )
     txt_box.tag_configure(
         "body_line",
-        font=("Segoe UI", 10),
-        foreground="#e5e8e8",
-        spacing1=3,
-        spacing2=2,
-        spacing3=3,
+        font=(body_fam, 10, "bold"),
+        foreground="#dce4ee",
+        spacing1=4,
+        spacing2=5,
+        spacing3=5,
     )
     txt_box.tag_configure(
         "bold_lead",
-        font=("Segoe UI", 10, "bold"),
+        font=(bold_fam, 10, "bold"),
         foreground="#ffd166",
     )
     txt_box.tag_configure(
+        "sub_bold_lead",
+        font=(bold_fam, 10, "bold"),
+        foreground="#7dd3fc",
+    )
+    txt_box.tag_configure(
         "bold_inline",
-        font=("Segoe UI", 10, "bold"),
+        font=(bold_fam, 10, "bold"),
         foreground="#ffffff",
     )
     txt_box.tag_configure(
         "code_span",
-        font=("Consolas", 10, "bold"),
-        foreground="#7dd3fc",
+        font=(bold_fam, 10, "bold"),
+        foreground="#67e8f9",
     )
     txt_box.tag_configure(
         "italic_span",
-        font=("Segoe UI", 10, "italic"),
+        font=(body_fam, 10, "bold"),
         foreground="#a3e4d7",
     )
     txt_box.tag_configure(
         "hr_div",
-        font=("Segoe UI", 8),
-        foreground="#243040",
-        spacing1=8,
-        spacing3=6,
+        font=(bold_fam, 8),
+        foreground="#263548",
+        spacing1=10,
+        spacing3=8,
     )
 
     versions = []
     curr_ver_idx = None
     in_quick_summary = False
     in_detailed_breakdown = False
+
+    _EMOJI_STRIP_RE = re.compile(
+        r"[\U0001F300-\U0001FAFF\u2699\uFE0F\u2728\u2705]+"
+    )
+
+    def _clean_tk_text(s):
+        cleaned = _EMOJI_STRIP_RE.sub("", str(s or ""))
+        cleaned = re.sub(r"\(\s*,\s*", "(", cleaned)
+        cleaned = re.sub(r"\(\s+", "(", cleaned)
+        cleaned = re.sub(r"\s+\)", ")", cleaned)
+        cleaned = re.sub(r"\(\s*\)", "", cleaned)
+        return re.sub(r"  +", " ", cleaned)
 
     def _active_scope_tags():
         tags = []
@@ -16179,22 +16203,31 @@ def _insert_formatted_changelog(txt_box, markdown_text):
 
     def _insert_rich_spans(text_line, base_tag):
         scope_tags = _active_scope_tags()
+        text_line = _clean_tk_text(text_line).strip()
         parts = re.split(r"(\*\*.*?\*\*|`[^`]+`|\*\"[^\"]+\"\*)", text_line)
         first_bold_seen = False
+        lead_tag = "sub_bold_lead" if base_tag == "bullet_2" else "bold_lead"
         for part in parts:
             if not part:
                 continue
             if part.startswith("**") and part.endswith("**") and len(part) > 4:
-                inner = part[2:-2].replace("`", "")
-                b_tag = "bold_lead" if not first_bold_seen else "bold_inline"
+                inner = _clean_tk_text(part[2:-2].replace("`", "")).strip()
+                if not inner:
+                    continue
+                b_tag = lead_tag if not first_bold_seen else "bold_inline"
                 first_bold_seen = True
                 txt_box.insert("end", inner, (base_tag, b_tag) + scope_tags)
             elif part.startswith("`") and part.endswith("`") and len(part) > 2:
-                txt_box.insert("end", part[1:-1], (base_tag, "code_span") + scope_tags)
+                inner_code = _clean_tk_text(part[1:-1]).strip()
+                if not inner_code:
+                    continue
+                txt_box.insert("end", inner_code, (base_tag, "code_span") + scope_tags)
             elif part.startswith('*"') and part.endswith('"*') and len(part) > 4:
                 txt_box.insert("end", part[1:-1], (base_tag, "italic_span") + scope_tags)
             else:
-                txt_box.insert("end", part, (base_tag,) + scope_tags)
+                cleaned_part = _clean_tk_text(part)
+                if cleaned_part:
+                    txt_box.insert("end", cleaned_part, (base_tag,) + scope_tags)
         txt_box.insert("end", "\n", (base_tag,) + scope_tags)
 
     def _format_ver_hdr_line(ver_label, collapsed):
@@ -16246,7 +16279,7 @@ def _insert_formatted_changelog(txt_box, markdown_text):
                 "body_tag": body_tag,
                 "det_hdr_tag": f"det_hdr_{v_idx}",
                 "det_tag": det_tag,
-                "det_title": "🔍 DETAILED BREAKDOWN",
+                "det_title": "DETAILED BREAKDOWN",
                 "collapsed": False,
                 "details_collapsed": False,
             })
@@ -16259,13 +16292,13 @@ def _insert_formatted_changelog(txt_box, markdown_text):
                 scope_t = (f"ver_body_{curr_ver_idx}",) if curr_ver_idx is not None else ()
                 txt_box.insert(
                     "end",
-                    f"⚡ {sec_upper.lstrip('⚡').strip()}\n",
+                    f"⚡ {_clean_tk_text(sec_upper.lstrip('⚡'))}\n",
                     ("qsum_hdr",) + scope_t,
                 )
             else:
                 in_quick_summary = False
                 in_detailed_breakdown = True
-                clean_title = sec_upper
+                clean_title = _clean_tk_text(sec_upper)
                 if curr_ver_idx is not None:
                     v_info = versions[curr_ver_idx]
                     v_info["det_title"] = clean_title
@@ -16831,10 +16864,10 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
 
         txt_frame = tk.Frame(
             card,
-            bg="#0e131a",
+            bg="#151d28",
             bd=0,
             highlightthickness=1,
-            highlightbackground="#1e293b",
+            highlightbackground="#263548",
         )
         txt_frame.pack(fill="both", expand=True)
 
@@ -16844,9 +16877,9 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
         txt_box = tk.Text(
             txt_frame,
             height=12,
-            bg="#0e131a",
-            fg="#e5e8e8",
-            font=("Consolas", 9),
+            bg="#151d28",
+            fg="#dce4ee",
+            font=("Arial", 10, "bold"),
             wrap="word",
             bd=0,
             padx=10,
@@ -17016,10 +17049,10 @@ def show_release_notes_dialog(parent=None):
 
     txt_frame = tk.Frame(
         card,
-        bg="#0e131a",
+        bg="#151d28",
         bd=0,
         highlightthickness=1,
-        highlightbackground="#1e293b",
+        highlightbackground="#263548",
     )
     txt_frame.pack(fill="both", expand=True)
 
@@ -17029,9 +17062,9 @@ def show_release_notes_dialog(parent=None):
     txt_box = tk.Text(
         txt_frame,
         height=16,
-        bg="#0e131a",
-        fg="#e5e8e8",
-        font=("Consolas", 9),
+        bg="#151d28",
+        fg="#dce4ee",
+        font=("Arial", 10, "bold"),
         wrap="word",
         bd=0,
         padx=10,
