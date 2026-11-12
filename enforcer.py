@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.44"
+APP_VERSION = "0.9.45"
 
 import os
 import sys
@@ -3027,7 +3027,7 @@ def load_config(log_restore=False):
     sel_acct = (
         config["brokers"].get(active_b, {}).get("selected_account_id", "")
     )
-    if start_equity is None and sel_acct:
+    if (start_equity is None or log_restore) and sel_acct:
         restore_account_session(active_b, sel_acct, log_restore=log_restore)
 
 
@@ -4656,11 +4656,48 @@ class WebullAdapter:
         )
 
     def reconnect_session(self):
-        """Rebuilds the Webull ApiClient and TradeClient with a 4.5s timeout
-        to flush stale TCP sockets after an internet connection drop."""
+        """Refreshes Webull client timeout state (or rebuilds ApiClient/TradeClient
+        atomically on auth/token errors) without clobbering the active in-memory
+        access token if a reconnect attempt times out mid-outage."""
         try:
+            err_l = str(getattr(self, "last_error", "") or "").lower()
+            needs_full_reinit = (
+                self.api_client is None
+                or self.trade_client is None
+                or any(
+                    k in err_l
+                    for k in (
+                        "401",
+                        "403",
+                        "unauthorized",
+                        "token",
+                        "expired",
+                        "sign",
+                    )
+                )
+            )
+            if not needs_full_reinit:
+                self.api_client._connect_timeout = 3.5
+                self.api_client._read_timeout = 4.5
+                if not self.api_client.get_token():
+                    tok_file = os.path.join(USER_HOME, "conf", "token.txt")
+                    if os.path.exists(tok_file):
+                        try:
+                            with open(tok_file, "r", encoding="utf-8") as tf:
+                                saved_tok = tf.readline().strip()
+                            if saved_tok:
+                                self.api_client.set_token(saved_tok)
+                        except Exception:
+                            pass
+                return True
+
             from webull.core.client import ApiClient
             from webull.trade.trade_client import TradeClient
+            old_tok = (
+                self.api_client.get_token()
+                if self.api_client is not None
+                else None
+            )
             try:
                 new_api = ApiClient(
                     self.app_key,
@@ -4676,8 +4713,11 @@ class WebullAdapter:
             if hasattr(new_api, "set_token_dir"):
                 new_api.set_token_dir(os.path.join(USER_HOME, "conf"))
             new_api.add_endpoint("us", "api.webull.com")
+            if old_tok and not new_api.get_token():
+                new_api.set_token(old_tok)
+            new_trade = TradeClient(new_api)
             self.api_client = new_api
-            self.trade_client = TradeClient(self.api_client)
+            self.trade_client = new_trade
             return True
         except Exception as e:
             self.last_error = str(e)

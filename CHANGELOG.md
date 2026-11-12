@@ -4,6 +4,20 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.45] — 2026-11-12
+### ⚡ Quick Summary
+- **Webull Fast Timeout Recovery (`reconnect_session`):** Eliminated redundant blocking `TradeClient` initializer HTTP calls on routine network read timeouts so Webull reconnects recover on the very next poll without cascading timeouts or interrupting active token state.
+- **Guaranteed `[SESSION] Restored ... baseline from memory` Audit Log:** Ensured `load_config(log_restore=True)` always logs the restored session baseline (`Start`, `LastFlat`, `SessionHighPnL`, `W/L`) on mid-day launches even after the startup liability waiver check loads config early.
+
+### 🔍 Detailed Breakdown
+- **Lightweight Webull Timeout Reconnect (`WebullAdapter.reconnect_session`):**
+  - Because `webull-openapi-python-sdk` already opens a fresh `requests.Session()` per HTTP call, routine network read timeouts no longer invoke `TradeClient(new_api)` (which previously fired extra blocking `ClientInitializer` HTTP calls during a network stall and assigned `self.api_client = new_api` before initialization completed).
+  - Instead, routine timeouts refresh `_connect_timeout = 3.5` / `_read_timeout = 4.5` and verify/reload the local `~/conf/token.txt` token in-place with zero extra network calls, reserving a full `TradeClient` rebuild strictly for authentication/token errors (`401`/`403`/`unauthorized`/`token`/`expired`/`sign`) with an atomic client swap after initialization succeeds.
+- **Unconditional Mid-Day Baseline Restore Logging (`load_config`):**
+  - Updated `load_config(log_restore=True)` so `[SESSION] Restored <BROKER> baseline from memory: Start=$... | LastFlat=$... | SessionHighPnL=... | W: ... | L: ...` is always written to `enforcer_log.txt` when `log_restore=True`, even when `show_liability_waiver()` previously populated `start_equity` via `load_config(log_restore=False)`.
+
+---
+
 ## [v0.9.43 & v0.9.44] — 2026-11-12
 ### ⚡ Quick Summary
 - **In-Trade Settings Access (`IN TRADE` Mode):** Open Pre-Flight Settings anytime during an active daytrade to customize **HUD Columns**, adjust **Audio / Voice / Poll Interval**, or export **Logs** — while all enforcement and rulebook settings across **Cards 1, 2, 4, and 5** stay tamper-locked until your position is flat.
