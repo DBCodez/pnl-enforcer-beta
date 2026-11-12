@@ -32,11 +32,26 @@ TRADING, FINANCIAL RISK & REGULATORY DISCLAIMER:
    spreads, market gaps, trading halts, and software bugs. The Software DOES NOT
    and CANNOT guarantee that trading losses will be capped at your configured
    thresholds. Actual account losses may significantly exceed configured limits.
+   If you continue trading after a Daily Stop breach in disarmed mode without
+   re-anchoring or adjusting your stop, the breached Daily Stop will not re-fire
+   until re-armed.
 
-3. EQUITIES VS. OPTIONS: Equities (stocks) may be configured for automated Market
-   or Extended-Hours Limit liquidation. Option contracts are tracked for display
-   and audio warning sirens ONLY and are NEVER automatically flattened or closed
-   by the Software.
+3. EQUITIES, OPTIONS & IGNORED POSITIONS:
+   (a) Equities (Stocks): Tracked for HUD PnL display, warning sirens, and
+       automated Market (9:30 AM – 4:00 PM ET) or Extended-Hours Limit liquidation.
+   (b) Options Contracts: Tracked for HUD PnL display and audio warning sirens
+       ONLY by default (`Include Options in Auto-Flatten` is OFF by default). If
+       you explicitly enable the optional experimental BETA Options Auto-Flatten
+       feature and accept the separate BETA Options Auto-Flatten Risk Waiver, the
+       Software submits single-leg Regular Trading Hours (9:30 AM – 4:00 PM ET)
+       Market orders (`BUY_TO_CLOSE` / `SELL_TO_CLOSE`), which carry severe
+       bid-ask spread, illiquidity, multi-leg legging, and market-order slippage
+       risks. Options cannot be auto-flattened outside Regular Trading Hours.
+   (c) Ignored Pre-Existing Positions (`Swing / Hold`): Any position marked as
+       Ignored is excluded from daytrade PnL calculations, warning sirens, daily
+       stops, order cancellation, and automated liquidation. You are 100% solely
+       responsible for monitoring and managing all ignored positions directly in
+       your brokerage platform.
 
 4. NO BROKER AFFILIATION: This Software is an independent third-party tool and is
    not affiliated with, endorsed by, or sponsored by Charles Schwab Corporation,

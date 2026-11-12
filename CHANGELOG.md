@@ -4,6 +4,27 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.43] — 2026-11-12
+### ⚡ Quick Summary
+- **In-Trade Settings Access with Enforcement Tamper-Lock (`🔒 IN TRADE ⚙`):** You can now open Pre-Flight Settings while an active daytrade is open to inspect your rulebooks, customize **`📊 HUD Columns`**, adjust **Audio/Voice/Poll Interval**, or export/upload **Logs** — while all enforcement and rulebook settings across **Cards 1, 2, 4, and 5** (plus baseline re-zero, position tracking, broker/account switching, and presets) remain strictly tamper-locked (`🔒 IN TRADE — LOCKED`) until the position is flat.
+- **Uninterrupted Background Polling & Real-Time Auto-Unlock:** `data_loop()` continues polling and enforcing stops live in the background while Settings is open, automatically unlocks Cards 1, 2, 4, and 5 the instant your position closes flat, and automatically closes the Settings modal if a stop or cooldown triggers.
+- **Updated Liability Waiver & License (`v2026.11.12`):** Updated `LICENSE.txt` and the startup Assumption of Risk waiver (`show_liability_waiver`) with structured 5-section formatting and explicit disclosures for Equities, Options (Siren-Only default + opt-in BETA RTH Market Order Auto-Flatten), Ignored Pre-Existing Positions (`Swing / Hold`), `Alarms Only Mode`, and Post-Daily-Breach `DISARMED` mode.
+
+### 🔍 Detailed Breakdown
+- **In-Trade Settings Access & Enforcement Tamper-Lock (`is_in_trade_tamper_locked`, `refresh_smart_dimming`, `save_and_launch`):**
+  - **HUD `🔒 IN TRADE ⚙` Button:** While an active daytrade is open (`not is_flat`), the HUD Settings button transitions to an amber **`🔒 IN TRADE ⚙`** button (`state="normal"`), while the HUD **`✕`** Close button stays locked (`🔒`, `state="disabled"`).
+  - **Cards 1, 2, 4, and 5 Locked (`🔒 IN TRADE — LOCKED` / `🔒 ACTIVE (LOCKED)` / `🔒 STANDBY (LOCKED)`):** All checkboxes and dollar/minute entry fields in Cards 1, 2, 4, and 5 are disabled while in a trade, with high-contrast amber/slate styling (`disabledforeground`) on armed guardrails so active stops remain easy to read.
+  - **Card 3 & Top/Bottom Bar Protection:** Broker/Account switching, `🔑 API Keys`, Risk Presets (`Standard Full Risk` / `50% Low Energy`), `Restore Defaults`, `Save as Default`, `↺ Re-Zero Baseline` (`🔒 In Trade`), `Start Fresh on Rulebook Switch`, and `Ignore Pre-Existing Positions on Launch` are locked while in a trade. Opening **`🛡️ Positions`** while in a trade opens in **`🔒 IN TRADE · READ-ONLY VIEW`** so an active daytrade cannot be switched to `IGNORE` mid-trade.
+  - **Editable Utility Controls (`💾 SAVE HUD & AUDIO >>`):** `📊 HUD Columns`, `📜 Logs ▾`, `🐞 Report Bug`, Release Notes, Voice/Audio cues, Upside Chime, API Poll Interval, and Auto-Share Safe Logs remain unlocked and savable while in a trade.
+- **Live Background Enforcement & Real-Time State Transitions (`data_loop`, `_close_active_settings_window_on_breach`, `_tick_preflight_streak`):**
+  - `data_loop()` continues polling the broker API while Settings is open (only pausing during an explicit broker/account reconfiguration wizard when flat).
+  - If an Open PnL Stop, Consecutive Loss Cooldown, or Daily Stop triggers while Settings is open, `_close_active_settings_window_on_breach()` closes the Settings modal on the UI thread immediately so flatten/lockout execution is unobstructed.
+  - `_tick_preflight_streak()` monitors `is_in_trade_tamper_locked()` at `200ms` intervals and automatically unlocks (or locks) Cards 1, 2, 4, and 5 in real time if a trade closes (or a working entry fills) while Settings is open.
+- **Liability Waiver & License Terminology Update (`WAIVER_VERSION = "2026.11.12"`, `LICENSE.txt`):**
+  - Updated `LICENSE.txt` and `show_liability_waiver()` to reflect all current functionality and risk disclosures, upgraded the startup waiver modal to the high-legibility 5-section badge layout, and bumped `WAIVER_VERSION` to `"2026.11.12"` so users acknowledge and log the updated SHA-256 hash once on update.
+
+---
+
 ## [v0.9.42] — 2026-11-11
 ### ⚡ Quick Summary
 - **🙌 Community Shoutout (`/u/InvWithRed`):** Huge thanks to Reddit beta tester **`/u/InvWithRed`** for catching the pre-existing swing/long-term position edge case and prompting the upgrades and position-scaling fixes in this release!
