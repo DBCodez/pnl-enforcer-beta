@@ -4,6 +4,25 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.46] — 2026-11-12
+### ⚡ Quick Summary
+- **Active Tier Tag on HUD `DAILY STOP` Column (`DAILY STOP (T1)`, `DAILY STOP (T2)`, `DAILY STOP (EXT)`, etc.):** The HUD `DAILY STOP` column header now dynamically labels which rulebook tier controls the active floor and highlights in emerald (`#6ee7b7`) whenever a profit ratchet (`T2`, `T3`, `T4`, or `EXT LOCK`) is active.
+- **Tier-Specific Post-Daily-Breach Review Dialog:** The Post-Breach Review popup now displays the exact active tier and unlock high-water mark (e.g., `-$1,000.00 · RTH Tier 2 Ratchet`) and points directly to the specific Card 4 / Card 5 field needed to adjust or disarm that tier.
+- **Guaranteed `[RATCHET]` Chime & Banner on Mid-Session Resume:** Fixed a launch-poll ordering edge case where unlocking a profit tier while Enforcer was closed (or in Pre-Flight) silently updated the floor without firing the `[RATCHET]` log, upside chime, or emerald HUD banner.
+
+### 🔍 Detailed Breakdown
+- **Active Daily Stop Tier Resolution (`describe_active_floor`):**
+  - Added `describe_active_floor(cfg=None, rth_mode=None)` to resolve `(floor_equity, stop_pnl, hud_hdr_tag, tier_short_label, tier_full_desc, setting_field_hint)` across Extended Hours (`Ext-Hours Base Stop`, `Ext-Hours Profit Lock`) and Regular Trading Hours (`RTH Tier 1 Base`, `RTH Tier 2 Ratchet`, `RTH Tier 3 Ratchet`, `RTH Tier 4 Trail`).
+- **Mid-Session Resume Tier Ratchet Notification (`data_loop`):**
+  - Captured `pre_poll_hwm_profit = round(max_equity - start_equity, 2)` before `_stabilize_mid_fill_realized_and_equity()` updates `max_equity` on `first_poll_of_launch`.
+  - When a trader closes a winning trade while Enforcer is closed (or while in Pre-Flight) and resumes flat above a new profit-ratchet trigger (e.g., RTH Tier 2 `+$250 -> -$1,000`), `data_loop()` now detects `new_upside_tier > current_upside_tier` on the first poll and fires `trigger_upside_tier_glow()` (`[RATCHET]` log, upside chime, and emerald HUD banner).
+- **Dynamic HUD `DAILY STOP` Column Header, Tooltip & Post-Breach Review Modal (`rebuild_hud_columns`, `update_gui`, `attach_hud_mute_tooltip`, `show_daily_breach_return_notice`):**
+  - Updated the HUD `terminate_lvl` column header to dynamically display `DAILY STOP (T1)`, `DAILY STOP (T2)`, `DAILY STOP (T3)`, `DAILY STOP (T4)`, `DAILY STOP (EXT)`, or `DAILY STOP (EXT LOCK)` and color the header `#6ee7b7` when a profit ratchet is active.
+  - Updated `show_daily_breach_return_notice()` Section 1 to display the active tier pill (`-$1,000.00 · RTH Tier 2 Ratchet`) and full rule description (`RTH Tier 2 Stop Ratchet (Unlocked at RTH High +$284.20 >= +$250)`), and updated Section 2 to point to the exact active setting (`Card 5 'Tier 2 — Stop Level ($)' (or uncheck Tier 2)`) instead of hardcoding `Starting Max Loss ($)`.
+  - Expanded `[SESSION] Restored <BROKER> baseline from memory:`, `[GUARDRAIL] Daily Stop remains BREACHED / DISARMED...`, and `[SESSION] Daily Stop RE-ARMED...` log entries to include `RulebookHWM` and `ActiveStop=... (<Tier>)`.
+
+---
+
 ## [v0.9.45] — 2026-11-12
 ### ⚡ Quick Summary
 - **Webull Fast Timeout Recovery (`reconnect_session`):** Eliminated redundant blocking `TradeClient` initializer HTTP calls on routine network read timeouts so Webull reconnects recover on the very next poll without cascading timeouts or interrupting active token state.

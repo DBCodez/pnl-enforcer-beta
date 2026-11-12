@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.45"
+APP_VERSION = "0.9.46"
 
 import os
 import sys
@@ -2099,13 +2099,34 @@ def format_dist_to_stop_hud(distance_to_terminate, locked_down=None):
     return f"${dist_val:,.2f}"
 
 
-def compute_active_floor_equity(cfg=None, rth_mode=None):
-    """Computes the active Daily Stop floor equity for the given config and
-    session state (or returns None if start_equity is not yet initialized)."""
-    if start_equity is None or start_equity <= 0.0:
-        return None
+def describe_active_floor(cfg=None, rth_mode=None):
+    """Returns (floor_equity, stop_pnl, hud_hdr_tag, tier_short_label,
+    tier_full_desc, setting_field_hint) for the currently active Daily Stop
+    tier so the HUD, Post-Breach Review dialog, and audit logs always state
+    explicitly WHICH rulebook & tier controls the active floor."""
     c = cfg or config
     rth_now = is_rth() if rth_mode is None else bool(rth_mode)
+    if start_equity is None or start_equity <= 0.0:
+        if not rth_now:
+            pm_max = float(c.get("pm_max_loss", 1500.0))
+            return (
+                None,
+                -pm_max,
+                "EXT",
+                "Ext-Hours Base Stop",
+                f"Ext-Hours Starting Max Loss (-${pm_max:,.0f})",
+                "Card 4 'Starting Max Loss ($)'",
+            )
+        t1_max = float(c.get("t1_max_loss", 2000.0))
+        return (
+            None,
+            -t1_max,
+            "T1",
+            "RTH Tier 1 Base",
+            f"RTH Tier 1 Starting Max Loss (-${t1_max:,.0f})",
+            "Card 5 'Starting Max Loss ($)'",
+        )
+
     hwm_eq = max_equity if max_equity is not None else start_equity
     max_realized_profit = round(hwm_eq - start_equity, 2)
     if not rth_now:
@@ -2114,8 +2135,26 @@ def compute_active_floor_equity(cfg=None, rth_mode=None):
         pm_trail = float(c.get("pm_trail_cushion", 500.0))
         pm_max = float(c.get("pm_max_loss", 1500.0))
         if pm_lock_on and max_realized_profit >= pm_trig:
-            return hwm_eq - pm_trail
-        return start_equity - pm_max
+            fl_eq = hwm_eq - pm_trail
+            st_pnl = round(fl_eq - start_equity, 2)
+            return (
+                fl_eq,
+                st_pnl,
+                "EXT LOCK",
+                "Ext-Hours Profit Lock",
+                f"Ext-Hours Profit Lock (Unlocked at High {format_dollar(max_realized_profit)} >= +${pm_trig:,.0f}, Trail ${pm_trail:,.0f})",
+                "Card 4 'Trail Peak By ($)' (or uncheck 'Profit Lock Trigger')",
+            )
+        fl_eq = start_equity - pm_max
+        return (
+            fl_eq,
+            round(fl_eq - start_equity, 2),
+            "EXT",
+            "Ext-Hours Base Stop",
+            f"Ext-Hours Starting Max Loss (-${pm_max:,.0f})",
+            "Card 4 'Starting Max Loss ($)'",
+        )
+
     t4_on = bool(c.get("enable_t4", True))
     t3_on = bool(c.get("enable_t3", True))
     t2_on = bool(c.get("enable_t2", True))
@@ -2127,12 +2166,53 @@ def compute_active_floor_equity(cfg=None, rth_mode=None):
     t2_max = float(c.get("t2_max_loss", -1000.0))
     t1_max = float(c.get("t1_max_loss", 2000.0))
     if t4_on and max_realized_profit >= t4_trig:
-        return hwm_eq - t4_trail
+        fl_eq = hwm_eq - t4_trail
+        st_pnl = round(fl_eq - start_equity, 2)
+        return (
+            fl_eq,
+            st_pnl,
+            "T4",
+            "RTH Tier 4 Trail",
+            f"RTH Tier 4 Trailing Lock (Unlocked at RTH High {format_dollar(max_realized_profit)} >= +${t4_trig:,.0f}, Trail ${t4_trail:,.0f})",
+            "Card 5 'Tier 4 — Trail Peak By ($)' (or uncheck Tier 4)",
+        )
     if t3_on and max_realized_profit >= t3_trig:
-        return start_equity + t3_max
+        fl_eq = start_equity + t3_max
+        st_pnl = round(fl_eq - start_equity, 2)
+        return (
+            fl_eq,
+            st_pnl,
+            "T3",
+            "RTH Tier 3 Ratchet",
+            f"RTH Tier 3 Stop Ratchet (Unlocked at RTH High {format_dollar(max_realized_profit)} >= +${t3_trig:,.0f})",
+            "Card 5 'Tier 3 — Stop Level ($)' (or uncheck Tier 3)",
+        )
     if t2_on and max_realized_profit >= t2_trig:
-        return start_equity + t2_max
-    return start_equity - t1_max
+        fl_eq = start_equity + t2_max
+        st_pnl = round(fl_eq - start_equity, 2)
+        return (
+            fl_eq,
+            st_pnl,
+            "T2",
+            "RTH Tier 2 Ratchet",
+            f"RTH Tier 2 Stop Ratchet (Unlocked at RTH High {format_dollar(max_realized_profit)} >= +${t2_trig:,.0f})",
+            "Card 5 'Tier 2 — Stop Level ($)' (or uncheck Tier 2)",
+        )
+    fl_eq = start_equity - t1_max
+    return (
+        fl_eq,
+        round(fl_eq - start_equity, 2),
+        "T1",
+        "RTH Tier 1 Base",
+        f"RTH Tier 1 Starting Max Loss (-${t1_max:,.0f})",
+        "Card 5 'Starting Max Loss ($)'",
+    )
+
+
+def compute_active_floor_equity(cfg=None, rth_mode=None):
+    """Computes the active Daily Stop floor equity for the given config and
+    session state (or returns None if start_equity is not yet initialized)."""
+    return describe_active_floor(cfg, rth_mode)[0]
 
 
 def backfill_trades_from_today_log(target_broker=None):
@@ -2913,12 +2993,15 @@ def restore_account_session(broker_name, account_id, log_restore=False):
                     if ignored_positions
                     else ""
                 )
+                _, st_pnl, _, tier_short, _, _ = describe_active_floor(config)
                 log_event(
                     "SESSION",
                     f"Restored {broker_name} baseline from memory: "
                     f"Start=${start_equity:,.2f} | "
                     f"LastFlat=${last_flat_equity:,.2f} | "
+                    f"RulebookHWM={format_dollar(max_equity - start_equity)} | "
                     f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
+                    f"ActiveStop={format_dollar(st_pnl)} ({tier_short}) | "
                     f"{format_trades_wl_inline(win_trades, loss_trades)}{ig_note}"
                 )
             return True
@@ -2955,12 +3038,15 @@ def restore_account_session(broker_name, account_id, log_restore=False):
         )
         first_poll_of_launch = True
         if log_restore:
+            _, st_pnl, _, tier_short, _, _ = describe_active_floor(config)
             log_event(
                 "SESSION",
                 f"Restored {broker_name} baseline from memory: "
                 f"Start=${start_equity:,.2f} | "
                 f"LastFlat=${last_flat_equity:,.2f} | "
+                f"RulebookHWM={format_dollar(max_equity - start_equity)} | "
                 f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
+                f"ActiveStop={format_dollar(st_pnl)} ({tier_short}) | "
                 f"{format_trades_wl_inline(win_trades, loss_trades)}"
             )
         return True
@@ -8584,6 +8670,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             "Rulebook to Extended-Hours Rulebook."
                         )
 
+                pre_poll_hwm_profit = round(max_equity - start_equity, 2)
+
                 current_eq, realized_pnl, open_pnl = (
                     _stabilize_mid_fill_realized_and_equity(
                         current_eq, is_flat, live_open_pnl, pos_details
@@ -8846,11 +8934,23 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 # Prevent immediate siren blast or flat re-lock on startup,
                 # at the 9:30 AM / 4:00 PM transitions, or right after saving Settings
                 if first_poll_of_launch or last_rth_mode != rth_now:
-                    if last_rth_mode is not None and last_rth_mode != rth_now:
+                    is_mode_switch = (
+                        last_rth_mode is not None and last_rth_mode != rth_now
+                    )
+                    if is_mode_switch:
                         first_poll_of_launch = True
                     last_rth_mode = rth_now
+                    # Use pre_poll_hwm_profit on launch/resume so if a new profit
+                    # tier was reached while Enforcer was closed or in Pre-Flight,
+                    # the [RATCHET] log, upside chime, and emerald HUD banner
+                    # still fire on the first poll.
+                    ref_hwm_for_init = (
+                        max_realized_profit
+                        if is_mode_switch
+                        else pre_poll_hwm_profit
+                    )
                     current_upside_tier = compute_upside_tier(
-                        rth_now, max_realized_profit, config
+                        rth_now, ref_hwm_for_init, config
                     )
 
                 if first_poll_of_launch and is_flat:
@@ -12657,7 +12757,9 @@ def show_preflight_window(
                     if last_flat_equity is not None
                     else start_equity
                 )
-                new_floor = compute_active_floor_equity(new_cfg)
+                new_floor, _, _, new_tier_short, _, _ = describe_active_floor(
+                    new_cfg
+                )
                 if (
                     ref_eq is not None
                     and new_floor is not None
@@ -12668,7 +12770,8 @@ def show_preflight_window(
                         "GUARDRAIL",
                         f"Daily Stop remains BREACHED / DISARMED after Settings save "
                         f"(Net PnL {format_dollar(round(ref_eq - start_equity, 2))} <= "
-                        f"Daily Stop {format_dollar(round(new_floor - start_equity, 2))}). "
+                        f"Daily Stop {format_dollar(round(new_floor - start_equity, 2))} "
+                        f"[{new_tier_short}]). "
                         f"Card 1 Trade/Tilt Stops remain active."
                     )
                 else:
@@ -12684,6 +12787,7 @@ def show_preflight_window(
                             "SESSION",
                             f"Daily Stop RE-ARMED at "
                             f"{format_dollar(round(new_floor - start_equity, 2))} "
+                            f"[{new_tier_short}] "
                             f"({format_dollar(round(ref_eq - new_floor, 2))} buffer to stop)."
                         )
 
@@ -15412,7 +15516,14 @@ def show_preflight_window(
         ref_eq = (
             last_flat_equity if last_flat_equity is not None else start_equity
         )
-        act_fl = compute_active_floor_equity(config)
+        (
+            act_fl,
+            _,
+            _,
+            tier_short_label,
+            tier_full_desc,
+            setting_field_hint,
+        ) = describe_active_floor(config)
         if (
             ref_eq is not None
             and start_equity is not None
@@ -15494,7 +15605,7 @@ def show_preflight_window(
         txt_box = tk.Text(
             card_outer,
             width=88,
-            height=19,
+            height=20,
             bg="#131922",
             fg="#dce4ee",
             font=("Segoe UI", 10),
@@ -15576,10 +15687,13 @@ def show_preflight_window(
             ("    Your Net PnL (", ("body",)),
             (f" {cur_net_str} ", ("body", "pill_red")),
             (") is past your active Daily Stop (", ("body",)),
-            (f" {stop_lvl_str} ", ("body", "pill_blue")),
+            (f" {stop_lvl_str} · {tier_short_label} ", ("body", "pill_blue")),
             (", ", ("body",)),
             (f" {over_str} ", ("body", "pill_red")),
             (").\n", ("body",)),
+            ("    Active Rule: ", ("body",)),
+            (f" {tier_full_desc} ", ("body", "pill_amber")),
+            ("\n", ("body",)),
             ("    To prevent an instant stop-out on your next entry, your Daily Stop is held in\n", ("body",)),
             ("    ", ("body",)),
             (" DAY STOP: BREACHED (DISARMED) ", ("body", "pill_red")),
@@ -15596,10 +15710,10 @@ def show_preflight_window(
             "hdr_green",
         )
         s2_spans = [
-            ("    • Raise ", ("body",)),
-            (" Starting Max Loss ($) ", ("body", "pill_red")),
-            (" in your active Rulebook (Card 4 or Card 5) to give\n", ("body",)),
-            ("      yourself room below ", ("body",)),
+            ("    • Adjust ", ("body",)),
+            (f" {setting_field_hint} ", ("body", "pill_red")),
+            (" to give yourself\n", ("body",)),
+            ("      room below ", ("body",)),
             (f" {cur_net_str} ", ("body", "pill_red")),
             (" and click ", ("body",)),
             (" SAVE & APPLY CHANGES >> ", ("body", "pill_green")),
@@ -15853,11 +15967,22 @@ def rebuild_hud_columns():
         )
         col_frame.grid(row=0, column=i, sticky="nsew", padx=2, pady=(2, 1))
 
+        if col_id == "terminate_lvl":
+            _, _, hud_tag, _, _, _ = describe_active_floor(config)
+            title = f"DAILY STOP ({hud_tag})"
+            hdr_fg = (
+                "#6ee7b7"
+                if hud_tag in ("T2", "T3", "T4", "EXT LOCK")
+                else "#cccccc"
+            )
+        else:
+            hdr_fg = "#cccccc"
+
         hdr_lbl = tk.Label(
             col_frame,
             text=title,
             font=("Arial", 8, "bold"),
-            fg="#cccccc",
+            fg=hdr_fg,
             bg="#1b1e22",
             pady=3
         )
@@ -15876,6 +16001,7 @@ def rebuild_hud_columns():
             bg="#262a2e",
             justify="center"
         )
+        val_lbl._hdr_lbl = hdr_lbl
         val_lbl.pack(fill="both", expand=True)
 
         if col_id == "dist_to_term":
@@ -15938,6 +16064,21 @@ def update_gui(
                 ui_labels[i].config(
                     text=text_val, bg=disp_bg, font=target_font
                 )
+            if i < len(active_cols) and active_cols[i] == "terminate_lvl":
+                hdr_w = getattr(ui_labels[i], "_hdr_lbl", None)
+                if hdr_w is not None and hdr_w.winfo_exists():
+                    _, _, hud_tag, _, _, _ = describe_active_floor(config)
+                    new_hdr_txt = f"DAILY STOP ({hud_tag})"
+                    new_hdr_fg = (
+                        "#6ee7b7"
+                        if hud_tag in ("T2", "T3", "T4", "EXT LOCK")
+                        else "#cccccc"
+                    )
+                    if (
+                        hdr_w.cget("text") != new_hdr_txt
+                        or hdr_w.cget("fg") != new_hdr_fg
+                    ):
+                        hdr_w.config(text=new_hdr_txt, fg=new_hdr_fg)
         if i == hud_leash_idx:
             hud_last_leash_bg = disp_bg
 
@@ -16085,10 +16226,13 @@ def attach_hud_mute_tooltip(widget, hud_win):
                     anchor="w",
                 ).pack(fill="x", pady=(0, 4))
 
+            _, st_pnl, _, tier_short_tip, _, hint_tip = describe_active_floor(
+                config
+            )
             if is_locked_down:
                 ld_txt = (
-                    "⚠️ DAILY STOP BREACHED (DISARMED): Open Settings to raise your "
-                    "Daily Max Loss or Re-Zero Baseline (Card 1 Trade/Tilt Stops remain active)."
+                    f"⚠️ DAILY STOP BREACHED ({format_dollar(st_pnl)} · {tier_short_tip} — DISARMED): "
+                    f"Adjust {hint_tip} or Re-Zero Baseline in Settings (Card 1 Trade/Tilt Stops remain active)."
                 )
                 tk.Label(
                     inner,
@@ -16148,6 +16292,7 @@ def attach_hud_mute_tooltip(widget, hud_win):
             )
             sub_txt = (
                 f"Active Rulebook: {r_mode}   ·   "
+                f"Active Floor: {format_dollar(st_pnl)} ({tier_short_tip})   ·   "
                 f"Poll Interval: {config.get('poll_interval', 2)}s"
             )
             tk.Label(
