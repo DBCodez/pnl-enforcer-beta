@@ -22,6 +22,8 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
   - `_tick_preflight_streak()` monitors `is_in_trade_tamper_locked()` at `200ms` intervals and automatically unlocks (or locks) Cards 1, 2, 4, and 5 in real time if a trade closes (or a working entry fills) while Settings is open.
 - **Liability Waiver & License Terminology Update (`WAIVER_VERSION = "2026.11.12"`, `LICENSE.txt`):**
   - Updated `LICENSE.txt` and `show_liability_waiver()` to reflect all current functionality and risk disclosures, upgraded the startup waiver modal to the high-legibility 5-section badge layout, and bumped `WAIVER_VERSION` to `"2026.11.12"` so users acknowledge and log the updated SHA-256 hash once on update.
+- **Penny-Exact Fill Neutralization on Ignored Position Trims & Exits (`_apply_ignored_positions_to_snapshot`, `_apply_preexisting_selection`):**
+  - When an ignored position changes quantity (scale-in, partial trim, or full exit to `0`) on a poll where no tracked daytrade position changed quantity, `locked_impact` is anchored directly against `(raw_adj_eq - tot_open_pnl) - last_flat_equity` so any difference between the actual broker fill price and the prior poll's `last_seen_price` is 100% absorbed into `locked_impact` with `$0.00` drift on daytrade `Realized PnL`.
 
 ---
 

@@ -3178,8 +3178,33 @@ def _apply_ignored_positions_to_snapshot(
             list(open_opt_cache or []),
         )
 
+    filt_pos_details = {
+        k: v
+        for k, v in raw_pos_details.items()
+        if not is_position_ignored(k, v.get("asset_type") == "OPTION")
+    }
+    filt_eq_cache = [
+        item
+        for item in (open_eq_cache or [])
+        if not is_position_ignored(item[0], is_opt=False)
+    ]
+    filt_opt_cache = [
+        item
+        for item in (open_opt_cache or [])
+        if not is_position_ignored(item[0], is_opt=True)
+    ]
+    tot_open_pnl = round(
+        sum(float(d.get("open_pnl", 0.0)) for d in filt_pos_details.values()),
+        2,
+    )
+    has_options = any(
+        d.get("asset_type") == "OPTION" for d in filt_pos_details.values()
+    )
+    is_flat = (len(filt_pos_details) == 0)
+
     sum_ignored_impact = 0.0
     state_mutated = False
+    mutated_igs = []
     transition_notes = []
 
     for tag, ig in list(ignored_positions.items()):
@@ -3227,6 +3252,7 @@ def _apply_ignored_positions_to_snapshot(
                 ig["ref_open_pnl"] = 0.0
                 ig["locked_impact"] = locked_impact
                 state_mutated = True
+                mutated_igs.append(ig)
             sum_ignored_impact += locked_impact
             continue
 
@@ -3284,6 +3310,7 @@ def _apply_ignored_positions_to_snapshot(
             ig["last_seen_price"] = round(curr_lp, 4)
             ig["locked_impact"] = locked_impact
             state_mutated = True
+            mutated_igs.append(ig)
             sum_ignored_impact += locked_impact
         else:
             ig["last_seen_price"] = round(curr_lp, 4)
@@ -3291,6 +3318,36 @@ def _apply_ignored_positions_to_snapshot(
             sum_ignored_impact += locked_impact + open_impact
 
     if state_mutated:
+        if mutated_igs and raw_adj_eq is not None:
+            tracked_qty_changed = (
+                set(filt_pos_details.keys()) != set(prev_pos_snapshot.keys())
+                or any(
+                    abs(
+                        float(filt_pos_details[k].get("qty", 0.0))
+                        - float(prev_pos_snapshot[k].get("qty", 0.0))
+                    )
+                    > 1e-6
+                    for k in filt_pos_details
+                )
+            )
+            ref_flat_eq = (
+                last_flat_equity if last_flat_equity is not None else start_equity
+            )
+            if (
+                not tracked_qty_changed
+                and ref_flat_eq is not None
+                and float(ref_flat_eq) > 0.0
+            ):
+                target_sum_ignored = round(
+                    (float(raw_adj_eq) - tot_open_pnl) - float(ref_flat_eq), 2
+                )
+                drift = round(target_sum_ignored - sum_ignored_impact, 2)
+                if abs(drift) >= 0.01 and abs(drift) <= 50000.0:
+                    last_ig = mutated_igs[-1]
+                    last_ig["locked_impact"] = round(
+                        float(last_ig.get("locked_impact", 0.0)) + drift, 2
+                    )
+                    sum_ignored_impact = round(sum_ignored_impact + drift, 2)
         save_session_state()
         if transition_notes:
             log_event(
@@ -3304,29 +3361,6 @@ def _apply_ignored_positions_to_snapshot(
         if raw_adj_eq is not None
         else None
     )
-    filt_pos_details = {
-        k: v
-        for k, v in raw_pos_details.items()
-        if not is_position_ignored(k, v.get("asset_type") == "OPTION")
-    }
-    filt_eq_cache = [
-        item
-        for item in (open_eq_cache or [])
-        if not is_position_ignored(item[0], is_opt=False)
-    ]
-    filt_opt_cache = [
-        item
-        for item in (open_opt_cache or [])
-        if not is_position_ignored(item[0], is_opt=True)
-    ]
-    tot_open_pnl = round(
-        sum(float(d.get("open_pnl", 0.0)) for d in filt_pos_details.values()),
-        2,
-    )
-    has_options = any(
-        d.get("asset_type") == "OPTION" for d in filt_pos_details.values()
-    )
-    is_flat = (len(filt_pos_details) == 0)
     return (
         adj_eq,
         is_flat,
@@ -9825,10 +9859,63 @@ def show_preflight_window(
                             _card3_base_cache["eq_str"] = (
                                 f"${start_equity:,.2f} (Saved)"
                             )
+            newly_ignored_igs = []
             for tag in chosen_ignored_tags:
                 if tag not in ignored_positions and tag in raw_pos:
-                    ignored_positions[tag] = build_ignored_position_entry(
+                    ig_entry = build_ignored_position_entry(
                         tag, raw_pos[tag], lock_existing_open_pnl=True
+                    )
+                    ignored_positions[tag] = ig_entry
+                    newly_ignored_igs.append(ig_entry)
+            raw_eq_now = _preexisting_state.get("raw_eq")
+            ref_flat_eq = (
+                last_flat_equity
+                if last_flat_equity is not None
+                else start_equity
+            )
+            if (
+                newly_ignored_igs
+                and raw_eq_now is not None
+                and float(raw_eq_now) > 0.0
+                and ref_flat_eq is not None
+                and float(ref_flat_eq) > 0.0
+            ):
+                tracked_opnl = round(
+                    sum(
+                        float(d.get("open_pnl", 0.0))
+                        for t, d in raw_pos.items()
+                        if t not in chosen_ignored_tags
+                    ),
+                    2,
+                )
+                cur_ig_sum = 0.0
+                for t_ig, ig_d in ignored_positions.items():
+                    if not isinstance(ig_d, dict):
+                        continue
+                    r_d = raw_pos.get(t_ig)
+                    l_imp = float(ig_d.get("locked_impact", 0.0))
+                    if r_d is not None:
+                        m_ig = (
+                            100.0
+                            if str(ig_d.get("asset_type", "EQUITY")).upper()
+                            == "OPTION"
+                            else 1.0
+                        )
+                        q_ig = float(r_d.get("qty", 0.0))
+                        lp_ig = float(r_d.get("last", 0.0))
+                        rp_ig = float(ig_d.get("ref_price", lp_ig))
+                        cur_ig_sum += l_imp + q_ig * (lp_ig - rp_ig) * m_ig
+                    else:
+                        cur_ig_sum += l_imp
+                target_ig_sum = round(
+                    (float(raw_eq_now) - tracked_opnl) - float(ref_flat_eq), 2
+                )
+                ig_drift = round(target_ig_sum - cur_ig_sum, 2)
+                if abs(ig_drift) >= 0.01 and abs(ig_drift) <= 50000.0:
+                    newly_ignored_igs[-1]["locked_impact"] = round(
+                        float(newly_ignored_igs[-1].get("locked_impact", 0.0))
+                        + ig_drift,
+                        2,
                     )
             save_session_state()
 
