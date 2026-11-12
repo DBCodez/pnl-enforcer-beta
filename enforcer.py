@@ -16649,20 +16649,34 @@ def start_gui():
 # ==========================================
 # 10. ENTRY POINT & SAFE FALLBACK
 # ==========================================
+MAIN_GIST_BUNDLE_ID = "6442a3ab2767aeb5ba0b13940d012634"
+BETA_GIST_BUNDLE_ID = "28088fe94e866e249b2c794c25eef6e9"
+MAIN_CHANGELOG_GIST_ID = "c91f71c6114caf3f2dee17cc8b60a757"
+
 GITHUB_RAW_BASE = (
     "https://raw.githubusercontent.com/DBCodez/pnl-enforcer-beta/main/"
 )
+BETA_GITHUB_RAW_BASE = (
+    "https://raw.githubusercontent.com/DBCodez/pnl-enforcer-beta/beta/"
+)
 GIST_ENFORCER_RAW_URL = (
-    "https://gist.githubusercontent.com/DBCodez/"
-    "6442a3ab2767aeb5ba0b13940d012634/raw/enforcer.py"
+    f"https://gist.githubusercontent.com/DBCodez/"
+    f"{MAIN_GIST_BUNDLE_ID}/raw/enforcer.py"
+)
+BETA_GIST_ENFORCER_RAW_URL = (
+    f"https://gist.githubusercontent.com/DBCodez/"
+    f"{BETA_GIST_BUNDLE_ID}/raw/enforcer.py"
 )
 CHANGELOG_WEB_URL = (
-    "https://gist.github.com/DBCodez/c91f71c6114caf3f2dee17cc8b60a757"
+    f"https://gist.github.com/DBCodez/{MAIN_CHANGELOG_GIST_ID}"
+)
+BETA_CHANGELOG_WEB_URL = (
+    f"https://gist.github.com/DBCodez/{BETA_GIST_BUNDLE_ID}#file-changelog-md"
 )
 GIST_DOC_RAW_URLS = {
     "CHANGELOG.md": (
-        "https://gist.githubusercontent.com/DBCodez/"
-        "c91f71c6114caf3f2dee17cc8b60a757/raw/CHANGELOG.md"
+        f"https://gist.githubusercontent.com/DBCodez/"
+        f"{MAIN_CHANGELOG_GIST_ID}/raw/CHANGELOG.md"
     ),
     "Launch_Enforcer.bat": (
         "https://gist.githubusercontent.com/DBCodez/"
@@ -16679,6 +16693,44 @@ GIST_DOC_RAW_URLS = {
 }
 
 
+def _is_beta_channel_build():
+    """Returns True when running from the experimental 'beta' git branch or a
+    Beta Channel Gist bundle (28088fe94e866e249b2c794c25eef6e9), so web
+    changelog links, remote doc fetches, and update checks automatically use
+    the Beta Channel without manual URL switching on branch merges."""
+    try:
+        git_head_path = os.path.join(SCRIPT_DIR, ".git", "HEAD")
+        if os.path.exists(git_head_path):
+            with open(
+                git_head_path, "r", encoding="utf-8", errors="replace"
+            ) as hf:
+                if "refs/heads/beta" in hf.read():
+                    return True
+    except Exception:
+        pass
+    try:
+        bat_path = os.path.join(SCRIPT_DIR, "Launch_Enforcer.bat")
+        if os.path.exists(bat_path):
+            with open(
+                bat_path, "r", encoding="utf-8", errors="replace"
+            ) as bf:
+                if BETA_GIST_BUNDLE_ID in bf.read():
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def get_changelog_web_url():
+    """Returns the Beta Channel Gist Changelog URL when running on the beta
+    branch/channel, or the Main Stable Changelog Gist URL on stable builds."""
+    return (
+        BETA_CHANGELOG_WEB_URL
+        if _is_beta_channel_build()
+        else CHANGELOG_WEB_URL
+    )
+
+
 def _parse_version_tuple(v_str):
     nums = [int(x) for x in re.findall(r"\d+", str(v_str))]
     return tuple(nums) if nums else (0,)
@@ -16688,9 +16740,16 @@ def _fetch_remote_doc_bytes(doc_name, ts=None):
     import urllib.request
     if ts is None:
         ts = int(time.time())
-    doc_urls = [f"{GITHUB_RAW_BASE}{doc_name}?t={ts}"]
-    if doc_name in GIST_DOC_RAW_URLS:
-        doc_urls.append(f"{GIST_DOC_RAW_URLS[doc_name]}?t={ts}")
+    is_beta = _is_beta_channel_build()
+    if is_beta:
+        doc_urls = [
+            f"https://gist.githubusercontent.com/DBCodez/{BETA_GIST_BUNDLE_ID}/raw/{doc_name}?t={ts}",
+            f"{BETA_GITHUB_RAW_BASE}{doc_name}?t={ts}",
+        ]
+    else:
+        doc_urls = [f"{GITHUB_RAW_BASE}{doc_name}?t={ts}"]
+        if doc_name in GIST_DOC_RAW_URLS:
+            doc_urls.append(f"{GIST_DOC_RAW_URLS[doc_name]}?t={ts}")
     for d_url in doc_urls:
         try:
             d_req = urllib.request.Request(
@@ -16703,6 +16762,12 @@ def _fetch_remote_doc_bytes(doc_name, ts=None):
             with urllib.request.urlopen(d_req, timeout=3) as d_resp:
                 doc_bytes = d_resp.read()
             if doc_bytes:
+                if is_beta and doc_name == "Launch_Enforcer.bat":
+                    doc_bytes = (
+                        doc_bytes.decode("utf-8", errors="replace")
+                        .replace(MAIN_GIST_BUNDLE_ID, BETA_GIST_BUNDLE_ID)
+                        .encode("utf-8")
+                    )
                 return doc_bytes
         except Exception:
             continue
@@ -17448,7 +17513,7 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
             canvas_bg="#0d1117",
             height=30,
             pad_x=22,
-            command=lambda: webbrowser.open(CHANGELOG_WEB_URL),
+            command=lambda: webbrowser.open(get_changelog_web_url()),
         ).pack(side="right")
 
         tk.Label(
@@ -17605,7 +17670,7 @@ def show_release_notes_dialog(parent=None):
             cl_text = cl_bytes.decode("utf-8", errors="replace")
 
     if not cl_text.strip():
-        webbrowser.open(CHANGELOG_WEB_URL)
+        webbrowser.open(get_changelog_web_url())
         return
 
     is_standalone = parent is None
@@ -17673,7 +17738,7 @@ def show_release_notes_dialog(parent=None):
         canvas_bg="#0d1117",
         height=30,
         pad_x=22,
-        command=lambda: webbrowser.open(CHANGELOG_WEB_URL),
+        command=lambda: webbrowser.open(get_changelog_web_url()),
     ).pack(side="right")
 
     btn_bar = tk.Frame(win, bg="#0d1117", pady=10)
@@ -17861,10 +17926,20 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
 
         import urllib.request
         ts = int(now_ts)
+        is_beta = _is_beta_channel_build()
+        active_gist_id = (
+            BETA_GIST_BUNDLE_ID if is_beta else MAIN_GIST_BUNDLE_ID
+        )
+        active_enforcer_raw = (
+            BETA_GIST_ENFORCER_RAW_URL if is_beta else GIST_ENFORCER_RAW_URL
+        )
+        active_raw_base = (
+            BETA_GITHUB_RAW_BASE if is_beta else GITHUB_RAW_BASE
+        )
         candidate_urls = []
         try:
             api_req = urllib.request.Request(
-                "https://api.github.com/gists/6442a3ab2767aeb5ba0b13940d012634",
+                f"https://api.github.com/gists/{active_gist_id}",
                 headers={
                     "User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}",
                     "Accept": "application/vnd.github+json",
@@ -17880,8 +17955,8 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
         except Exception:
             pass
         candidate_urls.extend([
-            f"{GIST_ENFORCER_RAW_URL}?t={ts}",
-            f"{GITHUB_RAW_BASE}enforcer.py?t={ts}",
+            f"{active_enforcer_raw}?t={ts}",
+            f"{active_raw_base}enforcer.py?t={ts}",
         ])
         best_ver = None
         best_bytes = None

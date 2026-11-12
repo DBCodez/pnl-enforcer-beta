@@ -28,8 +28,9 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 - **Webull Live Mark Alignment & Scale-In Realized PnL Stability (`WebullAdapter._extract_webull_equity_and_cash`, `_stabilize_mid_fill_realized_and_equity`):**
   - Extracted the balance payload's `total_market_value` / `market_value` (`bal_mkt_val`) in `WebullAdapter` and adjusted `raw_eq` by `(total_pos_mkt_val - bal_mkt_val)` so `raw_adj_eq` and `cash_plus_pos` stay synchronized during fast option/equity moves.
   - Tightened `_stabilize_mid_fill_realized_and_equity()` drift tolerance when holding or scaling in (`not any_closed_or_reduced`) to `max(6.0, added_opt_contracts * 1.50)` so sub-`$25` mark lag on scale-ins never shifts `Realized PnL`.
-- **Dropdown Menu Boundary Clamping (`DarkDropdownMenu.tk_popup`):**
+- **Dropdown Menu Boundary Clamping & Beta Channel Web Changelog Link (`DarkDropdownMenu.tk_popup`, `get_changelog_web_url`):**
   - Updated `DarkDropdownMenu.tk_popup()` to check parent window and monitor bounds and automatically flip upward (`2px` above the button) whenever opening downward would overflow the bottom of the Pre-Flight window or screen.
+  - Added `_is_beta_channel_build()` and `get_changelog_web_url()` so clicking **`Open Full Changelog on Web ↗`** (and checking for updates / remote docs) on a `beta` branch or Beta Channel Gist install automatically routes to the Beta Channel Gist (`28088fe94e866e249b2c794c25eef6e9#file-changelog-md`) while `main` / Stable installs continue linking to the Main Changelog Gist.
 
 ---
 
