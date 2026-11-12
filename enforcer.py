@@ -7451,9 +7451,81 @@ def play_unlock_chimes():
         pass
 
 
-def speak_async(text, force=False, voice_override=None):
+_tts_state_lock = threading.Lock()
+_tts_queue = []
+_tts_active_proc = None
+_tts_worker_running = False
+
+
+def _build_tts_ps_cmd(safe_text, safe_voice):
+    return (
+        "$sp = $null; "
+        "try { "
+        "$sp = New-Object -ComObject SAPI.SpVoice; "
+        "$cat = New-Object -ComObject SAPI.SpObjectTokenCategory; "
+        "$cat.SetId('HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices', $false); "
+        f"foreach ($t in $cat.EnumerateTokens()) {{ if ($t.GetDescription() -match '{safe_voice}') {{ $sp.Voice = $t; break }} }}; "
+        "$sp.Rate = 1 "
+        "} catch { $sp = $null }; "
+        "if ($sp -ne $null) { "
+        f"try {{ [void]$sp.Speak('{safe_text}') }} catch {{}} "
+        "} else { "
+        "try { "
+        "Add-Type -AssemblyName System.Speech; "
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        f"try {{ $s.SelectVoice('Microsoft {safe_voice} Desktop') }} catch {{}}; "
+        f"$s.Speak('{safe_text}') "
+        "} catch {} "
+        "}"
+    )
+
+
+def _tts_worker_loop():
+    global _tts_active_proc, _tts_worker_running
+    while True:
+        with _tts_state_lock:
+            if not _tts_queue:
+                _tts_active_proc = None
+                _tts_worker_running = False
+                return
+            safe_text, safe_voice = _tts_queue.pop(0)
+            ps_cmd = _build_tts_ps_cmd(safe_text, safe_voice)
+            try:
+                proc = subprocess.Popen(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-WindowStyle",
+                        "Hidden",
+                        "-Command",
+                        ps_cmd,
+                    ],
+                    creationflags=getattr(
+                        subprocess, "CREATE_NO_WINDOW", 0x08000000
+                    ),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                _tts_active_proc = proc
+            except Exception:
+                proc = None
+                _tts_active_proc = None
+        if proc is not None:
+            try:
+                proc.wait(timeout=15)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
+def speak_async(text, force=False, voice_override=None, interrupt=False):
     """Speaks text asynchronously using Windows OneCore / SAPI speech synthesis
-    (supports Zira, Mark, and David voices)."""
+    (supports Zira, Mark, and David voices). Serializes queued phrases so two
+    voice cues never talk over each other, or preempts active speech immediately
+    when interrupt=True."""
+    global _tts_active_proc, _tts_worker_running
     if not force and not config.get("enable_voice_cues", True):
         return
     try:
@@ -7464,34 +7536,35 @@ def speak_async(text, force=False, voice_override=None):
             or "Zira"
         )
         safe_voice = str(voice_id).replace("'", "")
-        ps_cmd = (
-            "$sp = $null; "
-            "try { "
-            "$sp = New-Object -ComObject SAPI.SpVoice; "
-            "$cat = New-Object -ComObject SAPI.SpObjectTokenCategory; "
-            "$cat.SetId('HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices', $false); "
-            f"foreach ($t in $cat.EnumerateTokens()) {{ if ($t.GetDescription() -match '{safe_voice}') {{ $sp.Voice = $t; break }} }}; "
-            "$sp.Rate = 1 "
-            "} catch { $sp = $null }; "
-            "if ($sp -ne $null) { "
-            f"try {{ [void]$sp.Speak('{safe_text}') }} catch {{}} "
-            "} else { "
-            "try { "
-            "Add-Type -AssemblyName System.Speech; "
-            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            f"try {{ $s.SelectVoice('Microsoft {safe_voice} Desktop') }} catch {{}}; "
-            f"$s.Speak('{safe_text}') "
-            "} catch {} "
-            "}"
-        )
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        with _tts_state_lock:
+            if interrupt:
+                _tts_queue.clear()
+                if _tts_active_proc is not None:
+                    try:
+                        _tts_active_proc.kill()
+                    except Exception:
+                        pass
+                    _tts_active_proc = None
+            _tts_queue.append((safe_text, safe_voice))
+            if not _tts_worker_running:
+                _tts_worker_running = True
+                threading.Thread(target=_tts_worker_loop, daemon=True).start()
     except Exception:
         pass
+
+
+def stop_active_tts():
+    """Clears any queued speech and terminates any currently speaking TTS
+    subprocess so unlock chimes or completion announcements start cleanly."""
+    global _tts_active_proc
+    with _tts_state_lock:
+        _tts_queue.clear()
+        if _tts_active_proc is not None:
+            try:
+                _tts_active_proc.kill()
+            except Exception:
+                pass
+            _tts_active_proc = None
 
 
 def play_upside_tier_chime():
@@ -7574,6 +7647,55 @@ def trigger_upside_tier_glow(
                 )
 
     ui_button.after(0, lambda: _step(0))
+
+
+def is_workstation_locked():
+    """Returns True when the Windows session is locked (WTSSessionInfoEx
+    SessionFlags == WTS_SESSIONSTATE_LOCK [0] on Windows 8/10/11), and False
+    only when the session is unlocked (WTS_SESSIONSTATE_UNLOCK [1])."""
+    try:
+        wts = ctypes.windll.wtsapi32
+        k32 = ctypes.windll.kernel32
+        ppbuf = ctypes.c_void_p()
+        bytes_ret = ctypes.c_ulong(0)
+        sess_id = k32.WTSGetActiveConsoleSessionId()
+        ok = wts.WTSQuerySessionInformationW(
+            0, sess_id, 25, ctypes.byref(ppbuf), ctypes.byref(bytes_ret)
+        )
+        if ok and ppbuf.value and bytes_ret.value >= 20:
+            try:
+                raw = ctypes.string_at(ppbuf.value, 20)
+                _, _, _, _, sflags = struct.unpack("<IIiiI", raw)
+                return sflags == 0
+            finally:
+                wts.WTSFreeMemory(ppbuf)
+    except Exception:
+        pass
+    return False
+
+
+def _format_exact_remaining_voice_msg(rem_seconds):
+    """Formats the exact remaining lockout time for verbal announcement when
+    an early screen-unlock attempt is detected and immediately re-locked."""
+    rem = max(1, int(round(float(rem_seconds))))
+    mins = rem // 60
+    secs = rem % 60
+    if mins > 0 and secs > 0:
+        m_word = "minute" if mins == 1 else "minutes"
+        s_word = "second" if secs == 1 else "seconds"
+        return f"Lockout still active. {mins} {m_word} and {secs} {s_word} remaining."
+    if mins > 0:
+        m_word = "minute" if mins == 1 else "minutes"
+        return f"Lockout still active. {mins} {m_word} remaining."
+    s_word = "second" if secs == 1 else "seconds"
+    return f"Lockout still active. {secs} {s_word} remaining."
+
+
+def _format_exact_remaining_log_str(rem_seconds):
+    rem = max(1, int(round(float(rem_seconds))))
+    mins = rem // 60
+    secs = rem % 60
+    return f"{mins}m {secs:02d}s" if mins > 0 else f"{secs}s"
 
 
 def _format_lock_voice_msg(duration_mins, label_prefix, upgraded=False):
@@ -7660,7 +7782,7 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
             f"Straggler positions detected after OS lock: {straggler_desc}! "
             f"Initiating emergency sweep..."
         )
-        speak_async("Warning, straggler shares detected, flattening now.")
+        speak_async("Warning, straggler shares detected, flattening now.", interrupt=True)
         swept_flat = flatten_equities(
             adapter, force_flatten=True, include_options=opt_armed
         )
@@ -7729,7 +7851,10 @@ def start_cooldown_lock(
                 f"Upgraded active lock to {label_prefix} for {duration_sec}s "
                 f"({duration_mins:g} min). Siren muted."
             )
-            speak_async(_format_lock_voice_msg(duration_mins, label_prefix, upgraded=True))
+            speak_async(
+                _format_lock_voice_msg(duration_mins, label_prefix, upgraded=True),
+                interrupt=True,
+            )
             _run_post_lock_watchdog(adapter, ui_button, label_prefix)
         return
 
@@ -7748,11 +7873,49 @@ def start_cooldown_lock(
             f"Persistent {cooldown_label} started for {duration_sec}s "
             f"({duration_mins:g} min). Siren muted."
         )
+        try:
+            ctypes.windll.user32.LockWorkStation()
+        except Exception:
+            pass
+        time.sleep(0.35)
         speak_async(_format_lock_voice_msg(duration_mins, cooldown_label, upgraded=False))
         watchdog_launched = False
+        lock_started_ts = time.time()
+        confirmed_locked = is_workstation_locked()
+        last_early_unlock_ts = 0.0
         while cooldown_active and time.time() < cooldown_end_time:
             alarm_active = False
-            rem = int(round(cooldown_end_time - time.time()))
+            now_ts = time.time()
+            rem = max(0, int(round(cooldown_end_time - now_ts)))
+            currently_locked = is_workstation_locked()
+            if currently_locked:
+                confirmed_locked = True
+            else:
+                try:
+                    ctypes.windll.user32.LockWorkStation()
+                except Exception:
+                    pass
+                if (
+                    confirmed_locked
+                    and (now_ts - lock_started_ts) >= 1.5
+                    and rem >= 1
+                    and (now_ts - last_early_unlock_ts) >= 2.5
+                ):
+                    confirmed_locked = False
+                    last_early_unlock_ts = now_ts
+                    rem_log = _format_exact_remaining_log_str(rem)
+                    log_event(
+                        "COOLDOWN",
+                        f"Early unlock attempt detected during {cooldown_label} "
+                        f"({rem_log} remaining) — workstation immediately re-locked."
+                    )
+                    time.sleep(0.30)
+                    rem_voice = max(1, int(round(cooldown_end_time - time.time())))
+                    speak_async(
+                        _format_exact_remaining_voice_msg(rem_voice),
+                        interrupt=True,
+                    )
+            recent_early_callout = (time.time() - last_early_unlock_ts) < 4.0
             if rem > 35:
                 m_mark = (rem + 4) // 60
                 if (
@@ -7761,11 +7924,13 @@ def start_cooldown_lock(
                     and (m_mark * 60) - 5 <= rem <= (m_mark * 60)
                 ):
                     cooldown_announced_mins.add(m_mark)
-                    m_word = "minute" if m_mark == 1 else "minutes"
-                    speak_async(f"{m_mark} {m_word} remaining until unlock.")
+                    if not recent_early_callout:
+                        m_word = "minute" if m_mark == 1 else "minutes"
+                        speak_async(f"{m_mark} {m_word} remaining until unlock.")
             if not cooldown_30s_announced and 0 < rem <= 30:
                 cooldown_30s_announced = True
-                speak_async("30 seconds remaining until unlock.")
+                if not recent_early_callout:
+                    speak_async("30 seconds remaining until unlock.")
             txt = (
                 f"🔒 LOCKED: {rem}s"
                 if is_compact_hud()
@@ -7781,11 +7946,10 @@ def start_cooldown_lock(
                     state="disabled"
                 )
             )
-            ctypes.windll.user32.LockWorkStation()
             if not watchdog_launched:
                 watchdog_launched = True
                 _run_post_lock_watchdog(adapter, ui_button, cooldown_label)
-            time.sleep(0.35)
+            time.sleep(0.20)
 
         if not cooldown_active:
             log_event(
@@ -7811,6 +7975,7 @@ def start_cooldown_lock(
                 state="disabled"
             )
         )
+        stop_active_tts()
         play_unlock_chimes()
         if was_daily_breach_lock and is_locked_down:
             ui_button.after(
@@ -14669,7 +14834,8 @@ def show_preflight_window(
         cb_voice,
         "Uses Windows Speech Synthesis to speak the lockout reason, duration, and 2s/15s\n"
         "post-lock flat check confirmations out loud when a Penalty Box or Daily Lockout triggers,\n"
-        "plus an announcement every whole minute remaining and at 30 seconds remaining."
+        "plus whole-minute / 30-second countdown reminders and an exact remaining time callout\n"
+        "whenever an early screen-unlock attempt is detected and immediately re-locked."
     )
 
     cb_chime = make_glass_checkbutton(
@@ -14930,25 +15096,29 @@ def show_preflight_window(
             speak_async(
                 "Open P and L stop triggered. Locked out for 2 minutes. Initial flat check passed.",
                 force=True,
-                voice_override=sel_voice_id
+                voice_override=sel_voice_id,
+                interrupt=True,
             )
         elif choice == "Voice: 15s Sweep Clear":
             speak_async(
                 "15 second sweep clear, account confirmed flat.",
                 force=True,
-                voice_override=sel_voice_id
+                voice_override=sel_voice_id,
+                interrupt=True,
             )
         elif choice == "Voice: 1m Warning":
             speak_async(
                 "1 minute remaining until unlock.",
                 force=True,
-                voice_override=sel_voice_id
+                voice_override=sel_voice_id,
+                interrupt=True,
             )
         elif choice == "Voice: 30s Warning":
             speak_async(
                 "30 seconds remaining until unlock.",
                 force=True,
-                voice_override=sel_voice_id
+                voice_override=sel_voice_id,
+                interrupt=True,
             )
         elif choice == "Unlock Chime (3-Tone)":
             threading.Thread(target=play_unlock_chimes, daemon=True).start()
@@ -14994,24 +15164,57 @@ def show_preflight_window(
                         ctypes.windll.user32.LockWorkStation()
                     except Exception:
                         pass
-                    time.sleep(0.25)
+                    time.sleep(0.35)
                     speak_async(
                         "Dry run lockout test started. Locked out for 10 seconds.",
                         force=True,
                         voice_override=sel_voice_id,
+                        interrupt=True,
                     )
-                    end_t = time.time() + 10.0
+                    lock_started_ts = time.time()
+                    end_t = lock_started_ts + 10.0
+                    confirmed_locked = is_workstation_locked()
+                    last_early_unlock_ts = 0.0
                     while time.time() < end_t:
-                        try:
-                            ctypes.windll.user32.LockWorkStation()
-                        except Exception:
-                            pass
-                        time.sleep(0.35)
+                        now_ts = time.time()
+                        rem = max(0, int(round(end_t - now_ts)))
+                        currently_locked = is_workstation_locked()
+                        if currently_locked:
+                            confirmed_locked = True
+                        else:
+                            try:
+                                ctypes.windll.user32.LockWorkStation()
+                            except Exception:
+                                pass
+                            if (
+                                confirmed_locked
+                                and (now_ts - lock_started_ts) >= 1.5
+                                and rem >= 1
+                                and (now_ts - last_early_unlock_ts) >= 2.0
+                            ):
+                                confirmed_locked = False
+                                last_early_unlock_ts = now_ts
+                                log_event(
+                                    "SESSION",
+                                    f"Early unlock attempt detected during 10s Dry-Run Lockout "
+                                    f"({rem}s remaining) — workstation immediately re-locked.",
+                                )
+                                time.sleep(0.30)
+                                rem_voice = max(1, int(round(end_t - time.time())))
+                                speak_async(
+                                    _format_exact_remaining_voice_msg(rem_voice),
+                                    force=True,
+                                    voice_override=sel_voice_id,
+                                    interrupt=True,
+                                )
+                        time.sleep(0.20)
+                    stop_active_tts()
                     play_unlock_chimes()
                     speak_async(
                         "Dry run lockout complete. You may unlock your screen.",
                         force=True,
                         voice_override=sel_voice_id,
+                        interrupt=True,
                     )
                     log_event(
                         "SESSION",
