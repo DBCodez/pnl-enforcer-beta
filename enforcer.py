@@ -1235,7 +1235,7 @@ class DarkDropdownMenu:
                     fg=self._fg,
                     anchor="w",
                     padx=10,
-                    pady=5,
+                    pady=4,
                     cursor="hand2",
                 )
                 row.pack(fill="x")
@@ -1257,6 +1257,34 @@ class DarkDropdownMenu:
             req_h = int(tw.winfo_reqheight())
             pos_x = int(x)
             pos_y = int(y)
+            try:
+                scr_w = int(tw.winfo_screenwidth())
+                scr_h = int(tw.winfo_screenheight())
+                top = self._parent.winfo_toplevel()
+                top_x = int(top.winfo_rootx())
+                top_y = int(top.winfo_rooty())
+                top_w = int(top.winfo_width())
+                top_h = int(top.winfo_height())
+                max_bottom = (
+                    min(top_y + top_h - 8, scr_h - 48)
+                    if top_h > 120
+                    else (scr_h - 48)
+                )
+                if pos_y + req_h > max_bottom and owner is not None:
+                    up_y = int(owner.winfo_rooty()) - req_h - 2
+                    if up_y >= max(8, top_y + 8):
+                        pos_y = up_y
+                    else:
+                        pos_y = max(8, max_bottom - req_h)
+                max_right = (
+                    min(top_x + top_w - 8, scr_w - 8)
+                    if top_w > 120
+                    else (scr_w - 8)
+                )
+                if pos_x + req_w > max_right:
+                    pos_x = max(8, max_right - req_w)
+            except Exception:
+                pass
             tw.wm_geometry(f"{req_w}x{req_h}+{pos_x}+{pos_y}")
             tw.lift()
             try:
@@ -5368,14 +5396,19 @@ class WebullAdapter:
 
     @staticmethod
     def _extract_webull_equity_and_cash(b_data):
-        """Extracts Total Account Value (Net Liquidation) and Cash Balance
-        from Webull's balance payload without ever mistaking Market Value
-        of positions for Total Account Value."""
+        """Extracts Total Account Value (Net Liquidation), Cash Balance, and
+        Balance-Snapshot Market Value from Webull's balance payload without
+        ever mistaking Market Value of positions for Total Account Value."""
         def to_f(val):
             try:
                 return float(val) if val is not None and val != "" else None
             except Exception:
                 return None
+
+        top_mkt = to_f(
+            b_data.get("total_market_value")
+            or b_data.get("market_value")
+        )
 
         # 1. Check direct top-level net liquidation fields
         for k in (
@@ -5394,12 +5427,16 @@ class WebullAdapter:
                     or b_data.get("cash_balance")
                     or b_data.get("total_cash")
                 )
-                return v, cash
+                return v, cash, top_mkt
 
         # 2. Check inside account_currency_assets (USD)
         assets = b_data.get("account_currency_assets")
         if isinstance(assets, list) and assets:
             for item in assets:
+                sub_mkt = to_f(
+                    item.get("market_value")
+                    or item.get("total_market_value")
+                )
                 for k in (
                     "net_liquidation_value",
                     "total_net_liquidation_value",
@@ -5413,7 +5450,7 @@ class WebullAdapter:
                             or item.get("total_cash_balance")
                             or item.get("total_cash")
                         )
-                        return v, cash
+                        return v, cash, (sub_mkt if sub_mkt is not None else top_mkt)
 
         # 3. Fallback: Sum Cash Balance + Market Value
         cash = to_f(
@@ -5421,12 +5458,9 @@ class WebullAdapter:
             or b_data.get("cash_balance")
             or b_data.get("total_cash")
         )
-        mkt = to_f(
-            b_data.get("total_market_value")
-            or b_data.get("market_value")
-        ) or 0.0
+        mkt = top_mkt or 0.0
         if cash is not None:
-            return cash + mkt, cash
+            return cash + mkt, cash, top_mkt
 
         if isinstance(assets, list) and assets:
             for item in assets:
@@ -5435,14 +5469,15 @@ class WebullAdapter:
                     or item.get("total_cash_balance")
                     or item.get("settled_cash")
                 )
-                m_sub = to_f(
+                m_sub_raw = to_f(
                     item.get("market_value")
                     or item.get("total_market_value")
-                ) or 0.0
+                )
+                m_sub = m_sub_raw or 0.0
                 if c_sub is not None:
-                    return c_sub + m_sub, c_sub
+                    return c_sub + m_sub, c_sub, m_sub_raw
 
-        return 0.0, None
+        return 0.0, None, None
 
     def fetch_account_data(self):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
@@ -5518,7 +5553,9 @@ class WebullAdapter:
                 if isinstance(b_json, dict) else {}
             )
 
-            raw_eq, cash_bal = self._extract_webull_equity_and_cash(b_data)
+            raw_eq, cash_bal, bal_mkt_val = (
+                self._extract_webull_equity_and_cash(b_data)
+            )
             if self.account_id not in self._logged_accounts:
                 self._logged_accounts.add(self.account_id)
                 log_event(
@@ -5663,8 +5700,13 @@ class WebullAdapter:
                 for s_k, d_v in pos_details.items()
             }
 
+            ref_bal_mkt_val = (
+                bal_mkt_val
+                if (bal_mkt_val is not None and len(pos_details) > 0)
+                else total_raw_pos_mkt_val
+            )
             raw_adj_eq = (
-                round(raw_eq + (total_pos_mkt_val - total_raw_pos_mkt_val), 2)
+                round(raw_eq + (total_pos_mkt_val - ref_bal_mkt_val), 2)
                 if (raw_eq is not None and raw_eq > 0)
                 else None
             )
@@ -7000,6 +7042,47 @@ def format_alarm_button_text(reason):
     return f"ACKNOWLEDGE ALARM ({reason})"
 
 
+def is_disconnect_alarm_reason(reason):
+    """Returns True when an alarm reason represents a broker API connection
+    drop or token expiration rather than a position/loss threshold breach."""
+    r_up = str(reason or "").upper()
+    return any(
+        k in r_up
+        for k in ("CONNECTION LOST", "DISCONNECTED", "TOKEN EXPIRED")
+    )
+
+
+def play_disconnect_tone_once():
+    """Plays a calm, non-startling 2-note descending telemetry tone
+    (660 Hz E5 -> 440 Hz A4) so API connection drops never sound like an
+    emergency position/loss siren."""
+    try:
+        winsound.Beep(660, 150)
+        time.sleep(0.04)
+        winsound.Beep(440, 220)
+    except Exception:
+        pass
+
+
+def sound_disconnect_alert_loop():
+    """Plays the calm 2-note descending connection-loss tone once immediately
+    and then repeats gently every 4.5 seconds until acknowledged or restored."""
+    global alarm_active
+    while alarm_active and not cooldown_active:
+        if not is_disconnect_alarm_reason(last_alarm_reason):
+            break
+        play_disconnect_tone_once()
+        # Wait 4.5s between gentle reminders in 0.15s slices for instant mute/recovery
+        for _ in range(30):
+            if (
+                not alarm_active
+                or cooldown_active
+                or not is_disconnect_alarm_reason(last_alarm_reason)
+            ):
+                break
+            time.sleep(0.15)
+
+
 def sound_alarm_loop():
     global alarm_active
     while alarm_active and not cooldown_active:
@@ -7040,7 +7123,12 @@ def trigger_alarm(reason, ui_button, context_str=""):
             state="normal",
         )
     )
-    threading.Thread(target=sound_alarm_loop, daemon=True).start()
+    loop_fn = (
+        sound_disconnect_alert_loop
+        if is_disconnect_alarm_reason(reason)
+        else sound_alarm_loop
+    )
+    threading.Thread(target=loop_fn, daemon=True).start()
 
 
 def check_alarm_rearm(reason, current_val, threshold_val):
@@ -7202,10 +7290,13 @@ def compute_upside_tier(rth_now, max_realized_profit, cfg):
     return 1
 
 
-def trigger_upside_tier_glow(ui_button, banner_text, log_msg):
-    """Logs the tier ratchet and, if enabled, plays the upside chime and pulses
-    the bottom HUD status bar with a 3-second emerald glow."""
-    log_event("RATCHET", log_msg)
+def trigger_upside_tier_glow(
+    ui_button, banner_text, log_msg, log_tag="RATCHET"
+):
+    """Logs the tier ratchet (or connection recovery when log_tag='SESSION')
+    and, if enabled, plays the upside chime and pulses the bottom HUD status
+    bar with a 3-second emerald glow."""
+    log_event(log_tag, log_msg)
     if not config.get("enable_upside_chime", True):
         return
     if alarm_active or cooldown_active or ui_button is None:
@@ -8418,7 +8509,18 @@ def _stabilize_mid_fill_realized_and_equity(
     )
 
     if not any_closed_or_reduced:
-        allowed_drift = max(25.0, pending_scale_out_tol)
+        added_opt_contracts = 0.0
+        if qty_changed_now:
+            for sym_k, new_d in pos_details.items():
+                if new_d.get("asset_type") == "OPTION":
+                    old_q = float(
+                        (prev_pos_snapshot.get(sym_k) or {}).get("qty", 0.0)
+                    )
+                    new_q = float(new_d.get("qty", 0.0))
+                    if abs(new_q) > abs(old_q):
+                        added_opt_contracts += abs(new_q) - abs(old_q)
+        fee_tol = max(6.0, added_opt_contracts * 1.50)
+        allowed_drift = max(fee_tol, pending_scale_out_tol)
         if (
             abs(raw_realized_pnl - settled_realized_pnl) > allowed_drift
             and (qty_changed_now or in_trade_desync_streak < 2)
@@ -8523,6 +8625,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 mute_btn,
                                 "✓ CONNECTION RESTORED — BACK ONLINE",
                                 f"Broker API connection restored after {recovered_attempts} attempt(s).",
+                                log_tag="SESSION",
                             )
                         else:
                             log_event(
@@ -13975,6 +14078,7 @@ def show_preflight_window(
 
     audio_choices = [
         "Warning Siren (Short Preview)",
+        "Connection Lost Tone (2-Tone)",
         "Upside Tier Chime",
         "Voice: Lockout Alert",
         "Voice: 15s Sweep Clear",
@@ -14146,6 +14250,10 @@ def show_preflight_window(
                 except Exception:
                     pass
             threading.Thread(target=_siren_sample, daemon=True).start()
+        elif choice == "Connection Lost Tone (2-Tone)":
+            threading.Thread(
+                target=play_disconnect_tone_once, daemon=True
+            ).start()
         elif choice == "Upside Tier Chime":
             play_upside_tier_chime()
         elif choice == "Voice: Lockout Alert":
