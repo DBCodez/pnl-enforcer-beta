@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.43"
+APP_VERSION = "0.9.44"
 
 import os
 import sys
@@ -1895,6 +1895,7 @@ first_poll_of_launch = True
 
 alarm_active = False
 cooldown_active = False
+dry_run_lock_active = False
 consecutive_api_failures = 0
 api_disconnect_alerted = False
 cooldown_end_time = 0.0
@@ -2566,10 +2567,22 @@ def _maybe_upload_prior_day_sanitized_log():
         _telemetry_auto_upload_in_flight = False
 
 
+def _get_os_env_summary():
+    py_ver = sys.version.split()[0]
+    try:
+        wv = sys.getwindowsversion()
+        os_lbl = "Win11" if wv.build >= 22000 else f"Win{wv.major}"
+        os_str = f"{os_lbl}(Build {wv.build})"
+    except Exception:
+        os_str = sys.platform
+    return f"OS={os_str} | Py={py_ver}"
+
+
 def init_daily_log():
     today_str = get_today_str()
+    env_info = _get_os_env_summary()
     header_line = (
-        f"=== ENFORCER SESSION LOG | v{APP_VERSION} | DATE: {today_str} ===\n"
+        f"=== ENFORCER SESSION LOG | v{APP_VERSION} | DATE: {today_str} | {env_info} ===\n"
     )
     needs_wipe = True
 
@@ -2595,7 +2608,7 @@ def init_daily_log():
                 )
             log_event(
                 "SESSION",
-                f"Initialized fresh daily log file (v{APP_VERSION})."
+                f"Initialized fresh daily log file (v{APP_VERSION} | {env_info})."
             )
             if archived_path:
                 log_event(
@@ -2612,7 +2625,7 @@ def init_daily_log():
             _sync_sanitized_log_archive()
             log_event(
                 "SESSION",
-                f"--- APPLICATION LAUNCHED / RESUMED (v{APP_VERSION}) ---"
+                f"--- APPLICATION LAUNCHED / RESUMED (v{APP_VERSION} | {env_info}) ---"
             )
         load_config(log_restore=False)
         _maybe_upload_prior_day_sanitized_log()
@@ -2777,6 +2790,26 @@ def format_config_summary(cfg):
     dl_str = (
         f"ON({dl_mins:g}m)" if dl_mins > 0 else "ON(Once)"
     ) if cfg.get("enable_lock_os") else "OFF"
+    eh_lock_str = (
+        f"ON(+${cfg.get('pm_lock_trigger', 500):,.0f}/Trail:${cfg.get('pm_trail_cushion', 500):,.0f})"
+        if cfg.get("enable_pm_lock", True)
+        else "OFF"
+    )
+    t2_str = (
+        f"ON(+${cfg.get('t2_trigger', 250):,.0f}->${cfg.get('t2_max_loss', -1000):+,.0f})"
+        if cfg.get("enable_t2", True)
+        else "OFF"
+    )
+    t3_str = (
+        f"ON(+${cfg.get('t3_trigger', 500):,.0f}->${cfg.get('t3_max_loss', -500):+,.0f})"
+        if cfg.get("enable_t3", True)
+        else "OFF"
+    )
+    t4_str = (
+        f"ON(+${cfg.get('t4_trigger', 1000):,.0f}/Trail:${cfg.get('t4_trail', 500):,.0f})"
+        if cfg.get("enable_t4", True)
+        else "OFF"
+    )
 
     return (
         f"Broker={broker} | Cols={len(get_active_hud_columns(cfg))} | "
@@ -2792,9 +2825,12 @@ def format_config_summary(cfg):
         f"LockOS={dl_str} | "
         f"Voice={'ON' if cfg.get('enable_voice_cues', True) else 'OFF'} | "
         f"UpChime={'ON' if cfg.get('enable_upside_chime', True) else 'OFF'} | "
+        f"ResetSwitch={'ON' if cfg.get('reset_at_925', True) else 'OFF'} | "
         f"IgnorePrePos={'ON' if cfg.get('ignore_preexisting_positions', True) else 'OFF'} | "
         f"EH_Max=-${cfg.get('pm_max_loss', 0):,.0f} | "
-        f"T1_Max=-${cfg.get('t1_max_loss', 0):,.0f}"
+        f"EH_Lock={eh_lock_str} | "
+        f"T1_Max=-${cfg.get('t1_max_loss', 0):,.0f} | "
+        f"T2={t2_str} | T3={t3_str} | T4={t4_str}"
     )
 
 
@@ -6982,18 +7018,23 @@ def speak_async(text, force=False, voice_override=None):
         )
         safe_voice = str(voice_id).replace("'", "")
         ps_cmd = (
+            "$sp = $null; "
             "try { "
             "$sp = New-Object -ComObject SAPI.SpVoice; "
             "$cat = New-Object -ComObject SAPI.SpObjectTokenCategory; "
             "$cat.SetId('HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices', $false); "
             f"foreach ($t in $cat.EnumerateTokens()) {{ if ($t.GetDescription() -match '{safe_voice}') {{ $sp.Voice = $t; break }} }}; "
-            "$sp.Rate = 1; "
-            f"[void]$sp.Speak('{safe_text}') "
-            "} catch { "
+            "$sp.Rate = 1 "
+            "} catch { $sp = $null }; "
+            "if ($sp -ne $null) { "
+            f"try {{ [void]$sp.Speak('{safe_text}') }} catch {{}} "
+            "} else { "
+            "try { "
             "Add-Type -AssemblyName System.Speech; "
             "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
             f"try {{ $s.SelectVoice('Microsoft {safe_voice} Desktop') }} catch {{}}; "
             f"$s.Speak('{safe_text}') "
+            "} catch {} "
             "}"
         )
         subprocess.Popen(
@@ -7294,7 +7335,7 @@ def start_cooldown_lock(
             if not watchdog_launched:
                 watchdog_launched = True
                 _run_post_lock_watchdog(adapter, ui_button, cooldown_label)
-            time.sleep(1.5)
+            time.sleep(0.35)
 
         if not cooldown_active:
             log_event(
@@ -9307,6 +9348,12 @@ def show_preflight_window(
     if parent is not None:
         if settings_win_open:
             return False
+        if cooldown_active or dry_run_lock_active:
+            log_event(
+                "GUARDRAIL",
+                "BLOCKED: Attempted to open Settings during an active lockout cooldown!",
+            )
+            return False
         if not current_is_flat:
             log_event(
                 "SESSION",
@@ -9345,8 +9392,14 @@ def show_preflight_window(
                 except Exception:
                     pass
 
-    def on_close():
+    def on_close(event=None):
         global settings_win_open, first_poll_of_launch, active_preflight_close_fn
+        if dry_run_lock_active or cooldown_active:
+            log_event(
+                "GUARDRAIL",
+                "BLOCKED: Attempted to close Pre-Flight Settings window during an active lockout!",
+            )
+            return "break"
         _cancel_pf_timers()
         active_preflight_close_fn = None
         if parent is None or current_is_flat:
@@ -9360,6 +9413,7 @@ def show_preflight_window(
     if parent is not None:
         active_preflight_close_fn = on_close
     pf.protocol("WM_DELETE_WINDOW", on_close)
+    pf.bind("<Alt-F4>", on_close)
 
     def _normalize_tooltip_paragraphs(raw_text):
         lines = [
@@ -12299,6 +12353,13 @@ def show_preflight_window(
         global force_reanchor, is_locked_down, current_is_flat, active_adapter
         global active_preflight_close_fn
 
+        if dry_run_lock_active or cooldown_active:
+            log_event(
+                "GUARDRAIL",
+                "BLOCKED: Attempted to save/close Pre-Flight during an active lockout!",
+            )
+            return
+
         if active_adapter is None:
             messagebox.showerror(
                 "Broker Not Connected",
@@ -13776,6 +13837,7 @@ def show_preflight_window(
         "Voice: 1m Warning",
         "Voice: 30s Warning",
         "Unlock Chime (3-Tone)",
+        "Full 10s Dry-Run Lockout",
     ]
     audio_dropdown = DarkDropdownMenu(
         pf,
@@ -13813,6 +13875,120 @@ def show_preflight_window(
     var_audio_test.trace_add(
         "write", lambda *_: audio_menu.config(text=var_audio_test.get())
     )
+
+    def _confirm_dry_run_lockout():
+        decision = {"ok": False}
+        dlg = tk.Toplevel(pf)
+        dlg.grab_set()
+        if os.path.exists(ICON_PATH):
+            try:
+                dlg.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+        apply_dark_title_bar(dlg)
+        dlg.title("PnL Enforcer — 10-Second Dry-Run OS Lockout Test")
+        dlg.config(bg="#0d1117", padx=26, pady=20)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+
+        def on_cancel():
+            decision["ok"] = False
+            dlg.destroy()
+
+        def on_start():
+            decision["ok"] = True
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        tk.Label(
+            dlg,
+            text="▶  🧪 10-SECOND DRY-RUN OS LOCKOUT TEST",
+            font=("Arial", 12, "bold"),
+            fg="#fbbf24",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 12))
+
+        card_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        card_outer.pack(fill="x", pady=(0, 16))
+        NeonBarCanvas(
+            card_outer, core_color="#fbbf24", card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+
+        msg_txt = (
+            "Run a 10-second simulated lockout sequence now?\n\n"
+            "• Plays the warning siren & verbal lockout voice announcement\n"
+            "• Locks your Windows screen (LockWorkStation) for 10 seconds\n"
+            "• Plays the 3-tone unlock chime & voice confirmation when finished\n\n"
+            "No orders are placed or canceled, and your session baseline and W/L stats remain untouched."
+        )
+        tk.Label(
+            card_outer,
+            text=msg_txt,
+            font=("Arial", 10, "bold"),
+            fg="#e2e8f0",
+            bg="#131922",
+            justify="left",
+            anchor="w",
+            wraplength=540,
+            padx=20,
+            pady=16,
+        ).pack(side="left", fill="both", expand=True)
+
+        btn_row = tk.Frame(dlg, bg="#0d1117")
+        btn_row.pack(fill="x")
+
+        make_stadium_button(
+            btn_row,
+            text="Cancel",
+            font=("Arial", 10, "bold"),
+            fill_color="#181e26",
+            border_color="#4a5568",
+            hover_fill="#232c38",
+            hover_border="#718096",
+            fg="#e2e8f0",
+            hover_fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=120,
+            height=34,
+            auto_width=False,
+            command=on_cancel,
+        ).pack(side="right", padx=(10, 0))
+
+        make_stadium_button(
+            btn_row,
+            text="▶ Start 10s Dry-Run Lock",
+            font=("Arial", 10, "bold"),
+            fill_color="#78350f",
+            fill_top_color="#92400e",
+            border_color="#f59e0b",
+            hover_fill="#92400e",
+            hover_fill_top="#b45309",
+            hover_border="#fbbf24",
+            fg="#fef3c7",
+            hover_fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=220,
+            height=34,
+            auto_width=False,
+            command=on_start,
+        ).pack(side="right")
+
+        dlg.update_idletasks()
+        w = dlg.winfo_reqwidth()
+        h = dlg.winfo_reqheight()
+        sw = dlg.winfo_screenwidth()
+        sh = dlg.winfo_screenheight()
+        dlg.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        pf.wait_window(dlg)
+        return decision["ok"]
 
     def play_selected_test_audio():
         choice = var_audio_test.get()
@@ -13854,6 +14030,90 @@ def show_preflight_window(
             )
         elif choice == "Unlock Chime (3-Tone)":
             threading.Thread(target=play_unlock_chimes, daemon=True).start()
+        elif choice == "Full 10s Dry-Run Lockout":
+            if dry_run_lock_active or cooldown_active:
+                return
+            if is_in_trade_tamper_locked():
+                messagebox.showwarning(
+                    "In Trade — Dry-Run Disabled",
+                    "Dry-Run OS Lockout is disabled while an active daytrade is open.\n\n"
+                    "Close your trade first so you are 100% flat before testing an OS lockout.",
+                    parent=pf,
+                )
+                return
+            if not _confirm_dry_run_lockout():
+                return
+            log_event(
+                "SESSION",
+                "User triggered 10-second Dry-Run OS Lockout test from Pre-Flight.",
+            )
+
+            def _dry_run_seq():
+                global dry_run_lock_active
+                dry_run_lock_active = True
+                try:
+                    pf.after(
+                        0,
+                        lambda: (
+                            btn_test_audio.config(text="🔒 10s", state="disabled"),
+                            btn_launch.config(
+                                text="🔒 DRY-RUN LOCKOUT ACTIVE...",
+                                state="disabled",
+                            ),
+                        ),
+                    )
+                except Exception:
+                    pass
+                try:
+                    for _ in range(4):
+                        winsound.Beep(2600, 180)
+                        time.sleep(0.04)
+                    try:
+                        ctypes.windll.user32.LockWorkStation()
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
+                    speak_async(
+                        "Dry run lockout test started. Locked out for 10 seconds.",
+                        force=True,
+                        voice_override=sel_voice_id,
+                    )
+                    end_t = time.time() + 10.0
+                    while time.time() < end_t:
+                        try:
+                            ctypes.windll.user32.LockWorkStation()
+                        except Exception:
+                            pass
+                        time.sleep(0.35)
+                    play_unlock_chimes()
+                    speak_async(
+                        "Dry run lockout complete. You may unlock your screen.",
+                        force=True,
+                        voice_override=sel_voice_id,
+                    )
+                    log_event(
+                        "SESSION",
+                        "10-second Dry-Run OS Lockout test completed cleanly.",
+                    )
+                except Exception:
+                    pass
+                finally:
+                    dry_run_lock_active = False
+                    try:
+                        pf.after(
+                            0,
+                            lambda: (
+                                btn_test_audio.config(
+                                    text="🔊 Test", state="normal"
+                                ),
+                                btn_launch.config(state="normal"),
+                                refresh_smart_dimming(),
+                            ),
+                        )
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_dry_run_seq, daemon=True).start()
 
     btn_test_audio = make_stadium_button(
         r_test_audio,
@@ -14435,17 +14695,24 @@ def show_preflight_window(
                 state="disabled" if in_trade_locked else "normal"
             )
         if btn_launch is not None:
-            btn_launch.config(
-                text=(
-                    "💾 SAVE HUD & AUDIO >>"
-                    if in_trade_locked
-                    else (
-                        "🚀 SAVE & LAUNCH ENFORCER >>"
-                        if parent is None
-                        else "🚀 SAVE & APPLY CHANGES >>"
-                    )
+            if dry_run_lock_active or cooldown_active:
+                btn_launch.config(
+                    text="🔒 DRY-RUN LOCKOUT ACTIVE...",
+                    state="disabled",
                 )
-            )
+            else:
+                btn_launch.config(
+                    text=(
+                        "💾 SAVE HUD & AUDIO >>"
+                        if in_trade_locked
+                        else (
+                            "🚀 SAVE & LAUNCH ENFORCER >>"
+                            if parent is None
+                            else "🚀 SAVE & APPLY CHANGES >>"
+                        )
+                    ),
+                    state="normal",
+                )
 
         if in_trade_locked:
             ao_on = bool(var_alarms_only.get())
@@ -15640,7 +15907,26 @@ def update_gui(
 
     refresh_acct_badge()
 
-    if is_flat:
+    if cooldown_active:
+        settings_btn.config(
+            text="🔒 LOCKED",
+            fill_color="#1e2228",
+            fill_top_color="#262a30",
+            border_color="#4b5563",
+            fg="#9ca3af",
+            disabledforeground="#9ca3af",
+            state="disabled",
+        )
+        close_btn.config(
+            text="🔒",
+            fill_color="#1e2228",
+            fill_top_color="#262a30",
+            border_color="#4b5563",
+            fg="#9ca3af",
+            disabledforeground="#9ca3af",
+            state="disabled",
+        )
+    elif is_flat:
         settings_btn.config(
             text="⚙ SETTINGS",
             fill_color="#141922",
@@ -15909,6 +16195,12 @@ def start_gui():
 
     def close_app(event=None):
         global alarm_active, current_is_flat
+        if cooldown_active or dry_run_lock_active:
+            log_event(
+                "GUARDRAIL",
+                "BLOCKED: Attempted to close HUD during an active lockout cooldown!",
+            )
+            return "break"
         if not current_is_flat:
             log_event(
                 "GUARDRAIL",
@@ -16355,7 +16647,10 @@ def _insert_formatted_changelog(txt_box, markdown_text):
             main_part, hint_part = _format_ver_hdr_line(ver_txt, False)
             txt_box.insert("end", main_part, ("ver_hdr", hdr_tag))
             txt_box.insert("end", hint_part, ("ver_hdr", "ver_hdr_hint", hdr_tag))
-            short_m = re.match(r"^(v?\d+\.\d+(?:\.\d+)?)", ver_txt)
+            short_m = re.match(
+                r"^(v?\d+\.\d+(?:\.\d+)?(?:\s*&\s*v?\d+\.\d+(?:\.\d+)?)?)",
+                ver_txt,
+            )
             short_ver = short_m.group(1) if short_m else ver_txt[:12]
             versions.append({
                 "idx": v_idx,

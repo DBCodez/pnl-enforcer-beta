@@ -4,10 +4,11 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
-## [v0.9.43] — 2026-11-12
+## [v0.9.43 & v0.9.44] — 2026-11-12
 ### ⚡ Quick Summary
 - **In-Trade Settings Access (`IN TRADE` Mode):** Open Pre-Flight Settings anytime during an active daytrade to customize **HUD Columns**, adjust **Audio / Voice / Poll Interval**, or export **Logs** — while all enforcement and rulebook settings across **Cards 1, 2, 4, and 5** stay tamper-locked until your position is flat.
 - **Live Background Enforcement & Real-Time Auto-Unlock:** Broker polling and stop enforcement continue uninterrupted while Settings is open, automatically unlocking all cards the instant your trade closes flat (or closing Settings if a stop triggers).
+- **10-Second Dry-Run OS Lockout & Hardened Cooldown Protection:** Added **`Full 10s Dry-Run Lockout`** to the Card 3 `Voice / Cue` **`Test`** dropdown so you can test the siren, voice cues, Windows lock screen, and unlock chime while flat — and locked HUD/Pre-Flight close & settings buttons with a `0.35s` re-lock cadence during active lockouts.
 - **Updated Liability Waiver & License (`v2026.11.12`):** Refreshed `LICENSE.txt` and the startup Assumption of Risk waiver with a high-legibility 5-section layout covering Equities, Options (Siren-Only default + opt-in BETA RTH Auto-Flatten), Ignored Swing Positions, `Alarms Only Mode`, and Post-Breach `DISARMED` mode.
 
 ### 🔍 Detailed Breakdown
@@ -24,6 +25,11 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
   - Updated `LICENSE.txt` and `show_liability_waiver()` to reflect all current functionality and risk disclosures, upgraded the startup waiver modal to the high-legibility 5-section badge layout, and bumped `WAIVER_VERSION` to `"2026.11.12"` so users acknowledge and log the updated SHA-256 hash once on update.
 - **Penny-Exact Fill Neutralization on Ignored Position Trims & Exits (`_apply_ignored_positions_to_snapshot`, `_apply_preexisting_selection`):**
   - When an ignored position changes quantity (scale-in, partial trim, or full exit to `0`) on a poll where no tracked daytrade position changed quantity, `locked_impact` is anchored directly against `(raw_adj_eq - tot_open_pnl) - last_flat_equity` so any difference between the actual broker fill price and the prior poll's `last_seen_price` is 100% absorbed into `locked_impact` with `$0.00` drift on daytrade `Realized PnL`.
+- **10-Second Dry-Run OS Lockout, Hardened Lockout Protection & Expanded Log Telemetry (`play_selected_test_audio`, `start_cooldown_lock`, `format_config_summary`, `init_daily_log`):**
+  - Added **`Full 10s Dry-Run Lockout`** to the Card 3 `Voice / Cue` **`Test`** dropdown (with a confirmation dialog while flat) so traders can test the full siren, voice announcement, 10-second `LockWorkStation()` screen lock, and 3-tone unlock chime sequence without placing orders or affecting session stats.
+  - Tightened the `LockWorkStation()` re-lock loop to `0.35s` and locked the HUD `✕` Close / `⚙ SETTINGS` buttons (and Pre-Flight close/launch during dry-runs) whenever an OS lockout cooldown is active so a lockout cannot be aborted during the Windows PIN-unlock transition window.
+  - Isolated SAPI `.Speak()` from the `System.Speech` fallback in `speak_async()` so Windows desktop-switch audio transitions never re-trigger the sentence a second time.
+  - Expanded `[CONFIG]` log lines to include `ResetSwitch`, `EH_Lock`, `T2`, `T3`, and `T4` profit ratchet thresholds, and stamped the OS build (`Win10`/`Win11`) and Python version in the daily session log header.
 
 ---
 
