@@ -21211,7 +21211,7 @@ def show_preflight_window(
     )
     attach_tooltip(
         src_diff_lbl,
-        "Open the public GitHub Gist revision history and full source code in your browser to inspect line-by-line diffs for every update."
+        "Open the public GitHub Gist bundle in your browser to inspect or download the full source code."
     )
 
     def show_daily_breach_return_notice():
@@ -22535,10 +22535,10 @@ BETA_CHANGELOG_WEB_URL = (
     f"https://gist.github.com/DBCodez/{BETA_GIST_BUNDLE_ID}#file-changelog-md"
 )
 SOURCE_DIFF_WEB_URL = (
-    f"https://gist.github.com/DBCodez/{MAIN_GIST_BUNDLE_ID}/revisions"
+    f"https://gist.github.com/DBCodez/{MAIN_GIST_BUNDLE_ID}"
 )
 BETA_SOURCE_DIFF_WEB_URL = (
-    f"https://gist.github.com/DBCodez/{BETA_GIST_BUNDLE_ID}/revisions"
+    f"https://gist.github.com/DBCodez/{BETA_GIST_BUNDLE_ID}"
 )
 GIST_DOC_RAW_URLS = {
     "CHANGELOG.md": (
@@ -23481,7 +23481,7 @@ def show_update_available_dialog(
 
         make_stadium_button(
             hdr_row,
-            text="Inspect Source / Diff ↗",
+            text="Inspect Source ↗",
             font=("Arial", 9, "bold"),
             fill_color="#161f2c",
             border_color="#475569",
@@ -23726,7 +23726,7 @@ def show_release_notes_dialog(parent=None):
 
     make_stadium_button(
         hdr_row,
-        text="Inspect Source / Diff ↗",
+        text="Inspect Source ↗",
         font=("Arial", 9, "bold"),
         fill_color="#161f2c",
         border_color="#475569",
