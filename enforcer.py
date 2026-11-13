@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.52"
+APP_VERSION = "0.9.53"
 
 import os
 import sys
@@ -1189,6 +1189,54 @@ def get_monitor_work_area(x=None, y=None, widget=None):
     except Exception:
         pass
     return (0, 0, 1920, 1032)
+
+
+def get_all_monitor_bounds(widget=None):
+    """Returns a list of (left, top, right, bottom, is_primary) full-screen
+    monitor rectangles across all connected displays via EnumDisplayMonitors."""
+    mons = []
+    try:
+        u32 = ctypes.windll.user32
+        get_mon_info = u32.GetMonitorInfoW
+        get_mon_info.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_WIN32_MONITORINFO),
+        ]
+        get_mon_info.restype = ctypes.c_int
+
+        mon_enum_proc = ctypes.WINFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(_WIN32_RECT),
+            ctypes.c_long,
+        )
+
+        def _enum_cb(h_mon, _hdc, _lprect, _lparam):
+            mi = _WIN32_MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_WIN32_MONITORINFO)
+            if get_mon_info(h_mon, ctypes.byref(mi)):
+                r = mi.rcMonitor
+                if (r.right - r.left) >= 320 and (r.bottom - r.top) >= 240:
+                    mons.append(
+                        (
+                            int(r.left),
+                            int(r.top),
+                            int(r.right),
+                            int(r.bottom),
+                            bool(mi.dwFlags & 1),
+                        )
+                    )
+            return 1
+
+        cb_fn = mon_enum_proc(_enum_cb)
+        u32.EnumDisplayMonitors(None, None, cb_fn, 0)
+    except Exception:
+        pass
+    if not mons:
+        l, t, r, b = get_monitor_work_area(widget=widget)
+        mons.append((l, t, r, b + 48, True))
+    return mons
 
 
 def center_dialog_over_parent(dlg, parent=None, width=None, height=None):
@@ -2789,9 +2837,8 @@ def _upload_sanitized_log_to_drive(
     filename, sanitized_text, active_broker, anonymous_id
 ) -> bool:
     """Uploads a balance-redacted session log to the Google Apps Script Drive
-    webhook. Treats HTTP 200 or Google Apps Script's post-write 302/405 redirect
-    to googleusercontent.com as True; returns False on network timeouts or
-    400/403/413/500 errors without raising."""
+    webhook. Inspects the JSON response body so application-level errors
+    (e.g., {"status": 413}) are never mistaken for HTTP 200 success."""
     import urllib.error
     import urllib.request
 
@@ -2811,8 +2858,21 @@ def _upload_sanitized_log_to_drive(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             code = getattr(resp, "status", None) or resp.getcode()
+            body_raw = ""
+            try:
+                body_raw = resp.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+            if body_raw.startswith("{"):
+                try:
+                    body_json = json.loads(body_raw)
+                    app_status = int(body_json.get("status", 200) or 200)
+                    if app_status >= 400 or body_json.get("error"):
+                        return False
+                except Exception:
+                    pass
             return code == 200 or (200 <= int(code or 0) < 300)
     except urllib.error.HTTPError as he:
         code = int(getattr(he, "code", 0) or 0)
@@ -8642,8 +8702,802 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
     threading.Thread(target=_watchdog, daemon=True).start()
 
 
+_active_penalty_box_overlay = None
+
+
+def _format_lock_duration_badge(duration_mins, is_dry_run=False):
+    if is_dry_run:
+        return "🔒 DRY-RUN OS LOCK: 10 SEC"
+    sec = int(round(float(duration_mins) * 60))
+    if sec <= 0:
+        return "🔒 OS LOCK: ONE-SHOT"
+    if sec < 60:
+        return f"🔒 OS LOCKOUT: {sec} SEC"
+    if sec % 60 == 0:
+        m = sec // 60
+        return f"🔒 OS LOCKOUT: {m} MIN ({sec}s)"
+    return f"🔒 OS LOCKOUT: {duration_mins:g} MIN ({sec}s)"
+
+
+def _format_lock_duration_human(duration_mins, is_dry_run=False):
+    if is_dry_run:
+        return "10 seconds (Dry-Run Simulation)"
+    sec = int(round(float(duration_mins) * 60))
+    if sec <= 0:
+        return "immediate one-shot Windows lock"
+    if sec < 60:
+        return f"{sec} seconds"
+    if sec % 60 == 0:
+        m = sec // 60
+        return f"{m} minute{'s' if m != 1 else ''} ({sec}s)"
+    return f"{duration_mins:g} minutes ({sec}s)"
+
+
+class PenaltyBoxBriefingOverlay:
+    """Full-screen all-monitor Penalty Box / Lockdown Briefing overlay that
+    appears across every connected display when a lockout triggers. Displays
+    the exact guardrail trigger, live broker flatten & flat-verification
+    progress, total lockout duration, and a 15-second (or 10s Dry-Run)
+    countdown (counted as part of the total lockout) before engaging the
+    Windows OS Lock — or locks Windows immediately if the user attempts to
+    close, click, or bypass the screen."""
+
+    def __init__(
+        self,
+        mode="OPEN_PNL",
+        title="PENALTY BOX COOLDOWN — OPEN PnL STOP BREACHED",
+        reason="",
+        context_str="",
+        lock_mins=1.0,
+        ui_anchor=None,
+        flat_enabled=True,
+        is_dry_run=False,
+        briefing_sec=None,
+    ):
+        self.mode = str(mode or "OPEN_PNL").upper()
+        self.title = str(title or "PENALTY BOX LOCKOUT")
+        self.reason = str(reason or "Guardrail Breach")
+        self.context_str = str(context_str or "")
+        self.lock_mins = float(lock_mins or 0.0)
+        self.ui_anchor = ui_anchor
+        self.flat_enabled = bool(flat_enabled)
+        self.is_dry_run = bool(is_dry_run)
+        self.briefing_sec = float(
+            briefing_sec
+            if briefing_sec is not None
+            else (10.0 if self.is_dry_run else 15.0)
+        )
+        self.windows = []
+        self.card_views = []
+        self.hwnd_set = set()
+        self.bypass_triggered = False
+        self.bypass_reason = ""
+        self.closed = False
+        self._stage_b_started_ts = None
+        self._fg_acquired = False
+        self._prev_grab = None
+
+    def _get_tk_master(self):
+        for cand in (
+            globals().get("hud_root"),
+            globals().get("active_preflight_win"),
+            self.ui_anchor,
+        ):
+            if cand is not None:
+                try:
+                    top = cand.winfo_toplevel()
+                    if top.winfo_exists():
+                        return top
+                except Exception:
+                    continue
+        return None
+
+    def _run_on_ui(self, fn, wait=False):
+        master = self._get_tk_master()
+        if master is None:
+            return
+        if threading.current_thread() is threading.main_thread():
+            try:
+                fn()
+                master.update_idletasks()
+            except Exception:
+                pass
+            return
+        done_ev = threading.Event() if wait else None
+
+        def _wrapped():
+            try:
+                fn()
+            except Exception:
+                pass
+            finally:
+                if done_ev is not None:
+                    done_ev.set()
+
+        try:
+            master.after(0, _wrapped)
+            if done_ev is not None:
+                done_ev.wait(timeout=1.5)
+        except Exception:
+            pass
+
+    def _on_bypass_event(self, why="user input on Penalty Box screen"):
+        if self.closed or self.bypass_triggered:
+            return
+        if self._stage_b_started_ts is None:
+            return
+        # Allow a 1.2s human reaction grace period after Stage B starts so an
+        # in-flight click from the moment the breach fired does not skip the
+        # briefing before the trader sees the screen.
+        if (time.time() - self._stage_b_started_ts) < 1.2:
+            return
+        self.bypass_triggered = True
+        self.bypass_reason = str(why)
+
+    def open(self):
+        global _active_penalty_box_overlay
+        prev_ov = _active_penalty_box_overlay
+        if prev_ov is not None and prev_ov is not self and not prev_ov.closed:
+            try:
+                prev_ov.close()
+            except Exception:
+                pass
+        _active_penalty_box_overlay = self
+
+        def _build():
+            master = self._get_tk_master()
+            if master is None:
+                return
+            try:
+                hide_all_tooltips()
+            except Exception:
+                pass
+            try:
+                self._prev_grab = master.grab_current()
+                if self._prev_grab is not None:
+                    self._prev_grab.grab_release()
+            except Exception:
+                self._prev_grab = None
+
+            if self.mode == "DAILY_LOCKDOWN":
+                accent_core = "#ef4444"
+                accent_rim = "#991b1b"
+                hdr_fg = "#fca5a5"
+                badge_fg = "#fecaca"
+                badge_bg = "#45141b"
+            elif self.is_dry_run:
+                accent_core = "#38bdf8"
+                accent_rim = "#1e40af"
+                hdr_fg = "#7dd3fc"
+                badge_fg = "#bae6fd"
+                badge_bg = "#16263b"
+            else:
+                accent_core = "#f59e0b"
+                accent_rim = "#92400e"
+                hdr_fg = "#fcd34d"
+                badge_fg = "#fde68a"
+                badge_bg = "#3b2106"
+
+            dur_badge_txt = _format_lock_duration_badge(
+                self.lock_mins, is_dry_run=self.is_dry_run
+            )
+            dur_human = _format_lock_duration_human(
+                self.lock_mins, is_dry_run=self.is_dry_run
+            )
+            broker_lbl = getattr(
+                active_adapter, "name", config.get("active_broker", "SCHWAB")
+            )
+            ctx_line = (
+                f"{self.context_str}   ·   Broker: {broker_lbl}   ·   "
+                f"Windows OS Lockout: {dur_human}"
+                if self.context_str
+                else f"Broker: {broker_lbl}   ·   Windows OS Lockout: {dur_human}"
+            )
+
+            if self.is_dry_run:
+                s1_init = (
+                    "⏳  1. Working Orders: Simulating working-order cancellation "
+                    "(Dry-Run — 0 orders touched)..."
+                )
+                s2_init = (
+                    "⏳  2. Daytrade Positions: Simulating broker API 100% flat "
+                    "verification..."
+                )
+                s3_init = (
+                    f"⏳  3. Windows OS Lock: Standing by to preview {dur_human}..."
+                )
+            elif self.flat_enabled:
+                s1_init = (
+                    "⏳  1. Working Orders: Canceling open working orders on "
+                    "tracked daytrade positions..."
+                )
+                s2_init = (
+                    "⏳  2. Daytrade Positions: Submitting exit orders & verifying "
+                    "0 open shares with broker API..."
+                )
+                s3_init = (
+                    f"⏳  3. Windows OS Lock ({dur_human}): Waiting for 100% flat "
+                    "confirmation before locking..."
+                )
+            else:
+                s1_init = (
+                    "✓  1. Working Orders: Auto-Flatten is OFF (no orders "
+                    "submitted by Enforcer)"
+                )
+                s2_init = (
+                    "⏳  2. Daytrade Positions: Verifying 0 open daytrade "
+                    "positions with broker API..."
+                )
+                s3_init = (
+                    f"⏳  3. Windows OS Lock ({dur_human}): Waiting for 100% flat "
+                    "confirmation before locking..."
+                )
+
+            mon_bounds = get_all_monitor_bounds(widget=master)
+            primary_win = None
+
+            for idx, (m_left, m_top, m_right, m_bottom, is_prim) in enumerate(
+                mon_bounds
+            ):
+                m_w = max(640, int(m_right - m_left))
+                m_h = max(480, int(m_bottom - m_top))
+                win = tk.Toplevel(master)
+                win.withdraw()
+                win.title("PnL Enforcer — Penalty Box Lockout")
+                win.overrideredirect(True)
+                win.attributes("-topmost", True)
+                try:
+                    win.attributes("-alpha", 0.96)
+                except Exception:
+                    pass
+                win.config(bg="#070a0f")
+                win.geometry(f"{m_w}x{m_h}+{m_left}+{m_top}")
+
+                card_w = min(780, m_w - 60)
+                card_outer = tk.Frame(
+                    win,
+                    bg="#131922",
+                    bd=0,
+                    highlightthickness=2,
+                    highlightbackground=accent_rim,
+                    width=card_w,
+                )
+                card_outer.place(relx=0.5, rely=0.5, anchor="center")
+
+                tk.Frame(
+                    card_outer,
+                    bg=accent_core,
+                    width=7,
+                    bd=0,
+                    highlightthickness=0,
+                ).pack(side="left", fill="y")
+
+                body = tk.Frame(card_outer, bg="#131922", padx=26, pady=22)
+                body.pack(side="left", fill="both", expand=True)
+
+                hdr_row = tk.Frame(body, bg="#131922")
+                hdr_row.pack(fill="x", pady=(0, 12))
+                tk.Label(
+                    hdr_row,
+                    text=f"▶  {self.title}",
+                    font=("Arial", 13, "bold"),
+                    fg=hdr_fg,
+                    bg="#131922",
+                    anchor="w",
+                ).pack(side="left")
+                tk.Label(
+                    hdr_row,
+                    text=dur_badge_txt,
+                    font=("Arial", 9, "bold"),
+                    fg=badge_fg,
+                    bg=badge_bg,
+                    padx=10,
+                    pady=4,
+                ).pack(side="right", padx=(12, 0))
+
+                trig_box = tk.Frame(
+                    body,
+                    bg="#0d1117",
+                    bd=0,
+                    highlightthickness=1,
+                    highlightbackground="#243040",
+                    padx=16,
+                    pady=12,
+                )
+                trig_box.pack(fill="x", pady=(0, 12))
+                tk.Label(
+                    trig_box,
+                    text="WHAT TRIGGERED THIS LOCKOUT:",
+                    font=("Arial", 8, "bold"),
+                    fg="#7dd3fc",
+                    bg="#0d1117",
+                    anchor="w",
+                ).pack(fill="x")
+                tk.Label(
+                    trig_box,
+                    text=self.reason,
+                    font=("Arial", 12, "bold"),
+                    fg="#ffffff",
+                    bg="#0d1117",
+                    anchor="w",
+                    justify="left",
+                ).pack(fill="x", pady=(2, 4))
+                tk.Label(
+                    trig_box,
+                    text=ctx_line,
+                    font=("Arial", 9, "bold"),
+                    fg="#94a3b8",
+                    bg="#0d1117",
+                    anchor="w",
+                    justify="left",
+                ).pack(fill="x")
+
+                steps_box = tk.Frame(
+                    body,
+                    bg="#0f151e",
+                    bd=0,
+                    highlightthickness=1,
+                    highlightbackground="#1e293b",
+                    padx=16,
+                    pady=12,
+                )
+                steps_box.pack(fill="x", pady=(0, 12))
+                tk.Label(
+                    steps_box,
+                    text="LIVE ENFORCEMENT & BROKER FLAT-VERIFICATION STATUS:",
+                    font=("Arial", 8, "bold"),
+                    fg="#7dd3fc",
+                    bg="#0f151e",
+                    anchor="w",
+                ).pack(fill="x", pady=(0, 6))
+
+                s1_lbl = tk.Label(
+                    steps_box,
+                    text=s1_init,
+                    font=("Arial", 10, "bold"),
+                    fg="#6ee7b7" if not self.flat_enabled and not self.is_dry_run else "#bae6fd",
+                    bg="#0f151e",
+                    anchor="w",
+                    justify="left",
+                )
+                s1_lbl.pack(fill="x", pady=2)
+
+                s2_lbl = tk.Label(
+                    steps_box,
+                    text=s2_init,
+                    font=("Arial", 10, "bold"),
+                    fg="#fde68a",
+                    bg="#0f151e",
+                    anchor="w",
+                    justify="left",
+                )
+                s2_lbl.pack(fill="x", pady=2)
+
+                s3_lbl = tk.Label(
+                    steps_box,
+                    text=s3_init,
+                    font=("Arial", 10, "bold"),
+                    fg="#94a3b8",
+                    bg="#0f151e",
+                    anchor="w",
+                    justify="left",
+                )
+                s3_lbl.pack(fill="x", pady=2)
+
+                cd_box = tk.Frame(
+                    body,
+                    bg="#171219",
+                    bd=0,
+                    highlightthickness=1,
+                    highlightbackground=accent_rim,
+                    padx=16,
+                    pady=12,
+                )
+                cd_box.pack(fill="x", pady=(0, 12))
+                cd_lbl = tk.Label(
+                    cd_box,
+                    text="⏳  FLATTENING & VERIFYING 100% FLAT WITH BROKER API...",
+                    font=("Arial", 12, "bold"),
+                    fg="#fde68a",
+                    bg="#171219",
+                    anchor="w",
+                )
+                cd_lbl.pack(fill="x", pady=(0, 8))
+
+                prog_w = max(480, card_w - 72)
+                prog_cvs = tk.Canvas(
+                    cd_box,
+                    width=prog_w,
+                    height=8,
+                    bg="#090c12",
+                    bd=0,
+                    highlightthickness=1,
+                    highlightbackground="#263548",
+                )
+                prog_cvs.pack(fill="x")
+                prog_rect = prog_cvs.create_rectangle(
+                    0, 0, prog_w, 8, fill=accent_core, outline=""
+                )
+
+                warn_box = tk.Frame(
+                    body,
+                    bg="#231217",
+                    bd=0,
+                    highlightthickness=1,
+                    highlightbackground="#7f1d1d",
+                    padx=14,
+                    pady=10,
+                )
+                warn_box.pack(fill="x")
+                tk.Label(
+                    warn_box,
+                    text=(
+                        "⚠️  HANDS OFF KEYBOARD & MOUSE: Attempting to close, click, "
+                        "Alt+Tab, or bypass this screen in any way will trigger the "
+                        "Windows OS Lock IMMEDIATELY."
+                    ),
+                    font=("Arial", 9, "bold"),
+                    fg="#fca5a5",
+                    bg="#231217",
+                    anchor="w",
+                    justify="left",
+                    wraplength=max(460, card_w - 68),
+                ).pack(fill="x")
+
+                win.protocol(
+                    "WM_DELETE_WINDOW",
+                    lambda: self._on_bypass_event("window close attempt"),
+                )
+                win.bind(
+                    "<KeyPress>",
+                    lambda _e: self._on_bypass_event("keyboard input"),
+                    add="+",
+                )
+                win.bind(
+                    "<Unmap>",
+                    lambda _e: self._on_bypass_event("window minimize/unmap"),
+                    add="+",
+                )
+
+                def _bind_clicks_recursive(w_node):
+                    try:
+                        for btn_ev in (
+                            "<ButtonPress-1>",
+                            "<ButtonPress-2>",
+                            "<ButtonPress-3>",
+                        ):
+                            w_node.bind(
+                                btn_ev,
+                                lambda _e: self._on_bypass_event("mouse click"),
+                                add="+",
+                            )
+                        for ch in w_node.winfo_children():
+                            _bind_clicks_recursive(ch)
+                    except Exception:
+                        pass
+
+                _bind_clicks_recursive(win)
+
+                self.windows.append(win)
+                self.card_views.append(
+                    {
+                        "win": win,
+                        "step1_lbl": s1_lbl,
+                        "step2_lbl": s2_lbl,
+                        "step3_lbl": s3_lbl,
+                        "countdown_lbl": cd_lbl,
+                        "prog_cvs": prog_cvs,
+                        "prog_rect": prog_rect,
+                        "prog_w": prog_w,
+                        "accent_core": accent_core,
+                    }
+                )
+                if is_prim or primary_win is None:
+                    primary_win = win
+
+            for w in self.windows:
+                try:
+                    w.deiconify()
+                    w.lift()
+                    w.update_idletasks()
+                    wid = int(w.winfo_id())
+                    self.hwnd_set.add(wid)
+                    p_wid = int(ctypes.windll.user32.GetParent(wid) or 0)
+                    if p_wid:
+                        self.hwnd_set.add(p_wid)
+                except Exception:
+                    pass
+
+            for extra_w in (
+                master,
+                globals().get("hud_root"),
+                globals().get("active_preflight_win"),
+            ):
+                if extra_w is not None:
+                    try:
+                        if extra_w.winfo_exists():
+                            ew_id = int(extra_w.winfo_id())
+                            self.hwnd_set.add(ew_id)
+                            ep_id = int(ctypes.windll.user32.GetParent(ew_id) or 0)
+                            if ep_id:
+                                self.hwnd_set.add(ep_id)
+                    except Exception:
+                        pass
+
+            if primary_win is not None:
+                try:
+                    primary_win.lift()
+                    primary_win.focus_force()
+                except Exception:
+                    pass
+
+        self._run_on_ui(_build, wait=True)
+
+    def update_flatten_progress(
+        self, step1_txt=None, step1_ok=False, step2_txt=None, step2_ok=False
+    ):
+        if self.closed:
+            return
+
+        def _upd():
+            for cv in self.card_views:
+                try:
+                    if not cv["win"].winfo_exists():
+                        continue
+                    if step1_txt is not None:
+                        cv["step1_lbl"].config(
+                            text=step1_txt,
+                            fg="#6ee7b7" if step1_ok else "#bae6fd",
+                        )
+                    if step2_txt is not None:
+                        cv["step2_lbl"].config(
+                            text=step2_txt,
+                            fg="#6ee7b7" if step2_ok else "#fde68a",
+                        )
+                except Exception:
+                    pass
+
+        self._run_on_ui(_upd, wait=False)
+
+    def mark_flat_confirmed(self, broker_name=None):
+        if self.closed:
+            return
+        self._stage_b_started_ts = time.time()
+        b_lbl = str(
+            broker_name
+            or getattr(
+                active_adapter, "name", config.get("active_broker", "SCHWAB")
+            )
+        )
+        dur_human = _format_lock_duration_human(
+            self.lock_mins, is_dry_run=self.is_dry_run
+        )
+        ig_cnt = len(ignored_positions) if isinstance(ignored_positions, dict) else 0
+        ig_note = (
+            f"  ({ig_cnt} Ignored swing position{'s' if ig_cnt != 1 else ''} left untouched)"
+            if ig_cnt > 0
+            else ""
+        )
+
+        if self.is_dry_run:
+            s1_done = (
+                "✓  1. Working Orders: Simulated working-order cancel complete "
+                "(Zero real orders touched)"
+            )
+            s2_done = (
+                f"✓  2. Daytrade Positions: Simulated 100% flat check passed{ig_note}"
+            )
+            s3_done = (
+                f"🔒  3. Windows OS Lock: Armed for {dur_human} — "
+                f"Persistent early-unlock re-lock active"
+            )
+        elif self.flat_enabled:
+            s1_done = (
+                "✓  1. Working Orders: Open working orders canceled & cleared"
+            )
+            s2_done = (
+                f"✓  2. Daytrade Positions: 100% of tracked daytrade positions "
+                f"confirmed FLAT by {b_lbl} API{ig_note}"
+            )
+            s3_done = (
+                f"🔒  3. Windows OS Lock: Armed for {dur_human} — "
+                f"Persistent early-unlock re-lock active"
+            )
+        else:
+            s1_done = (
+                "✓  1. Working Orders: Auto-Flatten is OFF (no orders submitted "
+                "by Enforcer)"
+            )
+            s2_done = (
+                f"✓  2. Daytrade Positions: 100% of tracked daytrade positions "
+                f"confirmed FLAT by {b_lbl} API{ig_note}"
+            )
+            s3_done = (
+                f"🔒  3. Windows OS Lock: Armed for {dur_human} — "
+                f"Persistent early-unlock re-lock active"
+            )
+
+        init_sec = int(math.ceil(self.briefing_sec))
+
+        def _upd_stage_b():
+            for cv in self.card_views:
+                try:
+                    if not cv["win"].winfo_exists():
+                        continue
+                    cv["step1_lbl"].config(text=s1_done, fg="#6ee7b7")
+                    cv["step2_lbl"].config(text=s2_done, fg="#6ee7b7")
+                    cv["step3_lbl"].config(text=s3_done, fg="#7dd3fc")
+                    cv["countdown_lbl"].config(
+                        text=(
+                            f"🔒  TRANSITIONING TO WINDOWS OS LOCK IN "
+                            f"{init_sec} SECOND{'S' if init_sec != 1 else ''}..."
+                        ),
+                        fg="#fde68a",
+                    )
+                    cv["win"].lift()
+                except Exception:
+                    pass
+
+        self._run_on_ui(_upd_stage_b, wait=True)
+
+    def wait_out_briefing_or_bypass(
+        self,
+        briefing_sec=None,
+        abort_check=None,
+        ui_button=None,
+        label_prefix="",
+        lock_end_time=None,
+    ):
+        """Runs the Stage B briefing countdown on the calling background worker
+        thread, updating all monitor cards every 0.15s and returning early if
+        the user touches the keyboard/mouse or switches focus away."""
+        total_sec = float(
+            briefing_sec if briefing_sec is not None else self.briefing_sec
+        )
+        if self._stage_b_started_ts is None:
+            self.mark_flat_confirmed()
+        start_t = time.time()
+        end_t = start_t + total_sec
+        u32 = ctypes.windll.user32
+
+        while not self.closed and time.time() < end_t:
+            if callable(abort_check) and abort_check():
+                break
+            now_t = time.time()
+            elapsed = now_t - start_t
+            rem_f = max(0.0, end_t - now_t)
+            rem_i = max(1, int(math.ceil(rem_f)))
+            frac = max(0.0, min(1.0, rem_f / max(0.1, total_sec)))
+            tot_rem_i = (
+                max(1, int(math.ceil(lock_end_time - now_t)))
+                if lock_end_time is not None
+                else None
+            )
+
+            try:
+                fg_hwnd = int(u32.GetForegroundWindow() or 0)
+                if fg_hwnd in self.hwnd_set:
+                    self._fg_acquired = True
+                elif (
+                    elapsed >= 1.2
+                    and self._fg_acquired
+                    and fg_hwnd != 0
+                    and fg_hwnd not in self.hwnd_set
+                ):
+                    self.bypass_triggered = True
+                    self.bypass_reason = "window focus switched away from Penalty Box screen"
+            except Exception:
+                pass
+
+            if self.bypass_triggered:
+                log_event(
+                    "SESSION" if self.is_dry_run else "COOLDOWN",
+                    f"Bypass/input detected on Penalty Box briefing screen "
+                    f"({self.bypass_reason or 'user input'}) — engaging "
+                    f"Windows OS Lock immediately.",
+                )
+                break
+
+            def _tick_ui(r_int=rem_i, f_val=frac, tot_rem=tot_rem_i):
+                cd_str = (
+                    f"🔒  TRANSITIONING TO WINDOWS OS LOCK IN {r_int}s   ·   "
+                    f"TOTAL LOCKOUT REMAINING: {_format_countdown_mm_ss(tot_rem)}"
+                    if tot_rem is not None
+                    else (
+                        f"🔒  TRANSITIONING TO WINDOWS OS LOCK IN "
+                        f"{r_int} SECOND{'S' if r_int != 1 else ''}..."
+                    )
+                )
+                for cv in self.card_views:
+                    try:
+                        if not cv["win"].winfo_exists():
+                            continue
+                        cv["countdown_lbl"].config(text=cd_str)
+                        cvs = cv["prog_cvs"]
+                        c_w = int(cvs.winfo_width())
+                        if c_w <= 20:
+                            c_w = cv["prog_w"]
+                        cvs.coords(
+                            cv["prog_rect"], 0, 0, int(round(c_w * f_val)), 8
+                        )
+                        cv["win"].lift()
+                    except Exception:
+                        pass
+
+            self._run_on_ui(_tick_ui, wait=False)
+
+            if ui_button is not None and label_prefix:
+                hud_rem = tot_rem_i if tot_rem_i is not None else rem_i
+                hud_txt = (
+                    f"🔒 LOCKED: {hud_rem}s"
+                    if is_compact_hud()
+                    else (
+                        f"{label_prefix}: {hud_rem}s REMAINING "
+                        f"(OS LOCK IN {rem_i}s)"
+                    )
+                )
+                try:
+                    ui_button.after(
+                        0,
+                        lambda t=hud_txt: ui_button.config(
+                            text=t,
+                            bg="#922b21",
+                            fg="white",
+                            disabledforeground="white",
+                            state="disabled",
+                        ),
+                    )
+                except Exception:
+                    pass
+
+            time.sleep(0.15)
+
+        was_bypassed = bool(self.bypass_triggered)
+        self.close()
+        return was_bypassed
+
+    def close(self):
+        global _active_penalty_box_overlay
+        if self.closed:
+            return
+        self.closed = True
+        if _active_penalty_box_overlay is self:
+            _active_penalty_box_overlay = None
+
+        def _destroy_all():
+            for w in list(self.windows):
+                try:
+                    if w.winfo_exists():
+                        try:
+                            w.grab_release()
+                        except Exception:
+                            pass
+                        w.destroy()
+                except Exception:
+                    pass
+            self.windows.clear()
+            self.card_views.clear()
+            if self._prev_grab is not None:
+                try:
+                    if self._prev_grab.winfo_exists():
+                        self._prev_grab.lift()
+                        self._prev_grab.grab_set()
+                        self._prev_grab.focus_force()
+                except Exception:
+                    pass
+                self._prev_grab = None
+
+        self._run_on_ui(_destroy_all, wait=True)
+
+
 def start_cooldown_lock(
-    duration_mins, ui_button, label_prefix="COOL-DOWN LOCK", adapter=None
+    duration_mins,
+    ui_button,
+    label_prefix="COOL-DOWN LOCK",
+    adapter=None,
+    overlay=None,
+    reason_text="",
+    context_str="",
 ):
     global cooldown_active, cooldown_end_time, cooldown_label
     global cooldown_30s_announced, cooldown_announced_mins, alarm_active
@@ -8655,6 +9509,11 @@ def start_cooldown_lock(
     }
 
     if cooldown_active:
+        if overlay is not None:
+            try:
+                overlay.close()
+            except Exception:
+                pass
         if new_end_time > cooldown_end_time:
             cooldown_end_time = new_end_time
             cooldown_label = label_prefix
@@ -8678,22 +9537,81 @@ def start_cooldown_lock(
     cooldown_30s_announced = (duration_sec <= 35)
     cooldown_announced_mins = set(init_announced_mins)
     alarm_active = False
+    brief_s = min(15.0, float(duration_sec))
+
+    if overlay is None:
+        ov_mode = (
+            "DAILY_LOCKDOWN"
+            if "DAILY" in str(label_prefix).upper()
+            else (
+                "TILT_STREAK"
+                if "TILT" in str(label_prefix).upper()
+                else "OPEN_PNL"
+            )
+        )
+        ov_title = (
+            "DAILY RULEBOOK LOCKDOWN — MAX LOSS / PROFIT STOP"
+            if ov_mode == "DAILY_LOCKDOWN"
+            else (
+                "PENALTY BOX COOLDOWN — TILT STREAK STOP TRIGGERED"
+                if ov_mode == "TILT_STREAK"
+                else "PENALTY BOX COOLDOWN — OPEN PnL STOP BREACHED"
+            )
+        )
+        overlay = PenaltyBoxBriefingOverlay(
+            mode=ov_mode,
+            title=ov_title,
+            reason=reason_text or label_prefix,
+            context_str=context_str,
+            lock_mins=duration_mins,
+            ui_anchor=ui_button,
+            flat_enabled=True,
+            is_dry_run=False,
+            briefing_sec=brief_s,
+        )
+        overlay.open()
+    else:
+        overlay.briefing_sec = brief_s
 
     def cooldown_worker():
         global cooldown_active, cooldown_end_time, cooldown_label
         global cooldown_30s_announced, cooldown_announced_mins, alarm_active
+        cooldown_end_time = time.time() + duration_sec
         log_event(
             "COOLDOWN",
             f"Persistent {cooldown_label} started for {duration_sec}s "
-            f"({duration_mins:g} min). Siren muted."
+            f"({duration_mins:g} min, starting with {brief_s:g}s Penalty Box "
+            f"briefing screen). Siren muted."
         )
+        b_name = getattr(
+            adapter, "name", config.get("active_broker", "SCHWAB")
+        )
+        overlay.mark_flat_confirmed(broker_name=b_name)
+        speak_async(
+            _format_lock_voice_msg(duration_mins, cooldown_label, upgraded=False)
+        )
+        watchdog_launched = True
+        _run_post_lock_watchdog(adapter, ui_button, cooldown_label)
+
+        overlay.wait_out_briefing_or_bypass(
+            briefing_sec=brief_s,
+            abort_check=lambda: not cooldown_active,
+            ui_button=ui_button,
+            label_prefix=cooldown_label,
+            lock_end_time=cooldown_end_time,
+        )
+        if not cooldown_active:
+            log_event(
+                "COOLDOWN",
+                f"{cooldown_label} aborted early by post-lock watchdog."
+            )
+            return
+
         try:
             ctypes.windll.user32.LockWorkStation()
         except Exception:
             pass
         time.sleep(0.35)
-        speak_async(_format_lock_voice_msg(duration_mins, cooldown_label, upgraded=False))
-        watchdog_launched = False
         lock_started_ts = time.time()
         confirmed_locked = is_workstation_locked()
         last_early_unlock_ts = 0.0
@@ -8800,7 +9718,9 @@ def start_cooldown_lock(
     threading.Thread(target=cooldown_worker, daemon=True).start()
 
 
-def flatten_equities(adapter, force_flatten=False, include_options=None):
+def flatten_equities(
+    adapter, force_flatten=False, include_options=None, status_cb=None
+):
     """Cancels working orders, submits RTH Market or EXT Limit liquidations
     for EQUITIES (and RTH Market liquidations for OPTIONS when the BETA Options
     Auto-Flatten toggle + waiver are active), and double-confirms (with 0.8s
@@ -8813,6 +9733,18 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
         include_options = is_options_flatten_armed(config)
     else:
         include_options = bool(include_options and is_options_flatten_armed(config))
+
+    def _notify_status(s1_txt=None, s1_ok=False, s2_txt=None, s2_ok=False):
+        if callable(status_cb):
+            try:
+                status_cb(
+                    step1_txt=s1_txt,
+                    step1_ok=s1_ok,
+                    step2_txt=s2_txt,
+                    step2_ok=s2_ok,
+                )
+            except Exception:
+                pass
 
     def _fmt_opt_summary(opt_list):
         if not opt_list:
@@ -8835,7 +9767,10 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
                 # Flatten any open equities first, then return False because
                 # options cannot be market-flattened outside RTH.
                 flatten_equities(
-                    adapter, force_flatten=force_flatten, include_options=False
+                    adapter,
+                    force_flatten=force_flatten,
+                    include_options=False,
+                    status_cb=status_cb,
                 )
                 log_event(
                     "GUARDRAIL",
@@ -8917,6 +9852,12 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
                 if include_options
                 else "Starting emergency equity flatten sequence..."
             )
+            _notify_status(
+                "⏳  1. Working Orders: Canceling open working orders on tracked daytrade positions...",
+                False,
+                "⏳  2. Daytrade Positions: Inspecting open daytrade positions...",
+                False,
+            )
             peek_pos = adapter.get_open_equity_positions()
             peek_opt = (
                 adapter.get_open_option_positions()
@@ -8931,6 +9872,12 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
 
             adapter.cancel_all_working_orders(
                 preserve_market_close_map=init_preserve_map
+            )
+            _notify_status(
+                "✓  1. Working Orders: Open working orders canceled & cleared",
+                True,
+                "⏳  2. Daytrade Positions: Verifying open daytrade positions with broker API...",
+                False,
             )
 
             open_pos = adapter.get_open_equity_positions()
@@ -8962,6 +9909,12 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
                     else "Initial check shows 0 open equity shares. Running 0.8s "
                     "settlement double-confirm..."
                 )
+                _notify_status(
+                    "✓  1. Working Orders: Open working orders canceled & cleared",
+                    True,
+                    "⏳  2. Daytrade Positions: 0 open positions reported — running 0.8s settlement double-confirm...",
+                    False,
+                )
                 time.sleep(0.8)
                 open_pos = adapter.get_open_equity_positions()
                 open_opt = (
@@ -8988,6 +9941,13 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
                 )
                 if to_sub_eq:
                     log_event("FLATTEN", f"Equity positions to liquidate: {to_sub_eq}")
+                    syms_str = ", ".join(f"{x[0]} ({x[1]:+g})" for x in to_sub_eq[:4])
+                    _notify_status(
+                        "✓  1. Working Orders: Open working orders canceled & cleared",
+                        True,
+                        f"⏳  2. Daytrade Positions: Submitting exit order(s) for {syms_str}...",
+                        False,
+                    )
                     sub_ok = adapter.submit_liquidation_batch(to_sub_eq) or {}
                     submitted_close_eq.update(sub_ok)
             if include_options and open_opt:
@@ -8998,6 +9958,12 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
                     log_event(
                         "FLATTEN",
                         f"Option positions to liquidate (BETA): {_fmt_opt_summary(to_sub_opt)}"
+                    )
+                    _notify_status(
+                        "✓  1. Working Orders: Open working orders canceled & cleared",
+                        True,
+                        f"⏳  2. Daytrade Positions: Submitting option exit order(s) ({len(to_sub_opt)} leg(s))...",
+                        False,
                     )
                     sub_opt_ok = (
                         adapter.submit_option_liquidation_batch(to_sub_opt)
@@ -9010,6 +9976,12 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
                     "Initial position query failed (None); entering verification polling loop..."
                 )
         else:
+            _notify_status(
+                "✓  1. Working Orders: Auto-Flatten is OFF (no orders submitted by Enforcer)",
+                True,
+                "⏳  2. Daytrade Positions: Verifying 0 open daytrade positions with broker API...",
+                False,
+            )
             open_pos = adapter.get_open_equity_positions()
             open_opt = (
                 adapter.get_open_option_positions()
@@ -9060,6 +10032,12 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
                 else []
             )
             elapsed = time.time() - start_wait
+            _notify_status(
+                "✓  1. Working Orders: Open working orders canceled & cleared",
+                True,
+                f"⏳  2. Daytrade Positions: Polling broker API to verify 100% flat (Check #{polls}, {elapsed:.1f}s)...",
+                False,
+            )
             if rem_pos is None or (include_options and rem_opt is None):
                 log_event(
                     "WARNING",
@@ -9096,6 +10074,12 @@ def flatten_equities(adapter, force_flatten=False, include_options=None):
                     if include_options
                     else f"Check #{polls} ({elapsed:.1f}s): 0 equity shares reported. "
                     f"Running 0.8s settlement double-confirm..."
+                )
+                _notify_status(
+                    "✓  1. Working Orders: Open working orders canceled & cleared",
+                    True,
+                    "⏳  2. Daytrade Positions: 0 open positions reported — running 0.8s settlement double-confirm...",
+                    False,
                 )
                 time.sleep(0.8)
                 rem_confirm = adapter.get_open_equity_positions()
@@ -9394,6 +10378,21 @@ def trigger_open_pnl_flatten(
     else:
         alarm_active = False
 
+    cd_mins = float(config.get("open_cooldown_mins", 1.0))
+    overlay = None
+    if cd_on and not cooldown_active:
+        overlay = PenaltyBoxBriefingOverlay(
+            mode="OPEN_PNL",
+            title="PENALTY BOX COOLDOWN — OPEN PnL STOP BREACHED",
+            reason=reason,
+            context_str=context_str,
+            lock_mins=cd_mins,
+            ui_anchor=ui_button,
+            flat_enabled=True,
+            is_dry_run=False,
+        )
+        overlay.open()
+
     log_event(
         "GUARDRAIL",
         f"OPEN PnL AUTO-FLATTEN {'(EQUITIES + OPTIONS BETA) ' if (has_options and opt_armed) else ''}INITIATED: "
@@ -9402,7 +10401,8 @@ def trigger_open_pnl_flatten(
     all_flat = flatten_equities(
         adapter,
         force_flatten=True,
-        include_options=(has_options and opt_armed)
+        include_options=(has_options and opt_armed),
+        status_cb=(overlay.update_flatten_progress if overlay is not None else None),
     )
     if all_flat:
         pending_halt_breach = None
@@ -9414,14 +10414,18 @@ def trigger_open_pnl_flatten(
         )
         if cd_on:
             alarm_active = False
-            cd_mins = config.get("open_cooldown_mins", 1.0)
             start_cooldown_lock(
                 cd_mins,
                 ui_button,
                 label_prefix="PENALTY BOX LOCK",
-                adapter=adapter
+                adapter=adapter,
+                overlay=overlay,
+                reason_text=reason,
+                context_str=context_str,
             )
     else:
+        if overlay is not None:
+            overlay.close()
         log_event(
             "CRITICAL",
             "Open PnL flatten timed out — Cool-Down Lock DEFERRED until "
@@ -9488,6 +10492,21 @@ def trigger_consec_loss_cooldown(
     else:
         alarm_active = False
 
+    cd_mins = float(config.get("open_cooldown_mins", 1.0))
+    overlay = None
+    if cd_on and not cooldown_active:
+        overlay = PenaltyBoxBriefingOverlay(
+            mode="TILT_STREAK",
+            title="PENALTY BOX COOLDOWN — TILT STREAK STOP TRIGGERED",
+            reason=reason,
+            context_str=context_str,
+            lock_mins=cd_mins,
+            ui_anchor=ui_button,
+            flat_enabled=True,
+            is_dry_run=False,
+        )
+        overlay.open()
+
     log_event(
         "GUARDRAIL",
         f"CONSECUTIVE LOSS COOLDOWN TRIGGERED: {reason} | {context_str}"
@@ -9495,7 +10514,8 @@ def trigger_consec_loss_cooldown(
     all_flat = flatten_equities(
         adapter,
         force_flatten=True,
-        include_options=(has_options and opt_armed)
+        include_options=(has_options and opt_armed),
+        status_cb=(overlay.update_flatten_progress if overlay is not None else None),
     )
     if all_flat:
         pending_halt_breach = None
@@ -9505,14 +10525,18 @@ def trigger_consec_loss_cooldown(
         )
         if cd_on:
             alarm_active = False
-            cd_mins = float(config.get("open_cooldown_mins", 1.0))
             start_cooldown_lock(
                 cd_mins,
                 ui_button,
                 label_prefix="TILT STREAK LOCK",
-                adapter=adapter
+                adapter=adapter,
+                overlay=overlay,
+                reason_text=reason,
+                context_str=context_str,
             )
     else:
+        if overlay is not None:
+            overlay.close()
         log_event(
             "CRITICAL",
             "Consecutive Loss Cooldown flatten timed out — OS Lock DEFERRED "
@@ -9581,9 +10605,30 @@ def trigger_lockdown(
     )
 
     opt_exec_now = bool(has_options and opt_armed and is_market_hours())
-    all_flat = flatten_equities(adapter, include_options=opt_exec_now)
+    dl_mins = float(config.get("daily_lock_mins", 15.0))
+    overlay = None
+    if lock_on and not (has_options and not opt_exec_now):
+        overlay = PenaltyBoxBriefingOverlay(
+            mode="DAILY_LOCKDOWN",
+            title="DAILY RULEBOOK LOCKDOWN — MAX LOSS / PROFIT STOP",
+            reason=reason,
+            context_str=context_str,
+            lock_mins=dl_mins,
+            ui_anchor=ui_button,
+            flat_enabled=flat_on,
+            is_dry_run=False,
+        )
+        overlay.open()
+
+    all_flat = flatten_equities(
+        adapter,
+        include_options=opt_exec_now,
+        status_cb=(overlay.update_flatten_progress if overlay is not None else None),
+    )
 
     if has_options and not opt_exec_now:
+        if overlay is not None:
+            overlay.close()
         log_event(
             "CRITICAL",
             "OPTIONS ARE STILL OPEN! Holding off on App Kill / OS Lock "
@@ -9600,6 +10645,8 @@ def trigger_lockdown(
         return
 
     if not all_flat:
+        if overlay is not None:
+            overlay.close()
         log_event(
             "CRITICAL",
             "OS ACTIONS ABORTED: Positions (Equities/Options) still open! "
@@ -9625,7 +10672,6 @@ def trigger_lockdown(
 
     if lock_on:
         alarm_active = False
-        dl_mins = float(config.get("daily_lock_mins", 15.0))
         if dl_mins > 0:
             log_event(
                 "LOCKDOWN",
@@ -9636,21 +10682,42 @@ def trigger_lockdown(
                 dl_mins,
                 ui_button,
                 label_prefix="DAILY BREACH OS LOCK",
-                adapter=adapter
+                adapter=adapter,
+                overlay=overlay,
+                reason_text=reason,
+                context_str=context_str,
             )
         else:
             log_event(
                 "LOCKDOWN",
-                "Confirmed flat. Muting siren and locking Windows once..."
+                "Confirmed flat. Showing Penalty Box briefing before one-shot Windows OS lock..."
             )
-            ctypes.windll.user32.LockWorkStation()
-            _run_post_lock_watchdog(
-                adapter, ui_button, "ONE-SHOT DAILY OS LOCK"
-            )
-            ui_button.after(
-                2500,
-                lambda: _prompt_daily_breach_settings_on_unlock(ui_button),
-            )
+
+            def _one_shot_daily_lock():
+                if overlay is not None:
+                    overlay.mark_flat_confirmed(
+                        broker_name=getattr(
+                            adapter, "name", config.get("active_broker", "SCHWAB")
+                        )
+                    )
+                    overlay.wait_out_briefing_or_bypass(
+                        briefing_sec=15.0,
+                        ui_button=ui_button,
+                        label_prefix="DAILY BREACH OS LOCK",
+                    )
+                try:
+                    ctypes.windll.user32.LockWorkStation()
+                except Exception:
+                    pass
+                _run_post_lock_watchdog(
+                    adapter, ui_button, "ONE-SHOT DAILY OS LOCK"
+                )
+                ui_button.after(
+                    2500,
+                    lambda: _prompt_daily_breach_settings_on_unlock(ui_button),
+                )
+
+            threading.Thread(target=_one_shot_daily_lock, daemon=True).start()
 
 
 # ==========================================
@@ -10033,27 +11100,26 @@ def _stabilize_mid_fill_realized_and_equity(
     )
 
     if not any_closed_or_reduced:
-        added_opt_contracts = 0.0
-        if qty_changed_now:
-            for sym_k, new_d in pos_details.items():
-                if new_d.get("asset_type") == "OPTION":
-                    old_q = float(
-                        (prev_pos_snapshot.get(sym_k) or {}).get("qty", 0.0)
-                    )
-                    new_q = float(new_d.get("qty", 0.0))
-                    if abs(new_q) > abs(old_q):
-                        added_opt_contracts += abs(new_q) - abs(old_q)
-        fee_tol = max(6.0, added_opt_contracts * 1.50)
-        allowed_drift = max(fee_tol, pending_scale_out_tol)
-        if (
-            abs(raw_realized_pnl - settled_realized_pnl) > allowed_drift
-            and (qty_changed_now or in_trade_desync_streak < 2)
-        ):
-            if not is_reverify:
-                if qty_changed_now:
-                    in_trade_desync_streak = 0
-                else:
+        if pending_scale_out_tol > 0.0:
+            if (
+                abs(raw_realized_pnl - settled_realized_pnl) > pending_scale_out_tol
+                and in_trade_desync_streak < 2
+            ):
+                if not is_reverify:
                     in_trade_desync_streak += 1
+                realized_pnl = settled_realized_pnl
+                current_eq = round(start_equity + realized_pnl + open_pnl, 2)
+            else:
+                in_trade_desync_streak = 0
+                pending_scale_out_tol = 0.0
+                realized_pnl = raw_realized_pnl
+                settled_realized_pnl = realized_pnl
+        else:
+            if (
+                not is_reverify
+                and qty_changed_now
+                and abs(raw_realized_pnl - settled_realized_pnl) > 50.0
+            ):
                 log_event(
                     "GUARDRAIL",
                     f"Filtered mid-fill cash/position desync on entry/add "
@@ -10061,13 +11127,9 @@ def _stabilize_mid_fill_realized_and_equity(
                     f"Settled: {format_dollar(settled_realized_pnl)} | "
                     f"Open: {format_dollar(open_pnl)})."
                 )
+            in_trade_desync_streak = 0
             realized_pnl = settled_realized_pnl
             current_eq = round(start_equity + realized_pnl + open_pnl, 2)
-        else:
-            in_trade_desync_streak = 0
-            pending_scale_out_tol = 0.0
-            realized_pnl = raw_realized_pnl
-            settled_realized_pnl = realized_pnl
     else:
         expected_realized = round(settled_realized_pnl + est_closed_delta, 2)
         tol = max(60.0, closed_notional * 0.30)
@@ -13710,8 +14772,9 @@ def show_preflight_window(
         parent_win = pf
         try:
             if not pf.winfo_exists():
-                if root is not None and root.winfo_exists():
-                    parent_win = root
+                fb_root = parent or hud_root
+                if fb_root is not None and fb_root.winfo_exists():
+                    parent_win = fb_root
                 else:
                     return
         except Exception:
@@ -16292,17 +17355,17 @@ def show_preflight_window(
 
         txt_box.insert("end", "─" * 76 + "\n", "div_line")
 
-        # Section 2: Persistent lock & watchdog
+        # Section 2: All-monitor briefing card + Persistent lock & watchdog
         txt_box.insert(
             "end",
-            "2. PERSISTENT WINDOWS SCREEN LOCK & VOICE COUNTDOWN\n",
+            "2. ALL-MONITOR PENALTY BOX BRIEFING  →  PERSISTENT WINDOWS LOCK\n",
             "hdr_sec",
         )
         s2_spans = [
-            ("    Locks your Windows screen for your set ", ("body",)),
+            ("    Shows an all-monitor Penalty Box briefing card for 15s (or locks immediately if clicked),\n", ("body",)),
+            ("    then locks Windows for the rest of your ", ("body",)),
             (" Lock Duration (Mins) ", ("body", "pill")),
-            (". If you log back in before the\n", ("body",)),
-            ("    timer expires, it immediately re-locks within 0.20s and announces the remaining time aloud.\n", ("body",)),
+            (" and re-locks within 0.20s if unlocked early.\n", ("body",)),
         ]
         for s_txt, s_tags in s2_spans:
             txt_box.insert("end", s_txt, s_tags)
@@ -17244,8 +18307,10 @@ def show_preflight_window(
             "pill", font=("Arial", 10, "bold"), foreground="#bae6fd", background="#1a2636"
         )
         dry_spans = [
-            ("• Plays the Warning Siren and your selected Verbal Lockout Voice Cue.\n", ("body",)),
-            ("• Locks your Windows screen for ", ("body",)),
+            ("• Opens the ", ("body",)),
+            (" All-Monitor Penalty Box Briefing Screen ", ("body", "pill")),
+            (" for 10s (clicks/keys lock immediately).\n", ("body",)),
+            ("• Plays the Warning Siren, Lockout Voice Cue, and locks Windows for ", ("body",)),
             (" 10 seconds ", ("body", "pill")),
             (".\n", ("body",)),
             ("• Plays the 3-Tone Unlock Chime and voice confirmation when finished.\n", ("body",)),
@@ -17389,6 +18454,7 @@ def show_preflight_window(
             def _dry_run_seq():
                 global dry_run_lock_active
                 dry_run_lock_active = True
+                overlay = None
                 try:
                     pf.after(
                         0,
@@ -17400,16 +18466,47 @@ def show_preflight_window(
                 except Exception:
                     pass
                 try:
+                    sim_broker = str(var_broker.get() or "SCHWAB").upper()
+                    overlay = PenaltyBoxBriefingOverlay(
+                        mode="DRY_RUN",
+                        title="PENALTY BOX LOCKOUT PREVIEW — 10s DRY-RUN TEST",
+                        reason="Simulated Guardrail Breach (10-Second Dry-Run Test)",
+                        context_str=(
+                            "Safe Simulation Mode — Zero broker orders sent or canceled "
+                            "(Baseline & W/L stats untouched)"
+                        ),
+                        lock_mins=10.0 / 60.0,
+                        ui_anchor=pf,
+                        flat_enabled=True,
+                        is_dry_run=True,
+                        briefing_sec=10.0,
+                    )
+                    overlay.open()
                     for _ in range(4):
                         winsound.Beep(2600, 180)
                         time.sleep(0.04)
+                    overlay.mark_flat_confirmed(broker_name=sim_broker)
+                    speak_async(
+                        "Dry run lockout test started. Penalty box briefing active. "
+                        "Windows will lock in 10 seconds.",
+                        force=True,
+                        voice_override=sel_voice_id,
+                        interrupt=True,
+                    )
+                    was_bypassed = overlay.wait_out_briefing_or_bypass(
+                        briefing_sec=10.0
+                    )
                     try:
                         ctypes.windll.user32.LockWorkStation()
                     except Exception:
                         pass
                     time.sleep(0.35)
                     speak_async(
-                        "Dry run lockout test started. Locked out for 10 seconds.",
+                        (
+                            "Bypass detected. Windows screen locked for 10 seconds."
+                            if was_bypassed
+                            else "Windows screen locked for 10 seconds."
+                        ),
                         force=True,
                         voice_override=sel_voice_id,
                         interrupt=True,
@@ -17466,6 +18563,11 @@ def show_preflight_window(
                 except Exception:
                     pass
                 finally:
+                    if overlay is not None:
+                        try:
+                            overlay.close()
+                        except Exception:
+                            pass
                     dry_run_lock_active = False
                     try:
                         pf.after(
