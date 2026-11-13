@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.50"
+APP_VERSION = "0.9.51"
 
 import os
 import sys
@@ -15400,9 +15400,9 @@ def show_preflight_window(
     open_stop_tip = (
         "Single-Trade Open PnL Stop:\n"
         "If your combined unrealized Open PnL drops to or below -Max Open Loss ($),\n"
-        "Enforcer cancels working orders and flattens open EQUITY shares immediately\n"
+        "Enforcer cancels working daytrade orders and flattens tracked intraday EQUITY shares immediately\n"
         "(Market order in RTH 9:30–4:00 ET; marketable GTC_EXT limit order in Extended Hours).\n"
-        "• Does NOT end your trading day.\n"
+        "• Does NOT end your trading day, and never touches Ignored swing positions or their GTC orders.\n"
         "• Option contracts are Siren-Only by default unless 'Include Options in Auto-Flatten (BETA)'\n"
         "  is explicitly enabled in Card 2 (RTH 9:30 AM – 4:00 PM ET Market orders only)."
     )
@@ -15785,7 +15785,7 @@ def show_preflight_window(
         "Consecutive Loss Cooldown ('Tilt Streak Stop'):\n"
         "Tracks completed losing round-trip trades inside a rolling time window.\n"
         "If you close X consecutive losing trades (each at least 'Min Loss ($)') within 'In (Mins)' minutes,\n"
-        "Enforcer cancels working orders and triggers the Penalty Box OS Lock Cooldown below.\n"
+        "Enforcer cancels working daytrade orders and triggers the Penalty Box OS Lock Cooldown below.\n"
         "• Min Loss ($): Ignores tiny scratch losses smaller than '-Min Loss ($)' (e.g. -$5 when Min Loss is -$25)\n"
         "  so disciplined micro-scratches are never penalized toward a loss streak.\n"
         "• Win Reset ($): Sets the minimum green trade required to reset an active loss streak early\n"
@@ -16057,9 +16057,9 @@ def show_preflight_window(
         "Penalty Box Cooldown Lock (Shared by Open PnL Stop & Consecutive Loss Cooldown):\n"
         "Locks your Windows screen for the set duration (supports decimals like 0.5 for 30s)\n"
         "after an Open PnL Stop or Consecutive Loss Cooldown triggers so you cannot revenge-trade.\n"
-        "• SAFETY GUARANTEE: The app ALWAYS confirms with the broker API that 100% of open\n"
-        "  positions are closed (flat) before locking your computer — it will never lock you\n"
-        "  out while a position is still open."
+        "• SAFETY GUARANTEE: The app ALWAYS confirms with the broker API that 100% of tracked\n"
+        "  intraday/daytrade positions are closed (flat) before locking your computer — it will never\n"
+        "  lock you out while an active daytrade is open (Ignored swing positions are untouched)."
     )
     attach_tooltip(cb_open_cd, open_cd_tip)
     attach_tooltip(lbl_cd_mins, open_cd_tip)
@@ -16101,7 +16101,8 @@ def show_preflight_window(
         "Auto-Flatten on Daily Stop (Max Loss or Profit Lock):\n"
         "When your total Net PnL (Realized + Open) hits your active Daily Stop in Rulebook 4 or 5\n"
         "(whether that is your Starting Max Loss, a tightened Tier 2/3 Max Loss, or a green\n"
-        "Trailing Profit Lock), Enforcer cancels working orders and liquidates open Equity shares.\n"
+        "Trailing Profit Lock), Enforcer cancels working daytrade orders and liquidates tracked\n"
+        "intraday Equity shares (Ignored swing positions and their GTC orders are never touched).\n"
         "• Option contracts are Siren-Only by default unless 'Include Options in Auto-Flatten (BETA)'\n"
         "  is enabled below; if options remain open, the siren blares until you close them."
     )
@@ -16124,7 +16125,8 @@ def show_preflight_window(
         "EXPERIMENTAL BETA — Options Auto-Flatten (RTH 9:30 AM – 4:00 PM ET Only):\n"
         "When checked (and after accepting the BETA Options Risk Waiver), Enforcer will also submit\n"
         "single-leg RTH MARKET orders (BUY_TO_CLOSE for short legs first, SELL_TO_CLOSE for long legs)\n"
-        "to liquidate open equity option contracts during Card 1 Open PnL stops and Card 2 Daily Stops.\n"
+        "to liquidate tracked intraday equity option contracts during Card 1 Open PnL stops and Card 2\n"
+        "Daily Stops (Ignored swing option positions are never touched).\n"
         "• WIDE SPREAD WARNING: Option Market orders fill at the live Bid/Ask and can suffer severe\n"
         "  slippage far beyond your stop threshold on wide-spread or fast-moving contracts.\n"
         "• MULTI-LEG SPREADS: Liquidated leg-by-leg as individual Market orders (short legs first).\n"
@@ -16186,7 +16188,8 @@ def show_preflight_window(
         "Platform Kill-Switch (When Flat):\n"
         "Force-closes your desktop trading platform (thinkorswim.exe and/or Webull Desktop) "
         "when your active Max Loss or Profit Lock is hit.\n"
-        "• SAFETY GUARANTEE: Only closes the app AFTER confirming your account is 100% flat."
+        "• SAFETY GUARANTEE: Only closes the app AFTER confirming 100% of tracked intraday/daytrade\n"
+        "  positions are closed (flat) — Ignored swing positions are untouched."
     )
     attach_tooltip(lbl_kill, kill_tip)
     attach_tooltip(cb_kill_tos, kill_tip)
@@ -16220,7 +16223,8 @@ def show_preflight_window(
         "Tier 2/3 Ratchet, or Trailing Profit Lock is hit.\n"
         "• 0 = Locks Windows one single time (1x).\n"
         "• > 0 (e.g. 15) = Persistent lockout timer that re-locks Windows every few seconds if you log back in early.\n"
-        "• SAFETY GUARANTEE: Always confirms with the broker API that 100% of open positions are flat before locking."
+        "• SAFETY GUARANTEE: Always confirms with the broker API that 100% of tracked intraday/daytrade\n"
+        "  positions are closed (flat) before locking — Ignored swing positions are untouched."
     )
     attach_tooltip(cb_lock_os, day_lock_tip)
     attach_tooltip(lbl_daily_lock_mins, day_lock_tip)
