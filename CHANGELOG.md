@@ -28,7 +28,7 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
   - Fixed `DarkDropdownMenu` popup rendering (`BROKER`, `ACCOUNT`, `Logs`, `Voices`), deduplicated rapid-hover tooltips, and eliminated primary-monitor popup flash on modal dialogs.
 - **Rulebook Ratchets, Halt Watch & Lockout Hardening:**
   - Added tier-aware HUD column headers/tooltips, tier-specific Post-Breach Review instructions, and first-poll `[RATCHET]` notifications on mid-session resume.
-  - Added LULD halt working-order preservation + 2-poll stale-replica filter + passive `⏳ HALT WATCH` deferral, instant early-unlock detection with exact remaining time TTS callouts, queued non-overlapping speech, calm 2-tone (`660 Hz -> 440 Hz`) disconnect alerts, and automatic Beta Channel changelog routing.
+  - Added LULD halt working-order preservation + 2-poll stale-replica filter + passive `⏳ HALT WATCH` deferral, instant early-unlock detection with exact remaining time TTS callouts, queued non-overlapping speech, calm 2-tone (`660 Hz -> 440 Hz`) disconnect alerts, seamless file-backed Schwab token re-binding & in-place `token_invalid` self-healing after manual 7-day token renewals, and automatic Beta Channel changelog routing.
 
 ---
 

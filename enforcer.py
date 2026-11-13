@@ -4394,6 +4394,13 @@ class SchwabAdapter:
             self.client = client_from_manual_flow(
                 self.app_key, self.app_secret, CALLBACK_URL, SCHWAB_TOKEN_PATH
             )
+            if os.path.exists(SCHWAB_TOKEN_PATH):
+                try:
+                    self.client = client_from_token_file(
+                        SCHWAB_TOKEN_PATH, self.app_key, self.app_secret
+                    )
+                except Exception:
+                    pass
             try:
                 self.client.set_timeout(4.5)
             except Exception:
@@ -4699,9 +4706,25 @@ class SchwabAdapter:
     def get_open_equity_positions(self):
         """Returns ONLY Equity positions for Auto-Flatten, or None on API error."""
         try:
-            resp = self.client.get_account(
-                self.account_id, fields=self.client.Account.Fields.POSITIONS
-            )
+            try:
+                resp = self.client.get_account(
+                    self.account_id, fields=self.client.Account.Fields.POSITIONS
+                )
+            except Exception as inner_e:
+                if (
+                    "token_invalid" in str(inner_e).lower()
+                    and self.reconnect_session()
+                ):
+                    log_event(
+                        "SESSION",
+                        "Schwab in-memory token refreshed from disk after token_invalid."
+                    )
+                    resp = self.client.get_account(
+                        self.account_id,
+                        fields=self.client.Account.Fields.POSITIONS
+                    )
+                else:
+                    raise
             if resp.status_code == 200:
                 open_eq = []
                 open_opt = []
@@ -4763,9 +4786,25 @@ class SchwabAdapter:
                 if not is_position_ignored(item[0], is_opt=True)
             ]
         try:
-            resp = self.client.get_account(
-                self.account_id, fields=self.client.Account.Fields.POSITIONS
-            )
+            try:
+                resp = self.client.get_account(
+                    self.account_id, fields=self.client.Account.Fields.POSITIONS
+                )
+            except Exception as inner_e:
+                if (
+                    "token_invalid" in str(inner_e).lower()
+                    and self.reconnect_session()
+                ):
+                    log_event(
+                        "SESSION",
+                        "Schwab in-memory token refreshed from disk after token_invalid."
+                    )
+                    resp = self.client.get_account(
+                        self.account_id,
+                        fields=self.client.Account.Fields.POSITIONS
+                    )
+                else:
+                    raise
             if resp.status_code == 200:
                 open_eq = []
                 open_opt = []
@@ -5003,9 +5042,25 @@ class SchwabAdapter:
                 return cached_snap[1]
 
         try:
-            resp = self.client.get_account(
-                self.account_id, fields=self.client.Account.Fields.POSITIONS
-            )
+            try:
+                resp = self.client.get_account(
+                    self.account_id, fields=self.client.Account.Fields.POSITIONS
+                )
+            except Exception as inner_e:
+                if (
+                    "token_invalid" in str(inner_e).lower()
+                    and self.reconnect_session()
+                ):
+                    log_event(
+                        "SESSION",
+                        "Schwab in-memory token refreshed from disk after token_invalid."
+                    )
+                    resp = self.client.get_account(
+                        self.account_id,
+                        fields=self.client.Account.Fields.POSITIONS
+                    )
+                else:
+                    raise
             if resp.status_code == 200:
                 self.last_error = ""
                 data = resp.json().get("securitiesAccount", {})
