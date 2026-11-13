@@ -3,6 +3,25 @@ setlocal EnableDelayedExpansion
 title PnL Enforcer Beta -- Launcher
 cd /d "%~dp0"
 
+:: 0. Fast-path launch when enforcer.py is already installed (skips console checks)
+if exist "enforcer.py" if /i not "%~1"=="--console" (
+    set "FAST_PYW="
+    for /d %%D in ("%LocalAppData%\Programs\Python\Python3*" "%LocalAppData%\Python\pythoncore-3*" "C:\Python3*" "C:\Program Files\Python3*") do (
+        if exist "%%~fD\pythonw.exe" set "FAST_PYW=%%~fD\pythonw.exe"
+    )
+    if defined FAST_PYW (
+        start "" "!FAST_PYW!" enforcer.py
+        exit /b 0
+    )
+    for /f "delims=" %%i in ('where pythonw 2^>nul') do (
+        echo "%%i" | find /i "WindowsApps\pythonw.exe" >nul
+        if !errorlevel! neq 0 (
+            start "" "%%i" enforcer.py
+            exit /b 0
+        )
+    )
+)
+
 echo ========================================================
 echo          PnL ENFORCER BETA -- STARTUP CHECK
 echo ========================================================

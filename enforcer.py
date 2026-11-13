@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.49"
+APP_VERSION = "0.9.50"
 
 import os
 import sys
@@ -4269,6 +4269,7 @@ class SchwabAdapter:
         self.last_cancel_failed_syms = set()
         self._rate_limit_until = 0.0
         self._last_429_log_ts = 0.0
+        self._fast_auth_deferred = False
         self.last_error = ""
 
     def get_last_raw_pos_details(self):
@@ -4279,13 +4280,41 @@ class SchwabAdapter:
     def get_last_intraday_cash_flow(self):
         return float(self._last_intraday_cash_flow.get(self.account_id, 0.0))
 
-    def authenticate(self):
+    def verify_accounts_live(self):
+        """Verifies live Schwab API connectivity and refreshes self.accounts."""
+        try:
+            if self.client is None:
+                return False
+            try:
+                resp = self.client.get_account_numbers()
+            except Exception as inner_e:
+                if (
+                    "token_invalid" in str(inner_e).lower()
+                    and self.reconnect_session()
+                ):
+                    resp = self.client.get_account_numbers()
+                else:
+                    raise
+            if resp.status_code == 200:
+                self._parse_accounts(resp.json())
+                self._fast_auth_deferred = False
+                return True
+        except Exception as e:
+            self.last_error = str(e)
+        return False
+
+    def authenticate(self, fast_cached_accounts=None):
         try:
             from schwab.auth import client_from_manual_flow, client_from_token_file
         except ImportError:
             print("[SETUP] Installing required Schwab SDK (schwab-py)...")
+            py_cli = sys.executable
+            if py_cli.lower().endswith("pythonw.exe"):
+                cand_py = py_cli[:-5] + ".exe"
+                if os.path.exists(cand_py):
+                    py_cli = cand_py
             subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--upgrade", "schwab-py"],
+                [py_cli, "-m", "pip", "install", "--upgrade", "schwab-py"],
                 check=False
             )
             from schwab.auth import client_from_manual_flow, client_from_token_file
@@ -4304,9 +4333,22 @@ class SchwabAdapter:
                     self.client.set_timeout(4.5)
                 except Exception:
                     pass
+                if (
+                    fast_cached_accounts
+                    and isinstance(fast_cached_accounts, list)
+                ):
+                    self.accounts = [
+                        dict(a)
+                        for a in fast_cached_accounts
+                        if isinstance(a, dict) and a.get("id")
+                    ]
+                    if self.accounts:
+                        self._fast_auth_deferred = True
+                        return True
                 resp = self.client.get_account_numbers()
                 if resp.status_code == 200:
                     self._parse_accounts(resp.json())
+                    self._fast_auth_deferred = False
                     return True
                 if resp.status_code in (400, 401, 403):
                     raise RuntimeError(
@@ -5310,6 +5352,7 @@ class WebullAdapter:
         self.last_cancel_failed_syms = set()
         self._rate_limit_until = 0.0
         self._last_429_log_ts = 0.0
+        self._fast_auth_deferred = False
         self.last_error = ""
 
     def get_last_raw_pos_details(self):
@@ -5320,7 +5363,48 @@ class WebullAdapter:
     def get_last_intraday_cash_flow(self):
         return float(self._last_intraday_cash_flow.get(self.account_id, 0.0))
 
-    def authenticate(self):
+    def _parse_webull_accounts(self, payload):
+        raw_list = (
+            payload if isinstance(payload, list)
+            else payload.get("data", payload.get("accounts", []))
+        )
+        self.accounts = []
+        for item in raw_list:
+            aid = str(
+                item.get("account_id")
+                or item.get("sec_account_id")
+                or item.get("id")
+                or ""
+            )
+            atype = (
+                item.get("account_type")
+                or item.get("account_class")
+                or item.get("type")
+                or "TRADING"
+            )
+            anum = str(item.get("account_number") or aid)
+            masked = f"...{anum[-4:]}" if len(anum) >= 4 else anum
+            if aid:
+                self.accounts.append({
+                    "id": aid,
+                    "label": f"Webull {atype} ({masked})"
+                })
+        if self.accounts and not self.account_id:
+            self.account_id = self.accounts[0]["id"]
+
+    def verify_accounts_live(self):
+        """Verifies live Webull API connectivity and refreshes self.accounts."""
+        try:
+            res = self._call_get_account_list()
+            if res.status_code == 200:
+                self._parse_webull_accounts(res.json())
+                self._fast_auth_deferred = False
+                return True
+        except Exception as e:
+            self.last_error = str(e)
+        return False
+
+    def authenticate(self, fast_cached_accounts=None):
         logging.getLogger("webull").setLevel(logging.CRITICAL)
         logging.getLogger("webull.core").setLevel(logging.CRITICAL)
         try:
@@ -5330,9 +5414,14 @@ class WebullAdapter:
             from webull.trade.trade_client import TradeClient
         except ImportError:
             print("[SETUP] Installing required Webull OpenAPI SDK & dependencies...")
+            py_cli = sys.executable
+            if py_cli.lower().endswith("pythonw.exe"):
+                cand_py = py_cli[:-5] + ".exe"
+                if os.path.exists(cand_py):
+                    py_cli = cand_py
             subprocess.run(
                 [
-                    sys.executable, "-m", "pip", "install", "--upgrade",
+                    py_cli, "-m", "pip", "install", "--upgrade",
                     "six", "jmespath", "protobuf", "paho-mqtt",
                     "requests", "urllib3", "certifi", "cryptography", "cachetools"
                 ],
@@ -5340,7 +5429,7 @@ class WebullAdapter:
             )
             subprocess.run(
                 [
-                    sys.executable, "-m", "pip", "install", "--upgrade",
+                    py_cli, "-m", "pip", "install", "--upgrade",
                     "--no-deps", "--ignore-requires-python",
                     "webull-openapi-python-sdk"
                 ],
@@ -5367,36 +5456,22 @@ class WebullAdapter:
         logging.getLogger("webull").setLevel(logging.CRITICAL)
         logging.getLogger("webull.core").setLevel(logging.CRITICAL)
 
+        if fast_cached_accounts and isinstance(fast_cached_accounts, list):
+            self.accounts = [
+                dict(a)
+                for a in fast_cached_accounts
+                if isinstance(a, dict) and a.get("id")
+            ]
+            if self.accounts:
+                if not self.account_id:
+                    self.account_id = self.accounts[0]["id"]
+                self._fast_auth_deferred = True
+                return True
+
         res = self._call_get_account_list()
         if res.status_code == 200:
-            payload = res.json()
-            raw_list = (
-                payload if isinstance(payload, list)
-                else payload.get("data", payload.get("accounts", []))
-            )
-            self.accounts = []
-            for item in raw_list:
-                aid = str(
-                    item.get("account_id")
-                    or item.get("sec_account_id")
-                    or item.get("id")
-                    or ""
-                )
-                atype = (
-                    item.get("account_type")
-                    or item.get("account_class")
-                    or item.get("type")
-                    or "TRADING"
-                )
-                anum = str(item.get("account_number") or aid)
-                masked = f"...{anum[-4:]}" if len(anum) >= 4 else anum
-                if aid:
-                    self.accounts.append({
-                        "id": aid,
-                        "label": f"Webull {atype} ({masked})"
-                    })
-            if self.accounts and not self.account_id:
-                self.account_id = self.accounts[0]["id"]
+            self._parse_webull_accounts(res.json())
+            self._fast_auth_deferred = False
             return True
         raise RuntimeError(
             f"Webull authentication failed (HTTP {res.status_code}): {res.text}"
@@ -7703,7 +7778,9 @@ def show_broker_setup_wizard(broker_name, parent=None):
     return saved_ok["status"]
 
 
-def connect_broker_adapter(broker_name, parent=None, force_wizard=False):
+def connect_broker_adapter(
+    broker_name, parent=None, force_wizard=False, fast_startup=False
+):
     """Ensures credentials exist for broker_name, authenticates, and
     returns an initialized SchwabAdapter or WebullAdapter."""
     load_config()
@@ -7721,20 +7798,41 @@ def connect_broker_adapter(broker_name, parent=None, force_wizard=False):
         else:
             adapter = WebullAdapter(b_cfg["app_key"], b_cfg["app_secret"])
 
-        adapter.authenticate()
+        cached_accts = (
+            b_cfg.get("cached_accounts")
+            if (fast_startup and not force_wizard)
+            else None
+        )
+        try:
+            adapter.authenticate(fast_cached_accounts=cached_accts)
+        except TypeError:
+            adapter.authenticate()
+
         saved_acct = b_cfg.get("selected_account_id", "")
         valid_ids = [a["id"] for a in adapter.accounts]
+        cfg_dirty = False
         if saved_acct in valid_ids:
             adapter.account_id = saved_acct
         elif valid_ids:
             adapter.account_id = valid_ids[0]
             config["brokers"][broker_name]["selected_account_id"] = valid_ids[0]
-            save_config(config)
+            cfg_dirty = True
 
-        log_event(
-            "SESSION",
-            f"{broker_name} API authenticated ({len(adapter.accounts)} account(s) found)."
-        )
+        if (
+            not getattr(adapter, "_fast_auth_deferred", False)
+            and adapter.accounts
+        ):
+            if b_cfg.get("cached_accounts") != adapter.accounts:
+                config["brokers"][broker_name]["cached_accounts"] = [
+                    dict(a) for a in adapter.accounts
+                ]
+                cfg_dirty = True
+            log_event(
+                "SESSION",
+                f"{broker_name} API authenticated ({len(adapter.accounts)} account(s) found)."
+            )
+        if cfg_dirty:
+            save_config(config)
         return adapter
     except Exception as e:
         log_event("ERROR", f"{broker_name} connection error: {e}")
@@ -11425,6 +11523,7 @@ def show_preflight_window(
         "reviewed": False,
         "reanchor_reviewed": False,
     }
+    _pf_initial_shown = {"done": False, "needs_bg_sync": False}
     btn_review_ignored = None
     var_reanchor = tk.BooleanVar(value=False)
     var_privacy_mode = tk.BooleanVar(
@@ -11949,9 +12048,20 @@ def show_preflight_window(
             _preexisting_state["reviewed"] = False
             _preexisting_state["reanchor_reviewed"] = False
 
+            is_live_broker = isinstance(
+                active_adapter, (SchwabAdapter, WebullAdapter)
+            )
+            defer_to_bg = (
+                parent is None
+                and not _pf_initial_shown["done"]
+                and not force_restore
+                and is_live_broker
+            )
             if had_saved and start_equity is not None and start_equity > 0:
                 force_reanchor = False
-                if (
+                if defer_to_bg:
+                    _pf_initial_shown["needs_bg_sync"] = True
+                elif (
                     parent is None
                     or not active_adapter.get_last_raw_pos_details()
                 ):
@@ -11974,6 +12084,9 @@ def show_preflight_window(
                             settled_realized_pnl = prev_flat_realized_pnl
                             save_session_state()
                 eq_str = f"${start_equity:,.2f} (Saved)"
+            elif defer_to_bg:
+                _pf_initial_shown["needs_bg_sync"] = True
+                eq_str = "Syncing live balance..."
             else:
                 eq, _, live_opnl, _, _ = active_adapter.fetch_account_data()
                 _preexisting_state["raw_eq"] = eq
@@ -14742,10 +14855,15 @@ def show_preflight_window(
                 active_adapter.account_id = chosen_id
                 new_cfg["brokers"][chosen_b]["selected_account_id"] = chosen_id
 
-            if (chosen_b, active_adapter.account_id) != (
-                _preexisting_state.get("broker"),
-                _preexisting_state.get("acct_id"),
+            if (
+                _pf_initial_shown.get("needs_bg_sync")
+                or (chosen_b, active_adapter.account_id)
+                != (
+                    _preexisting_state.get("broker"),
+                    _preexisting_state.get("acct_id"),
+                )
             ):
+                _pf_initial_shown["needs_bg_sync"] = False
                 refresh_baseline_preview()
             had_saved = bool(_preexisting_state.get("had_saved", False))
             if not had_saved:
@@ -19527,6 +19645,139 @@ def show_preflight_window(
         except Exception:
             pass
 
+    _pf_initial_shown["done"] = True
+
+    if parent is None:
+        if _IS_MAIN_PROCESS:
+            start_background_update_check(pf, cancel_pf_fn=_cancel_pf_timers)
+
+        if _pf_initial_shown.get("needs_bg_sync") or getattr(
+            active_adapter, "_fast_auth_deferred", False
+        ):
+            def _bg_preflight_broker_sync():
+                ad = active_adapter
+                if ad is None:
+                    return
+                verified_accts = False
+                if getattr(ad, "_fast_auth_deferred", False) and hasattr(
+                    ad, "verify_accounts_live"
+                ):
+                    verified_accts = bool(ad.verify_accounts_live())
+                    if verified_accts and ad.accounts:
+                        saved_id = (
+                            config.get("brokers", {})
+                            .get(ad.name, {})
+                            .get("selected_account_id", "")
+                        )
+                        valid_ids = [a["id"] for a in ad.accounts]
+                        if saved_id in valid_ids:
+                            ad.account_id = saved_id
+                        elif valid_ids:
+                            ad.account_id = valid_ids[0]
+                snap = None
+                if _pf_initial_shown.get("needs_bg_sync") and ad.account_id:
+                    try:
+                        snap = ad.fetch_account_data()
+                        if (
+                            snap
+                            and snap[0] is not None
+                            and snap[0] > 0
+                            and snap[1]
+                            and hasattr(ad, "has_any_filled_orders_today")
+                        ):
+                            ad.has_any_filled_orders_today()
+                    except Exception:
+                        snap = None
+
+                def _finish_bg_sync_on_ui():
+                    global start_equity, last_flat_equity, prev_flat_realized_pnl
+                    global settled_realized_pnl, anchor_cash_flow, force_reanchor
+                    if pf_timer_state.get("closing"):
+                        return
+                    try:
+                        if not pf.winfo_exists():
+                            return
+                    except Exception:
+                        return
+                    if active_adapter is not ad:
+                        return
+                    if verified_accts and ad.accounts:
+                        b_n = ad.name
+                        if (
+                            config.get("brokers", {})
+                            .get(b_n, {})
+                            .get("cached_accounts")
+                            != ad.accounts
+                        ):
+                            config["brokers"][b_n]["cached_accounts"] = [
+                                dict(a) for a in ad.accounts
+                            ]
+                            save_config(config)
+                        log_event(
+                            "SESSION",
+                            f"{b_n} API authenticated ({len(ad.accounts)} account(s) found).",
+                        )
+                        populate_account_dropdown()
+                    if not _pf_initial_shown.get("needs_bg_sync"):
+                        return
+                    _pf_initial_shown["needs_bg_sync"] = False
+                    if snap is None:
+                        return
+                    eq_now, is_fl_now, live_opnl, _, _ = snap
+                    had_svd = bool(_preexisting_state.get("had_saved", False))
+                    if (
+                        had_svd
+                        and start_equity is not None
+                        and start_equity > 0
+                    ):
+                        if eq_now is not None and eq_now > 0 and is_fl_now:
+                            if not _maybe_absorb_untouched_flat_fee_drift(
+                                eq_now, is_fl_now
+                            ):
+                                last_flat_equity = round(float(eq_now), 2)
+                                prev_flat_realized_pnl = round(
+                                    last_flat_equity - start_equity, 2
+                                )
+                                settled_realized_pnl = prev_flat_realized_pnl
+                                save_session_state()
+                        _card3_base_cache["eq_str"] = (
+                            f"${start_equity:,.2f} (Saved)"
+                        )
+                    else:
+                        _preexisting_state["raw_eq"] = eq_now
+                        raw_pos = ad.get_last_raw_pos_details()
+                        if var_ignore_preexisting.get() and raw_pos:
+                            ignored_positions.clear()
+                            for tag, d in raw_pos.items():
+                                ignored_positions[tag] = (
+                                    build_ignored_position_entry(
+                                        tag, d, lock_existing_open_pnl=False
+                                    )
+                                )
+                            live_opnl = 0.0
+                        if eq_now is not None and eq_now > 0:
+                            start_equity = round(eq_now - live_opnl, 2)
+                            anchor_cash_flow = ad.get_last_intraday_cash_flow()
+                            force_reanchor = True
+                            _card3_base_cache["eq_str"] = (
+                                f"${start_equity:,.2f} (Live)"
+                            )
+                        else:
+                            _card3_base_cache["eq_str"] = (
+                                "Will anchor on first API poll"
+                            )
+                    _refresh_ignored_positions_pill()
+                    _render_card3_telemetry_live(force=True)
+
+                try:
+                    pf.after(0, _finish_bg_sync_on_ui)
+                except Exception:
+                    pass
+
+            threading.Thread(
+                target=_bg_preflight_broker_sync, daemon=True
+            ).start()
+
     if post_daily_breach_prompt:
         pf.after(150, show_daily_breach_return_notice)
     elif (
@@ -21235,25 +21486,35 @@ def _build_changelog_nav_bar(parent_card, txt_box, nav_ctrl):
     return nav_bar
 
 
-def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
+def show_update_available_dialog(
+    curr_ver, new_ver, changelog_md="", parent=None
+):
     """Displays a dark-themed GUI popup when a new version is available,
     showing release notes and a clickable link to the full Changelog."""
     decision = {"install": False}
     try:
-        win = tk.Tk()
+        is_standalone = parent is None
+        if not is_standalone:
+            hide_all_tooltips()
+        win = tk.Tk() if is_standalone else tk.Toplevel(parent)
         win.withdraw()
+        if not is_standalone:
+            win.transient(parent)
         if os.path.exists(ICON_PATH):
             try:
                 win.iconbitmap(ICON_PATH)
             except Exception:
                 pass
+        apply_dark_title_bar(win)
         win.title(f"PnL Enforcer Beta — Update Available (v{new_ver})")
         win.config(bg="#0d1117", padx=24, pady=18)
         win.resizable(True, True)
         win.minsize(780, 500)
         win.attributes("-topmost", True)
 
-        m_left, m_top, m_right, m_bottom = get_monitor_work_area(widget=win)
+        m_left, m_top, m_right, m_bottom = get_monitor_work_area(
+            widget=(parent if parent is not None else win)
+        )
         mw = max(800, m_right - m_left)
         mh = max(600, m_bottom - m_top)
         w = min(1040, max(780, mw - 80))
@@ -21413,10 +21674,18 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
         txt_box.config(state="disabled")
 
         win.protocol("WM_DELETE_WINDOW", on_skip)
-        center_dialog_over_parent(win, width=w, height=h)
+        center_dialog_over_parent(win, parent=parent, width=w, height=h)
+        if not is_standalone:
+            try:
+                win.grab_set()
+            except Exception:
+                pass
         win.lift()
         win.focus_force()
-        win.mainloop()
+        if is_standalone:
+            win.mainloop()
+        else:
+            parent.wait_window(win)
         return decision["install"]
     except Exception:
         ans = input(
@@ -21662,19 +21931,18 @@ def _ensure_single_instance_or_exit():
         pass
 
 
-def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
-    """Checks GitHub / Gist for a newer APP_VERSION and pops up a GUI dialog
-    (with Changelog preview + link) to download and install the latest files."""
+def _fetch_available_update_payload(skip_if_recent=False):
+    """Checks GitHub / Gist for a newer APP_VERSION off the UI thread.
+    Returns (best_ver, best_bytes, cl_bytes, cl_text, ts) if a newer version
+    exists, or None if up to date / offline."""
     try:
-        if _is_another_instance_running():
-            return
         now_ts = time.time()
         if skip_if_recent and os.path.exists(UPDATE_CHECK_STAMP_PATH):
             try:
                 with open(UPDATE_CHECK_STAMP_PATH, "r", encoding="utf-8") as sf:
                     last_chk = float(sf.read().strip() or "0")
                 if (now_ts - last_chk) < 25.0:
-                    return
+                    return None
             except Exception:
                 pass
         try:
@@ -21696,6 +21964,9 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
             BETA_GITHUB_RAW_BASE if is_beta else GITHUB_RAW_BASE
         )
         candidate_urls = []
+        g_meta = None
+        best_ver = None
+        best_bytes = None
         try:
             api_req = urllib.request.Request(
                 f"https://api.github.com/gists/{active_gist_id}",
@@ -21705,10 +21976,20 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
                 },
             )
             with urllib.request.urlopen(api_req, timeout=3) as api_resp:
-                g_meta = json.loads(api_resp.read().decode("utf-8", errors="replace"))
-            live_raw = (
-                g_meta.get("files", {}).get("enforcer.py", {}).get("raw_url")
-            )
+                g_meta = json.loads(
+                    api_resp.read().decode("utf-8", errors="replace")
+                )
+            enf_meta = g_meta.get("files", {}).get("enforcer.py", {})
+            if not enf_meta.get("truncated") and enf_meta.get("content"):
+                c_txt = enf_meta["content"]
+                if "def data_loop" in c_txt:
+                    m_c = re.search(
+                        r'(?m)^APP_VERSION\s*=\s*["\']([^"\']+)["\']', c_txt
+                    )
+                    if m_c:
+                        best_ver = m_c.group(1).strip()
+                        best_bytes = c_txt.encode("utf-8")
+            live_raw = enf_meta.get("raw_url")
             if live_raw:
                 candidate_urls.append(live_raw)
         except Exception:
@@ -21717,37 +21998,46 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
             f"{active_enforcer_raw}?t={ts}",
             f"{active_raw_base}enforcer.py?t={ts}",
         ])
-        best_ver = None
-        best_bytes = None
-        best_txt = None
 
-        for url in candidate_urls:
-            try:
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}",
-                        "Cache-Control": "no-cache",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    rem_bytes = resp.read()
-                rem_txt = rem_bytes.decode("utf-8", errors="replace")
-                if "def data_loop" not in rem_txt:
+        if best_ver is None:
+            for url in candidate_urls:
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        headers={
+                            "User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}",
+                            "Cache-Control": "no-cache",
+                        },
+                    )
+                    with urllib.request.urlopen(req, timeout=3) as resp:
+                        head_bytes = resp.read(4096)
+                        head_txt = head_bytes.decode("utf-8", errors="replace")
+                        m_rem = re.search(
+                            r'(?m)^APP_VERSION\s*=\s*["\']([^"\']+)["\']',
+                            head_txt,
+                        )
+                        v_cand = (
+                            m_rem.group(1).strip() if m_rem else APP_VERSION
+                        )
+                        if _parse_version_tuple(v_cand) <= _parse_version_tuple(
+                            APP_VERSION
+                        ):
+                            if best_ver is None:
+                                best_ver = v_cand
+                            continue
+                        rem_bytes = head_bytes + resp.read()
+                    rem_txt = rem_bytes.decode("utf-8", errors="replace")
+                    if "def data_loop" not in rem_txt:
+                        continue
+                    if (
+                        best_ver is None
+                        or _parse_version_tuple(v_cand)
+                        > _parse_version_tuple(best_ver)
+                    ):
+                        best_ver = v_cand
+                        best_bytes = rem_bytes
+                except Exception:
                     continue
-                m_rem = re.search(
-                    r'(?m)^APP_VERSION\s*=\s*["\']([^"\']+)["\']', rem_txt
-                )
-                v_cand = m_rem.group(1).strip() if m_rem else "0.9.4"
-                if (
-                    best_ver is None
-                    or _parse_version_tuple(v_cand) > _parse_version_tuple(best_ver)
-                ):
-                    best_ver = v_cand
-                    best_bytes = rem_bytes
-                    best_txt = rem_txt
-            except Exception:
-                continue
 
         if not os.path.exists(ICON_PATH):
             ico_bytes = _fetch_remote_doc_bytes("enforcer.ico", ts=ts)
@@ -21760,47 +22050,79 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
 
         if best_ver is None:
             print(f"Version check: v{APP_VERSION} (Offline / skipped)")
-            return
+            return None
 
         if _parse_version_tuple(best_ver) <= _parse_version_tuple(APP_VERSION):
             print(f"Version check: v{APP_VERSION} (Up to date)")
-            return
+            return None
+
+        if not best_bytes:
+            return None
 
         print(f"New update available: v{APP_VERSION} -> v{best_ver}")
-        cl_bytes = _fetch_remote_doc_bytes("CHANGELOG.md", ts=ts)
+        cl_bytes = None
+        if isinstance(g_meta, dict):
+            cl_meta = g_meta.get("files", {}).get("CHANGELOG.md", {})
+            if not cl_meta.get("truncated") and cl_meta.get("content"):
+                cl_bytes = cl_meta["content"].encode("utf-8")
+        if not cl_bytes:
+            cl_bytes = _fetch_remote_doc_bytes("CHANGELOG.md", ts=ts)
         cl_text = (
             cl_bytes.decode("utf-8", errors="replace") if cl_bytes else ""
         )
+        return (best_ver, best_bytes, cl_bytes, cl_text, ts)
+    except Exception:
+        print(f"Version check: v{APP_VERSION} (Offline / skipped)")
+        return None
 
+
+def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
+    """Writes the downloaded update files to SCRIPT_DIR and returns target_py."""
+    script_dir = SCRIPT_DIR
+    target_py = os.path.join(script_dir, "enforcer.py")
+    tmp_py = target_py + ".tmp"
+    with open(tmp_py, "wb") as f:
+        f.write(best_bytes)
+    os.replace(tmp_py, target_py)
+
+    if cl_bytes:
+        try:
+            with open(os.path.join(script_dir, "CHANGELOG.md"), "wb") as cf:
+                cf.write(cl_bytes)
+        except Exception:
+            pass
+
+    for doc_name in (
+        "Launch_Enforcer.bat",
+        "README.md",
+        "LICENSE.txt",
+        "enforcer.ico",
+    ):
+        doc_bytes = _fetch_remote_doc_bytes(doc_name, ts=ts)
+        if doc_bytes:
+            try:
+                with open(os.path.join(script_dir, doc_name), "wb") as df:
+                    df.write(doc_bytes)
+            except Exception:
+                pass
+    print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver}.\n")
+    return target_py
+
+
+def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
+    """Checks GitHub / Gist for a newer APP_VERSION and pops up a GUI dialog
+    (with Changelog preview + link) to download and install the latest files."""
+    try:
+        if _is_another_instance_running():
+            return
+        payload = _fetch_available_update_payload(skip_if_recent=skip_if_recent)
+        if payload is None:
+            return
+        best_ver, best_bytes, cl_bytes, cl_text, ts = payload
         if show_update_available_dialog(APP_VERSION, best_ver, cl_text):
-            script_dir = SCRIPT_DIR
-            target_py = os.path.join(script_dir, "enforcer.py")
-            tmp_py = target_py + ".tmp"
-            with open(tmp_py, "wb") as f:
-                f.write(best_bytes)
-            os.replace(tmp_py, target_py)
-
-            if cl_bytes:
-                try:
-                    with open(os.path.join(script_dir, "CHANGELOG.md"), "wb") as cf:
-                        cf.write(cl_bytes)
-                except Exception:
-                    pass
-
-            for doc_name in (
-                "Launch_Enforcer.bat",
-                "README.md",
-                "LICENSE.txt",
-                "enforcer.ico",
-            ):
-                doc_bytes = _fetch_remote_doc_bytes(doc_name, ts=ts)
-                if doc_bytes:
-                    try:
-                        with open(os.path.join(script_dir, doc_name), "wb") as df:
-                            df.write(doc_bytes)
-                    except Exception:
-                        pass
-            print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver}.\n")
+            target_py = _install_update_payload(
+                best_ver, best_bytes, cl_bytes, ts
+            )
             if restart_on_update:
                 _release_single_instance_mutex()
                 _spawn_updated_enforcer(target_py)
@@ -21808,6 +22130,55 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
             print(f"[SKIPPED] Continuing with local v{APP_VERSION}...\n")
     except Exception:
         print(f"Version check: v{APP_VERSION} (Offline / skipped)")
+
+
+def start_background_update_check(parent_pf, cancel_pf_fn=None):
+    """Runs the version check in a background thread right after Pre-Flight
+    opens so startup is instant, and pops up the interactive Update Available
+    + Changelog modal over Pre-Flight only if a newer version is found."""
+    def _worker():
+        payload = _fetch_available_update_payload(skip_if_recent=True)
+        if payload is None:
+            return
+        best_ver, best_bytes, cl_bytes, cl_text, ts = payload
+
+        def _prompt_on_ui():
+            try:
+                if not parent_pf.winfo_exists():
+                    return
+                if parent_pf.grab_current() is not None:
+                    parent_pf.after(300, _prompt_on_ui)
+                    return
+                if show_update_available_dialog(
+                    APP_VERSION, best_ver, cl_text, parent=parent_pf
+                ):
+                    target_py = _install_update_payload(
+                        best_ver, best_bytes, cl_bytes, ts
+                    )
+                    if cancel_pf_fn is not None:
+                        try:
+                            cancel_pf_fn()
+                        except Exception:
+                            pass
+                    try:
+                        parent_pf.destroy()
+                    except Exception:
+                        pass
+                    _release_single_instance_mutex()
+                    _spawn_updated_enforcer(target_py)
+                else:
+                    print(f"[SKIPPED] Continuing with local v{APP_VERSION}...\n")
+            except SystemExit:
+                raise
+            except Exception:
+                pass
+
+        try:
+            parent_pf.after(150, _prompt_on_ui)
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 _IS_MAIN_PROCESS = False
@@ -21948,7 +22319,6 @@ if __name__ == "__main__":
         sys.exit(0)
     _configure_console_window(hide_unless_debug=True)
     _ensure_single_instance_or_exit()
-    check_for_updates_cli(restart_on_update=True, skip_if_recent=True)
     init_daily_log()
     print("\n=========================================")
     print(f"  INITIALIZING PnL ENFORCER BETA v{APP_VERSION}  ")
@@ -21960,7 +22330,9 @@ if __name__ == "__main__":
 
         load_config(log_restore=True)
         initial_broker = config.get("active_broker", "SCHWAB")
-        active_adapter = connect_broker_adapter(initial_broker)
+        active_adapter = connect_broker_adapter(
+            initial_broker, fast_startup=True
+        )
 
         # Safe fallback: if the active broker failed to connect and the other
         # broker already has saved credentials, switch to it automatically.
@@ -21977,7 +22349,9 @@ if __name__ == "__main__":
                 )
                 config["active_broker"] = fallback_broker
                 save_config(config)
-                active_adapter = connect_broker_adapter(fallback_broker)
+                active_adapter = connect_broker_adapter(
+                    fallback_broker, fast_startup=True
+                )
 
         # Always open Pre-Flight even if active_adapter is None so the user
         # is never locked out of the Broker dropdown or API Keys button.
