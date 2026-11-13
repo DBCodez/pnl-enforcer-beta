@@ -4,6 +4,22 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.54] — 2026-11-13
+### ⚡ Quick Summary
+- **One-Click `Inspect Source / Diff ↗` Links:** Added an **`Inspect Source / Diff ↗`** button to the **Update Available** dialog, the **Release Notes** viewer, and the Pre-Flight footer (`Inspect Source ↗`) that opens the GitHub Gist `/revisions` diff page in your browser so security-conscious users can inspect the full source code and exact line-by-line changes before or after any update.
+- **Background Update Modal & Full-File Verification Fixes:** Fixed a `NameError` (`hide_all_tooltips`) when opening the **Update Available** modal over the Pre-Flight window, verified full-file syntax (`compile()`) and end-of-file markers on 900 KB+ update payloads, and prioritized the user's primary `PATH` `pythonw.exe` in `Launch_Enforcer.bat`.
+
+### 🔍 Detailed Breakdown
+- **Source Code & Revision Diff Inspection (`get_source_diff_web_url`, `show_update_available_dialog`, `show_release_notes_dialog`):**
+  - Added `SOURCE_DIFF_WEB_URL` and `BETA_SOURCE_DIFF_WEB_URL` pointing to the GitHub Gist `/revisions` side-by-side diff view for the active channel, wired to **`Inspect Source / Diff ↗`** buttons in the Update Available and Release Notes headers plus **`Inspect Source ↗`** in the Pre-Flight footer.
+- **Updater & Launcher Hardening (`hide_all_tooltips`, `_fetch_available_update_payload`, `Launch_Enforcer.bat`):**
+  - Added a module-level `hide_all_tooltips()` dispatcher wired to `show_preflight_window()` so opening `show_update_available_dialog(parent=parent_pf)` from `start_background_update_check()` never raises `NameError` or falls back to `input()`.
+  - Guarded the CLI `input()` fallback in `show_update_available_dialog()` so it only runs when `parent is None` and `sys.stdin.isatty()` is `True`.
+  - Increased the raw-stream fallback timeout in `_fetch_available_update_payload()` from `3s` to `8s` and verified both `'if __name__ == "__main__":'` and `compile(rem_txt, "enforcer.py", "exec")` before accepting downloaded updates.
+  - Updated `Launch_Enforcer.bat` fast-path to check `where pythonw` on `PATH` first before scanning `%LocalAppData%\Programs\Python\Python3*` so multi-Python systems always launch with the primary `PATH` interpreter.
+
+---
+
 ## [v0.9.46 – v0.9.53] — 2026-11-13
 ### ⚡ Quick Summary
 - **All-Monitor 15-Second Penalty Box Briefing Screen:** Whenever a Penalty Box or Daily OS Lockout triggers (and during the **10-Second Dry-Run Lockout Test**), Enforcer now displays a full-screen **Penalty Box Briefing Card** across every connected monitor showing the exact breach trigger, live broker order-cancel & 100% flat-verification checklist, and a **15-second** countdown (counted as the first 15 seconds of your total lockout duration) before engaging the Windows OS Lock—or locking Windows immediately if clicked or bypassed.

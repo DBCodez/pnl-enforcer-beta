@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.53"
+APP_VERSION = "0.9.54"
 
 import os
 import sys
@@ -12348,11 +12348,26 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 # ==========================================
 # 8. SPACIOUS WIDESCREEN PRE-FLIGHT WINDOW
 # ==========================================
+_active_hide_tooltips_fn = None
+
+
+def hide_all_tooltips(_event=None):
+    """Module-level dispatcher so dialogs outside show_preflight_window()
+    (such as Update Available, Release Notes, and Penalty Box overlays)
+    can safely dismiss any active Pre-Flight tooltips without NameError."""
+    fn = _active_hide_tooltips_fn
+    if callable(fn):
+        try:
+            fn(_event)
+        except Exception:
+            pass
+
+
 def show_preflight_window(
     parent=None, mute_btn=None, post_daily_breach_prompt=False
 ):
     global settings_win_open, triggered_alarms, active_preflight_close_fn
-    global active_preflight_win, last_preflight_pos
+    global active_preflight_win, last_preflight_pos, _active_hide_tooltips_fn
     global force_reanchor, is_locked_down, current_is_flat
     global active_adapter, start_equity, daily_breach_settings_prompted
 
@@ -12493,6 +12508,8 @@ def show_preflight_window(
                 fn()
             except Exception:
                 pass
+
+    _active_hide_tooltips_fn = hide_all_tooltips
 
     def attach_tooltip(widget, text):
         """Attaches a clean dark-themed hover tooltip card to any widget."""
@@ -21118,6 +21135,38 @@ def show_preflight_window(
         "View the PnL Enforcer Beta Changelog and version release history."
     )
 
+    tk.Label(
+        ver_frame,
+        text="  ·  ",
+        font=("Arial", 9, "bold"),
+        fg="#64748b",
+        bg="#0d1117",
+    ).pack(side="left")
+
+    src_diff_lbl = tk.Label(
+        ver_frame,
+        text="Inspect Source ↗",
+        font=("Arial", 9, "bold underline"),
+        fg="#64748b",
+        bg="#0d1117",
+        cursor="hand2",
+    )
+    src_diff_lbl.pack(side="left")
+    src_diff_lbl.bind(
+        "<Enter>", lambda e: src_diff_lbl.config(fg="#94a3b8")
+    )
+    src_diff_lbl.bind(
+        "<Leave>", lambda e: src_diff_lbl.config(fg="#64748b")
+    )
+    src_diff_lbl.bind(
+        "<Button-1>",
+        lambda e: (hide_all_tooltips(), webbrowser.open(get_source_diff_web_url())),
+    )
+    attach_tooltip(
+        src_diff_lbl,
+        "Open the public GitHub Gist revision history and full source code in your browser to inspect line-by-line diffs for every update."
+    )
+
     def show_daily_breach_return_notice():
         """Displays a friendly dark-glass notice after a Daily Stop breach
         lockout finishes (or siren is muted), reminding the trader to raise
@@ -22438,6 +22487,12 @@ CHANGELOG_WEB_URL = (
 BETA_CHANGELOG_WEB_URL = (
     f"https://gist.github.com/DBCodez/{BETA_GIST_BUNDLE_ID}#file-changelog-md"
 )
+SOURCE_DIFF_WEB_URL = (
+    f"https://gist.github.com/DBCodez/{MAIN_GIST_BUNDLE_ID}/revisions"
+)
+BETA_SOURCE_DIFF_WEB_URL = (
+    f"https://gist.github.com/DBCodez/{BETA_GIST_BUNDLE_ID}/revisions"
+)
 GIST_DOC_RAW_URLS = {
     "CHANGELOG.md": (
         f"https://gist.githubusercontent.com/DBCodez/"
@@ -22493,6 +22548,17 @@ def get_changelog_web_url():
         BETA_CHANGELOG_WEB_URL
         if _is_beta_channel_build()
         else CHANGELOG_WEB_URL
+    )
+
+
+def get_source_diff_web_url():
+    """Returns the GitHub Gist '/revisions' source-diff URL for the active
+    channel so security-conscious users can inspect full source code and
+    line-by-line version diffs in their browser before or after updating."""
+    return (
+        BETA_SOURCE_DIFF_WEB_URL
+        if _is_beta_channel_build()
+        else SOURCE_DIFF_WEB_URL
     )
 
 
@@ -23362,9 +23428,25 @@ def show_update_available_dialog(
             hover_fg="#ffffff",
             canvas_bg="#0d1117",
             height=30,
-            pad_x=22,
+            pad_x=20,
             command=lambda: webbrowser.open(get_changelog_web_url()),
         ).pack(side="right")
+
+        make_stadium_button(
+            hdr_row,
+            text="Inspect Source / Diff ↗",
+            font=("Arial", 9, "bold"),
+            fill_color="#161f2c",
+            border_color="#475569",
+            hover_fill="#1f2c3f",
+            hover_border="#94a3b8",
+            fg="#cbd5e1",
+            hover_fg="#ffffff",
+            canvas_bg="#0d1117",
+            height=30,
+            pad_x=20,
+            command=lambda: webbrowser.open(get_source_diff_web_url()),
+        ).pack(side="right", padx=(0, 8))
 
         tk.Label(
             win,
@@ -23506,10 +23588,19 @@ def show_update_available_dialog(
             parent.wait_window(win)
         return decision["install"]
     except Exception:
-        ans = input(
-            f"Download and install v{new_ver} now? (Y/N): "
-        ).strip().lower()
-        return ans in ("y", "yes")
+        if (
+            parent is None
+            and sys.stdin is not None
+            and getattr(sys.stdin, "isatty", lambda: False)()
+        ):
+            try:
+                ans = input(
+                    f"Download and install v{new_ver} now? (Y/N): "
+                ).strip().lower()
+                return ans in ("y", "yes")
+            except Exception:
+                return False
+        return False
 
 
 def show_release_notes_dialog(parent=None):
@@ -23582,9 +23673,25 @@ def show_release_notes_dialog(parent=None):
         hover_fg="#ffffff",
         canvas_bg="#0d1117",
         height=30,
-        pad_x=22,
+        pad_x=20,
         command=lambda: webbrowser.open(get_changelog_web_url()),
     ).pack(side="right")
+
+    make_stadium_button(
+        hdr_row,
+        text="Inspect Source / Diff ↗",
+        font=("Arial", 9, "bold"),
+        fill_color="#161f2c",
+        border_color="#475569",
+        hover_fill="#1f2c3f",
+        hover_border="#94a3b8",
+        fg="#cbd5e1",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=30,
+        pad_x=20,
+        command=lambda: webbrowser.open(get_source_diff_web_url()),
+    ).pack(side="right", padx=(0, 8))
 
     btn_bar = tk.Frame(win, bg="#0d1117", pady=10)
     btn_bar.pack(fill="x", side="bottom")
@@ -23827,7 +23934,7 @@ def _fetch_available_update_payload(skip_if_recent=False):
                             "Cache-Control": "no-cache",
                         },
                     )
-                    with urllib.request.urlopen(req, timeout=3) as resp:
+                    with urllib.request.urlopen(req, timeout=8) as resp:
                         head_bytes = resp.read(4096)
                         head_txt = head_bytes.decode("utf-8", errors="replace")
                         m_rem = re.search(
@@ -23845,7 +23952,14 @@ def _fetch_available_update_payload(skip_if_recent=False):
                             continue
                         rem_bytes = head_bytes + resp.read()
                     rem_txt = rem_bytes.decode("utf-8", errors="replace")
-                    if "def data_loop" not in rem_txt:
+                    if (
+                        "def data_loop" not in rem_txt
+                        or 'if __name__ == "__main__":' not in rem_txt
+                    ):
+                        continue
+                    try:
+                        compile(rem_txt, "enforcer.py", "exec")
+                    except SyntaxError:
                         continue
                     if (
                         best_ver is None
