@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.47"
+APP_VERSION = "0.9.48"
 
 import os
 import sys
@@ -1906,6 +1906,9 @@ def is_options_flatten_armed(cfg=None):
     )
 
 
+LAYOUT_TOUR_VERSION = "0.9.48"
+_is_existing_user_install = False
+
 DEFAULT_CONFIG = {
     "waiver_accepted": False,
     "waiver_accepted_version": "",
@@ -1915,6 +1918,7 @@ DEFAULT_CONFIG = {
     "options_waiver_version": "",
     "options_waiver_accepted_at": "",
     "options_waiver_sha256": "",
+    "seen_layout_tour_version": "",
     "auto_share_sanitized_logs": False,
     "last_uploaded_sanitized_log": "",
     "anonymous_tester_id": "",
@@ -3318,7 +3322,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
 
 
 def load_config(log_restore=False):
-    global config
+    global config, _is_existing_user_install
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -3335,6 +3339,14 @@ def load_config(log_restore=False):
                     config["account_sessions"].update(saved_sessions)
                 if isinstance(saved_user_defs, dict):
                     config["user_defaults"] = saved_user_defs
+                _is_existing_user_install = bool(
+                    any(
+                        str(config["brokers"].get(b, {}).get("app_key", "")).strip()
+                        for b in ("SCHWAB", "WEBULL")
+                    )
+                    or config.get("account_sessions")
+                    or config.get("user_defaults")
+                )
 
                 # One-time migration: convert legacy unsigned t2_max_loss /
                 # t3_max_loss values (where 1000 meant -$1000) to signed values.
@@ -4569,6 +4581,96 @@ class SchwabAdapter:
             )
             return False
 
+    @staticmethod
+    def _order_ts_to_eastern_date(raw_ts):
+        """Converts an ISO-8601 Schwab order timestamp (e.g. '2026-11-12T20:28:18+0000')
+        into a YYYY-MM-DD date string in US/Eastern time."""
+        s = str(raw_ts or "").strip()
+        if not s:
+            return ""
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            elif re.search(r"[+-]\d{4}$", s):
+                s = s[:-2] + ":" + s[-2:]
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if ZoneInfo is not None:
+                return dt.astimezone(ZoneInfo("America/New_York")).strftime(
+                    "%Y-%m-%d"
+                )
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return s[:10]
+
+    def has_any_filled_orders_today(self):
+        """Returns False ONLY when the broker API confirms zero orders have been
+        filled (or partially filled) on today's US/Eastern calendar date.
+        Defaults to True on any API error so baseline fee-drift absorption is
+        100% fail-safe."""
+        if not self.client or not self.account_id:
+            return True
+        today_str = get_today_str()
+        cache_map = getattr(self, "_filled_today_cache", None)
+        if not isinstance(cache_map, dict):
+            cache_map = {}
+            self._filled_today_cache = cache_map
+        c_key = (str(self.account_id), today_str)
+        now_ts = time.time()
+        cached = cache_map.get(c_key)
+        if cached is not None:
+            c_ts, c_val = cached
+            if c_val or (now_ts - c_ts) < 30.0:
+                return bool(c_val)
+        try:
+            now_et = get_eastern_now()
+            from_dt = now_et.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) - timedelta(days=1)
+            to_dt = now_et + timedelta(days=1)
+            resp = self.client.get_orders_for_account(
+                self.account_id,
+                from_entered_datetime=from_dt,
+                to_entered_datetime=to_dt,
+            )
+            if resp.status_code != 200:
+                return True
+            orders = resp.json()
+            if not isinstance(orders, list):
+                return True
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                st = str(o.get("status") or "").upper()
+                try:
+                    filled_q = float(o.get("filledQuantity") or 0.0)
+                except Exception:
+                    filled_q = 0.0
+                if filled_q <= 0.0 and st not in ("FILLED", "PARTIAL_FILLED"):
+                    continue
+                candidate_dates = set()
+                for ts_key in ("closeTime", "enteredTime"):
+                    d_str = self._order_ts_to_eastern_date(o.get(ts_key))
+                    if d_str:
+                        candidate_dates.add(d_str)
+                for act in o.get("orderActivityCollection") or []:
+                    if isinstance(act, dict):
+                        for ex_leg in act.get("executionLegs") or []:
+                            if isinstance(ex_leg, dict):
+                                d_str = self._order_ts_to_eastern_date(
+                                    ex_leg.get("time")
+                                )
+                                if d_str:
+                                    candidate_dates.add(d_str)
+                if today_str in candidate_dates:
+                    cache_map[c_key] = (now_ts, True)
+                    return True
+            cache_map[c_key] = (now_ts, False)
+            return False
+        except Exception:
+            return True
+
     def get_open_equity_positions(self):
         """Returns ONLY Equity positions for Auto-Flatten, or None on API error."""
         try:
@@ -5463,6 +5565,104 @@ class WebullAdapter:
         except Exception as e:
             log_event("ERROR", f"Webull cancel working orders exception: {e}")
         return False
+
+    def has_any_filled_orders_today(self):
+        """Returns False ONLY when the Webull API confirms zero orders have been
+        filled (or partially filled) on today's US/Eastern calendar date.
+        Defaults to True on any API error so baseline fee-drift absorption is
+        100% fail-safe."""
+        if not self.trade_client or not self.account_id:
+            return True
+        today_str = get_today_str()
+        cache_map = getattr(self, "_filled_today_cache", None)
+        if not isinstance(cache_map, dict):
+            cache_map = {}
+            self._filled_today_cache = cache_map
+        c_key = (str(self.account_id), today_str)
+        now_ts = time.time()
+        cached = cache_map.get(c_key)
+        if cached is not None:
+            c_ts, c_val = cached
+            if c_val or (now_ts - c_ts) < 30.0:
+                return bool(c_val)
+        try:
+            res = None
+            if hasattr(self.trade_client, "order_v3") and hasattr(
+                self.trade_client.order_v3, "get_order_history"
+            ):
+                try:
+                    res = self.trade_client.order_v3.get_order_history(
+                        account_id=self.account_id,
+                        page_size=50,
+                        start_date=today_str,
+                        end_date=today_str,
+                    )
+                except TypeError:
+                    res = self.trade_client.order_v3.get_order_history(
+                        account_id=self.account_id, page_size=50
+                    )
+            elif hasattr(self.trade_client, "order_v2") and hasattr(
+                self.trade_client.order_v2, "get_order_history"
+            ):
+                try:
+                    res = self.trade_client.order_v2.get_order_history(
+                        account_id=self.account_id,
+                        page_size=50,
+                        start_date=today_str,
+                        end_date=today_str,
+                    )
+                except TypeError:
+                    res = self.trade_client.order_v2.get_order_history(
+                        account_id=self.account_id, page_size=50
+                    )
+            if res is None or res.status_code != 200:
+                return True
+            payload = res.json()
+            orders = (
+                payload
+                if isinstance(payload, list)
+                else payload.get("data", payload.get("orders", []))
+            )
+            if not isinstance(orders, list):
+                return True
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                st = str(
+                    o.get("status") or o.get("order_status") or ""
+                ).upper()
+                try:
+                    fq = float(
+                        o.get("filled_quantity")
+                        or o.get("filled_qty")
+                        or o.get("total_filled_quantity")
+                        or o.get("filledQuantity")
+                        or 0.0
+                    )
+                except Exception:
+                    fq = 0.0
+                if fq <= 0.0 and st not in (
+                    "FILLED",
+                    "PARTIAL_FILLED",
+                    "PARTIALLY_FILLED",
+                ):
+                    continue
+                raw_t = str(
+                    o.get("filled_time")
+                    or o.get("update_time")
+                    or o.get("create_time")
+                    or o.get("placed_time")
+                    or today_str
+                )
+                if today_str in raw_t or not re.search(
+                    r"\d{4}-\d{2}-\d{2}", raw_t
+                ):
+                    cache_map[c_key] = (now_ts, True)
+                    return True
+            cache_map[c_key] = (now_ts, False)
+            return False
+        except Exception:
+            return True
 
     @staticmethod
     def _parse_option_contract_meta(p):
@@ -9334,6 +9534,52 @@ def log_position_transitions(
     return consec_trigger_reason
 
 
+def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
+    """If an account anchored its baseline earlier today (e.g. overnight before
+    the broker's 4:00-5:00 AM ET clearing/fee batch) and current flat equity
+    differs from start_equity while 0 trades have been filled today on the
+    brokerage account, automatically re-aligns start_equity to eq_now so the
+    trader does not start their day with a phantom fee PnL."""
+    global start_equity, max_equity, daily_max_equity, last_flat_equity
+    global prev_flat_realized_pnl, settled_realized_pnl
+    if (
+        not is_fl_now
+        or eq_now is None
+        or float(eq_now) <= 0.0
+        or start_equity is None
+        or float(start_equity) <= 0.0
+        or int(win_trades) != 0
+        or int(loss_trades) != 0
+        or len(recent_loss_timestamps) > 0
+        or active_adapter is None
+    ):
+        return False
+    drift = round(float(eq_now) - float(start_equity), 2)
+    if abs(drift) < 0.01 or abs(drift) > 2500.0:
+        return False
+    if active_adapter.has_any_filled_orders_today():
+        return False
+    old_start = round(float(start_equity), 2)
+    new_start = round(float(eq_now), 2)
+    start_equity = new_start
+    max_equity = new_start
+    daily_max_equity = new_start
+    last_flat_equity = new_start
+    prev_flat_realized_pnl = 0.0
+    settled_realized_pnl = 0.0
+    save_session_state()
+    b_lbl = getattr(
+        active_adapter, "name", config.get("active_broker", "SCHWAB")
+    )
+    log_event(
+        "SESSION",
+        f"Auto-aligned {b_lbl} starting baseline from ${old_start:,.2f} to "
+        f"${new_start:,.2f} ({format_dollar(drift)} overnight broker "
+        f"fee/settlement adjustment; 0 trades filled today).",
+    )
+    return True
+
+
 def _stabilize_mid_fill_realized_and_equity(
     current_eq, is_flat, live_open_pnl, pos_details, is_reverify=False
 ):
@@ -9347,6 +9593,7 @@ def _stabilize_mid_fill_realized_and_equity(
 
     if first_poll_of_launch or settled_realized_pnl is None:
         if is_flat:
+            _maybe_absorb_untouched_flat_fee_drift(current_eq, is_flat)
             last_flat_equity = current_eq
             if current_eq > max_equity:
                 max_equity = current_eq
@@ -10806,6 +11053,7 @@ def show_preflight_window(
     pf_timer_state = {
         "rulebook_after_id": None,
         "streak_after_id": None,
+        "pulse_after_id": None,
         "closing": False,
     }
 
@@ -10846,7 +11094,7 @@ def show_preflight_window(
 
     def _cancel_pf_timers():
         pf_timer_state["closing"] = True
-        for k_id in ("rulebook_after_id", "streak_after_id"):
+        for k_id in ("rulebook_after_id", "streak_after_id", "pulse_after_id"):
             aid = pf_timer_state.get(k_id)
             if aid is not None:
                 pf_timer_state[k_id] = None
@@ -10938,6 +11186,9 @@ def show_preflight_window(
                 return
             try:
                 host_win = widget.winfo_toplevel() or pf
+                cur_grab = host_win.grab_current()
+                if cur_grab is not None and cur_grab is not host_win:
+                    return
                 tw = tk.Toplevel(host_win)
                 tw.withdraw()
                 tw.wm_overrideredirect(True)
@@ -11578,6 +11829,10 @@ def show_preflight_window(
         ):
             # Live HUD session is already actively running for this broker/account:
             # preserve live in-memory session state without re-running restore_account_session
+            if current_is_flat and last_flat_equity is not None:
+                _maybe_absorb_untouched_flat_fee_drift(
+                    last_flat_equity, current_is_flat
+                )
             _preexisting_state["broker"] = b_name
             _preexisting_state["acct_id"] = acct_id
             _preexisting_state["had_saved"] = True
@@ -11615,12 +11870,15 @@ def show_preflight_window(
                         and eq_now > 0
                         and is_fl_now
                     ):
-                        last_flat_equity = round(float(eq_now), 2)
-                        prev_flat_realized_pnl = round(
-                            last_flat_equity - start_equity, 2
-                        )
-                        settled_realized_pnl = prev_flat_realized_pnl
-                        save_session_state()
+                        if not _maybe_absorb_untouched_flat_fee_drift(
+                            eq_now, is_fl_now
+                        ):
+                            last_flat_equity = round(float(eq_now), 2)
+                            prev_flat_realized_pnl = round(
+                                last_flat_equity - start_equity, 2
+                            )
+                            settled_realized_pnl = prev_flat_realized_pnl
+                            save_session_state()
                 eq_str = f"${start_equity:,.2f} (Saved)"
             else:
                 eq, _, live_opnl, _, _ = active_adapter.fetch_account_data()
@@ -12423,15 +12681,18 @@ def show_preflight_window(
             broker_acct_capsule.configure(width=total_w, height=h)
 
         hz = _capsule_state["hover_zone"]
+        pulse_b = _capsule_state.get("pulse_border")
+        pulse_fill = _capsule_state.get("pulse_fill")
+        pulse_fill_top = _capsule_state.get("pulse_fill_top")
         _capsule_state["bg_photo"] = _get_glass_pill_photo(
             broker_acct_capsule,
             total_w,
             h,
             bg_hex="#11161f",
-            fill_hex="#141820",
-            fill_top_hex="#1c212b",
-            border_hex="#2e3746" if hz is None else "#475569",
-            hover=(hz is not None),
+            fill_hex=pulse_fill or "#141820",
+            fill_top_hex=pulse_fill_top or "#1c212b",
+            border_hex=pulse_b or ("#2e3746" if hz is None else "#475569"),
+            hover=(hz is not None or bool(pulse_b)),
             corner_radius=6,
         )
         broker_acct_capsule.create_image(
@@ -12671,6 +12932,7 @@ def show_preflight_window(
             refresh_baseline_preview(force_restore=True)
 
     def open_hud_columns_dialog():
+        hide_all_tooltips()
         dlg = tk.Toplevel(pf)
         dlg.withdraw()
         dlg.title("Customize HUD Columns & Order")
@@ -13354,6 +13616,7 @@ def show_preflight_window(
             )
 
     def show_auto_share_consent_dialog():
+        hide_all_tooltips()
         tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
         if not tester_id:
             tester_id = uuid.uuid4().hex[:6]
@@ -13397,9 +13660,9 @@ def show_preflight_window(
         hdr_row.pack(fill="x", pady=(0, 4))
         tk.Label(
             hdr_row,
-            text="▶  🤝 HELP IMPROVE PNL ENFORCER — AUTO-SHARE SAFE LOGS",
+            text="▶  HELP IMPROVE PNL ENFORCER — AUTO-SHARE SAFE LOGS",
             font=("Arial", 12, "bold"),
-            fg="#38bdf8",
+            fg="#7dd3fc",
             bg="#0d1117",
             anchor="w",
         ).pack(side="left")
@@ -13407,8 +13670,8 @@ def show_preflight_window(
             hdr_row,
             text="🔒 100% BALANCE-FREE & ANONYMOUS",
             font=("Arial", 8, "bold"),
-            fg="#6ee7b7",
-            bg="#112a20",
+            fg="#93c5fd",
+            bg="#162231",
             padx=8,
             pady=3,
         ).pack(side="right", padx=(12, 0))
@@ -13439,7 +13702,7 @@ def show_preflight_window(
             width=78,
             height=12,
             bg="#131922",
-            fg="#b8c7d9",
+            fg="#cbd5e1",
             font=("Arial", 10, "bold"),
             wrap="none",
             bd=0,
@@ -13453,28 +13716,28 @@ def show_preflight_window(
         txt_box.tag_configure(
             "hdr_green",
             font=("Arial", 10, "bold"),
-            foreground="#4ade80",
+            foreground="#7dd3fc",
             spacing1=0,
             spacing3=4,
         )
         txt_box.tag_configure(
             "hdr_blue",
             font=("Arial", 10, "bold"),
-            foreground="#38bdf8",
+            foreground="#7dd3fc",
             spacing1=2,
             spacing3=4,
         )
         txt_box.tag_configure(
             "body",
             font=("Arial", 10, "bold"),
-            foreground="#b8c7d9",
+            foreground="#cbd5e1",
             spacing1=2,
             spacing3=3,
         )
         txt_box.tag_configure(
             "pill_blue",
             font=("Arial", 10, "bold"),
-            foreground="#7dd3fc",
+            foreground="#bae6fd",
             background="#1a2636",
         )
         txt_box.tag_configure(
@@ -13486,8 +13749,8 @@ def show_preflight_window(
         txt_box.tag_configure(
             "pill_amber",
             font=("Arial", 10, "bold"),
-            foreground="#fde68a",
-            background="#3b2106",
+            foreground="#bae6fd",
+            background="#1a2636",
         )
         txt_box.tag_configure(
             "div_line",
@@ -13499,7 +13762,7 @@ def show_preflight_window(
 
         txt_box.insert(
             "end",
-            "✓  1. HOW IT WORKS  (Quiet & Automatic in the Background)\n",
+            "1.  HOW IT WORKS  (Quiet & Automatic in the Background)\n",
             "hdr_green",
         )
         s1_spans = [
@@ -13507,9 +13770,7 @@ def show_preflight_window(
             ("      ", ("body",)),
             (" enforcer_log_YYYY-MM-DD_sanitized.txt ", ("body", "pill_blue")),
             (" in the background.\n", ("body",)),
-            ("    • Captures relative ", ("body",)),
-            (" Realized / Open PnL ", ("body", "pill_green")),
-            (", guardrail triggers, and API timing.\n", ("body",)),
+            ("    • Captures relative Realized / Open PnL, guardrail triggers, and API timing.\n", ("body",)),
         ]
         for s_txt, s_tags in s1_spans:
             txt_box.insert("end", s_txt, s_tags)
@@ -13518,20 +13779,16 @@ def show_preflight_window(
 
         txt_box.insert(
             "end",
-            "🔒  2. YOUR PRIVACY IS 100% PROTECTED  (Zero Account Balances)\n",
+            "2.  YOUR PRIVACY IS 100% PROTECTED  (Zero Account Balances)\n",
             "hdr_blue",
         )
         s2_spans = [
             ("    • Every total account balance & equity figure is scrubbed to ", ("body",)),
             (" $[REDACTED] ", ("body", "pill_green")),
             (",\n", ("body",)),
-            ("      file paths to ", ("body",)),
-            (" ~ ", ("body", "pill_blue")),
-            (", and order IDs to ", ("body",)),
-            (" ...1234 ", ("body", "pill_blue")),
-            (" before upload.\n", ("body",)),
+            ("      file paths to ~, and order IDs to ...1234 before upload.\n", ("body",)),
             ("    • Tagged only with an anonymous 6-character ID (", ("body",)),
-            (f" {tester_id} ", ("body", "pill_amber")),
+            (f" {tester_id} ", ("body", "pill_blue")),
             (") — toggle off\n", ("body",)),
             ("      anytime in ", ("body",)),
             (" 📜 Logs ▾ ", ("body", "pill_blue")),
@@ -13675,7 +13932,10 @@ def show_preflight_window(
     btn_logs_menu = None
 
     def _refresh_logs_menu_btn_style():
-        if btn_logs_menu is None:
+        try:
+            if btn_logs_menu is None or not btn_logs_menu.winfo_exists():
+                return
+        except Exception:
             return
         if var_auto_share_logs.get():
             btn_logs_menu.config(
@@ -14496,6 +14756,9 @@ def show_preflight_window(
             new_cfg["anonymous_tester_id"] = config.get(
                 "anonymous_tester_id", ""
             )
+            new_cfg["seen_layout_tour_version"] = config.get(
+                "seen_layout_tour_version", ""
+            )
             new_cfg["enable_voice_cues"] = bool(var_voice_cues.get())
             new_cfg["tts_voice"] = TTS_LABEL_TO_ID.get(
                 var_tts_voice.get(), "Zira"
@@ -14997,6 +15260,7 @@ def show_preflight_window(
         return f"{prefix} ({m_txt} / {w_txt}) ▸"
 
     def open_tilt_filter_dialog():
+        hide_all_tooltips()
         is_locked = is_in_trade_tamper_locked() or is_tilt_streak_tamper_locked()
         dlg = tk.Toplevel(pf)
         dlg.withdraw()
@@ -15321,6 +15585,7 @@ def show_preflight_window(
         """Displays a friendly dark-glass reminder popup when the user enables
         Consecutive Loss Cooldown so they know upfront that the settings lock
         automatically during an active loss streak."""
+        hide_all_tooltips()
         decision = {"ok": False}
         dlg = tk.Toplevel(pf)
         dlg.withdraw()
@@ -15347,17 +15612,17 @@ def show_preflight_window(
             hdr_row,
             text="▶  CONSECUTIVE LOSS COOLDOWN — ANTI-TILT LOCK",
             font=("Arial", 12, "bold"),
-            fg="#38bdf8",
+            fg="#7dd3fc",
             bg="#0d1117",
             anchor="w",
         ).pack(side="left")
 
         tk.Label(
             hdr_row,
-            text="🔒 LOCKS ON ACTIVE STREAK",
+            text="LOCKS ON ACTIVE STREAK",
             font=("Arial", 8, "bold"),
-            fg="#fde68a",
-            bg="#451a03",
+            fg="#93c5fd",
+            bg="#162231",
             padx=8,
             pady=3,
         ).pack(side="right", padx=(12, 0))
@@ -15380,15 +15645,15 @@ def show_preflight_window(
         )
         card_outer.pack(fill="x", pady=(0, 16))
         NeonBarCanvas(
-            card_outer, core_color="#f59e0b", card_bg="#131922", glow_on=True
+            card_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
         ).pack(side="left", fill="y")
 
         txt_box = tk.Text(
             card_outer,
-            width=86,
+            width=84,
             height=15,
             bg="#131922",
-            fg="#b8c7d9",
+            fg="#cbd5e1",
             font=("Arial", 10, "bold"),
             wrap="none",
             bd=0,
@@ -15400,56 +15665,24 @@ def show_preflight_window(
         txt_box.pack(side="left", fill="both", expand=True)
 
         txt_box.tag_configure(
-            "hdr_green",
+            "hdr_sec",
             font=("Arial", 10, "bold"),
-            foreground="#4ade80",
-            spacing1=0,
-            spacing3=4,
-        )
-        txt_box.tag_configure(
-            "hdr_amber",
-            font=("Arial", 10, "bold"),
-            foreground="#fbbf24",
-            spacing1=2,
-            spacing3=4,
-        )
-        txt_box.tag_configure(
-            "hdr_blue",
-            font=("Arial", 10, "bold"),
-            foreground="#38bdf8",
+            foreground="#7dd3fc",
             spacing1=2,
             spacing3=4,
         )
         txt_box.tag_configure(
             "body",
             font=("Arial", 10, "bold"),
-            foreground="#b8c7d9",
+            foreground="#cbd5e1",
             spacing1=2,
             spacing3=3,
         )
         txt_box.tag_configure(
-            "pill_blue",
+            "pill",
             font=("Arial", 10, "bold"),
-            foreground="#7dd3fc",
+            foreground="#bae6fd",
             background="#1a2636",
-        )
-        txt_box.tag_configure(
-            "pill_red",
-            font=("Arial", 10, "bold"),
-            foreground="#fda4af",
-            background="#2c151d",
-        )
-        txt_box.tag_configure(
-            "pill_green",
-            font=("Arial", 10, "bold"),
-            foreground="#6ee7b7",
-            background="#112a20",
-        )
-        txt_box.tag_configure(
-            "pill_amber",
-            font=("Arial", 10, "bold"),
-            foreground="#fde68a",
-            background="#3b2106",
         )
         txt_box.tag_configure(
             "div_line",
@@ -15462,24 +15695,14 @@ def show_preflight_window(
         # Section 1: Clear state
         txt_box.insert(
             "end",
-            "✓  1. FREELY ADJUSTABLE WHEN CLEAR  (Streak: 0 / X)\n",
-            "hdr_green",
+            "1. FREELY ADJUSTABLE WHEN CLEAR  (Streak: 0 / X)\n",
+            "hdr_sec",
         )
         s1_spans = [
             ("    While your Loss Streak is ", ("body",)),
-            (" 0 / X ", ("body", "pill_green")),
-            (", you can freely tune your ", ("body",)),
-            (" Losses ", ("body", "pill_blue")),
-            (" count,\n", ("body",)),
-            ("    ", ("body",)),
-            (" Min Loss ($) ", ("body", "pill_red")),
-            (", ", ("body",)),
-            (" Win Reset ($) ", ("body", "pill_green")),
-            (", ", ("body",)),
-            (" In (Mins) ", ("body", "pill_blue")),
-            (" window, and ", ("body",)),
-            (" Penalty Box Lock Duration ", ("body", "pill_blue")),
-            (".\n", ("body",)),
+            (" 0 / X ", ("body", "pill")),
+            (", you can freely tune your Losses count,\n", ("body",)),
+            ("    Min Loss ($), Win Reset ($), In (Mins) window, and Penalty Box Lock Duration.\n", ("body",)),
         ]
         for s_txt, s_tags in s1_spans:
             txt_box.insert("end", s_txt, s_tags)
@@ -15489,25 +15712,17 @@ def show_preflight_window(
         # Section 2: Active streak lock
         txt_box.insert(
             "end",
-            "🔒  2. LOCKED DURING AN ACTIVE STREAK  (Streak: 1 / X or Higher)\n",
-            "hdr_amber",
+            "2. LOCKED DURING AN ACTIVE STREAK  (Streak: 1 / X or Higher)\n",
+            "hdr_sec",
         )
         s2_spans = [
             ("    Once you have ", ("body",)),
-            (" 1 qualifying loss ", ("body", "pill_amber")),
+            (" 1 qualifying loss ", ("body", "pill")),
             (" on the rolling clock, these controls switch to ", ("body",)),
-            (" 🔒 LOCKED ", ("body", "pill_amber")),
+            (" 🔒 LOCKED ", ("body", "pill")),
             ("\n", ("body",)),
-            ("    (and ignore ", ("body",)),
-            (" Restore Defaults ", ("body", "pill_blue")),
-            (", ", ("body",)),
-            (" Standard Full Risk ", ("body", "pill_blue")),
-            (", and ", ("body",)),
-            (" 50% Low Energy ", ("body", "pill_blue")),
-            (") so you\n", ("body",)),
-            ("    cannot raise your limit, lower ", ("body",)),
-            (" Win Reset ($) ", ("body", "pill_green")),
-            (", or turn off the cooldown mid-streak.\n", ("body",)),
+            ("    (and ignore Restore Defaults or Presets) so you cannot raise your limit,\n", ("body",)),
+            ("    lower Win Reset ($), or turn off the cooldown mid-streak.\n", ("body",)),
         ]
         for s_txt, s_tags in s2_spans:
             txt_box.insert("end", s_txt, s_tags)
@@ -15517,21 +15732,21 @@ def show_preflight_window(
         # Section 3: Unlock conditions
         txt_box.insert(
             "end",
-            "⏱  3. AUTOMATIC UNLOCK CONDITIONS\n",
-            "hdr_blue",
+            "3. AUTOMATIC UNLOCK CONDITIONS\n",
+            "hdr_sec",
         )
         s3_spans = [
             ("    The lock clears automatically as soon as your rolling streak countdown reaches ", ("body",)),
-            (" 00:00 ", ("body", "pill_blue")),
+            (" 00:00 ", ("body", "pill")),
             ("\n", ("body",)),
             ("    or when you close a qualifying winning trade (", ("body",)),
-            (" >= +Win Reset ($) ", ("body", "pill_green")),
+            (" >= +Win Reset ($) ", ("body", "pill")),
             (").", ("body",)),
         ]
         for s_txt, s_tags in s3_spans:
             txt_box.insert("end", s_txt, s_tags)
 
-        _autofit_readonly_text_box(txt_box, min_w=86, min_h=15)
+        _autofit_readonly_text_box(txt_box, min_w=84, min_h=14)
         txt_box.config(state="disabled")
 
         btn_row = tk.Frame(dlg, bg="#0d1117")
@@ -15996,6 +16211,7 @@ def show_preflight_window(
                 pass
 
     def _confirm_dry_run_lockout():
+        hide_all_tooltips()
         decision = {"ok": False}
         active_parent = _prefs_modal_refs.get("dlg")
         try:
@@ -16033,18 +16249,18 @@ def show_preflight_window(
         hdr_row.pack(fill="x", pady=(0, 4))
         tk.Label(
             hdr_row,
-            text="▶  🧪 10-SECOND DRY-RUN OS LOCKOUT TEST",
+            text="▶  10-SECOND DRY-RUN OS LOCKOUT TEST",
             font=("Arial", 12, "bold"),
-            fg="#fbbf24",
+            fg="#7dd3fc",
             bg="#0d1117",
             anchor="w",
         ).pack(side="left")
         tk.Label(
             hdr_row,
-            text="🛡️ SAFE SIMULATION · NO ORDERS",
+            text="SAFE SIMULATION · NO ORDERS",
             font=("Arial", 8, "bold"),
-            fg="#6ee7b7",
-            bg="#112a20",
+            fg="#93c5fd",
+            bg="#162231",
             padx=8,
             pady=3,
         ).pack(side="right", padx=(12, 0))
@@ -16067,15 +16283,15 @@ def show_preflight_window(
         )
         card_outer.pack(fill="x", pady=(0, 16))
         NeonBarCanvas(
-            card_outer, core_color="#fbbf24", card_bg="#131922", glow_on=True
+            card_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
         ).pack(side="left", fill="y")
 
         txt_box = tk.Text(
             card_outer,
-            width=84,
+            width=82,
             height=6,
             bg="#131922",
-            fg="#b8c7d9",
+            fg="#cbd5e1",
             font=("Arial", 10, "bold"),
             wrap="none",
             bd=0,
@@ -16086,40 +16302,24 @@ def show_preflight_window(
         )
         txt_box.pack(side="left", fill="both", expand=True)
         txt_box.tag_configure(
-            "body", font=("Arial", 10, "bold"), foreground="#b8c7d9", spacing1=2, spacing3=3
+            "body", font=("Arial", 10, "bold"), foreground="#cbd5e1", spacing1=2, spacing3=3
         )
         txt_box.tag_configure(
-            "pill_amber", font=("Arial", 10, "bold"), foreground="#fde68a", background="#3b2106"
-        )
-        txt_box.tag_configure(
-            "pill_blue", font=("Arial", 10, "bold"), foreground="#7dd3fc", background="#1a2636"
-        )
-        txt_box.tag_configure(
-            "pill_green", font=("Arial", 10, "bold"), foreground="#6ee7b7", background="#112a20"
+            "pill", font=("Arial", 10, "bold"), foreground="#bae6fd", background="#1a2636"
         )
         dry_spans = [
-            ("• Plays the ", ("body",)),
-            (" Warning Siren ", ("body", "pill_amber")),
-            (" and your selected ", ("body",)),
-            (" Verbal Lockout Voice Cue ", ("body", "pill_blue")),
+            ("• Plays the Warning Siren and your selected Verbal Lockout Voice Cue.\n", ("body",)),
+            ("• Locks your Windows screen for ", ("body",)),
+            (" 10 seconds ", ("body", "pill")),
             (".\n", ("body",)),
-            ("• Locks your Windows screen (", ("body",)),
-            (" LockWorkStation ", ("body", "pill_amber")),
-            (") for ", ("body",)),
-            (" 10 seconds ", ("body", "pill_blue")),
-            (".\n", ("body",)),
-            ("• Plays the ", ("body",)),
-            (" 3-Tone Unlock Chime ", ("body", "pill_green")),
-            (" and voice confirmation when finished.\n", ("body",)),
+            ("• Plays the 3-Tone Unlock Chime and voice confirmation when finished.\n", ("body",)),
             ("• ", ("body",)),
-            (" Zero broker orders ", ("body", "pill_green")),
-            (" are sent or canceled — your ", ("body",)),
-            (" Baseline & W/L stats ", ("body", "pill_green")),
-            (" stay untouched.", ("body",)),
+            (" Zero broker orders ", ("body", "pill")),
+            (" are sent or canceled — your Baseline & W/L stats stay untouched.", ("body",)),
         ]
         for s_txt, s_tags in dry_spans:
             txt_box.insert("end", s_txt, s_tags)
-        _autofit_readonly_text_box(txt_box, min_w=84, min_h=6)
+        _autofit_readonly_text_box(txt_box, min_w=82, min_h=5)
         txt_box.configure(state="disabled")
 
         btn_row = tk.Frame(dlg, bg="#0d1117")
@@ -16345,6 +16545,7 @@ def show_preflight_window(
             threading.Thread(target=_dry_run_seq, daemon=True).start()
 
     def open_preferences_audio_dialog():
+        hide_all_tooltips()
         existing_dlg = _prefs_modal_refs.get("dlg")
         if existing_dlg is not None:
             try:
@@ -18252,6 +18453,513 @@ def show_preflight_window(
         bg="#0d1117",
     ).pack(side="left", padx=(0, 6))
 
+    def pulse_relocated_controls():
+        """Pulses the border and surface glow of the relocated Pre-Flight controls
+        (BROKER/ACCOUNT capsule, Privacy Mode, Card 1 Filter, Card 3 Token &
+        Preferences & Audio, and Alarms Only) with a warm, cohesive sky-blue
+        spotlight for ~6.8 seconds so the user has plenty of time to scan the window."""
+        if not pf.winfo_exists() or pf_timer_state.get("closing"):
+            return
+        prev_aid = pf_timer_state.get("pulse_after_id")
+        if prev_aid is not None:
+            pf_timer_state["pulse_after_id"] = None
+            try:
+                pf.after_cancel(prev_aid)
+            except Exception:
+                pass
+
+        # 9 calm, single-hue sky-blue glow cycles (18 steps @ 380ms = ~6.8s total)
+        spotlight_theme = {
+            "border": "#38bdf8",
+            "fill": "#13283d",
+            "fill_top": "#1a3652",
+            "fg": "#e0f2fe",
+        }
+        pulse_themes = []
+        for _ in range(9):
+            pulse_themes.append(spotlight_theme)
+            pulse_themes.append(None)
+
+        target_btns = [
+            btn_privacy_mode,
+            btn_tilt_filter,
+            btn_prefs_card3,
+            btn_alarms_only,
+        ]
+
+        def _restore_normal_control_styles():
+            _capsule_state["pulse_border"] = None
+            _capsule_state["pulse_fill"] = None
+            _capsule_state["pulse_fill_top"] = None
+            _redraw_broker_acct_capsule()
+            _refresh_privacy_mode_ui()
+            if btn_prefs_card3 is not None and btn_prefs_card3.winfo_exists():
+                btn_prefs_card3.config(
+                    fill_color="#141820",
+                    fill_top_color="#1c212b",
+                    border_color="#2e3746",
+                    fg="#cbd5e1",
+                )
+            if btn_tilt_filter is not None and btn_tilt_filter.winfo_exists():
+                btn_tilt_filter.config(
+                    fill_color="#141820",
+                    fill_top_color="#1c212b",
+                    border_color="#2e3746",
+                    fg="#cbd5e1",
+                )
+            _render_card3_telemetry_live(force=True)
+            refresh_smart_dimming()
+
+        def _step_pulse(idx=0):
+            pf_timer_state["pulse_after_id"] = None
+            try:
+                if not pf.winfo_exists() or pf_timer_state.get("closing"):
+                    return
+                if idx >= len(pulse_themes) or is_in_trade_tamper_locked():
+                    _restore_normal_control_styles()
+                    return
+                theme = pulse_themes[idx]
+                if theme is None:
+                    _restore_normal_control_styles()
+                else:
+                    _capsule_state["pulse_border"] = theme["border"]
+                    _capsule_state["pulse_fill"] = theme["fill"]
+                    _capsule_state["pulse_fill_top"] = theme["fill_top"]
+                    _redraw_broker_acct_capsule()
+                    for b_w in target_btns:
+                        if b_w is not None and b_w.winfo_exists():
+                            b_w.config(
+                                fill_color=theme["fill"],
+                                fill_top_color=theme["fill_top"],
+                                border_color=theme["border"],
+                                fg=theme["fg"],
+                            )
+                    if base_sub_lbl is not None and base_sub_lbl.winfo_exists():
+                        for ch_w in base_sub_lbl.winfo_children():
+                            if (
+                                isinstance(ch_w, tk.Label)
+                                and "Token:" in str(ch_w.cget("text"))
+                            ):
+                                ch_w.config(
+                                    fg=theme["fg"],
+                                    bg=theme["fill"],
+                                )
+                pf_timer_state["pulse_after_id"] = pf.after(
+                    380, lambda: _step_pulse(idx + 1)
+                )
+            except Exception:
+                pass
+
+        _step_pulse(0)
+
+    def show_layout_tour_dialog(initial_mode=None):
+        """Displays a warm, low-noise first-run / layout-update tour popup tailored
+        to either existing users ('What Moved in This Update — Quick Layout Map')
+        or brand-new users ('Welcome to PnL Enforcer — 60-Second Quick Start'),
+        with a 1-click mode switcher and a calm spotlight pulse on close."""
+        hide_all_tooltips()
+        if not pf.winfo_exists():
+            return
+        if initial_mode in ("existing", "new"):
+            start_mode = initial_mode
+        else:
+            start_mode = (
+                "existing"
+                if (
+                    _is_existing_user_install
+                    or bool(config.get("account_sessions"))
+                    or bool(config.get("user_defaults"))
+                )
+                else "new"
+            )
+        tour_state = {"mode": start_mode}
+
+        dlg = tk.Toplevel(pf)
+        dlg.withdraw()
+        if os.path.exists(ICON_PATH):
+            try:
+                dlg.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+        apply_dark_title_bar(dlg)
+        dlg.configure(bg="#0d1117", padx=24, pady=20)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        dlg.transient(pf)
+
+        def _mark_tour_seen():
+            if config.get("seen_layout_tour_version") != LAYOUT_TOUR_VERSION:
+                config["seen_layout_tour_version"] = LAYOUT_TOUR_VERSION
+                save_config(config)
+
+        def on_close_plain():
+            _mark_tour_seen()
+            dlg.destroy()
+
+        def on_got_it_pulse():
+            _mark_tour_seen()
+            dlg.destroy()
+            pf.after(80, pulse_relocated_controls)
+
+        dlg.protocol("WM_DELETE_WINDOW", on_close_plain)
+        dlg.bind("<Escape>", lambda _e: on_close_plain())
+
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 4))
+
+        hdr_title_lbl = tk.Label(
+            hdr_row,
+            text="",
+            font=("Arial", 12, "bold"),
+            fg="#7dd3fc",
+            bg="#0d1117",
+            anchor="w",
+        )
+        hdr_title_lbl.pack(side="left")
+
+        hdr_badge_lbl = tk.Label(
+            hdr_row,
+            text="",
+            font=("Arial", 8, "bold"),
+            fg="#93c5fd",
+            bg="#162231",
+            padx=8,
+            pady=3,
+        )
+        hdr_badge_lbl.pack(side="right", padx=(12, 0))
+
+        sub_lbl = tk.Label(
+            dlg,
+            text="",
+            font=("Arial", 9, "bold"),
+            fg="#94a3b8",
+            bg="#0d1117",
+            anchor="w",
+        )
+        sub_lbl.pack(fill="x", pady=(0, 10))
+
+        card_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        card_outer.pack(fill="x", pady=(0, 16))
+        neon_bar = NeonBarCanvas(
+            card_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
+        )
+        neon_bar.pack(side="left", fill="y")
+
+        txt_box = tk.Text(
+            card_outer,
+            width=84,
+            height=17,
+            bg="#131922",
+            fg="#cbd5e1",
+            font=("Arial", 10, "bold"),
+            wrap="none",
+            bd=0,
+            highlightthickness=0,
+            padx=18,
+            pady=14,
+            cursor="arrow",
+        )
+        txt_box.pack(side="left", fill="both", expand=True)
+
+        txt_box.tag_configure(
+            "hdr_sec",
+            font=("Arial", 10, "bold"),
+            foreground="#7dd3fc",
+            spacing1=2,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "body",
+            font=("Arial", 10, "bold"),
+            foreground="#cbd5e1",
+            spacing1=2,
+            spacing3=3,
+        )
+        txt_box.tag_configure(
+            "pill",
+            font=("Arial", 10, "bold"),
+            foreground="#bae6fd",
+            background="#1a2636",
+        )
+        txt_box.tag_configure(
+            "div_line",
+            font=("Consolas", 8),
+            foreground="#222d3d",
+            spacing1=5,
+            spacing3=5,
+        )
+
+        btn_row = tk.Frame(dlg, bg="#0d1117")
+        btn_row.pack(fill="x")
+
+        tour_geom = {"txt_w": 84, "txt_h": 17, "locked": False}
+
+        def _toggle_tour_mode():
+            tour_state["mode"] = (
+                "new" if tour_state["mode"] == "existing" else "existing"
+            )
+            _render_tour_mode()
+
+        btn_switch_mode = make_stadium_button(
+            btn_row,
+            text="View New-User Quick Start ▸",
+            font=("Arial", 9, "bold"),
+            fill_color="#141820",
+            fill_top_color="#1c212b",
+            border_color="#2e3746",
+            hover_fill="#181e28",
+            hover_fill_top="#232a36",
+            hover_border="#38bdf8",
+            fg="#93c5fd",
+            canvas_bg="#0d1117",
+            width=236,
+            height=34,
+            auto_width=False,
+            command=_toggle_tour_mode,
+        )
+        btn_switch_mode.pack(side="left")
+
+        make_stadium_button(
+            btn_row,
+            text="Got It — Highlight Controls ✓",
+            font=("Arial", 10, "bold"),
+            fill_color="#0d3b20",
+            fill_top_color="#14532d",
+            border_color="#10b981",
+            hover_fill="#114b29",
+            hover_fill_top="#196638",
+            hover_border="#34d399",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=244,
+            height=34,
+            auto_width=False,
+            command=on_got_it_pulse,
+        ).pack(side="right")
+
+        def _render_tour_mode(mode_override=None):
+            mode = mode_override if mode_override in ("existing", "new") else tour_state["mode"]
+            txt_box.config(state="normal")
+            txt_box.delete("1.0", "end")
+            if mode == "existing":
+                dlg.title(
+                    f"PnL Enforcer v{APP_VERSION} — What Moved in This Update"
+                )
+                hdr_title_lbl.config(
+                    text="▶  WHAT MOVED IN THIS UPDATE — QUICK LAYOUT MAP",
+                    fg="#7dd3fc",
+                )
+                hdr_badge_lbl.config(
+                    text=f"UPDATED IN v{APP_VERSION}",
+                    fg="#93c5fd",
+                    bg="#162231",
+                )
+                sub_lbl.config(
+                    text="We simplified the Pre-Flight screen so your daily risk limits stand out. Here is where relocated settings live:"
+                )
+                neon_bar.set_neon("#38bdf8", glow_on=True)
+                btn_switch_mode.config(text="View New-User Quick Start ▸")
+
+                txt_box.insert(
+                    "end",
+                    "1. API KEYS & 7-DAY TOKEN RENEWAL\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • Moved from the separate top-bar API Keys button into the ", ("body",)),
+                    (" BROKER: SCHWAB ▾ ", ("body", "pill")),
+                    (" dropdown.\n", ("body",)),
+                    ("    • You can also click ", ("body",)),
+                    (" Token: X.Xd ↻ ", ("body", "pill")),
+                    (" directly inside Card 3 to renew in one click.\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "2. AUDIO, VOICE, POLL INTERVAL & SESSION PREFERENCES\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • Grouped inside ", ("body",)),
+                    (" ⚙ Preferences & Audio... ", ("body", "pill")),
+                    (" in the bottom-right corner of Card 3.\n", ("body",)),
+                    ("    • Holds Voice Cues, Sound & 10s Dry-Run Tester, Poll Rate, and Rulebook Switch / Swing Ignore.\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "3. QUALIFYING TRADE FILTER, ALARMS ONLY & PRIVACY MODE\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • ", ("body",)),
+                    (" ⚙ Filter (-$25 / +$10) ▸ ", ("body", "pill")),
+                    (" in Card 1 sets Min Loss to Count & Min Win to Reset your loss streak.\n", ("body",)),
+                    ("    • ", ("body",)),
+                    (" 🔔 Alarms Only: OFF ", ("body", "pill")),
+                    (" (bottom bar) disables all orders & OS locks globally for passive siren mode.\n", ("body",)),
+                    ("    • ", ("body",)),
+                    (" 👁 Privacy: OFF ", ("body", "pill")),
+                    (" (top bar) masks your account number and dollar baseline for screenshots.", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+            else:
+                dlg.title(
+                    f"Welcome to PnL Enforcer v{APP_VERSION} — 60-Second Quick Start"
+                )
+                hdr_title_lbl.config(
+                    text="▶  WELCOME TO PNL ENFORCER — 60-SECOND QUICK START",
+                    fg="#7dd3fc",
+                )
+                hdr_badge_lbl.config(
+                    text="QUICK START GUIDE",
+                    fg="#93c5fd",
+                    bg="#162231",
+                )
+                sub_lbl.config(
+                    text="A quick overview of how your Pre-Flight & Risk Rulebook screen is organized:"
+                )
+                neon_bar.set_neon("#38bdf8", glow_on=True)
+                btn_switch_mode.config(text="◂ View 'What Moved' Layout Map")
+
+                txt_box.insert(
+                    "end",
+                    "1. TOP BAR — BROKER CONNECTION, LOGS & PRIVACY\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • Click ", ("body",)),
+                    (" BROKER: SCHWAB ▾ ", ("body", "pill")),
+                    (" to connect Schwab or Webull, or ", ("body",)),
+                    (" ACCOUNT ▾ ", ("body", "pill")),
+                    (" to pick an account.\n", ("body",)),
+                    ("    • Use ", ("body",)),
+                    (" HUD Columns ", ("body", "pill")),
+                    (" to customize your HUD, and ", ("body",)),
+                    (" 👁 Privacy: OFF ", ("body", "pill")),
+                    (" to hide balances in screenshots.\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "2. LEFT COLUMN (CARDS 1 & 2) — INTRADAY vs. DAILY STOP ACTIONS\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • ", ("body",)),
+                    (" Card 1 (Trade & Tilt Stops) ", ("body", "pill")),
+                    (" stops single-trade blowups (Max Open Loss) and rapid loss streaks.\n", ("body",)),
+                    ("    • ", ("body",)),
+                    (" Card 2 (Daily Stop Actions) ", ("body", "pill")),
+                    (" chooses what fires when your Daily Stop hits (Flatten / Kill Apps / OS Lock).\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "3. RIGHT COLUMN (CARDS 4 & 5) & CARD 3 — RULEBOOKS & LAUNCH\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • ", ("body",)),
+                    (" Card 4 (Extended Hours) ", ("body", "pill")),
+                    (" & ", ("body",)),
+                    (" Card 5 (9:30–4:00 ET) ", ("body", "pill")),
+                    (" switch automatically and ratchet your stop upward.\n", ("body",)),
+                    ("    • Card 3 shows your $0.00 baseline, ", ("body",)),
+                    (" Positions ", ("body", "pill")),
+                    (" (to ignore swings), and ", ("body",)),
+                    (" ⚙ Preferences & Audio... ", ("body", "pill")),
+                    (".\n", ("body",)),
+                    ("    • Want to test with zero orders first? Toggle ", ("body",)),
+                    (" 🔔 Alarms Only: ON ", ("body", "pill")),
+                    (" beside SAVE & LAUNCH.", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+            if tour_geom["locked"]:
+                txt_box.config(
+                    width=tour_geom["txt_w"], height=tour_geom["txt_h"]
+                )
+            else:
+                _autofit_readonly_text_box(
+                    txt_box,
+                    min_w=tour_geom["txt_w"],
+                    min_h=tour_geom["txt_h"],
+                )
+            txt_box.config(state="disabled")
+
+        # Measure both modes while withdrawn so switching modes never resizes the window
+        max_txt_w, max_txt_h = 84, 15
+        max_dlg_w, max_dlg_h = 0, 0
+        for probe_mode in ("existing", "new"):
+            _render_tour_mode(mode_override=probe_mode)
+            dlg.update_idletasks()
+            max_txt_w = max(max_txt_w, int(txt_box.cget("width")))
+            max_txt_h = max(max_txt_h, int(txt_box.cget("height")))
+            max_dlg_w = max(max_dlg_w, int(dlg.winfo_reqwidth()))
+            max_dlg_h = max(max_dlg_h, int(dlg.winfo_reqheight()))
+        tour_geom["txt_w"] = max_txt_w
+        tour_geom["txt_h"] = max_txt_h
+        tour_geom["locked"] = True
+
+        _render_tour_mode()
+        dlg.update_idletasks()
+        final_w = max(max_dlg_w, int(dlg.winfo_reqwidth()))
+        final_h = max(max_dlg_h, int(dlg.winfo_reqheight()))
+        center_dialog_over_parent(dlg, parent=pf, width=final_w, height=final_h)
+        dlg.grab_set()
+        dlg.focus_set()
+        pf.wait_window(dlg)
+
+    quick_tour_lbl = tk.Label(
+        ver_frame,
+        text="✦ Quick Tour",
+        font=("Arial", 9, "bold underline"),
+        fg="#38bdf8",
+        bg="#0d1117",
+        cursor="hand2",
+    )
+    quick_tour_lbl.pack(side="left")
+    quick_tour_lbl.bind(
+        "<Enter>", lambda e: quick_tour_lbl.config(fg="#7dd3fc")
+    )
+    quick_tour_lbl.bind(
+        "<Leave>", lambda e: quick_tour_lbl.config(fg="#38bdf8")
+    )
+    quick_tour_lbl.bind(
+        "<Button-1>", lambda e: (hide_all_tooltips(), show_layout_tour_dialog())
+    )
+    attach_tooltip(
+        quick_tour_lbl,
+        "Open the Quick Layout Tour ('What Moved' map & New-User Quick Start) and highlight relocated controls."
+    )
+
+    tk.Label(
+        ver_frame,
+        text="  ·  ",
+        font=("Arial", 9, "bold"),
+        fg="#64748b",
+        bg="#0d1117",
+    ).pack(side="left")
+
     rel_notes_lbl = tk.Label(
         ver_frame,
         text="View Release Notes",
@@ -18268,7 +18976,8 @@ def show_preflight_window(
         "<Leave>", lambda e: rel_notes_lbl.config(fg="#5dade2")
     )
     rel_notes_lbl.bind(
-        "<Button-1>", lambda e: show_release_notes_dialog(parent=pf)
+        "<Button-1>",
+        lambda e: (hide_all_tooltips(), show_release_notes_dialog(parent=pf)),
     )
     attach_tooltip(
         rel_notes_lbl,
@@ -18281,6 +18990,7 @@ def show_preflight_window(
         their Daily Stop or Re-Zero Baseline if they want an active Daily Stop,
         or leave it as-is in BREACHED (DISARMED) mode so a new trade does not
         immediately stop them out on entry."""
+        hide_all_tooltips()
         if not pf.winfo_exists():
             return
         ref_eq = (
@@ -18621,6 +19331,11 @@ def show_preflight_window(
 
     if post_daily_breach_prompt:
         pf.after(150, show_daily_breach_return_notice)
+    elif (
+        parent is None
+        and config.get("seen_layout_tour_version") != LAYOUT_TOUR_VERSION
+    ):
+        pf.after(180, show_layout_tour_dialog)
 
     if parent is None:
         pf.mainloop()
@@ -19696,7 +20411,7 @@ def _insert_formatted_changelog(txt_box, markdown_text):
             txt_box.insert("end", main_part, ("ver_hdr", hdr_tag))
             txt_box.insert("end", hint_part, ("ver_hdr", "ver_hdr_hint", hdr_tag))
             short_m = re.match(
-                r"^(v?\d+\.\d+(?:\.\d+)?(?:\s*&\s*v?\d+\.\d+(?:\.\d+)?)?)",
+                r"^(v?\d+\.\d+(?:\.\d+)?(?:\s*(?:[&,–-]\s*v?\d+\.\d+(?:\.\d+)?)+)?)",
                 ver_txt,
             )
             short_ver = short_m.group(1) if short_m else ver_txt[:12]
