@@ -81,9 +81,23 @@ if !errorlevel! equ 0 (
 )
 
 echo Launching PnL Enforcer...
-"!PY_CMD!" enforcer.py
-if !errorlevel! neq 0 (
-    echo.
-    echo Application exited with an error. See messages above.
-    pause
+if /i "%~1"=="--console" (
+    "!PY_CMD!" enforcer.py --console
+    if !errorlevel! neq 0 (
+        echo.
+        echo Application exited with an error. See messages above.
+        pause
+    )
+    exit /b
 )
+
+set "PYW_CMD="
+for %%F in ("!PY_CMD!") do (
+    if exist "%%~dpFpythonw.exe" set "PYW_CMD=%%~dpFpythonw.exe"
+)
+if defined PYW_CMD (
+    start "" "!PYW_CMD!" enforcer.py
+) else (
+    start "" "!PY_CMD!" enforcer.py
+)
+exit /b 0

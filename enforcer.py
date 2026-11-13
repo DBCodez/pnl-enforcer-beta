@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.48"
+APP_VERSION = "0.9.49"
 
 import os
 import sys
@@ -29,6 +29,19 @@ import traceback
 import warnings
 import subprocess
 from datetime import datetime, time as dt_time, timedelta, timezone
+
+# Ensure sys.stdout and sys.stderr are always valid stream objects even when
+# launched windowless via pythonw.exe (where standard streams are None).
+if sys.stdout is None:
+    try:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    except Exception:
+        pass
+if sys.stderr is None:
+    try:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    except Exception:
+        pass
 
 # Suppress harmless Tkinter Variable.__del__ RuntimeError when Python's
 # cyclic garbage collector runs on the background API polling thread
@@ -1929,6 +1942,7 @@ DEFAULT_CONFIG = {
     "options_waiver_sha256": "",
     "seen_layout_tour_version": "",
     "auto_share_sanitized_logs": False,
+    "show_debug_console": False,
     "last_uploaded_sanitized_log": "",
     "anonymous_tester_id": "",
     "active_broker": "SCHWAB",
@@ -1973,6 +1987,8 @@ DEFAULT_CONFIG = {
         "dist_to_term",
         "session_high",
     ],
+    "hud_x": None,
+    "hud_y": None,
     "reset_at_925": True,
     "ignore_preexisting_positions": True,
     "poll_interval": 2,
@@ -11363,6 +11379,20 @@ def show_preflight_window(
         value=bool(config.get("auto_share_sanitized_logs", False))
     )
     _auto_share_guard = {"suppress": False}
+    var_debug_console = tk.BooleanVar(
+        value=bool(
+            config.get("show_debug_console", False)
+            or ("--console" in sys.argv)
+        )
+    )
+
+    def _on_toggle_debug_console(*_):
+        show_now = bool(var_debug_console.get())
+        config["show_debug_console"] = show_now
+        save_config(config)
+        set_debug_console_visible(show_now)
+
+    var_debug_console.trace_add("write", _on_toggle_debug_console)
     var_voice_cues = tk.BooleanVar(
         value=config.get("enable_voice_cues", True)
     )
@@ -14453,6 +14483,14 @@ def show_preflight_window(
         finally:
             _auto_share_guard["suppress"] = False
         rebuild_logs_dropdown()
+        var_debug_console.set(
+            bool(
+                src.get(
+                    "show_debug_console",
+                    DEFAULT_CONFIG["show_debug_console"],
+                )
+            )
+        )
         var_voice_cues.set(
             src.get("enable_voice_cues", DEFAULT_CONFIG["enable_voice_cues"])
         )
@@ -14530,6 +14568,7 @@ def show_preflight_window(
                 "reset_at_925": bool(var_reset925.get()),
                 "ignore_preexisting_positions": bool(var_ignore_preexisting.get()),
                 "auto_share_sanitized_logs": bool(var_auto_share_logs.get()),
+                "show_debug_console": bool(var_debug_console.get()),
                 "enable_voice_cues": bool(var_voice_cues.get()),
                 "tts_voice": TTS_LABEL_TO_ID.get(var_tts_voice.get(), "Zira"),
                 "enable_upside_chime": bool(var_upside_chime.get()),
@@ -14609,6 +14648,7 @@ def show_preflight_window(
             new_cfg["auto_share_sanitized_logs"] = bool(
                 var_auto_share_logs.get()
             )
+            new_cfg["show_debug_console"] = bool(var_debug_console.get())
             save_config(new_cfg)
             log_event(
                 "CONFIG",
@@ -14759,6 +14799,7 @@ def show_preflight_window(
             new_cfg["auto_share_sanitized_logs"] = bool(
                 var_auto_share_logs.get()
             )
+            new_cfg["show_debug_console"] = bool(var_debug_console.get())
             new_cfg["last_uploaded_sanitized_log"] = config.get(
                 "last_uploaded_sanitized_log", ""
             )
@@ -16861,6 +16902,28 @@ def show_preflight_window(
             f"• Tagged only with your anonymous 6-character Tester ID ({config.get('anonymous_tester_id', '')})."
         )
 
+        r_dbg_con = tk.Frame(sec3, bg="#131922")
+        r_dbg_con.pack(fill="x", pady=(6, 0))
+        cb_dbg_con = make_glass_checkbutton(
+            r_dbg_con,
+            text="Show Background Debug Terminal",
+            variable=var_debug_console,
+            font=("Arial", 10, "bold"),
+            fg="#94a3b8",
+            bg="#131922",
+            anchor="w",
+        )
+        cb_dbg_con.pack(side="left")
+        attach_tooltip(
+            cb_dbg_con,
+            "Show Background Debug Terminal (Developer / Diagnostic Mode):\n"
+            "Off by default so PnL Enforcer runs cleanly with zero background command prompt window.\n"
+            "• Check to immediately open the live diagnostic terminal window (with its 'X' Close button\n"
+            "  disabled so it can never be accidentally closed mid-trade or mid-lockout).\n"
+            "• Uncheck to immediately hide the terminal window from your desktop and taskbar.\n"
+            "• Your preference is saved automatically across restarts."
+        )
+
         lbl_poll_err = tk.Label(
             sec3,
             text="",
@@ -17222,8 +17285,9 @@ def show_preflight_window(
         "Extended-Hours Trailing Cushion ($):\n"
         "Once At Profit ($) is reached, your active Daily Stop trails behind\n"
         "your highest closed Realized PnL by this dollar amount.\n"
-        "(Example: Trigger +$500 with $500 Trail locks your stop at $0.00 breakeven\n"
-        "at +$500, and raises it to +$200 if you reach +$700.)\n"
+        "• Example 1: At Profit +$500 with $300 Trail locks in +$200 green immediately.\n"
+        "• Example 2: At Profit +$500 with $750 Trail starts your stop at -$250 and ratchets\n"
+        "  into the green once your closed Realized PnL peak exceeds +$750.\n"
         "• Hitting this trailed stop triggers your Card 2 Daily Stop Actions & OS Lock timer."
     )
     for _pmw in (cb_pm_lock, lbl_pm_trig, ent_pm_trig, lbl_pm_arrow):
@@ -17394,9 +17458,11 @@ def show_preflight_window(
             (
                 "RTH Tier 4 — Dynamic Trailing Profit Stop:\n"
                 "Once your closed Realized PnL reaches 'At Profit ($)', your active Daily Stop\n"
-                "locks in green and trails behind your highest realized PnL peak by 'Trail Peak By ($)'.\n"
-                "(Example: At Profit +$1,000 with $500 Trail locks in +$500 minimum, and ratchets\n"
-                "to +$900 if your closed Realized PnL reaches +$1,400.)\n"
+                "trails behind your highest realized PnL peak by 'Trail Peak By ($)'.\n"
+                "• Example 1: At Profit +$1,000 with $500 Trail locks in +$500 green immediately\n"
+                "  (and ratchets to +$900 if your closed Realized PnL reaches +$1,400).\n"
+                "• Example 2: At Profit +$1,000 with $1,200 Trail starts your stop at -$200 and\n"
+                "  ratchets into the green once your closed Realized PnL peak exceeds +$1,200.\n"
                 "• IMPORTANT: If Net PnL pulls back and touches this trailed stop, it triggers the\n"
                 "  exact same Card 2 Daily Stop Actions (Auto-Flatten, Kill Apps, and OS Lock\n"
                 "  for your Card 2 lock duration).\n"
@@ -17464,6 +17530,70 @@ def show_preflight_window(
         tier_widget_refs.append(
             (t_cb_var, cb_t, lbl_trig, ent_trig, lbl_arrow, lbl_fl, ent_fl, cb_fg_col)
         )
+
+    def _parse_ui_dollar_num(var_obj, default=0.0):
+        try:
+            raw = str(var_obj.get()).replace("$", "").replace(",", "").strip()
+            return float(raw) if raw else default
+        except Exception:
+            return default
+
+    def _apply_dynamic_stop_box_style(ent_w, locks_in_green):
+        if locks_in_green:
+            e_bg = "#10261e"
+            e_rim = "#266149"
+            e_focus = "#10b981"
+            e_fg = "#e2f7ec"
+        else:
+            e_bg = "#132333"
+            e_rim = "#2e526e"
+            e_focus = "#38bdf8"
+            e_fg = "#e6eef8"
+        ent_w._orig_rim = e_rim
+        if is_in_trade_tamper_locked():
+            ent_w.config(bg=e_bg, fg=e_fg, highlightcolor=e_focus)
+        else:
+            ent_w.config(
+                bg=e_bg,
+                fg=e_fg,
+                highlightbackground=e_rim,
+                highlightcolor=e_focus,
+            )
+
+    def _refresh_dynamic_stop_box_colors(*_):
+        if pf_timer_state.get("closing"):
+            return
+        try:
+            if not pf.winfo_exists():
+                return
+        except Exception:
+            return
+        pm_trig_v = abs(_parse_ui_dollar_num(dollar_vars["pm_lock_trigger"], 0.0))
+        pm_trail_v = abs(_parse_ui_dollar_num(dollar_vars["pm_trail_cushion"], 0.0))
+        _apply_dynamic_stop_box_style(ent_pm_trail, (pm_trig_v - pm_trail_v) > 0.0)
+
+        if len(tier_widget_refs) >= 3:
+            t2_stop_v = _parse_ui_dollar_num(dollar_vars["t2_max_loss"], 0.0)
+            _apply_dynamic_stop_box_style(tier_widget_refs[0][6], t2_stop_v > 0.0)
+
+            t3_stop_v = _parse_ui_dollar_num(dollar_vars["t3_max_loss"], 0.0)
+            _apply_dynamic_stop_box_style(tier_widget_refs[1][6], t3_stop_v > 0.0)
+
+            t4_trig_v = abs(_parse_ui_dollar_num(dollar_vars["t4_trigger"], 0.0))
+            t4_trail_v = abs(_parse_ui_dollar_num(dollar_vars["t4_trail"], 0.0))
+            _apply_dynamic_stop_box_style(
+                tier_widget_refs[2][6], (t4_trig_v - t4_trail_v) > 0.0
+            )
+
+    for _dyn_k in (
+        "pm_lock_trigger",
+        "pm_trail_cushion",
+        "t2_max_loss",
+        "t3_max_loss",
+        "t4_trigger",
+        "t4_trail",
+    ):
+        dollar_vars[_dyn_k].trace_add("write", _refresh_dynamic_stop_box_colors)
 
     # --- INTERACTIVE SMART DIMMING LOGIC ---
     _tamper_sync_guard = {"busy": False}
@@ -18005,6 +18135,7 @@ def show_preflight_window(
             cb_t.config(state="normal", disabledforeground="#526070")
             _restore_entry_rim(ent_trig)
             _restore_entry_rim(ent_fl)
+        _refresh_dynamic_stop_box_colors()
 
         if var_alarms_only.get():
             cb_open_flat.config(state="disabled")
@@ -19370,6 +19501,31 @@ hud_last_leash_pct = 1.0
 hud_last_leash_bg = "#262a2e"
 hud_start_move_fn = None
 hud_do_move_fn = None
+hud_end_move_fn = None
+
+
+def get_saved_hud_position(w_px, h_px=88, fallback_widget=None):
+    """Returns the saved (x, y) screen coordinates for the HUD from config,
+    clamped to the nearest connected monitor's work area so the HUD always
+    relaunches where the trader last placed it without ever spawning off-screen
+    if a monitor was disconnected."""
+    raw_x = config.get("hud_x")
+    raw_y = config.get("hud_y")
+    if raw_x is not None and raw_y is not None:
+        try:
+            ix = int(round(float(raw_x)))
+            iy = int(round(float(raw_y)))
+            m_left, m_top, m_right, m_bottom = get_monitor_work_area(
+                ix + int(w_px) // 2,
+                iy + int(h_px) // 2,
+                widget=fallback_widget,
+            )
+            cx = max(m_left, min(ix, max(m_left, m_right - int(w_px))))
+            cy = max(m_top, min(iy, max(m_top, m_bottom - int(h_px))))
+            return int(cx), int(cy)
+        except Exception:
+            pass
+    return 50, 50
 
 
 def refresh_acct_badge():
@@ -19552,19 +19708,34 @@ def rebuild_hud_columns():
             for widget in bind_list:
                 widget.bind("<Button-1>", hud_start_move_fn)
                 widget.bind("<B1-Motion>", hud_do_move_fn)
+                if hud_end_move_fn is not None:
+                    widget.bind("<ButtonRelease-1>", hud_end_move_fn)
 
         hud_ui_labels.append(val_lbl)
 
     w_px = compute_hud_width(len(active_cols))
     try:
-        hud_root.update_idletasks()
-        cur_x = hud_root.winfo_x()
-        cur_y = hud_root.winfo_y()
-        if cur_x <= 0 and cur_y <= 0:
+        if (
+            config.get("hud_x") is not None
+            and config.get("hud_y") is not None
+        ):
+            cur_x, cur_y = get_saved_hud_position(
+                w_px, 88, fallback_widget=hud_root
+            )
+        elif hud_root.winfo_ismapped():
+            hud_root.update_idletasks()
+            cur_x = int(hud_root.winfo_x())
+            cur_y = int(hud_root.winfo_y())
+            if cur_x == 0 and cur_y == 0:
+                cur_x, cur_y = 50, 50
+        else:
             cur_x, cur_y = 50, 50
-        hud_root.geometry(f"{w_px}x88+{cur_x}+{cur_y}")
+        hud_root.geometry(f"{w_px}x88+{int(cur_x)}+{int(cur_y)}")
     except Exception:
-        hud_root.geometry(f"{w_px}x88+50+50")
+        cur_x, cur_y = get_saved_hud_position(
+            w_px, 88, fallback_widget=hud_root
+        )
+        hud_root.geometry(f"{w_px}x88+{int(cur_x)}+{int(cur_y)}")
 
 
 def update_gui(
@@ -19881,27 +20052,67 @@ def attach_hud_mute_tooltip(widget, hud_win):
 
 def start_gui():
     global acct_badge_lbl, hud_root, hud_grid_frame
-    global hud_ui_labels, hud_start_move_fn, hud_do_move_fn
+    global hud_ui_labels, hud_start_move_fn, hud_do_move_fn, hud_end_move_fn
     root = tk.Tk()
     hud_root = root
     root.title(f"PnL Enforcer v{APP_VERSION}")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     w_init = compute_hud_width(len(get_active_hud_columns(config)))
-    root.geometry(f"{w_init}x88+50+50")
+    init_x, init_y = get_saved_hud_position(w_init, 88, fallback_widget=root)
+    root.geometry(f"{w_init}x88+{init_x}+{init_y}")
     root.config(bg="#1a1a1a")
+
+    hud_move_save_state = {"after_id": None}
+
+    def _flush_hud_pos_to_disk():
+        aid = hud_move_save_state.get("after_id")
+        if aid is not None:
+            hud_move_save_state["after_id"] = None
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+        try:
+            save_config(config)
+        except Exception:
+            pass
 
     def start_move(event):
         root.x = event.x_root - root.winfo_x()
         root.y = event.y_root - root.winfo_y()
 
     def do_move(event):
-        x = event.x_root - root.x
-        y = event.y_root - root.y
+        x = int(event.x_root - getattr(root, "x", 0))
+        y = int(event.y_root - getattr(root, "y", 0))
         root.geometry(f"+{x}+{y}")
+        config["hud_x"] = x
+        config["hud_y"] = y
+        prev_aid = hud_move_save_state.get("after_id")
+        if prev_aid is not None:
+            try:
+                root.after_cancel(prev_aid)
+            except Exception:
+                pass
+        try:
+            hud_move_save_state["after_id"] = root.after(
+                250, _flush_hud_pos_to_disk
+            )
+        except Exception:
+            _flush_hud_pos_to_disk()
+
+    def end_move(_event=None):
+        try:
+            if root.winfo_exists():
+                config["hud_x"] = int(root.winfo_x())
+                config["hud_y"] = int(root.winfo_y())
+                _flush_hud_pos_to_disk()
+        except Exception:
+            pass
 
     hud_start_move_fn = start_move
     hud_do_move_fn = do_move
+    hud_end_move_fn = end_move
 
     def close_app(event=None):
         global alarm_active, current_is_flat
@@ -19917,6 +20128,13 @@ def start_gui():
                 "BLOCKED: Attempted to close HUD while in a position!"
             )
             return "break"
+        try:
+            if root.winfo_exists():
+                config["hud_x"] = int(root.winfo_x())
+                config["hud_y"] = int(root.winfo_y())
+                _flush_hud_pos_to_disk()
+        except Exception:
+            pass
         alarm_active = False
         log_event("SESSION", "User closed Enforcer via HUD X button.")
         root.destroy()
@@ -19927,6 +20145,9 @@ def start_gui():
 
     grid_frame = tk.Frame(root, bg="#1a1a1a")
     grid_frame.pack(fill="both", expand=True)
+    grid_frame.bind("<Button-1>", start_move)
+    grid_frame.bind("<B1-Motion>", do_move)
+    grid_frame.bind("<ButtonRelease-1>", end_move)
     hud_grid_frame = grid_frame
 
     rebuild_hud_columns()
@@ -19934,6 +20155,9 @@ def start_gui():
 
     bottom_bar = tk.Frame(root, bg="#1a1a1a", pady=1)
     bottom_bar.pack(fill="x", side="bottom")
+    bottom_bar.bind("<Button-1>", start_move)
+    bottom_bar.bind("<B1-Motion>", do_move)
+    bottom_bar.bind("<ButtonRelease-1>", end_move)
 
     # Rounded Stadium Capsule Left Badge (Toggles between W/L, FLAT, and BASE)
     acct_badge_lbl = HudCapsulePill(
@@ -21524,14 +21748,137 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
             print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver}.\n")
             if restart_on_update:
                 _release_single_instance_mutex()
-                sys.exit(subprocess.call([sys.executable, target_py]))
+                _spawn_updated_enforcer(target_py)
         else:
             print(f"[SKIPPED] Continuing with local v{APP_VERSION}...\n")
     except Exception:
         print(f"Version check: v{APP_VERSION} (Offline / skipped)")
 
 
+_IS_MAIN_PROCESS = False
+_DEBUG_CONSOLE_STREAMS_ATTACHED = False
+
+
+def _peek_saved_debug_console_pref():
+    """Reads show_debug_console from CONFIG_PATH before load_config() runs."""
+    if "--console" in sys.argv:
+        return True
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return bool(data.get("show_debug_console", False))
+    except Exception:
+        pass
+    return False
+
+
+def set_debug_console_visible(visible_bool):
+    """Shows or hides the background Windows debug console window on the fly
+    (allocating a console if launched via pythonw.exe and toggled ON in
+    Preferences), while always keeping the console's 'X' Close button disabled
+    so it can never be accidentally closed mid-session."""
+    global _DEBUG_CONSOLE_STREAMS_ATTACHED
+    if not _IS_MAIN_PROCESS and "--console" not in sys.argv:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        hwnd = kernel32.GetConsoleWindow()
+        want_show = bool(visible_bool or ("--console" in sys.argv))
+
+        if want_show and not hwnd:
+            if kernel32.AllocConsole():
+                hwnd = kernel32.GetConsoleWindow()
+                _DEBUG_CONSOLE_STREAMS_ATTACHED = False
+
+        if not hwnd:
+            return
+
+        try:
+            kernel32.SetConsoleTitleW(
+                f"PnL Enforcer Beta v{APP_VERSION} — Debug Terminal"
+            )
+        except Exception:
+            pass
+
+        # Always grey out / remove SC_CLOSE (0xF060) on the console system menu
+        h_menu = user32.GetSystemMenu(hwnd, False)
+        if h_menu:
+            user32.DeleteMenu(h_menu, 0xF060, 0x00000000)
+
+        if want_show:
+            if not _DEBUG_CONSOLE_STREAMS_ATTACHED:
+                try:
+                    con_out = open(
+                        "CONOUT$",
+                        "w",
+                        encoding="utf-8",
+                        errors="replace",
+                        buffering=1,
+                    )
+                    sys.stdout = con_out
+                    sys.stderr = _StderrToLogTee(con_out)
+                    _DEBUG_CONSOLE_STREAMS_ATTACHED = True
+                    if os.path.exists(LOG_PATH):
+                        with open(
+                            LOG_PATH, "r", encoding="utf-8", errors="replace"
+                        ) as lf:
+                            tail_lines = lf.readlines()[-25:]
+                        for tl in tail_lines:
+                            con_out.write(tl)
+                except Exception:
+                    pass
+            # SW_RESTORE = 9, SW_SHOW = 5
+            user32.ShowWindow(hwnd, 9)
+            user32.ShowWindow(hwnd, 5)
+        else:
+            # SW_HIDE = 0
+            user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
+def _configure_console_window(hide_unless_debug=True):
+    """Hides the background Windows console window during normal GUI operation
+    (unless '--console' is passed on the command line or 'show_debug_console' is
+    enabled in Preferences) and disables the console window's 'X' Close button."""
+    if not hide_unless_debug:
+        try:
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                h_menu = ctypes.windll.user32.GetSystemMenu(hwnd, False)
+                if h_menu:
+                    ctypes.windll.user32.DeleteMenu(h_menu, 0xF060, 0x00000000)
+        except Exception:
+            pass
+        return
+    set_debug_console_visible(_peek_saved_debug_console_pref())
+
+
+def _spawn_updated_enforcer(target_py):
+    """Launches the newly updated enforcer.py process without a visible console
+    window (unless '--console' was passed or show_debug_console is enabled)."""
+    want_con = _peek_saved_debug_console_pref()
+    extra_args = ["--console"] if "--console" in sys.argv else []
+    if not want_con:
+        py_dir = os.path.dirname(os.path.abspath(sys.executable))
+        pyw_cand = os.path.join(py_dir, "pythonw.exe")
+        exe_use = pyw_cand if os.path.exists(pyw_cand) else sys.executable
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        try:
+            subprocess.Popen(
+                [exe_use, target_py] + extra_args,
+                creationflags=creation_flags,
+            )
+            sys.exit(0)
+        except Exception:
+            pass
+    sys.exit(subprocess.call([sys.executable, target_py] + extra_args))
+
+
 if __name__ == "__main__":
+    _IS_MAIN_PROCESS = True
     if "--preview-update-dialog" in sys.argv:
         cl_local = ""
         cl_path = os.path.join(SCRIPT_DIR, "CHANGELOG.md")
@@ -21541,8 +21888,10 @@ if __name__ == "__main__":
         show_update_available_dialog("0.9.10", APP_VERSION, cl_local)
         sys.exit(0)
     if "--check-update" in sys.argv:
+        _configure_console_window(hide_unless_debug=False)
         check_for_updates_cli(restart_on_update=False, skip_if_recent=False)
         sys.exit(0)
+    _configure_console_window(hide_unless_debug=True)
     _ensure_single_instance_or_exit()
     check_for_updates_cli(restart_on_update=True, skip_if_recent=True)
     init_daily_log()
