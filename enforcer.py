@@ -1641,7 +1641,16 @@ class GlassStadiumButton(tk.Canvas):
                     except Exception:
                         pass
         elif self._command is not None:
+            if self._hovered:
+                self._hovered = False
+                self._redraw()
             self._command()
+            try:
+                if self.winfo_exists() and self._hovered:
+                    self._hovered = False
+                    self._redraw()
+            except Exception:
+                pass
 
     def config(self, **kwargs):
         self.configure(**kwargs)
@@ -18491,6 +18500,9 @@ def show_preflight_window(
             _capsule_state["pulse_border"] = None
             _capsule_state["pulse_fill"] = None
             _capsule_state["pulse_fill_top"] = None
+            for b_w in target_btns:
+                if b_w is not None and b_w.winfo_exists():
+                    b_w._hovered = False
             _redraw_broker_acct_capsule()
             _refresh_privacy_mode_ui()
             if btn_prefs_card3 is not None and btn_prefs_card3.winfo_exists():
