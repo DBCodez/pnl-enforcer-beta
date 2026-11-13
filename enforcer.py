@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.51"
+APP_VERSION = "0.9.52"
 
 import os
 import sys
@@ -2154,6 +2154,7 @@ is_locked_down = False
 force_reanchor = False
 current_is_flat = True
 first_poll_of_launch = True
+_launch_fee_drift_checked = False
 
 alarm_active = False
 cooldown_active = False
@@ -2696,6 +2697,12 @@ def sanitize_log_for_export(raw_log_text):
             s,
         )
         s = re.sub(
+            r"(starting baseline from\s*)\$[0-9,]+(?:\.[0-9]{2})?(\s+to\s+)\$[0-9,]+(?:\.[0-9]{2})?",
+            r"\1$[REDACTED]\2$[REDACTED]",
+            s,
+            flags=re.IGNORECASE,
+        )
+        s = re.sub(
             r"((?:Start|Baseline|LastFlat|TotalAccountValue|NetLiq|Cash|MarketVal)=)\$[0-9,]+(?:\.[0-9]{2})?",
             r"\1$[REDACTED]",
             s,
@@ -3197,9 +3204,10 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     global win_trades, loss_trades, prev_flat_realized_pnl
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
-    global current_upside_tier, first_poll_of_launch, recent_loss_timestamps
-    global ignored_positions, pending_halt_breach
+    global current_upside_tier, first_poll_of_launch, _launch_fee_drift_checked
+    global recent_loss_timestamps, ignored_positions, pending_halt_breach
 
+    _launch_fee_drift_checked = False
     recent_loss_timestamps.clear()
     ignored_positions.clear()
     pending_halt_breach = None
@@ -4262,6 +4270,7 @@ class SchwabAdapter:
         self.accounts = []
         self._last_good_snapshot = {}
         self._last_raw_pos_details = {}
+        self._last_raw_adj_eq = {}
         self._last_open_eq = {}
         self._last_open_opt = {}
         self._last_intraday_cash_flow = {}
@@ -4276,6 +4285,10 @@ class SchwabAdapter:
         return json.loads(
             json.dumps(self._last_raw_pos_details.get(self.account_id, {}))
         )
+
+    def get_last_raw_adj_eq(self):
+        val = self._last_raw_adj_eq.get(self.account_id)
+        return float(val) if val is not None else None
 
     def get_last_intraday_cash_flow(self):
         return float(self._last_intraday_cash_flow.get(self.account_id, 0.0))
@@ -4780,7 +4793,7 @@ class SchwabAdapter:
                     )
                     if qty != 0:
                         sym = inst.get("symbol", "")
-                        if a_type == "EQUITY" and not is_position_ignored(
+                        if a_type in ("EQUITY", "COLLECTIVE_INVESTMENT") and not is_position_ignored(
                             sym, is_opt=False
                         ):
                             open_eq.append((sym, qty))
@@ -4860,7 +4873,7 @@ class SchwabAdapter:
                     )
                     if qty != 0:
                         sym = inst.get("symbol", "")
-                        if a_type == "EQUITY" and not is_position_ignored(
+                        if a_type in ("EQUITY", "COLLECTIVE_INVESTMENT") and not is_position_ignored(
                             sym, is_opt=False
                         ):
                             open_eq.append((sym, qty))
@@ -5133,7 +5146,7 @@ class SchwabAdapter:
                 has_options = False
                 for pos in positions:
                     a_type = pos.get("instrument", {}).get("assetType")
-                    if a_type in ("EQUITY", "OPTION"):
+                    if a_type in ("EQUITY", "COLLECTIVE_INVESTMENT", "OPTION"):
                         net_q = (
                             pos.get("longQuantity", 0)
                             - pos.get("shortQuantity", 0)
@@ -5157,6 +5170,7 @@ class SchwabAdapter:
 
                 if not open_assets:
                     self._last_raw_pos_details[self.account_id] = {}
+                    self._last_raw_adj_eq[self.account_id] = raw_eq
                     (
                         adj_eq,
                         is_flat,
@@ -5182,8 +5196,9 @@ class SchwabAdapter:
                 symbols = [
                     p[0]["instrument"]["symbol"] for p in open_assets
                 ]
-                adj_eq = raw_eq
                 total_open_pnl = 0.0
+                total_live_mkt_val = 0.0
+                total_acct_mkt_val = 0.0
                 pos_details = {}
 
                 try:
@@ -5197,7 +5212,14 @@ class SchwabAdapter:
 
                 for pos, net_q, a_type in open_assets:
                     sym = pos["instrument"]["symbol"]
-                    mult = 100.0 if a_type == "OPTION" else 1.0
+                    is_opt = (a_type == "OPTION")
+                    norm_a_type = "OPTION" if is_opt else "EQUITY"
+                    mult = 100.0 if is_opt else 1.0
+                    qty_val = (
+                        int(net_q)
+                        if float(net_q).is_integer()
+                        else round(float(net_q), 6)
+                    )
                     acct_mkt_val = float(pos.get("marketValue", 0.0))
                     avg_price = float(
                         pos.get("averageLongPrice")
@@ -5207,7 +5229,7 @@ class SchwabAdapter:
                     )
 
                     quote_info = q_data.get(sym, {}).get("quote", {})
-                    if a_type == "OPTION":
+                    if is_opt:
                         live_price = (
                             quote_info.get("mark")
                             or quote_info.get("lastPrice")
@@ -5227,48 +5249,98 @@ class SchwabAdapter:
                         if net_q != 0 else avg_price
                     )
                     if live_price is not None and float(live_price) > 0:
-                        lp = float(live_price)
-                        live_mkt_val = net_q * lp * mult
-                        adj_eq += (live_mkt_val - acct_mkt_val)
+                        lp = round(float(live_price), 4)
                     else:
-                        lp = acct_lp
+                        lp = round(float(acct_lp), 4)
 
-                    if a_type == "OPTION":
+                    live_mkt_val = qty_val * lp * mult
+                    total_live_mkt_val += live_mkt_val
+                    total_acct_mkt_val += acct_mkt_val
+
+                    if is_opt:
                         conf_lp = lp
                     else:
-                        conf_lp = compute_book_confirmed_price(
-                            lp=lp,
-                            bid=quote_info.get("bidPrice"),
-                            ask=quote_info.get("askPrice"),
-                            mark=quote_info.get("mark"),
-                            acct_lp=acct_lp,
-                            net_qty=net_q
+                        conf_lp = round(
+                            float(
+                                compute_book_confirmed_price(
+                                    lp=lp,
+                                    bid=quote_info.get("bidPrice"),
+                                    ask=quote_info.get("askPrice"),
+                                    mark=quote_info.get("mark"),
+                                    acct_lp=acct_lp,
+                                    net_qty=net_q,
+                                )
+                            ),
+                            4,
                         )
 
                     pos_open_pnl = (
-                        (lp - avg_price) * net_q * mult
+                        (lp - avg_price) * qty_val * mult
                         if avg_price > 0 else 0.0
                     )
                     conf_open_pnl = (
-                        (conf_lp - avg_price) * net_q * mult
+                        (conf_lp - avg_price) * qty_val * mult
                         if avg_price > 0 else pos_open_pnl
                     )
                     total_open_pnl += pos_open_pnl
-                    tag = f"{sym} (OPT)" if a_type == "OPTION" else sym
+                    tag = f"{sym} (OPT)" if is_opt else sym
                     pos_details[tag] = {
                         "symbol": sym,
                         "raw_symbol": sym,
-                        "qty": int(net_q),
+                        "qty": qty_val,
                         "avg": round(avg_price, 4),
-                        "last": round(lp, 4),
+                        "last": lp,
                         "open_pnl": round(pos_open_pnl, 2),
                         "confirmed_open_pnl": round(conf_open_pnl, 2),
-                        "asset_type": a_type
+                        "asset_type": norm_a_type
                     }
+
+                has_cb_mkt_fields = any(
+                    k in balances
+                    for k in (
+                        "longMarketValue",
+                        "shortMarketValue",
+                        "longOptionMarketValue",
+                        "shortOptionMarketValue",
+                    )
+                )
+                cb_eq_opt_mkt_val = (
+                    float(balances.get("longMarketValue") or 0.0)
+                    - abs(float(balances.get("shortMarketValue") or 0.0))
+                    + float(balances.get("longOptionMarketValue") or 0.0)
+                    - abs(float(balances.get("shortOptionMarketValue") or 0.0))
+                )
+                mf_val = float(balances.get("mutualFundValue") or 0.0)
+                if (
+                    mf_val != 0.0
+                    and any(
+                        a_t == "COLLECTIVE_INVESTMENT"
+                        for _, _, a_t in open_assets
+                    )
+                    and abs((cb_eq_opt_mkt_val + mf_val) - total_acct_mkt_val)
+                    < abs(cb_eq_opt_mkt_val - total_acct_mkt_val)
+                ):
+                    cb_eq_opt_mkt_val += mf_val
+
+                ref_bal_mkt_val = (
+                    cb_eq_opt_mkt_val
+                    if (
+                        has_cb_mkt_fields
+                        and (
+                            abs(cb_eq_opt_mkt_val) >= 0.01
+                            or abs(total_acct_mkt_val) < 0.01
+                        )
+                    )
+                    else total_acct_mkt_val
+                )
+                adj_eq = round(
+                    raw_eq + (total_live_mkt_val - ref_bal_mkt_val), 2
+                )
 
                 self._last_raw_pos_details[self.account_id] = json.loads(
                     json.dumps(pos_details)
                 )
+                self._last_raw_adj_eq[self.account_id] = adj_eq
                 (
                     adj_eq,
                     is_flat,
@@ -5345,6 +5417,7 @@ class WebullAdapter:
         self._last_pos_call_ts = 0.0
         self._last_good_snapshot = {}
         self._last_raw_pos_details = {}
+        self._last_raw_adj_eq = {}
         self._last_open_eq = {}
         self._last_open_opt = {}
         self._last_intraday_cash_flow = {}
@@ -5359,6 +5432,10 @@ class WebullAdapter:
         return json.loads(
             json.dumps(self._last_raw_pos_details.get(self.account_id, {}))
         )
+
+    def get_last_raw_adj_eq(self):
+        val = self._last_raw_adj_eq.get(self.account_id)
+        return float(val) if val is not None else None
 
     def get_last_intraday_cash_flow(self):
         return float(self._last_intraday_cash_flow.get(self.account_id, 0.0))
@@ -6559,27 +6636,31 @@ class WebullAdapter:
                     lp = raw_lp
                     conf_lp = lp
 
+                qty_val = (
+                    int(qty)
+                    if float(qty).is_integer()
+                    else round(float(qty), 6)
+                )
+                lp = round(float(lp), 4)
+                conf_lp = round(float(conf_lp), 4)
+                pos_mkt_val = qty_val * lp * mult
                 if abs(lp - raw_lp) > 0.0001:
-                    pos_mkt_val = qty * lp * mult
                     pos_open_pnl = (
-                        (lp - avg_price) * qty * mult
+                        (lp - avg_price) * qty_val * mult
                         if avg_price > 0 else 0.0
                     )
                 else:
-                    pos_mkt_val = float(
-                        p.get("market_value") or (qty * lp * mult)
-                    )
                     if "unrealized_profit_loss" in p and p.get(
                         "unrealized_profit_loss"
                     ) is not None:
                         pos_open_pnl = float(p["unrealized_profit_loss"])
                     else:
                         pos_open_pnl = (
-                            (lp - avg_price) * qty * mult
+                            (lp - avg_price) * qty_val * mult
                             if avg_price > 0 else 0.0
                         )
                 conf_open_pnl = (
-                    (conf_lp - avg_price) * qty * mult
+                    (conf_lp - avg_price) * qty_val * mult
                     if avg_price > 0 else pos_open_pnl
                 )
                 total_raw_pos_mkt_val += raw_mkt_val
@@ -6595,9 +6676,9 @@ class WebullAdapter:
                 pos_details[tag] = {
                     "symbol": sym,
                     "raw_symbol": raw_sym_val,
-                    "qty": int(qty),
+                    "qty": qty_val,
                     "avg": round(avg_price, 4),
-                    "last": round(lp, 4),
+                    "last": lp,
                     "open_pnl": round(pos_open_pnl, 2),
                     "confirmed_open_pnl": round(conf_open_pnl, 2),
                     "asset_type": "OPTION" if is_opt else "EQUITY"
@@ -6641,6 +6722,7 @@ class WebullAdapter:
                     else round(raw_eq or 0.0, 2)
                 )
 
+            self._last_raw_adj_eq[self.account_id] = adj_eq
             (
                 adj_eq,
                 is_flat,
@@ -9767,11 +9849,13 @@ def _stabilize_mid_fill_realized_and_equity(
         proceeds during a multi-lot scale-out before /positions reduces qty). """
     global last_flat_equity, max_equity, daily_max_equity
     global settled_realized_pnl, prev_flat_realized_pnl, flat_desync_streak
-    global in_trade_desync_streak, pending_scale_out_tol
+    global in_trade_desync_streak, pending_scale_out_tol, _launch_fee_drift_checked
 
     if first_poll_of_launch or settled_realized_pnl is None:
         if is_flat:
-            _maybe_absorb_untouched_flat_fee_drift(current_eq, is_flat)
+            if not _launch_fee_drift_checked:
+                _launch_fee_drift_checked = True
+                _maybe_absorb_untouched_flat_fee_drift(current_eq, is_flat)
             last_flat_equity = current_eq
             if current_eq > max_equity:
                 max_equity = current_eq
@@ -11859,7 +11943,14 @@ def show_preflight_window(
                     ignored_positions[tag] = build_ignored_position_entry(
                         tag, raw_pos[tag], lock_existing_open_pnl=False
                     )
-            raw_eq_now = _preexisting_state.get("raw_eq")
+            raw_eq_now = (
+                active_adapter.get_last_raw_adj_eq()
+                if (
+                    active_adapter is not None
+                    and hasattr(active_adapter, "get_last_raw_adj_eq")
+                )
+                else None
+            ) or _preexisting_state.get("raw_eq")
             if raw_eq_now is not None and raw_eq_now > 0:
                 tracked_opnl = round(
                     sum(
@@ -11932,7 +12023,14 @@ def show_preflight_window(
                     )
                     ignored_positions[tag] = ig_entry
                     newly_ignored_igs.append(ig_entry)
-            raw_eq_now = _preexisting_state.get("raw_eq")
+            raw_eq_now = (
+                active_adapter.get_last_raw_adj_eq()
+                if (
+                    active_adapter is not None
+                    and hasattr(active_adapter, "get_last_raw_adj_eq")
+                )
+                else None
+            ) or _preexisting_state.get("raw_eq")
             ref_flat_eq = (
                 last_flat_equity
                 if last_flat_equity is not None
@@ -13609,12 +13707,16 @@ def show_preflight_window(
             pass
 
     def show_telemetry_upload_result_dialog(ok, tester_id):
+        parent_win = pf
         try:
             if not pf.winfo_exists():
-                return
+                if root is not None and root.winfo_exists():
+                    parent_win = root
+                else:
+                    return
         except Exception:
             return
-        dlg = tk.Toplevel(pf)
+        dlg = tk.Toplevel(parent_win)
         dlg.withdraw()
         dlg.grab_set()
         if os.path.exists(ICON_PATH):
@@ -13753,7 +13855,7 @@ def show_preflight_window(
             command=dlg.destroy,
         ).pack(side="right")
 
-        center_dialog_over_parent(dlg, parent=pf)
+        center_dialog_over_parent(dlg, parent=parent_win)
 
     def send_today_safe_log_now():
         try:
@@ -13793,20 +13895,32 @@ def show_preflight_window(
                             f"Manually uploaded today's sanitized log "
                             f"({upload_fname}, Tester ID: {tester_id})",
                         )
-                        if default_status_lbl is not None:
-                            default_status_lbl.config(
-                                text=(
-                                    f"✓ Safe Log Sent! Uploaded {upload_fname} "
-                                    f"(Tester ID: {tester_id})."
-                                ),
-                                fg="#58d68d",
-                            )
+                        try:
+                            if (
+                                default_status_lbl is not None
+                                and default_status_lbl.winfo_exists()
+                            ):
+                                default_status_lbl.config(
+                                    text=(
+                                        f"✓ Safe Log Sent! Uploaded {upload_fname} "
+                                        f"(Tester ID: {tester_id})."
+                                    ),
+                                    fg="#58d68d",
+                                )
+                        except Exception:
+                            pass
                     else:
-                        if default_status_lbl is not None:
-                            default_status_lbl.config(
-                                text="⚠️ Safe Log upload failed (telemetry endpoint unreachable).",
-                                fg="#f5b041",
-                            )
+                        try:
+                            if (
+                                default_status_lbl is not None
+                                and default_status_lbl.winfo_exists()
+                            ):
+                                default_status_lbl.config(
+                                    text="⚠️ Safe Log upload failed (telemetry endpoint unreachable).",
+                                    fg="#f5b041",
+                                )
+                        except Exception:
+                            pass
                     show_telemetry_upload_result_dialog(ok, tester_id)
 
                 try:
@@ -14553,76 +14667,76 @@ def show_preflight_window(
             return
         src = config.get("user_defaults") or DEFAULT_CONFIG
         tamper_lk = is_tilt_streak_tamper_locked()
-        var_open_flat.set(
-            src.get("enable_open_flatten", DEFAULT_CONFIG["enable_open_flatten"])
-        )
-        if not tamper_lk:
-            _tilt_cd_popup_guard["suppress"] = True
-            try:
+        _tilt_cd_popup_guard["suppress"] = True
+        try:
+            var_open_flat.set(
+                src.get("enable_open_flatten", DEFAULT_CONFIG["enable_open_flatten"])
+            )
+            if not tamper_lk:
                 var_tilt_cd.set(
                     src.get(
                         "enable_consec_loss_cooldown",
                         DEFAULT_CONFIG["enable_consec_loss_cooldown"],
                     )
                 )
-            finally:
-                _tilt_cd_popup_guard["suppress"] = False
-            var_tilt_count.set(
-                str(
-                    max(
-                        2,
-                        int(
-                            round(
-                                float(
-                                    src.get(
-                                        "consec_loss_count",
-                                        DEFAULT_CONFIG["consec_loss_count"],
+                var_tilt_count.set(
+                    str(
+                        max(
+                            2,
+                            int(
+                                round(
+                                    float(
+                                        src.get(
+                                            "consec_loss_count",
+                                            DEFAULT_CONFIG["consec_loss_count"],
+                                        )
                                     )
                                 )
-                            )
-                        ),
+                            ),
+                        )
                     )
                 )
-            )
-            var_tilt_window.set(
-                f"{src.get('consec_loss_window_mins', DEFAULT_CONFIG['consec_loss_window_mins']):g}"
-            )
-        if not (tamper_lk and config.get("enable_open_cooldown", False)):
-            var_open_cd.set(
-                src.get("enable_open_cooldown", DEFAULT_CONFIG["enable_open_cooldown"])
-            )
-            var_cd_mins.set(
-                f"{src.get('open_cooldown_mins', DEFAULT_CONFIG['open_cooldown_mins']):g}"
-            )
-        if not tamper_lk:
-            var_alarms_only.set(
-                src.get("alarms_only_mode", DEFAULT_CONFIG["alarms_only_mode"])
-            )
-        var_flatten.set(
-            src.get("enable_auto_flatten", DEFAULT_CONFIG["enable_auto_flatten"])
-        )
-        _opt_waiver_guard["suppress"] = True
-        try:
-            var_flatten_options.set(
-                bool(
-                    src.get(
-                        "enable_flatten_options",
-                        DEFAULT_CONFIG["enable_flatten_options"],
-                    )
-                    and is_options_waiver_verified(config)
+                var_tilt_window.set(
+                    f"{src.get('consec_loss_window_mins', DEFAULT_CONFIG['consec_loss_window_mins']):g}"
                 )
+            if not (tamper_lk and config.get("enable_open_cooldown", False)):
+                var_open_cd.set(
+                    src.get("enable_open_cooldown", DEFAULT_CONFIG["enable_open_cooldown"])
+                )
+                var_cd_mins.set(
+                    f"{src.get('open_cooldown_mins', DEFAULT_CONFIG['open_cooldown_mins']):g}"
+                )
+            if not tamper_lk:
+                var_alarms_only.set(
+                    src.get("alarms_only_mode", DEFAULT_CONFIG["alarms_only_mode"])
+                )
+            var_flatten.set(
+                src.get("enable_auto_flatten", DEFAULT_CONFIG["enable_auto_flatten"])
+            )
+            _opt_waiver_guard["suppress"] = True
+            try:
+                var_flatten_options.set(
+                    bool(
+                        src.get(
+                            "enable_flatten_options",
+                            DEFAULT_CONFIG["enable_flatten_options"],
+                        )
+                        and is_options_waiver_verified(config)
+                    )
+                )
+            finally:
+                _opt_waiver_guard["suppress"] = False
+            var_kill_tos.set(
+                src.get("enable_kill_tos", DEFAULT_CONFIG["enable_kill_tos"])
+            )
+            var_kill_wb.set(
+                src.get("enable_kill_webull", DEFAULT_CONFIG["enable_kill_webull"])
+            )
+            var_lock_os.set(
+                src.get("enable_lock_os", DEFAULT_CONFIG["enable_lock_os"])
             )
         finally:
-            _opt_waiver_guard["suppress"] = False
-        var_kill_tos.set(
-            src.get("enable_kill_tos", DEFAULT_CONFIG["enable_kill_tos"])
-        )
-        var_kill_wb.set(
-            src.get("enable_kill_webull", DEFAULT_CONFIG["enable_kill_webull"])
-        )
-        var_lock_os.set(
-            src.get("enable_lock_os", DEFAULT_CONFIG["enable_lock_os"])
-        )
+            _tilt_cd_popup_guard["suppress"] = False
         var_daily_lock_mins.set(
             f"{src.get('daily_lock_mins', DEFAULT_CONFIG['daily_lock_mins']):g}"
         )
@@ -15812,9 +15926,16 @@ def show_preflight_window(
         decision = {"ok": False}
         dlg = tk.Toplevel(pf)
         dlg.withdraw()
+        if os.path.exists(ICON_PATH):
+            try:
+                dlg.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+        apply_dark_title_bar(dlg)
         dlg.title("PnL Enforcer — Consecutive Loss Cooldown")
         dlg.configure(bg="#0d1117", padx=24, pady=20)
         dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
         dlg.transient(pf)
 
         def on_cancel():
@@ -15827,6 +15948,7 @@ def show_preflight_window(
 
         dlg.protocol("WM_DELETE_WINDOW", on_cancel)
         dlg.bind("<Escape>", lambda _e: on_cancel())
+        dlg.bind("<Return>", lambda _e: on_confirm())
 
         hdr_row = tk.Frame(dlg, bg="#0d1117")
         hdr_row.pack(fill="x", pady=(0, 4))
@@ -15955,16 +16077,18 @@ def show_preflight_window(
         # Section 3: Unlock conditions
         txt_box.insert(
             "end",
-            "3. AUTOMATIC UNLOCK CONDITIONS\n",
+            "3. AUTOMATIC UNLOCK & SAFE 10S DRY-RUN TEST\n",
             "hdr_sec",
         )
         s3_spans = [
-            ("    The lock clears automatically as soon as your rolling streak countdown reaches ", ("body",)),
+            ("    Unlocks automatically when your rolling streak countdown reaches ", ("body",)),
             (" 00:00 ", ("body", "pill")),
-            ("\n", ("body",)),
-            ("    or when you close a qualifying winning trade (", ("body",)),
+            (" or on a qualifying win\n", ("body",)),
+            ("    (", ("body",)),
             (" >= +Win Reset ($) ", ("body", "pill")),
-            (").", ("body",)),
+            ("). You can test the OS lock anytime in Card 3 → ", ("body",)),
+            (" ⚙ Preferences & Audio... ", ("body", "pill")),
+            (".", ("body",)),
         ]
         for s_txt, s_tags in s3_spans:
             txt_box.insert("end", s_txt, s_tags)
@@ -15977,7 +16101,7 @@ def show_preflight_window(
 
         make_stadium_button(
             btn_row,
-            text="Got It — Arm Cooldown ✓",
+            text="Got It ✓",
             font=("Arial", 10, "bold"),
             fill_color="#0d3b20",
             fill_top_color="#14532d",
@@ -15987,7 +16111,7 @@ def show_preflight_window(
             hover_border="#34d399",
             fg="#ffffff",
             canvas_bg="#0d1117",
-            width=210,
+            width=160,
             height=34,
             auto_width=False,
             command=on_confirm,
@@ -16012,23 +16136,608 @@ def show_preflight_window(
         dlg.update_idletasks()
         center_dialog_over_parent(dlg, parent=pf)
         dlg.grab_set()
+        try:
+            dlg.focus_set()
+        except Exception:
+            pass
         pf.wait_window(dlg)
         return decision["ok"]
 
+    def show_os_lock_feature_notice(is_penalty_box=False):
+        """Displays a friendly dark-glass heads-up when the user enables
+        Penalty Box OS Lock Cooldown (Card 1) or Lock Windows OS on Max Loss /
+        Profit Stop (Card 2), explaining the 100% flat daytrade verification and
+        pointing to the 10s Dry-Run test in Preferences & Audio."""
+        hide_all_tooltips()
+        decision = {"ok": False}
+        dlg = tk.Toplevel(pf)
+        dlg.withdraw()
+        if os.path.exists(ICON_PATH):
+            try:
+                dlg.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+        apply_dark_title_bar(dlg)
+        dlg.title(
+            "PnL Enforcer — Penalty Box OS Lock Cooldown"
+            if is_penalty_box
+            else "PnL Enforcer — Windows OS Lockout"
+        )
+        dlg.configure(bg="#0d1117", padx=24, pady=20)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        dlg.transient(pf)
+
+        def on_cancel():
+            decision["ok"] = False
+            dlg.destroy()
+
+        def on_confirm():
+            decision["ok"] = True
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        dlg.bind("<Escape>", lambda _e: on_cancel())
+        dlg.bind("<Return>", lambda _e: on_confirm())
+
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 4))
+
+        tk.Label(
+            hdr_row,
+            text=(
+                "▶  PENALTY BOX OS LOCK COOLDOWN — HOW IT WORKS"
+                if is_penalty_box
+                else "▶  WINDOWS OS LOCKOUT — HOW IT WORKS"
+            ),
+            font=("Arial", 12, "bold"),
+            fg="#7dd3fc",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(side="left")
+
+        tk.Label(
+            hdr_row,
+            text="SAFETY-VERIFIED OS LOCK",
+            font=("Arial", 8, "bold"),
+            fg="#93c5fd",
+            bg="#162231",
+            padx=8,
+            pady=3,
+        ).pack(side="right", padx=(12, 0))
+
+        tk.Label(
+            dlg,
+            text=(
+                "Quick overview of how Penalty Box screen-locking protects you after an intraday stop:"
+                if is_penalty_box
+                else "Quick overview of how Windows OS Lockout protects you when your Daily Stop is hit:"
+            ),
+            font=("Arial", 9, "bold"),
+            fg="#94a3b8",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        card_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        card_outer.pack(fill="x", pady=(0, 16))
+        NeonBarCanvas(
+            card_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+
+        txt_box = tk.Text(
+            card_outer,
+            width=84,
+            height=15,
+            bg="#131922",
+            fg="#cbd5e1",
+            font=("Arial", 10, "bold"),
+            wrap="none",
+            bd=0,
+            highlightthickness=0,
+            padx=18,
+            pady=14,
+            cursor="arrow",
+        )
+        txt_box.pack(side="left", fill="both", expand=True)
+
+        txt_box.tag_configure(
+            "hdr_sec",
+            font=("Arial", 10, "bold"),
+            foreground="#7dd3fc",
+            spacing1=2,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "body",
+            font=("Arial", 10, "bold"),
+            foreground="#cbd5e1",
+            spacing1=2,
+            spacing3=3,
+        )
+        txt_box.tag_configure(
+            "pill",
+            font=("Arial", 10, "bold"),
+            foreground="#bae6fd",
+            background="#1a2636",
+        )
+        txt_box.tag_configure(
+            "div_line",
+            font=("Consolas", 8),
+            foreground="#222d3d",
+            spacing1=5,
+            spacing3=5,
+        )
+
+        # Section 1: Flat verification
+        txt_box.insert(
+            "end",
+            "1. NEVER LOCKS WHILE A DAYTRADE IS OPEN  (100% Flat Check)\n",
+            "hdr_sec",
+        )
+        s1_spans = [
+            ("    Before locking your computer, Enforcer confirms with your broker API that ", ("body",)),
+            (" 100% of tracked daytrades ", ("body", "pill")),
+            ("\n", ("body",)),
+            ("    are closed (flat). It will never lock you out in an open daytrade, and Ignored swing trades are untouched.\n", ("body",)),
+        ]
+        for s_txt, s_tags in s1_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+        # Section 2: Persistent lock & watchdog
+        txt_box.insert(
+            "end",
+            "2. PERSISTENT WINDOWS SCREEN LOCK & VOICE COUNTDOWN\n",
+            "hdr_sec",
+        )
+        s2_spans = [
+            ("    Locks your Windows screen for your set ", ("body",)),
+            (" Lock Duration (Mins) ", ("body", "pill")),
+            (". If you log back in before the\n", ("body",)),
+            ("    timer expires, it immediately re-locks within 0.20s and announces the remaining time aloud.\n", ("body",)),
+        ]
+        for s_txt, s_tags in s2_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+        # Section 3: How to test first
+        txt_box.insert(
+            "end",
+            "3. WANT TO PREVIEW IT SAFELY FIRST?  (10-Second Dry-Run Test)\n",
+            "hdr_sec",
+        )
+        s3_spans = [
+            ("    Open ", ("body",)),
+            (" ⚙ Preferences & Audio... ", ("body", "pill")),
+            (" in Card 3, select ", ("body",)),
+            (" Full 10s Dry-Run Lockout ", ("body", "pill")),
+            (", and click Test\n", ("body",)),
+            ("    to experience the exact screen-lock and voice countdown safely with zero orders.", ("body",)),
+        ]
+        for s_txt, s_tags in s3_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        _autofit_readonly_text_box(txt_box, min_w=84, min_h=14)
+        txt_box.config(state="disabled")
+
+        btn_row = tk.Frame(dlg, bg="#0d1117")
+        btn_row.pack(fill="x")
+
+        make_stadium_button(
+            btn_row,
+            text="Got It ✓",
+            font=("Arial", 10, "bold"),
+            fill_color="#0d3b20",
+            fill_top_color="#14532d",
+            border_color="#10b981",
+            hover_fill="#114b29",
+            hover_fill_top="#196638",
+            hover_border="#34d399",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=160,
+            height=34,
+            auto_width=False,
+            command=on_confirm,
+        ).pack(side="right")
+
+        make_stadium_button(
+            btn_row,
+            text="Cancel",
+            font=("Arial", 10, "bold"),
+            fill_color="#3b1520",
+            border_color="#f43f5e",
+            hover_fill="#4f1c2b",
+            hover_border="#fb7185",
+            fg="#ffe4e6",
+            canvas_bg="#0d1117",
+            width=104,
+            height=34,
+            auto_width=False,
+            command=on_cancel,
+        ).pack(side="right", padx=(0, 8))
+
+        dlg.update_idletasks()
+        center_dialog_over_parent(dlg, parent=pf)
+        dlg.grab_set()
+        try:
+            dlg.focus_set()
+        except Exception:
+            pass
+        pf.wait_window(dlg)
+        return decision["ok"]
+
+    def show_auto_flatten_feature_notice(is_open_stop=False):
+        """Displays a friendly dark-glass heads-up when the user enables
+        Single-Trade Open PnL Auto-Flatten (Card 1) or Daily Stop Auto-Flatten
+        (Card 2), explaining order cancellation, intraday-only liquidation, and
+        where to test with Alarms Only first."""
+        hide_all_tooltips()
+        decision = {"ok": False}
+        dlg = tk.Toplevel(pf)
+        dlg.withdraw()
+        if os.path.exists(ICON_PATH):
+            try:
+                dlg.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+        apply_dark_title_bar(dlg)
+        dlg.title(
+            "PnL Enforcer — Open PnL Auto-Flatten"
+            if is_open_stop
+            else "PnL Enforcer — Daily Stop Auto-Flatten"
+        )
+        dlg.configure(bg="#0d1117", padx=24, pady=20)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        dlg.transient(pf)
+
+        def on_cancel():
+            decision["ok"] = False
+            dlg.destroy()
+
+        def on_confirm():
+            decision["ok"] = True
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        dlg.bind("<Escape>", lambda _e: on_cancel())
+        dlg.bind("<Return>", lambda _e: on_confirm())
+
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 4))
+
+        tk.Label(
+            hdr_row,
+            text=(
+                "▶  OPEN PNL AUTO-FLATTEN — HOW IT WORKS"
+                if is_open_stop
+                else "▶  DAILY STOP AUTO-FLATTEN — HOW IT WORKS"
+            ),
+            font=("Arial", 12, "bold"),
+            fg="#7dd3fc",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(side="left")
+
+        tk.Label(
+            hdr_row,
+            text="AUTOMATED EQUITY EXIT",
+            font=("Arial", 8, "bold"),
+            fg="#93c5fd",
+            bg="#162231",
+            padx=8,
+            pady=3,
+        ).pack(side="right", padx=(12, 0))
+
+        tk.Label(
+            dlg,
+            text=(
+                "Quick overview of what happens when your Single-Trade Max Open Loss ($) is hit:"
+                if is_open_stop
+                else "Quick overview of what happens when your active Daily Stop in Rulebook 4 or 5 is hit:"
+            ),
+            font=("Arial", 9, "bold"),
+            fg="#94a3b8",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        card_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        card_outer.pack(fill="x", pady=(0, 16))
+        NeonBarCanvas(
+            card_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+
+        txt_box = tk.Text(
+            card_outer,
+            width=84,
+            height=15,
+            bg="#131922",
+            fg="#cbd5e1",
+            font=("Arial", 10, "bold"),
+            wrap="none",
+            bd=0,
+            highlightthickness=0,
+            padx=18,
+            pady=14,
+            cursor="arrow",
+        )
+        txt_box.pack(side="left", fill="both", expand=True)
+
+        txt_box.tag_configure(
+            "hdr_sec",
+            font=("Arial", 10, "bold"),
+            foreground="#7dd3fc",
+            spacing1=2,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "body",
+            font=("Arial", 10, "bold"),
+            foreground="#cbd5e1",
+            spacing1=2,
+            spacing3=3,
+        )
+        txt_box.tag_configure(
+            "pill",
+            font=("Arial", 10, "bold"),
+            foreground="#bae6fd",
+            background="#1a2636",
+        )
+        txt_box.tag_configure(
+            "div_line",
+            font=("Consolas", 8),
+            foreground="#222d3d",
+            spacing1=5,
+            spacing3=5,
+        )
+
+        # Section 1: Liquidation mechanics
+        txt_box.insert(
+            "end",
+            "1. CANCELS WORKING ORDERS & LIQUIDATES DAYTRADE EQUITIES\n",
+            "hdr_sec",
+        )
+        if is_open_stop:
+            s1_spans = [
+                ("    When unrealized Open PnL hits ", ("body",)),
+                (" Max Open Loss ($) ", ("body", "pill")),
+                (", Enforcer cancels working daytrade orders\n", ("body",)),
+                ("    and closes tracked Equity shares (RTH Market order 9:30–4:00 ET; Extended Hours GTC_EXT limit).\n", ("body",)),
+            ]
+        else:
+            s1_spans = [
+                ("    When Net PnL hits your active ", ("body",)),
+                (" Daily Stop ", ("body", "pill")),
+                (" in Rulebook 4 or 5, Enforcer cancels working daytrade\n", ("body",)),
+                ("    orders and closes tracked Equity shares (RTH Market order 9:30–4:00 ET; Extended Hours GTC_EXT limit).\n", ("body",)),
+            ]
+        for s_txt, s_tags in s1_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+        # Section 2: Swing positions & Options
+        txt_box.insert(
+            "end",
+            "2. IGNORED SWING TRADES & OPTIONS BEHAVIOR\n",
+            "hdr_sec",
+        )
+        s2_spans = [
+            ("    Pre-existing or manually ", ("body",)),
+            (" Ignored ", ("body", "pill")),
+            (" swing positions (and their GTC orders) are never touched.\n", ("body",)),
+            ("    Option contracts are Siren-Only unless ", ("body",)),
+            (" Include Options in Auto-Flatten (BETA) ", ("body", "pill")),
+            (" is armed in Card 2.\n", ("body",)),
+        ]
+        for s_txt, s_tags in s2_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+        # Section 3: How to test first
+        txt_box.insert(
+            "end",
+            "3. WANT TO TEST THRESHOLDS WITHOUT ORDERS FIRST?\n",
+            "hdr_sec",
+        )
+        s3_spans = [
+            ("    Toggle ", ("body",)),
+            (" 🔔 Alarms Only: ON ", ("body", "pill")),
+            (" on the bottom bar to test your stops with audio sirens only (zero orders),\n", ("body",)),
+            ("    or preview all warning/lockout sounds inside Card 3 → ", ("body",)),
+            (" ⚙ Preferences & Audio... ", ("body", "pill")),
+            (".", ("body",)),
+        ]
+        for s_txt, s_tags in s3_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        _autofit_readonly_text_box(txt_box, min_w=84, min_h=14)
+        txt_box.config(state="disabled")
+
+        btn_row = tk.Frame(dlg, bg="#0d1117")
+        btn_row.pack(fill="x")
+
+        make_stadium_button(
+            btn_row,
+            text="Got It ✓",
+            font=("Arial", 10, "bold"),
+            fill_color="#0d3b20",
+            fill_top_color="#14532d",
+            border_color="#10b981",
+            hover_fill="#114b29",
+            hover_fill_top="#196638",
+            hover_border="#34d399",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=160,
+            height=34,
+            auto_width=False,
+            command=on_confirm,
+        ).pack(side="right")
+
+        make_stadium_button(
+            btn_row,
+            text="Cancel",
+            font=("Arial", 10, "bold"),
+            fill_color="#3b1520",
+            border_color="#f43f5e",
+            hover_fill="#4f1c2b",
+            hover_border="#fb7185",
+            fg="#ffe4e6",
+            canvas_bg="#0d1117",
+            width=104,
+            height=34,
+            auto_width=False,
+            command=on_cancel,
+        ).pack(side="right", padx=(0, 8))
+
+        dlg.update_idletasks()
+        center_dialog_over_parent(dlg, parent=pf)
+        dlg.grab_set()
+        try:
+            dlg.focus_set()
+        except Exception:
+            pass
+        pf.wait_window(dlg)
+        return decision["ok"]
+
+    _prev_toggle_state = {
+        "open_flat": bool(var_open_flat.get()),
+        "tilt_cd": bool(var_tilt_cd.get()),
+        "open_cd": bool(var_open_cd.get()),
+        "day_flat": bool(var_flatten.get()),
+        "lock_os": bool(var_lock_os.get()),
+    }
+
+    def _sync_prev_toggle_state():
+        _prev_toggle_state["open_flat"] = bool(var_open_flat.get())
+        _prev_toggle_state["tilt_cd"] = bool(var_tilt_cd.get())
+        _prev_toggle_state["open_cd"] = bool(var_open_cd.get())
+        _prev_toggle_state["day_flat"] = bool(var_flatten.get())
+        _prev_toggle_state["lock_os"] = bool(var_lock_os.get())
+
+    def _on_toggle_open_flat(*_):
+        if _tilt_cd_popup_guard["suppress"] or _tamper_sync_guard["busy"]:
+            _sync_prev_toggle_state()
+            refresh_smart_dimming()
+            return
+        was_on = _prev_toggle_state["open_flat"]
+        now_on = bool(var_open_flat.get())
+        if (not was_on) and now_on:
+            if not show_auto_flatten_feature_notice(is_open_stop=True):
+                _tilt_cd_popup_guard["suppress"] = True
+                try:
+                    var_open_flat.set(False)
+                finally:
+                    _tilt_cd_popup_guard["suppress"] = False
+                _prev_toggle_state["open_flat"] = False
+                refresh_smart_dimming()
+                return
+        _prev_toggle_state["open_flat"] = now_on
+        refresh_smart_dimming()
+
     def _on_toggle_tilt_cd(*_):
         if _tilt_cd_popup_guard["suppress"] or _tamper_sync_guard["busy"]:
+            _sync_prev_toggle_state()
             return
-        if var_tilt_cd.get():
+        was_on = _prev_toggle_state["tilt_cd"]
+        now_on = bool(var_tilt_cd.get())
+        if (not was_on) and now_on:
             if not show_tilt_cooldown_lock_notice():
                 _tilt_cd_popup_guard["suppress"] = True
                 try:
                     var_tilt_cd.set(False)
                 finally:
                     _tilt_cd_popup_guard["suppress"] = False
+                _prev_toggle_state["tilt_cd"] = False
                 refresh_smart_dimming()
                 return
             if not var_open_cd.get():
-                var_open_cd.set(True)
+                _tilt_cd_popup_guard["suppress"] = True
+                try:
+                    var_open_cd.set(True)
+                finally:
+                    _tilt_cd_popup_guard["suppress"] = False
+                _prev_toggle_state["open_cd"] = True
+        _prev_toggle_state["tilt_cd"] = now_on
+        refresh_smart_dimming()
+
+    def _on_toggle_open_cd(*_):
+        if _tilt_cd_popup_guard["suppress"] or _tamper_sync_guard["busy"]:
+            _sync_prev_toggle_state()
+            refresh_smart_dimming()
+            return
+        was_on = _prev_toggle_state["open_cd"]
+        now_on = bool(var_open_cd.get())
+        if (not was_on) and now_on:
+            if not show_os_lock_feature_notice(is_penalty_box=True):
+                _tilt_cd_popup_guard["suppress"] = True
+                try:
+                    var_open_cd.set(False)
+                finally:
+                    _tilt_cd_popup_guard["suppress"] = False
+                _prev_toggle_state["open_cd"] = False
+                refresh_smart_dimming()
+                return
+        _prev_toggle_state["open_cd"] = now_on
+        refresh_smart_dimming()
+
+    def _on_toggle_day_flat(*_):
+        if _tilt_cd_popup_guard["suppress"] or _tamper_sync_guard["busy"]:
+            _sync_prev_toggle_state()
+            refresh_smart_dimming()
+            return
+        was_on = _prev_toggle_state["day_flat"]
+        now_on = bool(var_flatten.get())
+        if (not was_on) and now_on:
+            if not show_auto_flatten_feature_notice(is_open_stop=False):
+                _tilt_cd_popup_guard["suppress"] = True
+                try:
+                    var_flatten.set(False)
+                finally:
+                    _tilt_cd_popup_guard["suppress"] = False
+                _prev_toggle_state["day_flat"] = False
+                refresh_smart_dimming()
+                return
+        _prev_toggle_state["day_flat"] = now_on
+        refresh_smart_dimming()
+
+    def _on_toggle_lock_os(*_):
+        if _tilt_cd_popup_guard["suppress"] or _tamper_sync_guard["busy"]:
+            _sync_prev_toggle_state()
+            refresh_smart_dimming()
+            return
+        was_on = _prev_toggle_state["lock_os"]
+        now_on = bool(var_lock_os.get())
+        if (not was_on) and now_on:
+            if not show_os_lock_feature_notice(is_penalty_box=False):
+                _tilt_cd_popup_guard["suppress"] = True
+                try:
+                    var_lock_os.set(False)
+                finally:
+                    _tilt_cd_popup_guard["suppress"] = False
+                _prev_toggle_state["lock_os"] = False
+                refresh_smart_dimming()
+                return
+        _prev_toggle_state["lock_os"] = now_on
         refresh_smart_dimming()
 
     r_open2 = tk.Frame(c1, bg="#131922")
@@ -18536,10 +19245,13 @@ def show_preflight_window(
                 lbl_fl.config(fg="#526070")
                 ent_fl.config(state="disabled")
 
+    var_open_flat.trace_add("write", _on_toggle_open_flat)
     var_tilt_cd.trace_add("write", _on_toggle_tilt_cd)
+    var_open_cd.trace_add("write", _on_toggle_open_cd)
+    var_flatten.trace_add("write", _on_toggle_day_flat)
+    var_lock_os.trace_add("write", _on_toggle_lock_os)
     for trace_var in (
         var_alarms_only,
-        var_open_flat, var_open_cd, var_flatten, var_lock_os,
         var_pm_w1_on, var_pm_w2_on, var_pm_lock_on,
         var_t1_w1_on, var_t1_w2_on, var_t2_on, var_t3_on, var_t4_on
     ):
