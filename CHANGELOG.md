@@ -6,12 +6,13 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ## [v0.9.54] — 2026-11-13
 ### ⚡ Quick Summary
-- **One-Click `Inspect Source / Diff ↗` Links:** Added an **`Inspect Source / Diff ↗`** button to the **Update Available** dialog, the **Release Notes** viewer, and the Pre-Flight footer (`Inspect Source ↗`) that opens the GitHub Gist `/revisions` diff page in your browser so security-conscious users can inspect the full source code and exact line-by-line changes before or after any update.
+- **One-Click `Inspect Source / Diff ↗` Links & `Check for Updates on Startup` Toggle:** Added an **`Inspect Source / Diff ↗`** button to the **Update Available** dialog, the **Release Notes** viewer, and the Pre-Flight footer (`Inspect Source ↗`) that opens the GitHub Gist `/revisions` diff page in your browser, plus a **`Check for Updates on Startup`** checkbox (enabled by default) inside **`⚙ Preferences & Audio...`** for users who prefer to manage updates manually.
 - **Background Update Modal & Full-File Verification Fixes:** Fixed a `NameError` (`hide_all_tooltips`) when opening the **Update Available** modal over the Pre-Flight window, verified full-file syntax (`compile()`) and end-of-file markers on 900 KB+ update payloads, and prioritized the user's primary `PATH` `pythonw.exe` in `Launch_Enforcer.bat`.
 
 ### 🔍 Detailed Breakdown
-- **Source Code & Revision Diff Inspection (`get_source_diff_web_url`, `show_update_available_dialog`, `show_release_notes_dialog`):**
+- **Source Code & Revision Diff Inspection (`get_source_diff_web_url`, `show_update_available_dialog`, `show_release_notes_dialog`, `open_preferences_modal`):**
   - Added `SOURCE_DIFF_WEB_URL` and `BETA_SOURCE_DIFF_WEB_URL` pointing to the GitHub Gist `/revisions` side-by-side diff view for the active channel, wired to **`Inspect Source / Diff ↗`** buttons in the Update Available and Release Notes headers plus **`Inspect Source ↗`** in the Pre-Flight footer.
+  - Added a **`Check for Updates on Startup`** toggle (`check_updates_on_startup`, default `True`) in Section 3 (`SYSTEM & TELEMETRY`) of **`⚙ Preferences & Audio...`** that persists immediately on toggle and skips startup update checks when unchecked.
 - **Updater & Launcher Hardening (`hide_all_tooltips`, `_fetch_available_update_payload`, `Launch_Enforcer.bat`):**
   - Added a module-level `hide_all_tooltips()` dispatcher wired to `show_preflight_window()` so opening `show_update_available_dialog(parent=parent_pf)` from `start_background_update_check()` never raises `NameError` or falls back to `input()`.
   - Guarded the CLI `input()` fallback in `show_update_available_dialog()` so it only runs when `parent is None` and `sys.stdin.isatty()` is `True`.

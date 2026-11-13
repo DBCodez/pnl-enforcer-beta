@@ -1991,6 +1991,7 @@ DEFAULT_CONFIG = {
     "seen_layout_tour_version": "",
     "auto_share_sanitized_logs": False,
     "show_debug_console": False,
+    "check_updates_on_startup": True,
     "last_uploaded_sanitized_log": "",
     "anonymous_tester_id": "",
     "active_broker": "SCHWAB",
@@ -12710,6 +12711,18 @@ def show_preflight_window(
         set_debug_console_visible(show_now)
 
     var_debug_console.trace_add("write", _on_toggle_debug_console)
+
+    var_check_updates_on_startup = tk.BooleanVar(
+        value=bool(config.get("check_updates_on_startup", True))
+    )
+
+    def _on_toggle_check_updates(*_):
+        config["check_updates_on_startup"] = bool(
+            var_check_updates_on_startup.get()
+        )
+        save_config(config)
+
+    var_check_updates_on_startup.trace_add("write", _on_toggle_check_updates)
     var_voice_cues = tk.BooleanVar(
         value=config.get("enable_voice_cues", True)
     )
@@ -15853,6 +15866,14 @@ def show_preflight_window(
                 )
             )
         )
+        var_check_updates_on_startup.set(
+            bool(
+                src.get(
+                    "check_updates_on_startup",
+                    DEFAULT_CONFIG["check_updates_on_startup"],
+                )
+            )
+        )
         var_voice_cues.set(
             src.get("enable_voice_cues", DEFAULT_CONFIG["enable_voice_cues"])
         )
@@ -15931,6 +15952,9 @@ def show_preflight_window(
                 "ignore_preexisting_positions": bool(var_ignore_preexisting.get()),
                 "auto_share_sanitized_logs": bool(var_auto_share_logs.get()),
                 "show_debug_console": bool(var_debug_console.get()),
+                "check_updates_on_startup": bool(
+                    var_check_updates_on_startup.get()
+                ),
                 "enable_voice_cues": bool(var_voice_cues.get()),
                 "tts_voice": TTS_LABEL_TO_ID.get(var_tts_voice.get(), "Zira"),
                 "enable_upside_chime": bool(var_upside_chime.get()),
@@ -16167,6 +16191,9 @@ def show_preflight_window(
                 var_auto_share_logs.get()
             )
             new_cfg["show_debug_console"] = bool(var_debug_console.get())
+            new_cfg["check_updates_on_startup"] = bool(
+                var_check_updates_on_startup.get()
+            )
             new_cfg["last_uploaded_sanitized_log"] = config.get(
                 "last_uploaded_sanitized_log", ""
             )
@@ -18927,6 +18954,26 @@ def show_preflight_window(
             "  disabled so it can never be accidentally closed mid-trade or mid-lockout).\n"
             "• Uncheck to immediately hide the terminal window from your desktop and taskbar.\n"
             "• Your preference is saved automatically across restarts."
+        )
+
+        cb_chk_upd = make_glass_checkbutton(
+            r_dbg_con,
+            text="Check for Updates on Startup",
+            variable=var_check_updates_on_startup,
+            font=("Arial", 10, "bold"),
+            fg="#94a3b8",
+            bg="#131922",
+            anchor="e",
+        )
+        cb_chk_upd.pack(side="right", padx=(24, 0))
+        attach_tooltip(
+            cb_chk_upd,
+            "Check for Updates on Startup (Enabled by Default):\n"
+            "• When checked, PnL Enforcer checks GitHub in the background at launch and pops up\n"
+            "  the Update Available + Changelog screen if a newer version exists (never installing\n"
+            "  without your confirmation).\n"
+            "• Uncheck if you prefer to disable automatic update checks on startup and review/download\n"
+            "  updates manually via 'Inspect Source ↗'."
         )
 
         lbl_poll_err = tk.Label(
@@ -24041,10 +24088,26 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
     return target_py
 
 
+def _peek_saved_check_updates_pref():
+    """Reads check_updates_on_startup from CONFIG_PATH (defaults to True)."""
+    try:
+        if isinstance(config, dict) and "check_updates_on_startup" in config:
+            return bool(config.get("check_updates_on_startup", True))
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return bool(data.get("check_updates_on_startup", True))
+    except Exception:
+        pass
+    return True
+
+
 def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
     """Checks GitHub / Gist for a newer APP_VERSION and pops up a GUI dialog
     (with Changelog preview + link) to download and install the latest files."""
     try:
+        if not _peek_saved_check_updates_pref():
+            return
         if _is_another_instance_running():
             return
         payload = _fetch_available_update_payload(skip_if_recent=skip_if_recent)
@@ -24068,6 +24131,9 @@ def start_background_update_check(parent_pf, cancel_pf_fn=None):
     """Runs the version check in a background thread right after Pre-Flight
     opens so startup is instant, and pops up the interactive Update Available
     + Changelog modal over Pre-Flight only if a newer version is found."""
+    if not _peek_saved_check_updates_pref():
+        return
+
     def _worker():
         payload = _fetch_available_update_payload(skip_if_recent=True)
         if payload is None:
