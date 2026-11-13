@@ -4,21 +4,24 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
-## [v0.9.46] — 2026-11-12
+## [v0.9.46 & v0.9.47] — 2026-11-13
 ### ⚡ Quick Summary
-- **Pre-Flight Settings Overhaul & Cleaner Rulebooks:** Grouped set-and-forget preferences inside Card 3's **`⚙ Preferences & Audio...`** modal, moved API key setup & 7-day token renewal into the **`BROKER:`** dropdown (and clickable **`Token: X.Xd ↻`** readout), tucked Card 1's micro-scratch filter behind **`⚙ Filter`**, promoted **`🔔 Alarms Only`** to a global caution-amber toggle beside the launch button, bolded **`Starting Max Loss ($)`** at the top of both Rulebooks, and unified profit ratchet rows across Cards 4 & 5.
+- **Pre-Flight Settings Overhaul, Privacy Mode & Smoother Dialog Typography:** Grouped set-and-forget preferences inside Card 3's **`⚙ Preferences & Audio...`** modal, added a top-bar **`👁 Privacy: OFF / ON`** screenshot toggle that masks account numbers & balances (`*******************` / `********** (Saved)`), unified crimson styling across **`Max Open Loss ($)`** and both **`Starting Max Loss ($)`** fields, and upgraded all modal popups and API setup wizards to smooth anti-aliased bold typography.
+- **Moved API Setup, Tilt Filter & Alarms Only to Dedicated Controls:** Moved API key setup & 7-day token renewal into the **`BROKER:`** dropdown (plus clickable **`Token: X.Xd ↻`** readout in Card 3), tucked Card 1's micro-scratch filter behind **`⚙ Filter`**, promoted **`🔔 Alarms Only`** to a global caution-amber toggle beside the launch button, and unified profit ratchet rows across Cards 4 & 5.
 - **Intraday Deposit & Withdrawal Neutralization (Schwab & Webull):** Mid-session deposits, transfers, and withdrawals no longer distort daily `Realized PnL` or `Net PnL` — your morning session baseline stays intact unless you explicitly click **`↺ Re-Zero Baseline`**.
 - **Seamless Multi-Monitor Dialogs & Dropdowns:** Popups, wizards, tooltips, and dark dropdown menus now detect your active monitor work area, center cleanly over the Pre-Flight window without primary-monitor flicker, and auto-flip upward when near bottom screen edges.
 - **Active Profit Tier HUD Tag & Smart Post-Breach Guidance:** The HUD `DAILY STOP` column now shows the live tier (`(T1)`–`(T4)`, `(EXT)`, `(EXT LOCK)`), highlights emerald on active ratchets, plays `[RATCHET]` chime/glow when resuming mid-session into a higher tier, and points to the exact active tier field after a breach.
 - **LULD Halt Protection, Early-Unlock Re-Lock & Calm Disconnect Tone:** Preserves working RTH `MARKET` exit orders during halts (`HALT WATCH` defers App Kill/OS Lock until 100% flat), re-locks early screen unlocks within `0.20s` with exact remaining-time speech, and swaps the disconnect alert to a gentle 2-tone telemetry chime.
 
 ### 🔍 Detailed Breakdown
-- **Pre-Flight UI & Workflow Streamlining:**
+- **Pre-Flight UI, Privacy Mode & Dialog Typography Polish:**
   - Moved Session Behavior, Audio/Voice Cues (`🔊 Test`), Poll Interval (with validation), and Auto-Share Safe Logs behind Card 3's **`⚙ Preferences & Audio...`** modal (`3. TODAY'S SESSION & BASELINE`), preserving focus/grab across nested confirmation popups.
-  - Added API setup/token renewal directly to the **`BROKER:`** dropdown + clickable Card 3 **`Token: X.Xd ↻`** status, moved Tilt **`Min Loss` / `Win Reset`** behind Card 1's **`⚙ Filter`** pill, moved **`🔔 Alarms Only: OFF / ON`** into the bottom launch bar (with a caution-amber **`SAVE & LAUNCH (ALARMS ONLY)`** state), and placed bold crimson **`Starting Max Loss ($):`** first in Cards 4 & 5 with unified `At Profit → Stop / Trail` rows.
+  - Added top-bar **`👁 Privacy: OFF / ON`** pill (with zero top-bar layout shift) to mask account labels in the top bar/dropdown and baseline dollar balances in Card 3 for safe screenshots, and locked Pre-Flight window geometry when toggling **`Include Options in Auto-Flatten`**.
+  - Added welcoming **`✨ Help Improve Enforcer — Auto-Share Safe Logs`** CTA in **`📜 Logs ▾`** and upgraded the Auto-Share Safe Logs modal, 10s Dry-Run Lockout modal, Broker API Setup Wizards, and Release Notes version picker to smooth bold typography with auto-fitted cards.
+  - Added API setup/token renewal directly to the **`BROKER:`** dropdown + clickable Card 3 **`Token: X.Xd ↻`** status, moved Tilt **`Min Loss` / `Win Reset`** behind Card 1's **`⚙ Filter`** pill, moved **`🔔 Alarms Only: OFF / ON`** into the bottom launch bar (with a caution-amber **`SAVE & LAUNCH (ALARMS ONLY)`** state), and unified crimson styling across **`Max Open Loss ($)`** (Card 1) and **`Starting Max Loss ($)`** (Cards 4 & 5) with uniform `At Profit → Stop / Trail` rows.
 - **Account Balance, Cash-Flow & Multi-Monitor Fixes (Schwab & Webull):**
   - Persisted intraday `anchor_cash_flow` per session across relaunches to neutralize same-day deposits and withdrawals (without double-counting or tripping when overnight pending deposits settle) and synced Webull equity/market-value marks during fast moves and scale-ins.
-  - Fixed `DarkDropdownMenu` popup rendering (`BROKER`, `ACCOUNT`, `Logs`, `Voices`) across monitors and eliminated primary-monitor popup flash on modal dialogs.
+  - Fixed `DarkDropdownMenu` popup rendering (`BROKER`, `ACCOUNT`, `Logs`, `Voices`), deduplicated rapid-hover tooltips, and eliminated primary-monitor popup flash on modal dialogs.
 - **Rulebook Ratchets, Halt Watch & Lockout Hardening:**
   - Added tier-aware HUD column headers/tooltips, tier-specific Post-Breach Review instructions, and first-poll `[RATCHET]` notifications on mid-session resume.
   - Added LULD halt working-order preservation + 2-poll stale-replica filter + passive `⏳ HALT WATCH` deferral, instant early-unlock detection with exact remaining time TTS callouts, queued non-overlapping speech, calm 2-tone (`660 Hz -> 440 Hz`) disconnect alerts, and automatic Beta Channel changelog routing.

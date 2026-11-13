@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.46"
+APP_VERSION = "0.9.47"
 
 import os
 import sys
@@ -1285,7 +1285,15 @@ class DarkDropdownMenu:
         self._last_close_ts = 0.0
 
     def add_command(
-        self, label="", command=None, fg=None, activeforeground=None, **_ignored
+        self,
+        label="",
+        command=None,
+        fg=None,
+        activeforeground=None,
+        bg=None,
+        activebg=None,
+        font=None,
+        **_ignored,
     ):
         self._items.append(
             {
@@ -1294,6 +1302,9 @@ class DarkDropdownMenu:
                 "command": command,
                 "fg": fg,
                 "active_fg": activeforeground,
+                "bg": bg,
+                "active_bg": activebg,
+                "font": font,
             }
         )
 
@@ -1397,11 +1408,14 @@ class DarkDropdownMenu:
                 cmd = item.get("command")
                 item_fg = item.get("fg") or self._fg
                 item_active_fg = item.get("active_fg") or self._active_fg
+                item_bg = item.get("bg") or self._bg
+                item_active_bg = item.get("active_bg") or self._active_bg
+                item_font = item.get("font") or self._font
                 row = tk.Label(
                     inner,
                     text=lbl_txt,
-                    font=self._font,
-                    bg=self._bg,
+                    font=item_font,
+                    bg=item_bg,
                     fg=item_fg,
                     anchor="w",
                     padx=10,
@@ -1411,14 +1425,14 @@ class DarkDropdownMenu:
                 row.pack(fill="x")
                 row.bind(
                     "<Enter>",
-                    lambda _e, r=row, afg=item_active_fg: r.config(
-                        bg=self._active_bg, fg=afg
+                    lambda _e, r=row, afg=item_active_fg, abg=item_active_bg: r.config(
+                        bg=abg, fg=afg
                     ),
                 )
                 row.bind(
                     "<Leave>",
-                    lambda _e, r=row, nfg=item_fg: r.config(
-                        bg=self._bg, fg=nfg
+                    lambda _e, r=row, nfg=item_fg, nbg=item_bg: r.config(
+                        bg=nbg, fg=nfg
                     ),
                 )
                 row.bind(
@@ -1919,6 +1933,7 @@ DEFAULT_CONFIG = {
     },
     "account_sessions": {},
     "user_defaults": {},
+    "privacy_mode": False,
     "alarms_only_mode": False,
     "enable_auto_flatten": False,
     "enable_flatten_options": False,
@@ -3930,14 +3945,25 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
     dlg.resizable(False, False)
     dlg.attributes("-topmost", True)
 
+    hdr_row = tk.Frame(dlg, bg="#0d1117")
+    hdr_row.pack(fill="x", pady=(0, 8))
     tk.Label(
-        dlg,
+        hdr_row,
         text="🔐 SCHWAB 7-DAY SECURITY LOGIN (STEP-BY-STEP)",
         font=("Arial", 12, "bold"),
         fg="#5dade2",
         bg="#0d1117",
-        anchor="w"
-    ).pack(fill="x", pady=(0, 8))
+        anchor="w",
+    ).pack(side="left")
+    tk.Label(
+        hdr_row,
+        text="🔒 7-DAY TOKEN RENEWAL",
+        font=("Arial", 8, "bold"),
+        fg="#7dd3fc",
+        bg="#142334",
+        padx=8,
+        pady=3,
+    ).pack(side="right", padx=(12, 0))
 
     steps_outer = tk.Frame(
         dlg, bg="#131922", bd=0, highlightthickness=1, highlightbackground="#243040"
@@ -3947,49 +3973,86 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
         steps_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
     ).pack(side="left", fill="y")
     steps_frame = tk.Frame(
-        steps_outer, bg="#131922", padx=16, pady=12
+        steps_outer, bg="#131922", padx=18, pady=14
     )
     steps_frame.pack(side="left", fill="both", expand=True)
 
-    tk.Label(
+    def _add_login_step_line(parent_f, segments, pady=(0, 2)):
+        row = tk.Frame(parent_f, bg="#131922")
+        row.pack(fill="x", pady=pady)
+        for seg_txt, seg_fg, seg_font, seg_bg in segments:
+            tk.Label(
+                row,
+                text=seg_txt,
+                font=seg_font,
+                fg=seg_fg,
+                bg=seg_bg or "#131922",
+                padx=5 if seg_bg else 0,
+                pady=1 if seg_bg else 0,
+                anchor="w",
+            ).pack(side="left")
+
+    _s_fnt = ("Arial", 10, "bold")
+    _s_bld = ("Arial", 10, "bold")
+    _c_fnt = ("Consolas", 10, "bold")
+
+    _add_login_step_line(
         steps_frame,
-        text=(
-            "STEP 1: Log into your Charles Schwab account in the browser window that just opened\n"
-            "        and approve account access. (If your browser didn't open, click the link below):"
-        ),
-        font=("Arial", 10, "bold"),
-        fg="#dce4ee",
-        bg="#131922",
-        justify="left",
-        anchor="w"
-    ).pack(fill="x", pady=(0, 4))
+        [
+            (" STEP 1 ", "#7dd3fc", _c_fnt, "#1a2636"),
+            ("  Log into Charles Schwab in the browser window that just opened and click ", "#dce4ee", _s_fnt, None),
+            (" Approve ", "#6ee7b7", _c_fnt, "#112a20"),
+            (".", "#dce4ee", _s_fnt, None),
+        ],
+        pady=(0, 4),
+    )
 
     link_lbl = tk.Label(
         steps_frame,
-        text="🌐 Click Here to Open / Re-Open the Charles Schwab Login Page in Your Browser",
+        text="🌐 Click Here to Open / Re-Open the Charles Schwab Login Page in Your Browser ↗",
         font=("Arial", 10, "bold underline"),
         fg="#38bdf8",
         bg="#131922",
         cursor="hand2",
-        anchor="w"
+        anchor="w",
     )
-    link_lbl.pack(fill="x", padx=18, pady=(0, 10))
+    link_lbl.pack(fill="x", padx=8, pady=(0, 8))
     link_lbl.bind("<Button-1>", lambda _e: webbrowser.open(login_url))
 
-    tk.Label(
+    tk.Frame(steps_frame, bg="#222d3d", height=1).pack(fill="x", pady=(0, 8))
+
+    _add_login_step_line(
         steps_frame,
-        text=(
-            "STEP 2: After clicking Approve on Schwab's site, your browser will redirect to a blank\n"
-            "        \"This site can't be reached (127.0.0.1)\" page. This is 100% normal!\n\n"
-            "STEP 3: Copy the ENTIRE URL from the top of your browser's address bar\n"
-            "        (it starts with  https://127.0.0.1/?code=... ) and paste it below:"
-        ),
-        font=("Arial", 10),
-        fg="#97a7b9",
-        bg="#131922",
-        justify="left",
-        anchor="w"
-    ).pack(fill="x")
+        [
+            (" STEP 2 ", "#7dd3fc", _c_fnt, "#1a2636"),
+            ("  Your browser will redirect to a blank ", "#dce4ee", _s_fnt, None),
+            (" This site can't be reached (127.0.0.1) ", "#fde68a", _c_fnt, "#33220c"),
+            (" page — ", "#dce4ee", _s_fnt, None),
+            (" 100% Normal! ", "#6ee7b7", _c_fnt, "#112a20"),
+        ],
+        pady=(0, 8),
+    )
+
+    tk.Frame(steps_frame, bg="#222d3d", height=1).pack(fill="x", pady=(0, 8))
+
+    _add_login_step_line(
+        steps_frame,
+        [
+            (" STEP 3 ", "#7dd3fc", _c_fnt, "#1a2636"),
+            ("  Copy the full ", "#dce4ee", _s_fnt, None),
+            (" https://127.0.0.1/?code=... ", "#6ee7b7", _c_fnt, "#112a20"),
+            (" URL from your browser address bar", "#dce4ee", _s_fnt, None),
+        ],
+        pady=(0, 2),
+    )
+    _add_login_step_line(
+        steps_frame,
+        [
+            ("           — this window ", "#94a3b8", _s_fnt, None),
+            (" auto-detects it directly from your clipboard! ", "#7dd3fc", _s_bld, None),
+        ],
+        pady=(0, 0),
+    )
 
     tk.Label(
         dlg,
@@ -6414,8 +6477,8 @@ def show_liability_waiver():
                 fill="x", pady=(10, 10)
             )
 
-    _b_txt = "#e2e8f0"
-    _b_fnt = ("Arial", 10)
+    _b_txt = "#cbd5e1"
+    _b_fnt = ("Arial", 10, "bold")
     _b_bld = ("Arial", 10, "bold")
     _c_fnt = ("Consolas", 10, "bold")
 
@@ -6736,8 +6799,8 @@ def show_options_flatten_beta_waiver(parent=None, force_prompt=True):
                 fill="x", pady=(10, 10)
             )
 
-    _b_txt = "#e2e8f0"
-    _b_fnt = ("Arial", 10)
+    _b_txt = "#cbd5e1"
+    _b_fnt = ("Arial", 10, "bold")
     _b_bld = ("Arial", 10, "bold")
     _c_fnt = ("Consolas", 10, "bold")
 
@@ -7048,11 +7111,11 @@ def show_broker_setup_wizard(broker_name, parent=None):
             1,
             [
                 [
-                    ("Log in at ", "#cbd5e1", ("Arial", 10), None),
+                    ("Log in at ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("https://developer.schwab.com", "#7dd3fc", ("Consolas", 10, "bold"), "#192536"),
-                    (" and create a free ", "#cbd5e1", ("Arial", 10), None),
+                    (" and create a free ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("Individual Developer", "#ffffff", ("Arial", 10, "bold"), None),
-                    (" account.", "#cbd5e1", ("Arial", 10), None),
+                    (" account.", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ]
             ],
         )
@@ -7060,11 +7123,11 @@ def show_broker_setup_wizard(broker_name, parent=None):
             2,
             [
                 [
-                    ("Click ", "#cbd5e1", ("Arial", 10), None),
+                    ("Click ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("'Apps' ➔ 'Create App'", "#ffffff", ("Arial", 10, "bold"), None),
-                    (" and select the API product ", "#cbd5e1", ("Arial", 10), None),
+                    (" and select the API product ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("Accounts and Trading Production", "#fbbf24", ("Arial", 10, "bold"), "#262115"),
-                    (".", "#cbd5e1", ("Arial", 10), None),
+                    (".", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ]
             ],
         )
@@ -7072,9 +7135,9 @@ def show_broker_setup_wizard(broker_name, parent=None):
             3,
             [
                 [
-                    ("Set the ", "#cbd5e1", ("Arial", 10), None),
+                    ("Set the ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("Callback URL", "#ffffff", ("Arial", 10, "bold"), None),
-                    (" to exactly:  ", "#cbd5e1", ("Arial", 10), None),
+                    (" to exactly:  ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("https://127.0.0.1", "#69f0ae", ("Consolas", 10, "bold"), "#122b22"),
                 ]
             ],
@@ -7112,13 +7175,13 @@ def show_broker_setup_wizard(broker_name, parent=None):
             4,
             [
                 [
-                    ("Once your App status changes to ", "#cbd5e1", ("Arial", 10), None),
+                    ("Once your App status changes to ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("Ready for Use", "#69f0ae", ("Arial", 10, "bold"), "#122b22"),
-                    (", paste your ", "#cbd5e1", ("Arial", 10), None),
+                    (", paste your ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("App Key", "#ffffff", ("Arial", 10, "bold"), None),
-                    (" & ", "#cbd5e1", ("Arial", 10), None),
+                    (" & ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("App Secret", "#ffffff", ("Arial", 10, "bold"), None),
-                    (" into the fields below.", "#cbd5e1", ("Arial", 10), None),
+                    (" into the fields below.", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ]
             ],
         )
@@ -7126,17 +7189,17 @@ def show_broker_setup_wizard(broker_name, parent=None):
             5,
             [
                 [
-                    ("When you click ", "#cbd5e1", ("Arial", 10), None),
+                    ("When you click ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("Save & Connect", "#69f0ae", ("Arial", 10, "bold"), None),
-                    (", your browser will open to log into Schwab and approve your account.", "#cbd5e1", ("Arial", 10), None),
+                    (", your browser will open to log into Schwab and approve your account.", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ],
                 [
-                    ("After approving, copy the full ", "#cbd5e1", ("Arial", 10), None),
-                    ("https://127.0.0.1/?code=...", "#7dd3fc", ("Consolas", 9, "bold"), "#192536"),
-                    (" URL from your browser address bar", "#cbd5e1", ("Arial", 10), None),
+                    ("After approving, copy the full ", "#b8c7d9", ("Arial", 10, "bold"), None),
+                    ("https://127.0.0.1/?code=...", "#7dd3fc", ("Consolas", 10, "bold"), "#192536"),
+                    (" URL from your browser address bar", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ],
                 [
-                    ("— our popup window will ", "#94a3b8", ("Arial", 10), None),
+                    ("— our popup window will ", "#94a3b8", ("Arial", 10, "bold"), None),
                     ("auto-detect it directly from your clipboard!", "#ffffff", ("Arial", 10, "bold"), None),
                 ],
             ],
@@ -7146,9 +7209,9 @@ def show_broker_setup_wizard(broker_name, parent=None):
             1,
             [
                 [
-                    ("Log in to ", "#cbd5e1", ("Arial", 10), None),
+                    ("Log in to ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("Webull Web ➔ Account Management ➔ OpenAPI Management", "#ffffff", ("Arial", 10, "bold"), None),
-                    (".", "#cbd5e1", ("Arial", 10), None),
+                    (".", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ]
             ],
         )
@@ -7156,9 +7219,9 @@ def show_broker_setup_wizard(broker_name, parent=None):
             2,
             [
                 [
-                    ("Apply for a ", "#cbd5e1", ("Arial", 10), None),
+                    ("Apply for a ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("Retail Trading API Key", "#7dd3fc", ("Arial", 10, "bold"), "#192536"),
-                    (" (typically approved within a few minutes).", "#cbd5e1", ("Arial", 10), None),
+                    (" (typically approved within a few minutes).", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ]
             ],
         )
@@ -7166,11 +7229,11 @@ def show_broker_setup_wizard(broker_name, parent=None):
             3,
             [
                 [
-                    ("Generate your ", "#cbd5e1", ("Arial", 10), None),
+                    ("Generate your ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("App Key", "#ffffff", ("Arial", 10, "bold"), None),
-                    (" and ", "#cbd5e1", ("Arial", 10), None),
+                    (" and ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("App Secret", "#ffffff", ("Arial", 10, "bold"), None),
-                    (" in the Webull portal and paste both into the fields below.", "#cbd5e1", ("Arial", 10), None),
+                    (" in the Webull portal and paste both into the fields below.", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ]
             ],
         )
@@ -7178,9 +7241,9 @@ def show_broker_setup_wizard(broker_name, parent=None):
             4,
             [
                 [
-                    ("Click ", "#cbd5e1", ("Arial", 10), None),
+                    ("Click ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("Save & Connect", "#69f0ae", ("Arial", 10, "bold"), None),
-                    (" below to verify your credentials and load your Webull trading accounts.", "#cbd5e1", ("Arial", 10), None),
+                    (" below to verify your credentials and load your Webull trading accounts.", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ]
             ],
         )
@@ -7189,9 +7252,9 @@ def show_broker_setup_wizard(broker_name, parent=None):
             [
                 [
                     ("⚠️ Mobile 2FA:", "#fbbf24", ("Arial", 10, "bold"), "#262115"),
-                    (" On first connection, check your ", "#cbd5e1", ("Arial", 10), None),
+                    (" On first connection, check your ", "#b8c7d9", ("Arial", 10, "bold"), None),
                     ("Webull Mobile App / SMS", "#ffffff", ("Arial", 10, "bold"), None),
-                    (" if prompted for a verification code.", "#cbd5e1", ("Arial", 10), None),
+                    (" if prompted for a verification code.", "#b8c7d9", ("Arial", 10, "bold"), None),
                 ]
             ],
         )
@@ -7215,11 +7278,11 @@ def show_broker_setup_wizard(broker_name, parent=None):
     tk.Entry(
         form,
         textvariable=var_key,
-        font=("Consolas", 10, "bold"),
-        width=52,
+        font=("Arial", 10, "bold"),
+        width=54,
         bg="#0e141d",
-        fg="#e2e8f0",
-        insertbackground="#e2e8f0",
+        fg="#f1f5f9",
+        insertbackground="#f1f5f9",
         bd=0,
         highlightthickness=1,
         highlightbackground="#28374a",
@@ -7238,11 +7301,11 @@ def show_broker_setup_wizard(broker_name, parent=None):
     tk.Entry(
         form,
         textvariable=var_sec,
-        font=("Consolas", 10, "bold"),
-        width=52,
+        font=("Arial", 10, "bold"),
+        width=54,
         bg="#0e141d",
-        fg="#e2e8f0",
-        insertbackground="#e2e8f0",
+        fg="#f1f5f9",
+        insertbackground="#f1f5f9",
         show="*",
         bd=0,
         highlightthickness=1,
@@ -10853,7 +10916,7 @@ def show_preflight_window(
     _all_hide_tip_callbacks = []
 
     def hide_all_tooltips(_event=None):
-        for fn in _all_hide_tip_callbacks:
+        for fn in list(_all_hide_tip_callbacks):
             try:
                 fn()
             except Exception:
@@ -10866,6 +10929,7 @@ def show_preflight_window(
 
         def show_tip():
             tip_state["after_id"] = None
+            hide_all_tooltips()
             if (
                 tip_state["win"] is not None
                 or not widget.winfo_exists()
@@ -10950,7 +11014,7 @@ def show_preflight_window(
                 tip_state["win"] = None
 
         def schedule_tip(_event=None):
-            hide_tip()
+            hide_all_tooltips()
             if getattr(widget, "_menu_open", False):
                 return
             try:
@@ -10958,12 +11022,19 @@ def show_preflight_window(
             except Exception:
                 pass
 
+        def _on_destroy_tip(_event=None):
+            hide_tip()
+            try:
+                _all_hide_tip_callbacks.remove(hide_tip)
+            except ValueError:
+                pass
+
         _all_hide_tip_callbacks.append(hide_tip)
         widget._hide_tooltip_fn = hide_tip
         widget.bind("<Enter>", schedule_tip, add="+")
         widget.bind("<Leave>", hide_tip, add="+")
         widget.bind("<ButtonPress>", hide_tip, add="+")
-        widget.bind("<Destroy>", hide_tip, add="+")
+        widget.bind("<Destroy>", _on_destroy_tip, add="+")
 
     # --- STATE VARIABLES ---
     var_broker = tk.StringVar(value=config.get("active_broker", "SCHWAB"))
@@ -11025,6 +11096,9 @@ def show_preflight_window(
     }
     btn_review_ignored = None
     var_reanchor = tk.BooleanVar(value=False)
+    var_privacy_mode = tk.BooleanVar(
+        value=bool(config.get("privacy_mode", False))
+    )
     var_auto_share_logs = tk.BooleanVar(
         value=bool(config.get("auto_share_sanitized_logs", False))
     )
@@ -11197,10 +11271,21 @@ def show_preflight_window(
             return
 
         b_name = _card3_base_cache["b_name"]
-        eq_str = _card3_base_cache["eq_str"]
+        raw_eq_str = _card3_base_cache["eq_str"]
+        if var_privacy_mode.get() and raw_eq_str.startswith("$"):
+            _, _, suffix_part = raw_eq_str.partition(" ")
+            eq_str = (
+                f"********** {suffix_part}".strip()
+                if suffix_part
+                else "**********"
+            )
+            eq_col = "#94a3b8"
+        else:
+            eq_str = raw_eq_str
+            eq_col = "#7dd3fc"
         spans = [
             (f"Baseline ({b_name}): ", "#94a3b8"),
-            (eq_str, "#7dd3fc"),
+            (eq_str, eq_col),
         ]
         if b_name == "SCHWAB":
             rem_h = get_schwab_token_remaining_hours()
@@ -11713,7 +11798,7 @@ def show_preflight_window(
         tk.Label(
             dlg,
             text=sub_txt,
-            font=("Arial", 9),
+            font=("Arial", 9, "bold"),
             fg="#94a3b8",
             bg="#0d1117",
             justify="left",
@@ -11772,7 +11857,7 @@ def show_preflight_window(
                     "When 'Ignore Pre-Existing Positions on Launch' is checked, any swing or long-term positions\n"
                     "open in your account when you launch PnL Enforcer will appear here and default to Ignored."
                 ),
-                font=("Arial", 10),
+                font=("Arial", 10, "bold"),
                 fg="#cbd5e1",
                 bg="#131922",
                 justify="left",
@@ -11876,7 +11961,7 @@ def show_preflight_window(
                     tk.Label(
                         bot_line,
                         text=f"Started at Qty: {init_q:+g}  ·  Ref Price: ${init_p:,.2f}  ·  Closed earlier today",
-                        font=("Consolas", 9),
+                        font=("Consolas", 9, "bold"),
                         fg="#94a3b8",
                         bg="#131922",
                     ).pack(side="left")
@@ -11888,7 +11973,7 @@ def show_preflight_window(
                     tk.Label(
                         bot_line,
                         text=f"Qty: {qty:+g}   ·   Avg: ${avg:,.2f}   ·   Last: ${last:,.2f}   ·   Open PnL: ",
-                        font=("Consolas", 9),
+                        font=("Consolas", 9, "bold"),
                         fg="#cbd5e1",
                         bg="#131922",
                     ).pack(side="left")
@@ -12029,7 +12114,7 @@ def show_preflight_window(
                 "  daytrade Realized/Open/Net PnL, never locks Settings/Close, and is skipped by Auto-Flatten & Order Cancellation.\n"
                 "• ⚡ Tracked Daytrade Rule: Monitored live for Open PnL, Daily Stop, and Auto-Flatten (starting at $0.00 Realized PnL)."
             ),
-            font=("Arial", 8),
+            font=("Arial", 8, "bold"),
             fg="#94a3b8",
             bg="#11161f",
             justify="left",
@@ -12291,11 +12376,29 @@ def show_preflight_window(
         fnt_lbl = ("Arial", 9, "bold")
         fnt_val = ("Arial", 9, "bold")
         b_val = var_broker.get() or "SCHWAB"
-        a_val = var_account_label.get() or "Loading..."
+        priv_on = bool(var_privacy_mode.get())
+        raw_a_val = var_account_label.get() or "Loading..."
 
         w_b_lbl = _measure_canvas_txt(broker_acct_capsule, "BROKER:", fnt_lbl)
         w_b_val = _measure_canvas_txt(broker_acct_capsule, b_val, fnt_val)
         w_a_lbl = _measure_canvas_txt(broker_acct_capsule, "ACCOUNT:", fnt_lbl)
+        w_a_raw = _measure_canvas_txt(broker_acct_capsule, raw_a_val, fnt_val)
+        if priv_on:
+            w_star = max(
+                4, _measure_canvas_txt(broker_acct_capsule, "*", fnt_val)
+            )
+            n_stars = max(14, int(w_a_raw // w_star))
+            while (
+                n_stars > 12
+                and _measure_canvas_txt(
+                    broker_acct_capsule, "*" * n_stars, fnt_val
+                )
+                > w_a_raw
+            ):
+                n_stars -= 1
+            a_val = "*" * n_stars
+        else:
+            a_val = raw_a_val
         w_a_val = _measure_canvas_txt(broker_acct_capsule, a_val, fnt_val)
 
         pad_l = 16
@@ -12306,8 +12409,9 @@ def show_preflight_window(
         x_dot = x_div + 4
         x_a_lbl = x_dot + 19
         x_a_val = x_a_lbl + w_a_lbl + 7
-        x_a_chev = x_a_val + w_a_val + 6
-        total_w = max(360, int(x_a_chev + 20))
+        x_a_chev_full = x_a_val + max(w_a_val, w_a_raw) + 6
+        total_w = max(360, int(x_a_chev_full + 20))
+        x_a_chev = total_w - 20
         h = 32
         cy = h // 2
 
@@ -12495,14 +12599,24 @@ def show_preflight_window(
     def populate_account_dropdown():
         account_label_to_id.clear()
         acct_dropdown.delete(0, "end")
+        priv_on = bool(var_privacy_mode.get())
         if active_adapter and active_adapter.accounts:
             selected_lbl = active_adapter.accounts[0]["label"]
-            for acc in active_adapter.accounts:
+            n_accts = len(active_adapter.accounts)
+            for idx, acc in enumerate(active_adapter.accounts):
                 lbl = acc["label"]
                 aid = acc["id"]
                 account_label_to_id[lbl] = aid
+                if priv_on:
+                    disp_lbl = (
+                        f"**************** (#{idx + 1})"
+                        if n_accts > 1
+                        else "****************"
+                    )
+                else:
+                    disp_lbl = lbl
                 acct_dropdown.add_command(
-                    label=lbl,
+                    label=disp_lbl,
                     command=lambda v=lbl: on_account_select(v)
                 )
                 if aid == active_adapter.account_id:
@@ -12579,7 +12693,7 @@ def show_preflight_window(
                 "Check the columns you want on your HUD and use ▲ / ▼ to arrange their left-to-right order.\n"
                 "• Small HUD Mode: Selecting 3 (or fewer) columns shrinks the HUD and uses a compact hover-over status pill."
             ),
-            font=("Arial", 9),
+            font=("Arial", 9, "bold"),
             fg="#94a3b8",
             bg="#0d1117",
             justify="left",
@@ -12628,7 +12742,7 @@ def show_preflight_window(
                 tk.Label(
                     row,
                     text=desc,
-                    font=("Arial", 9),
+                    font=("Arial", 9, "bold"),
                     fg="#8b9bb0",
                     bg="#131922",
                     anchor="w",
@@ -12977,6 +13091,54 @@ def show_preflight_window(
                 parent=pf,
             )
 
+    def _autofit_readonly_text_box(txt_box, min_w=74, min_h=5):
+        """Sizes a read-only tk.Text card from its exact per-tag font metrics and line spacings."""
+        try:
+            import math
+            import tkinter.font as _tkfont
+            base_fnt = _tkfont.Font(txt_box, font=txt_box.cget("font"))
+            hdr_fnt = _tkfont.Font(txt_box, font=("Arial", 10, "bold"))
+            pill_fnt = _tkfont.Font(txt_box, font=("Arial", 10, "bold"))
+            div_fnt = _tkfont.Font(txt_box, font=("Consolas", 8))
+            char_px = max(1, base_fnt.measure("0"))
+            line_px = max(1, base_fnt.metrics("linespace"))
+            raw_content = txt_box.get("1.0", "end-1c")
+            lines = raw_content.split("\n")
+            max_line_px = 0
+            total_y_px = 0
+            for idx, ln in enumerate(lines, start=1):
+                line_tags = set(txt_box.tag_names(f"{idx}.0"))
+                if "div_line" in line_tags:
+                    ln_px = div_fnt.measure(ln)
+                    total_y_px += div_fnt.metrics("linespace") + 10
+                elif any(t.startswith("hdr_") for t in line_tags):
+                    ln_px = hdr_fnt.measure(ln)
+                    total_y_px += hdr_fnt.metrics("linespace") + 6
+                else:
+                    ln_px = 0
+                    cur_is_pill = None
+                    seg_chars = []
+                    for col_i, ch in enumerate(ln):
+                        c_tags = txt_box.tag_names(f"{idx}.{col_i}")
+                        is_p = any(t.startswith("pill_") for t in c_tags)
+                        if cur_is_pill is not None and is_p != cur_is_pill:
+                            f_use = pill_fnt if cur_is_pill else base_fnt
+                            ln_px += f_use.measure("".join(seg_chars))
+                            seg_chars = []
+                        cur_is_pill = is_p
+                        seg_chars.append(ch)
+                    if seg_chars:
+                        f_use = pill_fnt if cur_is_pill else base_fnt
+                        ln_px += f_use.measure("".join(seg_chars))
+                    total_y_px += line_px + 5
+                if ln_px > max_line_px:
+                    max_line_px = ln_px
+            req_w = max(min_w, int(math.ceil((max_line_px + 28) / char_px)))
+            req_h = max(min_h, int(math.ceil((total_y_px + 12) / line_px)))
+            txt_box.configure(width=req_w, height=req_h)
+        except Exception:
+            pass
+
     def show_telemetry_upload_result_dialog(ok, tester_id):
         try:
             if not pf.winfo_exists():
@@ -13004,26 +13166,35 @@ def show_preflight_window(
         bar_col = "#10b981" if ok else "#f59e0b"
         rim_col = "#1f4d3a" if ok else "#5c3d1e"
         hdr_txt = (
-            "✅ Safe Log Sent!"
+            "▶  ✅ SAFE LOG SENT — THANK YOU!"
             if ok
-            else "⚠️ Upload Failed"
+            else "▶  ⚠️ SAFE LOG UPLOAD COULD NOT COMPLETE"
         )
-        body_txt = (
-            f"✅ Safe Log Sent! Your balance-redacted session log "
-            f"(Tester ID: {tester_id}) was uploaded directly to the beta diagnostic drive."
+        badge_txt = (
+            "🔒 100% BALANCE-REDACTED"
             if ok
-            else "⚠️ Upload Failed: Could not reach the telemetry endpoint. "
-            "You can still use Export Safe Log or Report Bug."
+            else "⚠️ CONNECTION UNREACHABLE"
         )
 
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 10))
         tk.Label(
-            dlg,
+            hdr_row,
             text=hdr_txt,
             font=("Arial", 12, "bold"),
             fg="#69f0ae" if ok else "#fbbf24",
             bg="#0d1117",
             anchor="w",
-        ).pack(fill="x", pady=(0, 10))
+        ).pack(side="left")
+        tk.Label(
+            hdr_row,
+            text=badge_txt,
+            font=("Arial", 8, "bold"),
+            fg="#6ee7b7" if ok else "#fde68a",
+            bg="#112a20" if ok else "#3b2106",
+            padx=8,
+            pady=3,
+        ).pack(side="right", padx=(12, 0))
 
         card_outer = tk.Frame(
             dlg,
@@ -13036,18 +13207,62 @@ def show_preflight_window(
         NeonBarCanvas(
             card_outer, core_color=bar_col, card_bg="#131922", glow_on=True
         ).pack(side="left", fill="y")
-        tk.Label(
+
+        txt_box = tk.Text(
             card_outer,
-            text=body_txt,
-            font=("Arial", 10),
-            fg="#e2e8f0",
+            width=78,
+            height=5,
             bg="#131922",
-            justify="left",
-            anchor="w",
-            wraplength=480,
+            fg="#b8c7d9",
+            font=("Arial", 10, "bold"),
+            wrap="none",
+            bd=0,
+            highlightthickness=0,
             padx=18,
             pady=14,
-        ).pack(side="left", fill="both", expand=True)
+            cursor="arrow",
+        )
+        txt_box.pack(side="left", fill="both", expand=True)
+        txt_box.tag_configure(
+            "body", font=("Arial", 10, "bold"), foreground="#b8c7d9", spacing1=2, spacing3=3
+        )
+        txt_box.tag_configure(
+            "pill_green", font=("Arial", 10, "bold"), foreground="#6ee7b7", background="#112a20"
+        )
+        txt_box.tag_configure(
+            "pill_blue", font=("Arial", 10, "bold"), foreground="#7dd3fc", background="#1a2636"
+        )
+        txt_box.tag_configure(
+            "pill_amber", font=("Arial", 10, "bold"), foreground="#fde68a", background="#3b2106"
+        )
+        if ok:
+            spans = [
+                ("• Your privacy-scrubbed session log was uploaded to the diagnostic drive.\n", ("body",)),
+                ("• All account balances (", ("body",)),
+                (" $[REDACTED] ", ("body", "pill_green")),
+                ("), Windows paths (", ("body",)),
+                (" ~ ", ("body", "pill_blue")),
+                ("), and order IDs were removed.\n", ("body",)),
+                ("• Tagged only with your anonymous ID: ", ("body",)),
+                (f" {tester_id} ", ("body", "pill_amber")),
+                (" — thank you for helping improve PnL Enforcer!", ("body",)),
+            ]
+        else:
+            spans = [
+                ("• Could not reach the diagnostic drive right now (network or firewall blocked).\n", ("body",)),
+                ("• Your trading guardrails and local logs are ", ("body",)),
+                (" 100% unaffected ", ("body", "pill_green")),
+                (".\n", ("body",)),
+                ("• You can still share a log anytime via ", ("body",)),
+                (" 🔒 Export Today's Safe Log ", ("body", "pill_blue")),
+                (" or ", ("body",)),
+                (" 🐞 Report Bug ", ("body", "pill_amber")),
+                (".", ("body",)),
+            ]
+        for s_txt, s_tags in spans:
+            txt_box.insert("end", s_txt, s_tags)
+        _autofit_readonly_text_box(txt_box, min_w=78, min_h=5)
+        txt_box.configure(state="disabled")
 
         btn_row = tk.Frame(dlg, bg="#0d1117")
         btn_row.pack(fill="x")
@@ -13092,7 +13307,7 @@ def show_preflight_window(
                 default_status_lbl.config(
                     text=(
                         f"⏳ Uploading today's Safe Log (Tester ID: {tester_id}) "
-                        "to beta diagnostic drive..."
+                        "to diagnostic drive..."
                     ),
                     fg="#38bdf8",
                 )
@@ -13160,7 +13375,7 @@ def show_preflight_window(
             except Exception:
                 pass
         apply_dark_title_bar(dlg)
-        dlg.title("PnL Enforcer — Auto-Share Daily Safe Logs (Beta Opt-In)")
+        dlg.title("PnL Enforcer — Auto-Share Daily Safe Logs")
         dlg.config(bg="#0d1117", padx=26, pady=20)
         dlg.resizable(False, False)
         dlg.attributes("-topmost", True)
@@ -13176,15 +13391,36 @@ def show_preflight_window(
 
         dlg.protocol("WM_DELETE_WINDOW", on_cancel)
         dlg.bind("<Escape>", lambda _e: on_cancel())
+        dlg.bind("<Return>", lambda _e: on_enable())
 
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 4))
         tk.Label(
-            dlg,
-            text="▶  📤 AUTO-SHARE DAILY SAFE LOGS (BETA OPT-IN)",
+            hdr_row,
+            text="▶  🤝 HELP IMPROVE PNL ENFORCER — AUTO-SHARE SAFE LOGS",
             font=("Arial", 12, "bold"),
             fg="#38bdf8",
             bg="#0d1117",
             anchor="w",
-        ).pack(fill="x", pady=(0, 12))
+        ).pack(side="left")
+        tk.Label(
+            hdr_row,
+            text="🔒 100% BALANCE-FREE & ANONYMOUS",
+            font=("Arial", 8, "bold"),
+            fg="#6ee7b7",
+            bg="#112a20",
+            padx=8,
+            pady=3,
+        ).pack(side="right", padx=(12, 0))
+
+        tk.Label(
+            dlg,
+            text="Sharing your sanitized daily session logs helps us spot broker API hiccups and improve Enforcer faster:",
+            font=("Arial", 9, "bold"),
+            fg="#94a3b8",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
 
         card_outer = tk.Frame(
             dlg,
@@ -13198,33 +13434,120 @@ def show_preflight_window(
             card_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
         ).pack(side="left", fill="y")
 
-        msg_txt = (
-            "When enabled, PnL Enforcer will automatically upload yesterday's "
-            "balance-redacted log (enforcer_log_YYYY-MM-DD_sanitized.txt) in the "
-            "background when you launch the app. All account balances ($[REDACTED]), "
-            "Windows usernames (~), and order IDs are scrubbed, and your log is "
-            f"tagged only with an anonymous 6-character Tester ID ({tester_id}). "
-            "You can turn this off anytime."
-        )
-        tk.Label(
+        txt_box = tk.Text(
             card_outer,
-            text=msg_txt,
-            font=("Arial", 10),
-            fg="#e2e8f0",
+            width=78,
+            height=12,
             bg="#131922",
-            justify="left",
-            anchor="w",
-            wraplength=560,
-            padx=20,
-            pady=16,
-        ).pack(side="left", fill="both", expand=True)
+            fg="#b8c7d9",
+            font=("Arial", 10, "bold"),
+            wrap="none",
+            bd=0,
+            highlightthickness=0,
+            padx=18,
+            pady=14,
+            cursor="arrow",
+        )
+        txt_box.pack(side="left", fill="both", expand=True)
+
+        txt_box.tag_configure(
+            "hdr_green",
+            font=("Arial", 10, "bold"),
+            foreground="#4ade80",
+            spacing1=0,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "hdr_blue",
+            font=("Arial", 10, "bold"),
+            foreground="#38bdf8",
+            spacing1=2,
+            spacing3=4,
+        )
+        txt_box.tag_configure(
+            "body",
+            font=("Arial", 10, "bold"),
+            foreground="#b8c7d9",
+            spacing1=2,
+            spacing3=3,
+        )
+        txt_box.tag_configure(
+            "pill_blue",
+            font=("Arial", 10, "bold"),
+            foreground="#7dd3fc",
+            background="#1a2636",
+        )
+        txt_box.tag_configure(
+            "pill_green",
+            font=("Arial", 10, "bold"),
+            foreground="#6ee7b7",
+            background="#112a20",
+        )
+        txt_box.tag_configure(
+            "pill_amber",
+            font=("Arial", 10, "bold"),
+            foreground="#fde68a",
+            background="#3b2106",
+        )
+        txt_box.tag_configure(
+            "div_line",
+            font=("Consolas", 8),
+            foreground="#222d3d",
+            spacing1=5,
+            spacing3=5,
+        )
+
+        txt_box.insert(
+            "end",
+            "✓  1. HOW IT WORKS  (Quiet & Automatic in the Background)\n",
+            "hdr_green",
+        )
+        s1_spans = [
+            ("    • On launch, Enforcer quietly uploads yesterday's\n", ("body",)),
+            ("      ", ("body",)),
+            (" enforcer_log_YYYY-MM-DD_sanitized.txt ", ("body", "pill_blue")),
+            (" in the background.\n", ("body",)),
+            ("    • Captures relative ", ("body",)),
+            (" Realized / Open PnL ", ("body", "pill_green")),
+            (", guardrail triggers, and API timing.\n", ("body",)),
+        ]
+        for s_txt, s_tags in s1_spans:
+            txt_box.insert("end", s_txt, s_tags)
+
+        txt_box.insert("end", "─" * 72 + "\n", "div_line")
+
+        txt_box.insert(
+            "end",
+            "🔒  2. YOUR PRIVACY IS 100% PROTECTED  (Zero Account Balances)\n",
+            "hdr_blue",
+        )
+        s2_spans = [
+            ("    • Every total account balance & equity figure is scrubbed to ", ("body",)),
+            (" $[REDACTED] ", ("body", "pill_green")),
+            (",\n", ("body",)),
+            ("      file paths to ", ("body",)),
+            (" ~ ", ("body", "pill_blue")),
+            (", and order IDs to ", ("body",)),
+            (" ...1234 ", ("body", "pill_blue")),
+            (" before upload.\n", ("body",)),
+            ("    • Tagged only with an anonymous 6-character ID (", ("body",)),
+            (f" {tester_id} ", ("body", "pill_amber")),
+            (") — toggle off\n", ("body",)),
+            ("      anytime in ", ("body",)),
+            (" 📜 Logs ▾ ", ("body", "pill_blue")),
+            (" or preview your Safe Log below.", ("body",)),
+        ]
+        for s_txt, s_tags in s2_spans:
+            txt_box.insert("end", s_txt, s_tags)
+        _autofit_readonly_text_box(txt_box, min_w=78, min_h=12)
+        txt_box.configure(state="disabled")
 
         btn_row = tk.Frame(dlg, bg="#0d1117")
         btn_row.pack(fill="x")
 
         make_stadium_button(
             btn_row,
-            text="Preview Safe Log",
+            text="🔍 Preview Safe Log",
             font=("Arial", 9, "bold"),
             fill_color="#141820",
             fill_top_color="#1c212b",
@@ -13234,7 +13557,7 @@ def show_preflight_window(
             hover_border="#38bdf8",
             fg="#7dd3fc",
             canvas_bg="#0d1117",
-            width=154,
+            width=162,
             height=34,
             auto_width=False,
             command=preview_most_recent_safe_log,
@@ -13242,7 +13565,7 @@ def show_preflight_window(
 
         make_stadium_button(
             btn_row,
-            text="Enable Auto-Share",
+            text="✓ Enable Auto-Share",
             font=("Arial", 10, "bold"),
             fill_color="#0d3b20",
             fill_top_color="#14532d",
@@ -13252,7 +13575,7 @@ def show_preflight_window(
             hover_border="#34d399",
             fg="#ffffff",
             canvas_bg="#0d1117",
-            width=174,
+            width=182,
             height=34,
             auto_width=False,
             command=on_enable,
@@ -13260,15 +13583,16 @@ def show_preflight_window(
 
         make_stadium_button(
             btn_row,
-            text="Cancel",
+            text="Not Now",
             font=("Arial", 10, "bold"),
-            fill_color="#3b1520",
-            border_color="#f43f5e",
-            hover_fill="#4f1c2b",
-            hover_border="#fb7185",
-            fg="#ffe4e6",
+            fill_color="#181e26",
+            border_color="#4a5568",
+            hover_fill="#232c38",
+            hover_border="#718096",
+            fg="#e2e8f0",
+            hover_fg="#ffffff",
             canvas_bg="#0d1117",
-            width=108,
+            width=114,
             height=34,
             auto_width=False,
             command=on_cancel,
@@ -13304,14 +13628,30 @@ def show_preflight_window(
 
     def rebuild_logs_dropdown():
         logs_dropdown.delete(0, "end")
+        auto_on = bool(var_auto_share_logs.get())
+        if auto_on:
+            logs_dropdown.add_command(
+                label="💚 ☑ Auto-Share Daily Safe Logs: ON  (Thank You!)",
+                command=_toggle_auto_share_from_menu,
+                fg="#6ee7b7",
+                activeforeground="#d1fae5",
+                bg="#0f2920",
+                activebg="#15392c",
+                font=("Arial", 9, "bold"),
+            )
+        else:
+            logs_dropdown.add_command(
+                label="✨ ☐ Help Improve Enforcer — Auto-Share Safe Logs (100% Redacted)",
+                command=_toggle_auto_share_from_menu,
+                fg="#7dd3fc",
+                activeforeground="#e0f2fe",
+                bg="#102336",
+                activebg="#16324d",
+                font=("Arial", 9, "bold"),
+            )
         logs_dropdown.add_command(
             label="📤 Send Today's Safe Log Now",
             command=send_today_safe_log_now,
-        )
-        chk_mark = "☑" if var_auto_share_logs.get() else "☐"
-        logs_dropdown.add_command(
-            label=f"{chk_mark} Auto-Share Daily Safe Logs (Beta Opt-In)",
-            command=_toggle_auto_share_from_menu,
         )
         logs_dropdown.add_separator()
         logs_dropdown.add_command(
@@ -13332,6 +13672,32 @@ def show_preflight_window(
             command=open_log_archive_folder,
         )
 
+    btn_logs_menu = None
+
+    def _refresh_logs_menu_btn_style():
+        if btn_logs_menu is None:
+            return
+        if var_auto_share_logs.get():
+            btn_logs_menu.config(
+                fill_color="#11221b",
+                fill_top_color="#172e25",
+                border_color="#1f6e4c",
+                hover_fill="#152b22",
+                hover_fill_top="#1c392d",
+                hover_border="#34d399",
+                fg="#bbf7d0",
+            )
+        else:
+            btn_logs_menu.config(
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2a4869",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#38bdf8",
+                fg="#e2e8f0",
+            )
+
     def _on_toggle_auto_share_logs(*_):
         if _auto_share_guard["suppress"]:
             return
@@ -13343,6 +13709,7 @@ def show_preflight_window(
                 finally:
                     _auto_share_guard["suppress"] = False
                 rebuild_logs_dropdown()
+                _refresh_logs_menu_btn_style()
                 return
             config["auto_share_sanitized_logs"] = True
             save_config(config)
@@ -13352,6 +13719,7 @@ def show_preflight_window(
                 f"User enabled Auto-Share Daily Safe Logs (Tester ID: {tester_id}).",
             )
             rebuild_logs_dropdown()
+            _refresh_logs_menu_btn_style()
             _maybe_upload_prior_day_sanitized_log()
         else:
             config["auto_share_sanitized_logs"] = False
@@ -13361,6 +13729,7 @@ def show_preflight_window(
                 "User disabled Auto-Share Daily Safe Logs in Pre-Flight.",
             )
             rebuild_logs_dropdown()
+            _refresh_logs_menu_btn_style()
 
     var_auto_share_logs.trace_add("write", _on_toggle_auto_share_logs)
     rebuild_logs_dropdown()
@@ -13382,12 +13751,13 @@ def show_preflight_window(
         pad_x=22,
         menu=logs_dropdown,
     )
+    _refresh_logs_menu_btn_style()
     btn_logs_menu.pack(side="left", padx=(0, 5))
     attach_tooltip(
         btn_logs_menu,
         "Session & Audit Logs Menu:\n"
-        "• Send Today's Safe Log Now: Uploads today's balance-redacted log directly to the beta diagnostic drive\n"
-        "• Auto-Share Daily Safe Logs (Beta Opt-In): Automatically uploads yesterday's redacted log on startup\n"
+        "• Auto-Share Daily Safe Logs: Automatically uploads yesterday's balance-redacted log on startup\n"
+        "• Send Today's Safe Log Now: Uploads today's balance-redacted log directly to the diagnostic drive\n"
         f"• View Today's Log: Opens your local audit log in Notepad ({_mask_user_path(LOG_PATH)})\n"
         "• Export Today's Safe Log: Creates a privacy-scrubbed copy with total account balances redacted ($[REDACTED]) and copies it to clipboard\n"
         f"• Open Safe Archived Logs: Opens your {LOG_RETENTION_DAYS}-day redacted log archive ({_mask_user_path(SANITIZED_ARCHIVE_DIR)})\n"
@@ -13411,7 +13781,7 @@ def show_preflight_window(
         pad_x=22,
         command=report_bug_action,
     )
-    btn_report_bug.pack(side="left", padx=(0, 6))
+    btn_report_bug.pack(side="left", padx=(0, 5))
     attach_tooltip(
         btn_report_bug,
         "One-Click Bug Report & Safe Log Prep:\n"
@@ -13419,6 +13789,71 @@ def show_preflight_window(
         "• Copies your privacy-scrubbed log straight to your clipboard (ready to Ctrl+V)\n"
         "• Saves enforcer_log_sanitized.txt (in ~ and ~/Downloads) and highlights it in Windows Explorer so you can drag-and-drop it straight into the form\n"
         "• Redacts all total account balances ($[REDACTED]), Windows usernames (~), and order IDs (...1234)."
+    )
+
+    def _toggle_privacy_mode():
+        new_val = not bool(var_privacy_mode.get())
+        var_privacy_mode.set(new_val)
+        config["privacy_mode"] = new_val
+        save_config(config)
+        _refresh_privacy_mode_ui()
+        _sync_broker_acct_pills()
+        populate_account_dropdown()
+        _render_card3_telemetry_live(force=True)
+
+    btn_privacy_mode = make_stadium_button(
+        top_bar,
+        text="👁 Privacy: OFF",
+        font=("Arial", 9, "bold"),
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#2e3746",
+        hover_fill="#181e28",
+        hover_fill_top="#232a36",
+        hover_border="#38bdf8",
+        fg="#cbd5e1",
+        canvas_bg="#11161f",
+        width=116,
+        height=32,
+        pad_x=18,
+        auto_width=False,
+        command=_toggle_privacy_mode,
+    )
+    btn_privacy_mode.pack(side="left", padx=(0, 6))
+
+    def _refresh_privacy_mode_ui():
+        if var_privacy_mode.get():
+            btn_privacy_mode.config(
+                text="🙈 Privacy: ON",
+                fill_color="#102a3a",
+                fill_top_color="#173a4f",
+                border_color="#38bdf8",
+                hover_fill="#143448",
+                hover_fill_top="#1c4760",
+                hover_border="#7dd3fc",
+                fg="#e0f2fe",
+            )
+        else:
+            btn_privacy_mode.config(
+                text="👁 Privacy: OFF",
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#38bdf8",
+                fg="#cbd5e1",
+            )
+
+    _refresh_privacy_mode_ui()
+    attach_tooltip(
+        btn_privacy_mode,
+        "Screenshot Privacy Mode:\n"
+        "Masks sensitive identifiers with ***** in the Pre-Flight window so you can take\n"
+        "clean screenshots or stream safely:\n"
+        "• Hides your ACCOUNT name & digits in the top bar and account selector\n"
+        "• Hides your starting account equity/balance figure in Card 3 (Baseline)\n"
+        "• Keeps all PnL rules, Win/Loss counts, Streak, and Risk guardrails working normally."
     )
 
     populate_account_dropdown()
@@ -13999,6 +14434,7 @@ def show_preflight_window(
                 _apply_preexisting_selection(set(), mark_reviewed=True)
 
             new_cfg["alarms_only_mode"] = bool(var_alarms_only.get())
+            new_cfg["privacy_mode"] = bool(var_privacy_mode.get())
             new_cfg["enable_open_flatten"] = bool(var_open_flat.get())
             if is_tilt_streak_tamper_locked():
                 new_cfg["enable_consec_loss_cooldown"] = True
@@ -14439,6 +14875,19 @@ def show_preflight_window(
     )
     attach_tooltip(c1_tamper_lbl, c1_tamper_tip)
 
+    def _accentuate_max_loss_row(lbl_w, ent_w):
+        """Visually elevates hard Max Loss fields above soft warning alarms."""
+        lbl_w.config(font=("Arial", 10, "bold"), fg="#f26d6d")
+        ent_w.config(
+            font=("Consolas", 11, "bold"),
+            bg="#2e151e",
+            fg="#ffffff",
+            highlightbackground="#b93848",
+            highlightcolor="#f87171",
+            highlightthickness=1,
+        )
+        ent_w._orig_rim = "#b93848"
+
     r_open1 = tk.Frame(c1, bg="#131922")
     r_open1.pack(fill="x", pady=3)
     cb_open_flat = make_glass_checkbutton(
@@ -14457,10 +14906,11 @@ def show_preflight_window(
         r_open1,
         text="Max Open Loss ($):",
         font=("Arial", 10, "bold"),
-        fg="#dc6d72",
+        fg="#f26d6d",
         bg="#131922"
     )
     lbl_open_loss.pack(side="right", padx=(16, 8))
+    _accentuate_max_loss_row(lbl_open_loss, ent_open_loss)
     open_stop_tip = (
         "Single-Trade Open PnL Stop:\n"
         "If your combined unrealized Open PnL drops to or below -Max Open Loss ($),\n"
@@ -14473,6 +14923,24 @@ def show_preflight_window(
     attach_tooltip(cb_open_flat, open_stop_tip)
     attach_tooltip(lbl_open_loss, open_stop_tip)
     attach_tooltip(ent_open_loss, open_stop_tip)
+    # Lock left column minsize wide enough to accommodate the longer
+    # "(Eq + Opt BETA)" label plus comfortable breathing room so toggling
+    # "Include Options" never shifts or resizes the Pre-Flight window.
+    try:
+        import tkinter.font as _tkfont
+        _open_lbl_font = _tkfont.Font(pf, font=("Arial", 10, "bold"))
+        _open_opt_extra_w = max(
+            0,
+            _open_lbl_font.measure("Enable Open PnL Auto-Flatten (Eq + Opt BETA)")
+            - _open_lbl_font.measure("Enable Open PnL Auto-Flatten (Equities)"),
+        )
+        pf.update_idletasks()
+        _left_min_w = max(
+            560, int(r_open1.winfo_reqwidth() + _open_opt_extra_w + 56)
+        )
+        body_frame.columnconfigure(0, weight=1, minsize=_left_min_w)
+    except Exception:
+        body_frame.columnconfigure(0, weight=1, minsize=560)
 
     r_tilt = tk.Frame(c1, bg="#131922")
     r_tilt.pack(fill="x", pady=3)
@@ -14594,7 +15062,7 @@ def show_preflight_window(
                 "Controls which closed round-trip trades count toward or reset your\n"
                 "Consecutive Loss Cooldown streak (ignores tiny micro-scratches)."
             ),
-            font=("Arial", 9),
+            font=("Arial", 9, "bold"),
             fg="#94a3b8",
             bg="#131922",
             justify="left",
@@ -14897,7 +15365,7 @@ def show_preflight_window(
         tk.Label(
             dlg,
             text="Friendly heads-up on how your streak settings behave once a losing streak starts:",
-            font=("Arial", 9),
+            font=("Arial", 9, "bold"),
             fg="#94a3b8",
             bg="#0d1117",
             anchor="w",
@@ -14920,8 +15388,8 @@ def show_preflight_window(
             width=86,
             height=15,
             bg="#131922",
-            fg="#dce4ee",
-            font=("Segoe UI", 10),
+            fg="#b8c7d9",
+            font=("Arial", 10, "bold"),
             wrap="none",
             bd=0,
             highlightthickness=0,
@@ -14933,53 +15401,53 @@ def show_preflight_window(
 
         txt_box.tag_configure(
             "hdr_green",
-            font=("Segoe UI", 10, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#4ade80",
             spacing1=0,
             spacing3=4,
         )
         txt_box.tag_configure(
             "hdr_amber",
-            font=("Segoe UI", 10, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#fbbf24",
             spacing1=2,
             spacing3=4,
         )
         txt_box.tag_configure(
             "hdr_blue",
-            font=("Segoe UI", 10, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#38bdf8",
             spacing1=2,
             spacing3=4,
         )
         txt_box.tag_configure(
             "body",
-            font=("Segoe UI", 10),
-            foreground="#dce4ee",
-            spacing1=1,
-            spacing3=2,
+            font=("Arial", 10, "bold"),
+            foreground="#b8c7d9",
+            spacing1=2,
+            spacing3=3,
         )
         txt_box.tag_configure(
             "pill_blue",
-            font=("Consolas", 9, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#7dd3fc",
             background="#1a2636",
         )
         txt_box.tag_configure(
             "pill_red",
-            font=("Consolas", 9, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#fda4af",
             background="#2c151d",
         )
         txt_box.tag_configure(
             "pill_green",
-            font=("Consolas", 9, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#6ee7b7",
             background="#112a20",
         )
         txt_box.tag_configure(
             "pill_amber",
-            font=("Consolas", 9, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#fde68a",
             background="#3b2106",
         )
@@ -15063,6 +15531,7 @@ def show_preflight_window(
         for s_txt, s_tags in s3_spans:
             txt_box.insert("end", s_txt, s_tags)
 
+        _autofit_readonly_text_box(txt_box, min_w=86, min_h=15)
         txt_box.config(state="disabled")
 
         btn_row = tk.Frame(dlg, bg="#0d1117")
@@ -15445,11 +15914,6 @@ def show_preflight_window(
     base_sub_lbl.pack(fill="x", pady=(2, 6))
     tk.Frame(c3, bg="#222d3d", height=1).pack(fill="x", pady=(0, 6))
     refresh_baseline_preview()
-    attach_tooltip(
-        base_sub_lbl,
-        "Shows today's anchored starting account equity ($0.00 PnL reference point),\n"
-        "remaining Schwab 7-day token lifetime, and today's completed Win/Loss trade count."
-    )
 
     prepos_tip = (
         "Pre-Existing Swing / Long-Term Position Filter (ON by Default):\n"
@@ -15563,15 +16027,36 @@ def show_preflight_window(
 
         dlg.protocol("WM_DELETE_WINDOW", on_cancel)
         dlg.bind("<Escape>", lambda _e: on_cancel())
+        dlg.bind("<Return>", lambda _e: on_start())
 
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 4))
         tk.Label(
-            dlg,
+            hdr_row,
             text="▶  🧪 10-SECOND DRY-RUN OS LOCKOUT TEST",
             font=("Arial", 12, "bold"),
             fg="#fbbf24",
             bg="#0d1117",
             anchor="w",
-        ).pack(fill="x", pady=(0, 12))
+        ).pack(side="left")
+        tk.Label(
+            hdr_row,
+            text="🛡️ SAFE SIMULATION · NO ORDERS",
+            font=("Arial", 8, "bold"),
+            fg="#6ee7b7",
+            bg="#112a20",
+            padx=8,
+            pady=3,
+        ).pack(side="right", padx=(12, 0))
+
+        tk.Label(
+            dlg,
+            text="Preview your lockout audio and Windows screen-lock sequence without affecting your live session:",
+            font=("Arial", 9, "bold"),
+            fg="#94a3b8",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
 
         card_outer = tk.Frame(
             dlg,
@@ -15585,25 +16070,57 @@ def show_preflight_window(
             card_outer, core_color="#fbbf24", card_bg="#131922", glow_on=True
         ).pack(side="left", fill="y")
 
-        msg_txt = (
-            "Run a 10-second simulated lockout sequence now?\n\n"
-            "• Plays the warning siren & verbal lockout voice announcement\n"
-            "• Locks your Windows screen (LockWorkStation) for 10 seconds\n"
-            "• Plays the 3-tone unlock chime & voice confirmation when finished\n\n"
-            "No orders are placed or canceled, and your session baseline and W/L stats remain untouched."
-        )
-        tk.Label(
+        txt_box = tk.Text(
             card_outer,
-            text=msg_txt,
-            font=("Arial", 10, "bold"),
-            fg="#e2e8f0",
+            width=84,
+            height=6,
             bg="#131922",
-            justify="left",
-            anchor="w",
-            wraplength=540,
-            padx=20,
-            pady=16,
-        ).pack(side="left", fill="both", expand=True)
+            fg="#b8c7d9",
+            font=("Arial", 10, "bold"),
+            wrap="none",
+            bd=0,
+            highlightthickness=0,
+            padx=18,
+            pady=14,
+            cursor="arrow",
+        )
+        txt_box.pack(side="left", fill="both", expand=True)
+        txt_box.tag_configure(
+            "body", font=("Arial", 10, "bold"), foreground="#b8c7d9", spacing1=2, spacing3=3
+        )
+        txt_box.tag_configure(
+            "pill_amber", font=("Arial", 10, "bold"), foreground="#fde68a", background="#3b2106"
+        )
+        txt_box.tag_configure(
+            "pill_blue", font=("Arial", 10, "bold"), foreground="#7dd3fc", background="#1a2636"
+        )
+        txt_box.tag_configure(
+            "pill_green", font=("Arial", 10, "bold"), foreground="#6ee7b7", background="#112a20"
+        )
+        dry_spans = [
+            ("• Plays the ", ("body",)),
+            (" Warning Siren ", ("body", "pill_amber")),
+            (" and your selected ", ("body",)),
+            (" Verbal Lockout Voice Cue ", ("body", "pill_blue")),
+            (".\n", ("body",)),
+            ("• Locks your Windows screen (", ("body",)),
+            (" LockWorkStation ", ("body", "pill_amber")),
+            (") for ", ("body",)),
+            (" 10 seconds ", ("body", "pill_blue")),
+            (".\n", ("body",)),
+            ("• Plays the ", ("body",)),
+            (" 3-Tone Unlock Chime ", ("body", "pill_green")),
+            (" and voice confirmation when finished.\n", ("body",)),
+            ("• ", ("body",)),
+            (" Zero broker orders ", ("body", "pill_green")),
+            (" are sent or canceled — your ", ("body",)),
+            (" Baseline & W/L stats ", ("body", "pill_green")),
+            (" stay untouched.", ("body",)),
+        ]
+        for s_txt, s_tags in dry_spans:
+            txt_box.insert("end", s_txt, s_tags)
+        _autofit_readonly_text_box(txt_box, min_w=84, min_h=6)
+        txt_box.configure(state="disabled")
 
         btn_row = tk.Frame(dlg, bg="#0d1117")
         btn_row.pack(fill="x")
@@ -16115,7 +16632,7 @@ def show_preflight_window(
 
         cb_auto_share = make_glass_checkbutton(
             r_poll,
-            text="Auto-Share Safe Logs (Beta Opt-In)",
+            text="Auto-Share Daily Safe Logs",
             variable=var_auto_share_logs,
             font=("Arial", 10, "bold"),
             fg="#7dd3fc",
@@ -16127,7 +16644,7 @@ def show_preflight_window(
         cb_auto_share.pack(side="right", padx=(24, 0))
         attach_tooltip(
             cb_auto_share,
-            "Beta Diagnostic Telemetry (Strictly Opt-In — OFF by Default):\n"
+            "Auto-Share Daily Safe Logs (100% Balance-Redacted):\n"
             "When enabled, PnL Enforcer automatically uploads yesterday's balance-redacted log\n"
             "(enforcer_log_YYYY-MM-DD_sanitized.txt) in the background when you launch the app.\n"
             "• All total account balances ($[REDACTED]), Windows usernames (~), and order IDs are scrubbed.\n"
@@ -16369,7 +16886,7 @@ def show_preflight_window(
         "Open Preferences & Audio Settings:\n"
         "• Session Behavior: Start Fresh on Rulebook Switch & Ignore Pre-Existing Positions\n"
         "• Audio & Voice Cues: Voice Cues, Upside Chime, Voice Selector & Sound/Dry-Run Tester\n"
-        "• System & Telemetry: API Poll Interval (s) & Auto-Share Safe Logs (Beta Opt-In)"
+        "• System & Telemetry: API Poll Interval (s) & Auto-Share Daily Safe Logs"
     )
 
     # ==========================================================
@@ -16385,26 +16902,13 @@ def show_preflight_window(
         return_parts=True
     )
 
-    def _accentuate_max_loss_row(lbl_w, ent_w):
-        """Visually elevates Starting Max Loss fields above soft warning alarms."""
-        lbl_w.config(font=("Arial", 11, "bold"), fg="#f87171")
-        ent_w.config(
-            font=("Consolas", 12, "bold"),
-            bg="#35141d",
-            fg="#ffffff",
-            highlightbackground="#dc2626",
-            highlightcolor="#f87171",
-            highlightthickness=2,
-        )
-        ent_w._orig_rim = "#dc2626"
-
     lbl_pm_max, ent_pm_max, _, _ = make_dual_field_row(
         c4,
         "Starting Max Loss ($):",
         dollar_vars["pm_max_loss"],
         None,
         None,
-        fg1="#f87171",
+        fg1="#f26d6d",
         tip1=(
             "Extended-Hours Starting Max Loss:\n"
             "Your initial worst-case Extended-Hours loss limit before Profit Lock is triggered.\n"
@@ -16587,7 +17091,7 @@ def show_preflight_window(
         dollar_vars["t1_max_loss"],
         None,
         None,
-        fg1="#f87171",
+        fg1="#f26d6d",
         tip1=(
             "RTH Base Tier 1 — Starting Max Loss:\n"
             "Your initial worst-case RTH loss limit before any profit ratchet tiers are unlocked.\n"
@@ -17274,9 +17778,9 @@ def show_preflight_window(
             ent_t1_max,
         ):
             _restore_entry_rim(_ent_w)
-        lbl_pm_max.config(fg="#f87171")
+        lbl_pm_max.config(fg="#f26d6d")
         ent_pm_max.config(state="normal")
-        lbl_t1_max.config(fg="#f87171")
+        lbl_t1_max.config(fg="#f26d6d")
         ent_t1_max.config(state="normal")
         for (
             _t_cb_var,
@@ -17294,7 +17798,7 @@ def show_preflight_window(
 
         if var_alarms_only.get():
             cb_open_flat.config(state="disabled")
-            ent_open_loss.config(state="disabled")
+            ent_open_loss.config(state="disabled", highlightbackground="#3a2029")
             lbl_open_loss.config(fg="#526070")
             cb_tilt_cd.config(state="disabled")
             ent_tilt_count.config(state="disabled")
@@ -17332,10 +17836,10 @@ def show_preflight_window(
                 ),
             )
             if var_open_flat.get():
-                ent_open_loss.config(state="normal")
-                lbl_open_loss.config(fg="#dc6d72")
+                ent_open_loss.config(state="normal", highlightbackground="#b93848")
+                lbl_open_loss.config(fg="#f26d6d")
             else:
-                ent_open_loss.config(state="disabled")
+                ent_open_loss.config(state="disabled", highlightbackground="#3a2029")
                 lbl_open_loss.config(fg="#526070")
 
             if tamper_locked:
@@ -17851,7 +18355,7 @@ def show_preflight_window(
         tk.Label(
             dlg,
             text="Your Daily Stop lockout has finished. Before placing another trade, please review your Daily Stop:",
-            font=("Arial", 9),
+            font=("Arial", 9, "bold"),
             fg="#94a3b8",
             bg="#0d1117",
             anchor="w",
@@ -17874,8 +18378,8 @@ def show_preflight_window(
             width=88,
             height=20,
             bg="#131922",
-            fg="#dce4ee",
-            font=("Segoe UI", 10),
+            fg="#b8c7d9",
+            font=("Arial", 10, "bold"),
             wrap="none",
             bd=0,
             highlightthickness=0,
@@ -17887,53 +18391,53 @@ def show_preflight_window(
 
         txt_box.tag_configure(
             "hdr_red",
-            font=("Segoe UI", 10, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#f87171",
             spacing1=0,
             spacing3=4,
         )
         txt_box.tag_configure(
             "hdr_green",
-            font=("Segoe UI", 10, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#4ade80",
             spacing1=2,
             spacing3=4,
         )
         txt_box.tag_configure(
             "hdr_amber",
-            font=("Segoe UI", 10, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#fbbf24",
             spacing1=2,
             spacing3=4,
         )
         txt_box.tag_configure(
             "body",
-            font=("Segoe UI", 10),
-            foreground="#dce4ee",
-            spacing1=1,
-            spacing3=2,
+            font=("Arial", 10, "bold"),
+            foreground="#b8c7d9",
+            spacing1=2,
+            spacing3=3,
         )
         txt_box.tag_configure(
             "pill_blue",
-            font=("Consolas", 9, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#7dd3fc",
             background="#1a2636",
         )
         txt_box.tag_configure(
             "pill_red",
-            font=("Consolas", 9, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#fca5a5",
             background="#311820",
         )
         txt_box.tag_configure(
             "pill_green",
-            font=("Consolas", 9, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#6ee7b7",
             background="#132a22",
         )
         txt_box.tag_configure(
             "pill_amber",
-            font=("Consolas", 9, "bold"),
+            font=("Arial", 10, "bold"),
             foreground="#fde68a",
             background="#33220c",
         )
@@ -18018,6 +18522,7 @@ def show_preflight_window(
         for s_txt, s_tags in s3_spans:
             txt_box.insert("end", s_txt, s_tags)
 
+        _autofit_readonly_text_box(txt_box, min_w=88, min_h=20)
         txt_box.config(state="disabled")
 
         btn_row = tk.Frame(dlg, bg="#0d1117")
@@ -19410,7 +19915,14 @@ def _build_changelog_nav_bar(parent_card, txt_box, nav_ctrl):
         bg="#0f151e",
     ).pack(side="left", padx=(2, 4))
 
-    def _close_ver_popup():
+    def _close_ver_popup(*_):
+        top_win = parent_card.winfo_toplevel()
+        for seq, bid in nav_state.get("top_bind_ids", []):
+            try:
+                top_win.unbind(seq, bid)
+            except Exception:
+                pass
+        nav_state["top_bind_ids"] = []
         pop = nav_state.get("popup")
         nav_state["popup"] = None
         if pop is not None:
@@ -19429,70 +19941,129 @@ def _build_changelog_nav_bar(parent_card, txt_box, nav_ctrl):
         if nav_state.get("popup") is not None:
             _close_ver_popup()
             return
-        pop = tk.Toplevel(parent_card.winfo_toplevel())
-        pop.wm_overrideredirect(True)
-        pop.attributes("-topmost", True)
-        pop.config(bg="#38bdf8", padx=1, pady=1)
-        nav_state["popup"] = pop
-
-        list_frame = tk.Frame(pop, bg="#111722")
-        list_frame.pack(fill="both", expand=True)
-
-        vis_rows = min(12, len(versions))
-        lb_sb = tk.Scrollbar(list_frame)
-        lb_sb.pack(side="right", fill="y")
-        lb = tk.Listbox(
-            list_frame,
-            height=vis_rows,
-            width=26,
-            bg="#111722",
-            fg="#e2e8f0",
-            selectbackground="#1e3a5f",
-            selectforeground="#38bdf8",
-            font=("Segoe UI", 9, "bold"),
-            bd=0,
-            highlightthickness=0,
-            activestyle="none",
-            yscrollcommand=lb_sb.set,
-            cursor="hand2",
-        )
-        lb.pack(side="left", fill="both", expand=True, padx=2, pady=2)
-        lb_sb.config(command=lb.yview)
-
-        for v_item in versions:
-            lb.insert("end", f"  {v_item['label']}")
-        lb.selection_set(nav_state["cur_idx"])
-        lb.see(nav_state["cur_idx"])
-
-        def _on_lb_click(_evt=None):
-            sel = lb.curselection()
-            if sel:
-                _select_version(int(sel[0]))
-
-        lb.bind("<ButtonRelease-1>", _on_lb_click)
-        lb.bind("<Return>", _on_lb_click)
-        pop.bind("<Escape>", lambda _e: _close_ver_popup())
-        pop.bind("<FocusOut>", lambda _e: _close_ver_popup())
-
-        pop.update_idletasks()
-        bx = ver_pick_btn.winfo_rootx()
-        by = ver_pick_btn.winfo_rooty() + ver_pick_btn.winfo_height() + 2
-        m_left, m_top, m_right, m_bottom = get_monitor_work_area(
-            bx, by, widget=ver_pick_btn
-        )
-        if by + pop_h > m_bottom - 8:
-            by = max(m_top + 8, ver_pick_btn.winfo_rooty() - pop_h - 2)
-        if bx + pop_w > m_right - 8:
-            bx = max(m_left + 8, m_right - pop_w - 8)
-        bx = max(m_left + 8, bx)
-        by = max(m_top + 8, by)
-        pop.wm_geometry(f"+{int(bx)}+{int(by)}")
-        pop.deiconify()
-        pop.lift()
         try:
-            lb.focus_set()
+            top_win = parent_card.winfo_toplevel()
+            pop = tk.Toplevel(top_win)
+            pop.withdraw()
+            pop.wm_overrideredirect(True)
+            pop.attributes("-topmost", True)
+            pop.config(bg="#38bdf8", padx=1, pady=1)
+            nav_state["popup"] = pop
+            nav_state["top_bind_ids"] = []
+
+            list_frame = tk.Frame(pop, bg="#111722")
+            list_frame.pack(fill="both", expand=True)
+
+            vis_rows = min(12, len(versions))
+            lb_sb = tk.Scrollbar(list_frame)
+            lb_sb.pack(side="right", fill="y")
+            lb = tk.Listbox(
+                list_frame,
+                height=vis_rows,
+                width=26,
+                bg="#111722",
+                fg="#e2e8f0",
+                selectbackground="#1e3a5f",
+                selectforeground="#38bdf8",
+                font=("Segoe UI", 9, "bold"),
+                bd=0,
+                highlightthickness=0,
+                activestyle="none",
+                yscrollcommand=lb_sb.set,
+                cursor="hand2",
+            )
+            lb.pack(side="left", fill="both", expand=True, padx=2, pady=2)
+            lb_sb.config(command=lb.yview)
+
+            for v_item in versions:
+                lb.insert("end", f"  {v_item['label']}")
+            lb.selection_set(nav_state["cur_idx"])
+            lb.see(nav_state["cur_idx"])
+
+            def _on_lb_click(_evt=None):
+                sel = lb.curselection()
+                if sel:
+                    _select_version(int(sel[0]))
+
+            def _on_lb_motion(evt):
+                try:
+                    hov_idx = lb.nearest(evt.y)
+                    if 0 <= hov_idx < len(versions):
+                        lb.selection_clear(0, "end")
+                        lb.selection_set(hov_idx)
+                except Exception:
+                    pass
+
+            def _on_lb_wheel(evt):
+                try:
+                    delta = int(-1 * (evt.delta / 120))
+                    if delta != 0:
+                        lb.yview_scroll(delta, "units")
+                except Exception:
+                    pass
+                return "break"
+
+            lb.bind("<Motion>", _on_lb_motion)
+            lb.bind("<MouseWheel>", _on_lb_wheel)
+            lb.bind("<ButtonRelease-1>", _on_lb_click)
+            lb.bind("<Return>", _on_lb_click)
+
+            pop.update_idletasks()
+            pop_w = max(
+                int(pop.winfo_reqwidth()), int(ver_pick_btn.winfo_width()), 200
+            )
+            pop_h = max(int(pop.winfo_reqheight()), 80)
+            bx = int(ver_pick_btn.winfo_rootx())
+            by = int(
+                ver_pick_btn.winfo_rooty() + ver_pick_btn.winfo_height() + 2
+            )
+            m_left, m_top, m_right, m_bottom = get_monitor_work_area(
+                bx, by, widget=ver_pick_btn
+            )
+            if by + pop_h > m_bottom - 8:
+                by = max(m_top + 8, int(ver_pick_btn.winfo_rooty()) - pop_h - 2)
+            if bx + pop_w > m_right - 8:
+                bx = max(m_left + 8, m_right - pop_w - 8)
+            bx = max(m_left + 8, bx)
+            by = max(m_top + 8, by)
+            pop.wm_geometry(f"{pop_w}x{pop_h}+{int(bx)}+{int(by)}")
+            pop.deiconify()
+            pop.lift()
+            try:
+                lb.focus_force()
+            except Exception:
+                pass
+
+            pop.bind("<Escape>", _close_ver_popup)
+            lb.bind("<Escape>", _close_ver_popup)
+
+            def _on_top_click(evt):
+                try:
+                    w_obj = getattr(evt, "widget", None)
+                    w_str = str(w_obj or "")
+                    if w_str.startswith(str(pop)) or w_obj is ver_pick_btn:
+                        return
+                except Exception:
+                    pass
+                _close_ver_popup()
+
+            def _bind_outside_dismiss():
+                if nav_state.get("popup") is not pop or not pop.winfo_exists():
+                    return
+                try:
+                    b1 = top_win.bind("<Button-1>", _on_top_click, add="+")
+                    if b1:
+                        nav_state["top_bind_ids"].append(("<Button-1>", b1))
+                    for seq in ("<Configure>", "<Unmap>", "<Escape>"):
+                        bid = top_win.bind(seq, _close_ver_popup, add="+")
+                        if bid:
+                            nav_state["top_bind_ids"].append((seq, bid))
+                except Exception:
+                    pass
+
+            pop.after(30, _bind_outside_dismiss)
         except Exception:
-            pass
+            _close_ver_popup()
 
     ver_pick_btn = make_stadium_button(
         nav_bar,
@@ -19716,7 +20287,7 @@ def show_update_available_dialog(curr_ver, new_ver, changelog_md=""):
                 "Your saved Pre-Flight settings, daily account baselines, and "
                 "broker API tokens are 100% preserved."
             ),
-            font=("Arial", 9),
+            font=("Arial", 9, "bold"),
             fg="#94a3b8",
             bg="#0d1117",
             anchor="w",
