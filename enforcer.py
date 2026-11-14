@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.54"
+APP_VERSION = "0.9.55"
 
 import os
 import sys
@@ -2414,6 +2414,15 @@ def format_dist_to_stop_hud(distance_to_terminate, locked_down=None):
     return f"${dist_val:,.2f}"
 
 
+def _get_effective_rth_tier_stops(t1_max, t2_on, t2_max, t3_on, t3_max):
+    """Ensures RTH Profit Ratchet Tiers 2 & 3 never loosen the Daily Stop
+    below Starting Max Loss (-t1_max) or a lower enabled tier's stop."""
+    base_t1_stop = -abs(float(t1_max))
+    eff_t2 = max(base_t1_stop, float(t2_max)) if t2_on else base_t1_stop
+    eff_t3 = max(eff_t2, float(t3_max)) if t3_on else eff_t2
+    return base_t1_stop, eff_t2, eff_t3
+
+
 def describe_active_floor(cfg=None, rth_mode=None):
     """Returns (floor_equity, stop_pnl, hud_hdr_tag, tier_short_label,
     tier_full_desc, setting_field_hint) for the currently active Daily Stop
@@ -2450,7 +2459,7 @@ def describe_active_floor(cfg=None, rth_mode=None):
         pm_trail = float(c.get("pm_trail_cushion", 500.0))
         pm_max = float(c.get("pm_max_loss", 1500.0))
         if pm_lock_on and max_realized_profit >= pm_trig:
-            fl_eq = hwm_eq - pm_trail
+            fl_eq = max(start_equity - pm_max, hwm_eq - pm_trail)
             st_pnl = round(fl_eq - start_equity, 2)
             return (
                 fl_eq,
@@ -2480,8 +2489,20 @@ def describe_active_floor(cfg=None, rth_mode=None):
     t2_trig = float(c.get("t2_trigger", 250.0))
     t2_max = float(c.get("t2_max_loss", -1000.0))
     t1_max = float(c.get("t1_max_loss", 2000.0))
+    base_t1_stop, eff_t2_max, eff_t3_max = _get_effective_rth_tier_stops(
+        t1_max, t2_on, t2_max, t3_on, t3_max
+    )
     if t4_on and max_realized_profit >= t4_trig:
-        fl_eq = hwm_eq - t4_trail
+        prior_stop_pnl = (
+            eff_t3_max
+            if (t3_on and max_realized_profit >= t3_trig)
+            else (
+                eff_t2_max
+                if (t2_on and max_realized_profit >= t2_trig)
+                else base_t1_stop
+            )
+        )
+        fl_eq = max(start_equity + prior_stop_pnl, hwm_eq - t4_trail)
         st_pnl = round(fl_eq - start_equity, 2)
         return (
             fl_eq,
@@ -2492,7 +2513,7 @@ def describe_active_floor(cfg=None, rth_mode=None):
             "Card 5 'Tier 4 — Trail Peak By ($)' (or uncheck Tier 4)",
         )
     if t3_on and max_realized_profit >= t3_trig:
-        fl_eq = start_equity + t3_max
+        fl_eq = start_equity + eff_t3_max
         st_pnl = round(fl_eq - start_equity, 2)
         return (
             fl_eq,
@@ -2503,7 +2524,7 @@ def describe_active_floor(cfg=None, rth_mode=None):
             "Card 5 'Tier 3 — Stop Level ($)' (or uncheck Tier 3)",
         )
     if t2_on and max_realized_profit >= t2_trig:
-        fl_eq = start_equity + t2_max
+        fl_eq = start_equity + eff_t2_max
         st_pnl = round(fl_eq - start_equity, 2)
         return (
             fl_eq,
@@ -10587,6 +10608,8 @@ def trigger_lockdown(
     lock_on = (not alarms_only) and config.get("enable_lock_os", False)
 
     if not flat_on and not kill_tos and not kill_wb and not lock_on:
+        is_locked_down = True
+        daily_breach_settings_prompted = False
         trigger_alarm(reason, ui_button, context_str)
         mode_desc = (
             "Alarms Only Mode is ON"
@@ -11415,6 +11438,20 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 t2_on = config.get("enable_t2", True)
                 t3_on = config.get("enable_t3", True)
                 t4_on = config.get("enable_t4", True)
+                base_t1_stop, eff_t2_max, eff_t3_max = (
+                    _get_effective_rth_tier_stops(
+                        t1_max, t2_on, t2_max, t3_on, t3_max
+                    )
+                )
+                prior_rth_stop = (
+                    eff_t3_max
+                    if (t3_on and max_realized_profit >= t3_trig)
+                    else (
+                        eff_t2_max
+                        if (t2_on and max_realized_profit >= t2_trig)
+                        else base_t1_stop
+                    )
+                )
 
                 rth_now = is_rth()
 
@@ -11429,17 +11466,17 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 #    0.2s re-verification poll before firing enforcement.
                 active_floor_now = (
                     (
-                        max_equity - pm_trail
+                        max(start_equity - pm_max, max_equity - pm_trail)
                         if (pm_lock_on and max_realized_profit >= pm_trig)
                         else start_equity - pm_max
                     )
                     if not rth_now
                     else (
-                        max_equity - t4_trail
+                        max(start_equity + prior_rth_stop, max_equity - t4_trail)
                         if (t4_on and max_realized_profit >= t4_trig)
-                        else start_equity + t3_max
+                        else start_equity + eff_t3_max
                         if (t3_on and max_realized_profit >= t3_trig)
-                        else start_equity + t2_max
+                        else start_equity + eff_t2_max
                         if (t2_on and max_realized_profit >= t2_trig)
                         else start_equity - t1_max
                     )
@@ -11463,13 +11500,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         pass
                     elif t3_on and max_realized_profit >= t3_trig:
                         if (
-                            t3_max < 0
+                            eff_t3_max < 0
                             and "Hit $0 (Tier 3)" not in triggered_alarms
                         ):
                             warn_floors.append(start_equity)
                     elif t2_on and max_realized_profit >= t2_trig:
                         if (
-                            t2_max < 0
+                            eff_t2_max < 0
                             and "Hit $0 (Tier 2)" not in triggered_alarms
                         ):
                             warn_floors.append(start_equity)
@@ -11666,20 +11703,40 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         triggered_alarms[f"Ext-Hours -${pm_w1:,.0f} Warn 1"] = time.time()
                     if pm_w2_on and net_pnl <= -pm_w2:
                         triggered_alarms[f"Ext-Hours -${pm_w2:,.0f} Warn 2"] = time.time()
-                    if (t2_on or t3_on) and current_eq <= start_equity:
+                    if (
+                        t2_on
+                        and max_realized_profit >= t2_trig
+                        and eff_t2_max < 0
+                        and current_eq <= start_equity
+                    ):
                         triggered_alarms["Hit $0 (Tier 2)"] = time.time()
+                    if (
+                        t3_on
+                        and max_realized_profit >= t3_trig
+                        and eff_t3_max < 0
+                        and current_eq <= start_equity
+                    ):
                         triggered_alarms["Hit $0 (Tier 3)"] = time.time()
                     if t1_w1_on and current_eq <= (start_equity - t1_w1):
                         triggered_alarms[f"Hit -${t1_w1:,.0f} (Tier 1)"] = time.time()
                     if t1_w2_on and current_eq <= (start_equity - t1_w2):
                         triggered_alarms[f"Hit -${t1_w2:,.0f} (Tier 1)"] = time.time()
                     active_floor = (
-                        (max_equity - pm_trail if (pm_lock_on and max_realized_profit >= pm_trig) else start_equity - pm_max)
+                        (
+                            max(start_equity - pm_max, max_equity - pm_trail)
+                            if (pm_lock_on and max_realized_profit >= pm_trig)
+                            else start_equity - pm_max
+                        )
                         if not is_rth() else
-                        (max_equity - t4_trail if (t4_on and max_realized_profit >= t4_trig) else
-                         start_equity + t3_max if (t3_on and max_realized_profit >= t3_trig) else
-                         start_equity + t2_max if (t2_on and max_realized_profit >= t2_trig) else
-                         start_equity - t1_max)
+                        (
+                            max(start_equity + prior_rth_stop, max_equity - t4_trail)
+                            if (t4_on and max_realized_profit >= t4_trig)
+                            else start_equity + eff_t3_max
+                            if (t3_on and max_realized_profit >= t3_trig)
+                            else start_equity + eff_t2_max
+                            if (t2_on and max_realized_profit >= t2_trig)
+                            else start_equity - t1_max
+                        )
                     )
                     if current_eq <= active_floor:
                         is_locked_down = True
@@ -11855,7 +11912,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         check_alarm_rearm(r_pm_w1, net_pnl, -pm_w1)
 
                     if pm_lock_on and max_realized_profit >= pm_trig:
-                        floor_equity = max_equity - pm_trail
+                        floor_equity = max(start_equity - pm_max, max_equity - pm_trail)
                         check_alarm_rearm(
                             r_pm_tr, current_eq, floor_equity
                         )
@@ -11900,11 +11957,18 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 else:
                     if t4_on and max_realized_profit >= t4_trig:
-                        floor_equity = max_equity - t4_trail
+                        floor_equity = max(
+                            start_equity + prior_rth_stop,
+                            max_equity - t4_trail,
+                        )
                         if pending_halt_breach is not None:
                             pass
                         elif not is_locked_down and current_eq <= floor_equity:
-                            msg = f"Breached ${t4_trail:,.0f} Trailing Floor"
+                            msg = (
+                                f"Breached ${t4_trail:,.0f} Trailing Floor"
+                                if (max_equity - t4_trail) >= (start_equity + prior_rth_stop)
+                                else f"Breached Tier 4 Clamped Floor ({format_dollar(round(floor_equity - start_equity, 2))})"
+                            )
                             trigger_lockdown(
                                 active_adapter, msg, mute_btn, has_options, ctx
                             )
@@ -11923,14 +11987,14 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
 
                     elif t3_on and max_realized_profit >= t3_trig:
-                        floor_equity = start_equity + t3_max
+                        floor_equity = start_equity + eff_t3_max
                         r_t3 = "Hit $0 (Tier 3)"
-                        if t3_max < 0:
+                        if eff_t3_max < 0:
                             check_alarm_rearm(r_t3, current_eq, start_equity)
                         if pending_halt_breach is not None:
                             pass
                         elif not is_locked_down and current_eq <= floor_equity:
-                            msg = f"Breached Tier 3 Stop ({format_dollar(t3_max)})"
+                            msg = f"Breached Tier 3 Stop ({format_dollar(eff_t3_max)})"
                             trigger_lockdown(
                                 active_adapter, msg, mute_btn, has_options, ctx
                             )
@@ -11939,7 +12003,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             and not is_flat
                             and open_pnl <= -open_max
                         ):
-                            if t3_max < 0 and current_eq <= start_equity:
+                            if eff_t3_max < 0 and current_eq <= start_equity:
                                 triggered_alarms.setdefault(r_t3, time.time())
                             r_open = f"Open PnL -${open_max:,.0f} Stop"
                             trigger_open_pnl_flatten(
@@ -11951,20 +12015,20 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
                         elif (
                             not is_locked_down
-                            and t3_max < 0
+                            and eff_t3_max < 0
                             and current_eq <= start_equity
                         ):
                             trigger_alarm(r_t3, mute_btn, ctx)
 
                     elif t2_on and max_realized_profit >= t2_trig:
-                        floor_equity = start_equity + t2_max
+                        floor_equity = start_equity + eff_t2_max
                         r_t2 = "Hit $0 (Tier 2)"
-                        if t2_max < 0:
+                        if eff_t2_max < 0:
                             check_alarm_rearm(r_t2, current_eq, start_equity)
                         if pending_halt_breach is not None:
                             pass
                         elif not is_locked_down and current_eq <= floor_equity:
-                            msg = f"Breached Tier 2 Stop ({format_dollar(t2_max)})"
+                            msg = f"Breached Tier 2 Stop ({format_dollar(eff_t2_max)})"
                             trigger_lockdown(
                                 active_adapter, msg, mute_btn, has_options, ctx
                             )
@@ -11973,7 +12037,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             and not is_flat
                             and open_pnl <= -open_max
                         ):
-                            if t2_max < 0 and current_eq <= start_equity:
+                            if eff_t2_max < 0 and current_eq <= start_equity:
                                 triggered_alarms.setdefault(r_t2, time.time())
                             r_open = f"Open PnL -${open_max:,.0f} Stop"
                             trigger_open_pnl_flatten(
@@ -11985,7 +12049,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
                         elif (
                             not is_locked_down
-                            and t2_max < 0
+                            and eff_t2_max < 0
                             and current_eq <= start_equity
                         ):
                             trigger_alarm(r_t2, mute_btn, ctx)
@@ -12082,7 +12146,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 if not rth_now:
                     full_leash = (
-                        max(1.0, float(pm_trail))
+                        max(1.0, float(pm_trail), float(pm_max))
                         if (pm_lock_on and max_realized_profit >= pm_trig)
                         else max(1.0, float(pm_max))
                     )
@@ -12092,13 +12156,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     elif t3_on and max_realized_profit >= t3_trig:
                         full_leash = max(
                             1.0,
-                            float(max_realized_profit - t3_max),
+                            float(max_realized_profit - eff_t3_max),
                             float(t1_max)
                         )
                     elif t2_on and max_realized_profit >= t2_trig:
                         full_leash = max(
                             1.0,
-                            float(max_realized_profit - t2_max),
+                            float(max_realized_profit - eff_t2_max),
                             float(t1_max)
                         )
                     else:
@@ -12116,25 +12180,75 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     current_upside_tier = new_upside_tier
                     fl_str = format_dollar(terminate_pnl_level)
                     if not rth_now:
-                        banner_txt = (
-                            f"★ EXT-HOURS PROFIT LOCK UNLOCKED — "
-                            f"FLOOR RAISED TO {fl_str} ★"
+                        ext_clamped = (
+                            pm_lock_on
+                            and max_realized_profit >= pm_trig
+                            and (max_equity - pm_trail) < (start_equity - pm_max)
                         )
-                        log_txt = (
-                            f"Extended-Hours Profit Lock unlocked at "
-                            f"{format_dollar(max_realized_profit)} — "
-                            f"Floor raised to {fl_str}"
-                        )
+                        if ext_clamped:
+                            raw_ext_pnl = round(
+                                (max_equity - pm_trail) - start_equity, 2
+                            )
+                            banner_txt = (
+                                f"★ EXT-HOURS PROFIT LOCK UNLOCKED — "
+                                f"FLOOR HELD AT {fl_str} ★"
+                            )
+                            log_txt = (
+                                f"Extended-Hours Profit Lock unlocked at "
+                                f"{format_dollar(max_realized_profit)} — "
+                                f"Floor held at {fl_str} (clamped; trailing stop "
+                                f"{format_dollar(raw_ext_pnl)} is below base floor "
+                                f"-${pm_max:,.0f})"
+                            )
+                        else:
+                            banner_txt = (
+                                f"★ EXT-HOURS PROFIT LOCK UNLOCKED — "
+                                f"FLOOR RAISED TO {fl_str} ★"
+                            )
+                            log_txt = (
+                                f"Extended-Hours Profit Lock unlocked at "
+                                f"{format_dollar(max_realized_profit)} — "
+                                f"Floor raised to {fl_str}"
+                            )
                     else:
-                        banner_txt = (
-                            f"★ TIER {new_upside_tier} UNLOCKED — "
-                            f"DAILY FLOOR RAISED TO {fl_str} ★"
-                        )
-                        log_txt = (
-                            f"RTH Tier {new_upside_tier} unlocked at "
-                            f"{format_dollar(max_realized_profit)} — "
-                            f"Daily Floor raised to {fl_str}"
-                        )
+                        tier_clamped = False
+                        raw_tier_stop = None
+                        if new_upside_tier == 2 and eff_t2_max > float(t2_max):
+                            tier_clamped = True
+                            raw_tier_stop = float(t2_max)
+                        elif new_upside_tier == 3 and eff_t3_max > float(t3_max):
+                            tier_clamped = True
+                            raw_tier_stop = float(t3_max)
+                        elif new_upside_tier == 4 and (
+                            (max_equity - t4_trail) < (start_equity + prior_rth_stop)
+                        ):
+                            tier_clamped = True
+                            raw_tier_stop = round(
+                                (max_equity - t4_trail) - start_equity, 2
+                            )
+
+                        if tier_clamped and raw_tier_stop is not None:
+                            banner_txt = (
+                                f"★ TIER {new_upside_tier} UNLOCKED — "
+                                f"DAILY FLOOR HELD AT {fl_str} ★"
+                            )
+                            log_txt = (
+                                f"RTH Tier {new_upside_tier} unlocked at "
+                                f"{format_dollar(max_realized_profit)} — "
+                                f"Daily Floor held at {fl_str} (clamped; "
+                                f"configured Tier {new_upside_tier} stop "
+                                f"{format_dollar(raw_tier_stop)} is below prior floor)"
+                            )
+                        else:
+                            banner_txt = (
+                                f"★ TIER {new_upside_tier} UNLOCKED — "
+                                f"DAILY FLOOR RAISED TO {fl_str} ★"
+                            )
+                            log_txt = (
+                                f"RTH Tier {new_upside_tier} unlocked at "
+                                f"{format_dollar(max_realized_profit)} — "
+                                f"Daily Floor raised to {fl_str}"
+                            )
                     trigger_upside_tier_glow(mute_btn, banner_txt, log_txt)
 
                 c1_bg = (
@@ -12218,10 +12332,15 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     )
                 )
                 if consecutive_api_failures == 1 and not is_tok_exp:
+                    if hasattr(active_adapter, "reconnect_session"):
+                        try:
+                            active_adapter.reconnect_session()
+                        except Exception:
+                            pass
                     log_event(
                         "WARN",
                         f"Broker API poll failed (Attempt #1: {raw_err[:90]}) — "
-                        f"retrying automatically...",
+                        f"refreshed HTTP session & retrying automatically...",
                     )
                     if not alarm_active and not cooldown_active:
                         retry_1_txt = (
@@ -16232,6 +16351,46 @@ def show_preflight_window(
                     float(config.get("consec_win_reset_dollars", 10.0))
                 )
             new_cfg["signed_tier_stops"] = True
+
+            t1_stop_chk = -abs(float(new_cfg["t1_max_loss"]))
+            inv_warnings = []
+            prev_tier_lbl = f"Tier 1 Starting Max Loss ({format_dollar(t1_stop_chk)})"
+            prev_tier_eff = t1_stop_chk
+            if new_cfg.get("enable_t2", True):
+                t2_val_chk = float(new_cfg["t2_max_loss"])
+                if t2_val_chk < prev_tier_eff:
+                    inv_warnings.append(
+                        f"• Tier 2 Stop Level ({format_dollar(t2_val_chk)}) is below "
+                        f"{prev_tier_lbl}."
+                    )
+                else:
+                    prev_tier_lbl = f"Tier 2 Stop ({format_dollar(t2_val_chk)})"
+                    prev_tier_eff = t2_val_chk
+            if new_cfg.get("enable_t3", True):
+                t3_val_chk = float(new_cfg["t3_max_loss"])
+                if t3_val_chk < prev_tier_eff:
+                    inv_warnings.append(
+                        f"• Tier 3 Stop Level ({format_dollar(t3_val_chk)}) is below "
+                        f"{prev_tier_lbl}."
+                    )
+            if inv_warnings:
+                hide_all_tooltips()
+                go_back = messagebox.askyesno(
+                    "Inverted Profit Ratchet Stop Level(s)",
+                    "Heads up — one or more RTH Profit Ratchet tiers have a lower (wider loss) "
+                    "'Stop Level ($)' than an earlier tier:\n\n"
+                    + "\n".join(inv_warnings)
+                    + "\n\nRemember: 'Stop Level ($)' is your Daily Net PnL stop level "
+                    "(for example: -250 for -$250, 0 for breakeven, or +100 for locked profit) "
+                    "— NOT a trailing offset.\n\n"
+                    "Enforcer automatically clamps profit ratchets so unlocking a higher tier "
+                    "will never widen your Daily Max Loss.\n\n"
+                    "Would you like to go back and adjust your Card 5 Stop Levels now?\n"
+                    "(Click 'Yes' to edit, or 'No' to continue with floor clamping active.)",
+                    parent=pf,
+                )
+                if go_back:
+                    return
 
             first_poll_of_launch = True
 

@@ -4,6 +4,25 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.55] — 2026-11-14
+### ⚡ Quick Summary
+- **Monotonic Profit Ratchet Floor Clamping & Pre-Flight Inverted Stop Warning:** RTH Tiers 2–4 and Extended-Hours Profit Lock now enforce monotonic floor clamping so unlocking a higher profit tier can never loosen your Daily Stop below `Starting Max Loss ($)` or a lower enabled tier, and Pre-Flight warns you before launch if a Tier 2/3 `Stop Level ($)` is entered lower than an earlier tier.
+- **Observation / `Alarms Only` Daily Breach Latch & Clean Tier 2/3 Startup:** Breaching the Daily Floor in `Alarms Only` Mode now latches cleanly so it sounds and logs once instead of re-checking every 2-second poll, and Tier 2/3 `$0` pullback warnings only pre-seed at launch once their unlock profit threshold has been reached (eliminating false `[REARM]` log entries).
+- **Attempt `#1` Stale Socket Auto-Refresh (Schwab & Webull):** Refreshes the broker HTTP session immediately on Attempt `#1` of a read timeout so stale idle keep-alive sockets recover cleanly without tripping a 2-poll `CONNECTION LOST` alert.
+
+### 🔍 Detailed Breakdown
+- **Monotonic Profit Ratchet Floor Protection (`_get_effective_rth_tier_stops`, `describe_active_floor`, `data_loop`, `save_and_launch`):**
+  - Added `_get_effective_rth_tier_stops()` and applied consistent floor clamping across `describe_active_floor()` and `data_loop()` (covering RTH Tiers 2–4 and Extended-Hours Profit Lock) so an inverted `Stop Level ($)` or wide trailing offset never drops the active floor below `Starting Max Loss ($)` or a prior unlocked tier.
+  - Updated `[RATCHET]` log and emerald HUD banner messaging to display `FLOOR HELD AT ... (clamped; configured Tier N stop ... is below prior floor)` whenever clamping holds the prior floor.
+  - Added a Pre-Flight confirmation prompt in `save_and_launch()` when an enabled Tier 2 or Tier 3 `Stop Level ($)` is below the preceding tier, clarifying that `Stop Level ($)` represents the Daily Net PnL stop level (e.g., `-250`, `0`, or `+100`) rather than a trailing offset.
+- **Observation Mode Daily Breach Latch & Tier 2/3 `$0` Pre-Seed Fix (`trigger_lockdown`, `data_loop`):**
+  - Latched `is_locked_down = True` and `daily_breach_settings_prompted = False` inside `trigger_lockdown()` when `Alarms Only Mode` is ON (or all daily enforcement toggles are OFF), preventing repeated `0.2s` anti-wick broker re-fetches and `[GUARDRAIL]` log spam on every subsequent poll while still preserving recovery auto-rearm (`RECOVERY_BUFFER_DOLLARS`).
+  - Guarded `first_poll_of_launch` pre-seeding of `"Hit $0 (Tier 2)"` and `"Hit $0 (Tier 3)"` in `data_loop()` so those pullback alerts are only pre-seeded when the corresponding tier is already unlocked (`max_realized_profit >= t2_trig` / `t3_trig` with a negative effective stop).
+- **Attempt `#1` Stale Keep-Alive Socket Refresh (`data_loop` — Schwab & Webull):**
+  - Called `active_adapter.reconnect_session()` immediately on `consecutive_api_failures == 1` (non-token-expiration errors) so stale `httpx` / `requests` keep-alive connections after idle periods are flushed before Attempt `#2` runs, eliminating false 2-poll `CONNECTION LOST` alerts.
+
+---
+
 ## [v0.9.54] — 2026-11-13
 ### ⚡ Quick Summary
 - **One-Click `Inspect Source ↗` Links & `Check for Updates on Startup` Toggle:** Added an **`Inspect Source ↗`** button to the **Update Available** dialog, the **Release Notes** viewer, and the Pre-Flight footer (`Inspect Source ↗`) that opens the GitHub Gist source bundle in your browser, plus a **`Check for Updates on Startup`** checkbox (enabled by default) inside **`⚙ Preferences & Audio...`** for users who prefer to manage updates manually.
