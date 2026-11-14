@@ -4,6 +4,29 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.56] — 2026-11-14
+### ⚡ Quick Summary
+- **Built-In In-App `🐞 Report Bug` Dialog with Auto-Attached Safe Log:** Clicking **`🐞 Report Bug`** now opens an in-app bug report modal with an optional contact field (persisted locally), a required description box, and automatic attachment of today's balance-redacted Safe Log (plus a **`🔍 Preview Safe Log`** button, optional prior-day Safe Log checkbox, and an **`Open Tally Web Form ↗`** fallback link).
+- **Live Numeric Entry Filtering, 3-State `Stop Level ($)` Highlighting & Field-Specific Validation:** Pre-Flight numeric boxes now restrict invalid characters and multiple signs while typing, support `+`/`-` key sign-toggling and full double-click selection (including `-`), highlight Tier 2/3 **`Stop Level ($)`** boxes in rose-red (`< $0`), slate-blue (`$0`), or emerald green (`> $0`), and name the exact field in validation popups.
+- **`Mute All Sounds & Voice Callouts (Silent Mode)` & Clearer Rulebook Switch Setting:** Added a master **`Mute All Sounds & Voice Callouts (Silent Mode — Work Calls / Quiet Room)`** checkbox inside **`⚙ Preferences & Audio...`** to silence all sirens, warning alarms, chimes, and TTS voice callouts during calls/meetings, and renamed the rulebook switch toggle to **`Reset Profit Ratchets at 9:30 AM & 4:00 PM Session Switch (Start at Base Tier 1)`** with a clear inline explanation.
+- **Streamlined `✦ Quick Tour`, Non-Blocking Spotlight Pulse & Tcl `[TCL_ERR]` Logging:** Redesigned **`✦ Quick Tour`** into structured overview/controls/checklist tabs with an on-demand **`✦ Highlight Controls`** button (clicking anywhere stops the pulse immediately), fixed a `<Button-1>` event propagation error when closing Pre-Flight on launch, and routed C-level Tcl `bgerror` messages into `enforcer_log.txt` under `[TCL_ERR]`.
+
+### 🔍 Detailed Breakdown
+- **In-App Bug Report & Safe Log Attachment (`open_bug_report_dialog`, `_build_bug_report_header`, `_prepare_sanitized_log`, `_upload_sanitized_log_to_drive`, `show_telemetry_upload_result_dialog`, `bug_report_contact`):**
+  - Replaced the external-only Tally browser jump in `report_bug_action()` with a dark-glass `open_bug_report_dialog()` modal that auto-attaches today's redacted Safe Log (and optionally the most recent prior-day Safe Log), prepends an environment + redacted config + description header (`_build_bug_report_header()`), and persists the optional Reddit/Discord/email field (`bug_report_contact`) locally.
+  - Extended `_upload_sanitized_log_to_drive()` with optional `extra_fields` (`report_type`, `contact`, `description`) and preserved `Open Tally Web Form ↗` plus local/clipboard fallback when offline.
+- **Numeric Entry Validation & 3-State Signed Stop Coloring (`_attach_numeric_entry_behavior`, `_validate_preflight_numeric_inputs`, `_apply_dynamic_stop_box_style`, `_signed_stop_visual_state`, `_refresh_dynamic_stop_box_colors`, `save_and_launch`):**
+  - Added live keystroke validation (`_attach_numeric_entry_behavior`), `+`/`-` sign-toggling (`_on_key_minus`), and full-text double-click selection (`_on_double_click`) across Pre-Flight numeric inputs, plus field-specific error alerts in `_validate_preflight_numeric_inputs()`.
+  - Updated `_apply_dynamic_stop_box_style()` and `_signed_stop_visual_state()` so Tier 2 and Tier 3 `Stop Level ($)` boxes reflect rose-red (`< $0`), slate-blue (`$0`), or emerald green (`> $0`).
+- **Master Silent Mode & Session Behavior Clarity (`mute_all_audio`, `open_preferences_audio_dialog`, `format_config_summary`):**
+  - Added `mute_all_audio` across all siren, warning alarm, chime, and speech paths (plus `SILENT MODE ACTIVE` status badge, live Card 3 summary indicator, and `SilentMode=ON/OFF` in `[CONFIG]` logs) inside `open_preferences_audio_dialog()`.
+  - Clarified **`Reset Profit Ratchets at 9:30 AM & 4:00 PM Session Switch (Start at Base Tier 1)`** wording, hint text, and tooltip so users clearly see why Pre-Market peaks don't pre-trigger RTH profit tiers while full-day HUD totals remain intact.
+- **Quick Tour, Non-Blocking Control Pulse & Tcl Error Hook (`show_layout_tour_dialog`, `pulse_relocated_controls`, `_stop_control_pulse`, `GlassStadiumButton._on_click`, `_install_tcl_bgerror_hook`, `_install_global_error_hooks`):**
+  - Updated `show_layout_tour_dialog()` with fixed geometry across `Overview`, `Where Controls Live`, and `60-Second Checklist` tabs and added non-blocking `✦ Highlight Controls` spotlight pulsing (`pulse_relocated_controls()`, `_stop_control_pulse()`).
+  - Updated `GlassStadiumButton._on_click()` to stop pulsing before action callbacks, guard destroyed widgets in `_after_menu_close()`, and `return "break"` to prevent `<Button-1>` event bubbling onto a destroyed Pre-Flight window (`_on_pf_button1` / `_cancel_pf_timers`), and installed `_install_tcl_bgerror_hook()` to capture C-level Tcl background errors in `enforcer_log.txt` as `[TCL_ERR]`.
+
+---
+
 ## [v0.9.55] — 2026-11-14
 ### ⚡ Quick Summary
 - **Monotonic Profit Ratchet Floor Clamping & Pre-Flight Inverted Stop Warning:** RTH Tiers 2–4 and Extended-Hours Profit Lock now enforce monotonic floor clamping so unlocking a higher profit tier can never loosen your Daily Stop below `Starting Max Loss ($)` or a lower enabled tier, and Pre-Flight warns you before launch if a Tier 2/3 `Stop Level ($)` is entered lower than an earlier tier.

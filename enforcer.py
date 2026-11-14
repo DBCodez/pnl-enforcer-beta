@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.55"
+APP_VERSION = "0.9.56"
 
 import os
 import sys
@@ -1671,13 +1671,24 @@ class GlassStadiumButton(tk.Canvas):
         if callable(hide_fn):
             hide_fn()
         if self._state != "normal":
-            return
+            return "break"
+        try:
+            top_w = self.winfo_toplevel()
+            stop_pulse_fn = getattr(top_w, "_pf_stop_pulse_fn", None)
+            if callable(stop_pulse_fn):
+                stop_pulse_fn()
+        except Exception:
+            pass
         if self._menu is not None:
             def _after_menu_close():
                 if callable(hide_fn):
                     hide_fn()
-                self._hovered = False
-                self._redraw()
+                try:
+                    if self.winfo_exists():
+                        self._hovered = False
+                        self._redraw()
+                except Exception:
+                    pass
 
             if isinstance(self._menu, DarkDropdownMenu):
                 self._menu.tk_popup(
@@ -1701,6 +1712,7 @@ class GlassStadiumButton(tk.Canvas):
                         self._menu.grab_release()
                     except Exception:
                         pass
+            return "break"
         elif self._command is not None:
             if self._hovered:
                 self._hovered = False
@@ -1712,6 +1724,8 @@ class GlassStadiumButton(tk.Canvas):
                     self._redraw()
             except Exception:
                 pass
+            return "break"
+        return "break"
 
     def config(self, **kwargs):
         self.configure(**kwargs)
@@ -2026,6 +2040,7 @@ DEFAULT_CONFIG = {
     "consec_loss_window_mins": 15.0,
     "enable_open_cooldown": False,
     "open_cooldown_mins": 1.0,
+    "mute_all_audio": False,
     "enable_voice_cues": True,
     "tts_voice": "Zira",
     "enable_upside_chime": True,
@@ -2073,7 +2088,8 @@ DEFAULT_CONFIG = {
     "saved_has_reset_at_close": False,
     "saved_win_trades": 0,
     "saved_loss_trades": 0,
-    "saved_account_id": ""
+    "saved_account_id": "",
+    "bug_report_contact": ""
 }
 
 SIGNED_DOLLAR_KEYS = ("t2_max_loss", "t3_max_loss")
@@ -2856,24 +2872,27 @@ _telemetry_auto_upload_in_flight = False
 
 
 def _upload_sanitized_log_to_drive(
-    filename, sanitized_text, active_broker, anonymous_id
+    filename, sanitized_text, active_broker, anonymous_id, extra_fields=None
 ) -> bool:
-    """Uploads a balance-redacted session log to the Google Apps Script Drive
+    """Uploads a balance-redacted session log (or bug report + log) to the Google Apps Script Drive
     webhook. Inspects the JSON response body so application-level errors
     (e.g., {"status": 413}) are never mistaken for HTTP 200 success."""
     import urllib.error
     import urllib.request
 
     try:
-        payload_bytes = json.dumps(
-            {
-                "filename": str(filename),
-                "version": APP_VERSION,
-                "broker": str(active_broker or "SCHWAB"),
-                "tester_id": str(anonymous_id or ""),
-                "content": str(sanitized_text or ""),
-            }
-        ).encode("utf-8")
+        payload_dict = {
+            "filename": str(filename),
+            "version": APP_VERSION,
+            "broker": str(active_broker or "SCHWAB"),
+            "tester_id": str(anonymous_id or ""),
+            "content": str(sanitized_text or ""),
+        }
+        if isinstance(extra_fields, dict):
+            for ek, ev in extra_fields.items():
+                if ek not in payload_dict and ev is not None:
+                    payload_dict[ek] = ev
+        payload_bytes = json.dumps(payload_dict).encode("utf-8")
         req = urllib.request.Request(
             BETA_TELEMETRY_WEBHOOK_URL,
             data=payload_bytes,
@@ -3166,9 +3185,27 @@ class _StderrToLogTee:
         return getattr(self._orig, name)
 
 
+def _install_tcl_bgerror_hook(tk_obj):
+    """Routes C-level Tcl background/event errors into enforcer_log.txt."""
+    try:
+        def _tcl_bgerror(msg):
+            try:
+                err_info = str(tk_obj.tk.globalgetvar("errorInfo") or "").strip()
+            except Exception:
+                err_info = ""
+            detail = err_info or str(msg or "")
+            flat = " | ".join(ln.strip() for ln in detail.splitlines() if ln.strip())
+            if flat:
+                log_event("TCL_ERR", flat)
+
+        tk_obj.createcommand("bgerror", _tcl_bgerror)
+    except Exception:
+        pass
+
+
 def _install_global_error_hooks():
     """Routes all uncaught main-thread, background-thread, Tkinter callback,
-    and Tcl/stderr errors into enforcer_log.txt."""
+    Tcl background errors, and stderr messages into enforcer_log.txt."""
     warnings.showwarning = _custom_showwarning
     logging.getLogger().addHandler(_EnforcerFileLogHandler())
     if not isinstance(sys.stderr, _StderrToLogTee):
@@ -3210,6 +3247,15 @@ def _install_global_error_hooks():
     if hasattr(threading, "excepthook"):
         threading.excepthook = _handle_thread_uncaught
     tk.Tk.report_callback_exception = _handle_tk_callback_exc
+    if not getattr(tk.Tk, "_enforcer_bgerror_hooked", False):
+        _orig_tk_init = tk.Tk.__init__
+
+        def _hooked_tk_init(self, *args, **kwargs):
+            _orig_tk_init(self, *args, **kwargs)
+            _install_tcl_bgerror_hook(self)
+
+        tk.Tk.__init__ = _hooked_tk_init
+        tk.Tk._enforcer_bgerror_hooked = True
 
 
 if __name__ == "__main__":
@@ -3266,6 +3312,7 @@ def format_config_summary(cfg):
         f"KillTOS={'ON' if cfg.get('enable_kill_tos') else 'OFF'} | "
         f"KillWB={'ON' if cfg.get('enable_kill_webull') else 'OFF'} | "
         f"LockOS={dl_str} | "
+        f"SilentMode={'ON' if cfg.get('mute_all_audio', False) else 'OFF'} | "
         f"Voice={'ON' if cfg.get('enable_voice_cues', True) else 'OFF'} | "
         f"UpChime={'ON' if cfg.get('enable_upside_chime', True) else 'OFF'} | "
         f"ResetSwitch={'ON' if cfg.get('reset_at_925', True) else 'OFF'} | "
@@ -8181,10 +8228,12 @@ def is_disconnect_alarm_reason(reason):
     )
 
 
-def play_disconnect_tone_once():
+def play_disconnect_tone_once(force=False):
     """Plays a calm, non-startling 2-note descending telemetry tone
     (660 Hz E5 -> 440 Hz A4) so API connection drops never sound like an
     emergency position/loss siren."""
+    if not force and config.get("mute_all_audio", False):
+        return
     try:
         winsound.Beep(660, 150)
         time.sleep(0.04)
@@ -8200,7 +8249,8 @@ def sound_disconnect_alert_loop():
     while alarm_active and not cooldown_active:
         if not is_disconnect_alarm_reason(last_alarm_reason):
             break
-        play_disconnect_tone_once()
+        if not config.get("mute_all_audio", False):
+            play_disconnect_tone_once()
         # Wait 4.5s between gentle reminders in 0.15s slices for instant mute/recovery
         for _ in range(30):
             if (
@@ -8215,8 +8265,11 @@ def sound_disconnect_alert_loop():
 def sound_alarm_loop():
     global alarm_active
     while alarm_active and not cooldown_active:
+        if config.get("mute_all_audio", False):
+            time.sleep(0.25)
+            continue
         for _ in range(10):
-            if not alarm_active or cooldown_active:
+            if not alarm_active or cooldown_active or config.get("mute_all_audio", False):
                 break
             winsound.Beep(2600, 220)
             time.sleep(0.04)
@@ -8336,9 +8389,11 @@ def mute_alarm(ui_button):
                 )
 
 
-def play_unlock_chimes():
+def play_unlock_chimes(force=False):
     """Plays 3 pleasant ascending musical chimes (C5 -> E5 -> G5)
     when the OS Cool-Down Lock timer expires."""
+    if not force and config.get("mute_all_audio", False):
+        return
     try:
         for freq, dur in ((523, 180), (659, 180), (784, 320)):
             winsound.Beep(freq, dur)
@@ -8422,7 +8477,10 @@ def speak_async(text, force=False, voice_override=None, interrupt=False):
     voice cues never talk over each other, or preempts active speech immediately
     when interrupt=True."""
     global _tts_active_proc, _tts_worker_running
-    if not force and not config.get("enable_voice_cues", True):
+    if not force and (
+        config.get("mute_all_audio", False)
+        or not config.get("enable_voice_cues", True)
+    ):
         return
     try:
         safe_text = str(text).replace("'", "")
@@ -8463,9 +8521,12 @@ def stop_active_tts():
             _tts_active_proc = None
 
 
-def play_upside_tier_chime():
+def play_upside_tier_chime(force=False):
     """Plays a crisp 4-note ascending D-major arpeggio (D5 -> F#5 -> A5 -> D6)
     when a higher profit tier is unlocked while 100% flat."""
+    if not force and config.get("mute_all_audio", False):
+        return
+
     def _chime_worker():
         try:
             for freq, dur in ((587, 110), (740, 110), (880, 110), (1175, 240)):
@@ -12513,6 +12574,7 @@ def show_preflight_window(
         "rulebook_after_id": None,
         "streak_after_id": None,
         "pulse_after_id": None,
+        "pulse_stop_fn": None,
         "closing": False,
     }
 
@@ -12530,11 +12592,62 @@ def show_preflight_window(
     pf.resizable(False, False)
     pf.attributes("-topmost", True)
 
+    def _stop_control_pulse():
+        stop_fn = pf_timer_state.get("pulse_stop_fn")
+        if callable(stop_fn):
+            try:
+                stop_fn()
+            except Exception:
+                pass
+
+    def _restore_pf_modal_focus(closed_dlg=None):
+        """Releases any modal grab held by a child dialog before destroying it
+        and restores focus/grab to an active Preferences dialog or Pre-Flight."""
+        _stop_control_pulse()
+        if closed_dlg is not None:
+            try:
+                closed_dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                if closed_dlg.winfo_exists():
+                    closed_dlg.destroy()
+            except Exception:
+                pass
+        try:
+            prefs_dlg = _prefs_modal_refs.get("dlg")
+            if (
+                prefs_dlg is not None
+                and prefs_dlg is not closed_dlg
+                and prefs_dlg.winfo_exists()
+            ):
+                prefs_dlg.lift()
+                prefs_dlg.focus_force()
+                prefs_dlg.grab_set()
+                return
+            if not pf_timer_state.get("closing") and pf.winfo_exists():
+                pf.lift()
+                pf.focus_force()
+                if parent is not None:
+                    pf.grab_set()
+        except Exception:
+            pass
+
+    def _on_pf_button1(_event=None):
+        _stop_control_pulse()
+
+    pf._pf_stop_pulse_fn = _stop_control_pulse
+    pf.bind("<Button-1>", _on_pf_button1, add="+")
+
     _prefs_modal_refs = {
         "dlg": None,
         "cb_reset925": None,
         "cb_ignore_prepos": None,
         "lbl_session_lock": None,
+        "cb_mute_all": None,
+        "cb_voice_cues": None,
+        "cb_upside_chime": None,
+        "lbl_silent_badge": None,
         "btn_test_audio": None,
         "btn_done": None,
         "cleanup_fn": None,
@@ -12553,6 +12666,11 @@ def show_preflight_window(
 
     def _cancel_pf_timers():
         pf_timer_state["closing"] = True
+        try:
+            pf._pf_stop_pulse_fn = None
+            pf.unbind("<Button-1>")
+        except Exception:
+            pass
         for k_id in ("rulebook_after_id", "streak_after_id", "pulse_after_id"):
             aid = pf_timer_state.get(k_id)
             if aid is not None:
@@ -12842,6 +12960,22 @@ def show_preflight_window(
         save_config(config)
 
     var_check_updates_on_startup.trace_add("write", _on_toggle_check_updates)
+    var_mute_all_audio = tk.BooleanVar(
+        value=bool(config.get("mute_all_audio", False))
+    )
+
+    def _on_toggle_mute_all_audio(*_):
+        muted_now = bool(var_mute_all_audio.get())
+        config["mute_all_audio"] = muted_now
+        save_config(config)
+        if muted_now:
+            stop_active_tts()
+        try:
+            _sync_prefs_modal_state()
+        except Exception:
+            pass
+
+    var_mute_all_audio.trace_add("write", _on_toggle_mute_all_audio)
     var_voice_cues = tk.BooleanVar(
         value=config.get("enable_voice_cues", True)
     )
@@ -12905,14 +13039,198 @@ def show_preflight_window(
         for k in dollar_keys
     }
 
-    def _bind_loss_sign_normalizer(var_obj):
-        def _on_focus_out(_event=None):
+    _NUMERIC_MODE_PATTERNS = {
+        "signed_float": re.compile(r"^[+-]?\d*(\.\d*)?$"),
+        "loss_float": re.compile(r"^-?\d*(\.\d*)?$"),
+        "pos_float": re.compile(r"^\d*(\.\d*)?$"),
+        "pos_int": re.compile(r"^\d*$"),
+    }
+
+    def _attach_numeric_entry_behavior(ent, var_obj, mode="pos_float", min_val=None):
+        """Restricts numeric entry keystrokes/pastes live, handles smart +/- sign toggling,
+        highlights empty/incomplete input borders, and normalizes formatting on FocusOut."""
+        pat = _NUMERIC_MODE_PATTERNS.get(mode, _NUMERIC_MODE_PATTERNS["pos_float"])
+        max_len = 6 if mode == "pos_int" else 12
+
+        def _validate_candidate(new_val):
+            if len(new_val) > max_len:
+                return False
+            return bool(pat.fullmatch(new_val))
+
+        vcmd = ent.winfo_toplevel().register(_validate_candidate)
+        ent.configure(validate="key", validatecommand=(vcmd, "%P"))
+
+        def _ensure_validate_key():
             try:
-                mag = abs(float(var_obj.get().strip()))
-                var_obj.set(f"-{mag:.0f}" if mag > 0 else "0")
-            except ValueError:
+                if ent.winfo_exists() and str(ent.cget("validate")) != "key":
+                    ent.configure(validate="key")
+            except Exception:
                 pass
-        return _on_focus_out
+
+        def _update_entry_rim():
+            try:
+                if not ent.winfo_exists():
+                    return
+                if str(ent.cget("state")) != "normal":
+                    return
+                raw_s = str(var_obj.get()).strip()
+                valid_num = False
+                if raw_s:
+                    try:
+                        valid_num = math.isfinite(float(raw_s))
+                    except Exception:
+                        valid_num = False
+                target_rim = (
+                    getattr(ent, "_orig_rim", "#2e526e") if valid_num else "#f43f5e"
+                )
+                if ent.cget("highlightbackground") != target_rim:
+                    ent.config(highlightbackground=target_rim)
+            except Exception:
+                pass
+
+        def _all_text_selected(cur_len):
+            try:
+                return (
+                    cur_len > 0
+                    and ent.selection_present()
+                    and ent.index("sel.first") == 0
+                    and ent.index("sel.last") == cur_len
+                )
+            except Exception:
+                return False
+
+        def _set_text_keep_cursor(new_txt, new_pos):
+            var_obj.set(new_txt)
+            _ensure_validate_key()
+            try:
+                pos = max(0, min(len(new_txt), int(new_pos)))
+                ent.icursor(pos)
+                ent.selection_clear()
+            except Exception:
+                pass
+            _update_entry_rim()
+
+        def _on_key_plus(_event=None):
+            if str(ent.cget("state")) != "normal":
+                return None
+            if mode != "signed_float":
+                return "break"
+            cur = str(var_obj.get())
+            if _all_text_selected(len(cur)):
+                _set_text_keep_cursor("", 0)
+                return "break"
+            if cur.startswith("-"):
+                cur_pos = ent.index(tk.INSERT)
+                _set_text_keep_cursor(cur[1:], max(0, cur_pos - 1))
+                return "break"
+            if cur.startswith("+") or cur != "":
+                return "break"
+            return None
+
+        def _on_key_minus(_event=None):
+            if str(ent.cget("state")) != "normal":
+                return None
+            if mode not in ("signed_float", "loss_float"):
+                return "break"
+            cur = str(var_obj.get())
+            if _all_text_selected(len(cur)):
+                _set_text_keep_cursor("-", 1)
+                return "break"
+            if cur.startswith("-"):
+                if mode == "signed_float" and len(cur) > 1:
+                    cur_pos = ent.index(tk.INSERT)
+                    _set_text_keep_cursor(cur[1:], max(0, cur_pos - 1))
+                return "break"
+            if cur == "":
+                return None
+            cur_pos = ent.index(tk.INSERT)
+            if cur.startswith("+"):
+                _set_text_keep_cursor("-" + cur[1:], max(1, cur_pos))
+            else:
+                _set_text_keep_cursor("-" + cur, cur_pos + 1)
+            return "break"
+
+        def _on_double_click(_event=None):
+            if str(ent.cget("state")) != "normal":
+                return None
+            try:
+                ent.focus_set()
+                ent.selection_range(0, "end")
+                ent.icursor("end")
+            except Exception:
+                pass
+            return "break"
+
+        def _on_focus_in(_event=None):
+            _ensure_validate_key()
+
+        def _on_focus_out(_event=None):
+            raw_s = str(var_obj.get()).strip()
+            if raw_s:
+                try:
+                    num_v = float(raw_s)
+                    if math.isfinite(num_v):
+                        if mode == "signed_float":
+                            if abs(num_v) <= 1e-9:
+                                var_obj.set("0")
+                            elif num_v.is_integer():
+                                var_obj.set(f"{num_v:.0f}")
+                            else:
+                                var_obj.set(f"{num_v:g}")
+                        elif mode == "loss_float":
+                            mag = abs(num_v)
+                            if mag <= 1e-9:
+                                var_obj.set("0")
+                            elif mag.is_integer():
+                                var_obj.set(f"-{mag:.0f}")
+                            else:
+                                var_obj.set(f"-{mag:g}")
+                        elif mode == "pos_int":
+                            iv = int(round(abs(num_v)))
+                            if min_val is not None:
+                                iv = max(int(min_val), iv)
+                            var_obj.set(str(iv))
+                        else:
+                            mag = abs(num_v)
+                            if mag <= 1e-9:
+                                var_obj.set("0")
+                            elif mag.is_integer():
+                                var_obj.set(f"{mag:.0f}")
+                            else:
+                                var_obj.set(f"{mag:g}")
+                except Exception:
+                    pass
+            _ensure_validate_key()
+            _update_entry_rim()
+
+        def _on_var_write(*_):
+            try:
+                if ent.winfo_exists():
+                    ent.after_idle(
+                        lambda: (_ensure_validate_key(), _update_entry_rim())
+                    )
+            except Exception:
+                pass
+
+        ent.bind("<FocusIn>", _on_focus_in, add="+")
+        ent.bind("<FocusOut>", _on_focus_out, add="+")
+        ent.bind("<KeyRelease>", lambda _e: _update_entry_rim(), add="+")
+        ent.bind("<Double-Button-1>", _on_double_click)
+        for _p_seq in ("<KeyPress-plus>", "<KeyPress-KP_Add>"):
+            ent.bind(_p_seq, _on_key_plus)
+        for _m_seq in ("<KeyPress-minus>", "<KeyPress-KP_Subtract>"):
+            ent.bind(_m_seq, _on_key_minus)
+        trace_id = var_obj.trace_add("write", _on_var_write)
+
+        def _on_destroy(event=None):
+            if event is not None and getattr(event, "widget", None) is not ent:
+                return
+            try:
+                var_obj.trace_remove("write", trace_id)
+            except Exception:
+                pass
+
+        ent.bind("<Destroy>", _on_destroy, add="+")
 
     def _render_baseline_telemetry_spans(spans):
         """Renders multi-color inline telemetry spans inside base_sub_lbl frame."""
@@ -13445,6 +13763,7 @@ def show_preflight_window(
         positions in the account so the trader can keep swing/long-term holdings
         Ignored (default) or toggle specific positions to Track as Active
         Daytrades."""
+        _stop_control_pulse()
         read_only = is_in_trade_tamper_locked()
         if active_adapter is not None and not from_launch and not read_only:
             try:
@@ -13484,7 +13803,7 @@ def show_preflight_window(
 
         def on_cancel():
             decision["ok"] = False
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         dlg.protocol("WM_DELETE_WINDOW", on_cancel)
         dlg.bind("<Escape>", lambda _e: on_cancel())
@@ -14005,7 +14324,7 @@ def show_preflight_window(
                     f"Tracked={sorted(t for t in row_vars if t not in chosen_ig)}",
                 )
                 decision["ok"] = True
-                dlg.destroy()
+                _restore_pf_modal_focus(dlg)
 
             confirm_lbl = (
                 "✔ Apply & Launch Enforcer >>"
@@ -14056,6 +14375,7 @@ def show_preflight_window(
         center_dialog_over_parent(dlg, parent=pf, width=w_req, height=h_req)
 
         pf.wait_window(dlg)
+        _restore_pf_modal_focus(dlg)
         return decision["ok"]
 
     # --- TOP BAR: UNIFIED BROKER/ACCOUNT CAPSULE, UTILITY PILLS & PRESETS ---
@@ -14303,6 +14623,7 @@ def show_preflight_window(
 
     def _on_capsule_click(event):
         hide_all_tooltips()
+        _stop_control_pulse()
         if is_in_trade_tamper_locked():
             if default_status_lbl is not None:
                 default_status_lbl.config(
@@ -14449,6 +14770,7 @@ def show_preflight_window(
 
     def open_hud_columns_dialog():
         hide_all_tooltips()
+        _stop_control_pulse()
         dlg = tk.Toplevel(pf)
         dlg.withdraw()
         dlg.title("Customize HUD Columns & Order")
@@ -14610,7 +14932,7 @@ def show_preflight_window(
             selected_hud_columns.clear()
             selected_hud_columns.extend(chosen)
             hud_cols_btn.config(text=format_hud_cols_btn_label(chosen))
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         b_bar = tk.Frame(dlg, bg="#0d1117", pady=12)
         b_bar.pack(fill="x")
@@ -14724,6 +15046,7 @@ def show_preflight_window(
 
         center_dialog_over_parent(dlg, parent=pf)
         pf.wait_window(dlg)
+        _restore_pf_modal_focus(dlg)
 
     hud_cols_btn = make_stadium_button(
         top_bar,
@@ -14783,7 +15106,7 @@ def show_preflight_window(
                 parent=pf
             )
 
-    def _prepare_sanitized_log():
+    def _prepare_sanitized_log(report_header=""):
         """Generates ~/enforcer_log_sanitized.txt (and a convenience copy in
         ~/Downloads if present) and copies the sanitized text to the clipboard."""
         if not os.path.exists(LOG_PATH):
@@ -14791,6 +15114,8 @@ def show_preflight_window(
         with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
             raw_txt = f.read()
         sanitized_txt = sanitize_log_for_export(raw_txt)
+        if report_header:
+            sanitized_txt = f"{report_header}{sanitized_txt}"
         with open(SANITIZED_LOG_PATH, "w", encoding="utf-8") as sf:
             sf.write(sanitized_txt)
         try:
@@ -14831,30 +15156,497 @@ def show_preflight_window(
                 parent=pf,
             )
 
-    def report_bug_action():
+    def _build_bug_report_header(tester_id, active_b, contact_str, desc_str):
+        return (
+            "========================================================\n"
+            "  PNL ENFORCER — USER BUG REPORT\n"
+            "========================================================\n"
+            f"Timestamp     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"App Version   : v{APP_VERSION}\n"
+            f"Tester ID     : {tester_id}\n"
+            f"Broker        : {active_b}\n"
+            f"Contact       : {contact_str or '(Anonymous / Not provided)'}\n"
+            f"Environment   : {_get_os_env_summary()}\n"
+            f"Config        : {format_config_summary(config)}\n"
+            "--------------------------------------------------------\n"
+            "USER DESCRIPTION:\n"
+            f"{desc_str}\n"
+            "========================================================\n\n"
+            "==================== ATTACHED TODAY'S SAFE LOG ====================\n"
+        )
+
+    def open_bug_report_dialog():
+        hide_all_tooltips()
+        _stop_control_pulse()
+        if not pf.winfo_exists():
+            return
+
+        tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
+        if not tester_id:
+            tester_id = uuid.uuid4().hex[:6]
+            config["anonymous_tester_id"] = tester_id
+            save_config(config)
+        active_b = str(
+            var_broker.get() or config.get("active_broker", "SCHWAB") or "SCHWAB"
+        )
         try:
-            out_path = _prepare_sanitized_log()
-            if default_status_lbl is not None:
-                default_status_lbl.config(
-                    text=(
-                        "✓ Safe log copied to clipboard & highlighted in Explorer "
-                        "— Opening Bug Report form..."
-                    ),
-                    fg="#f5cba7",
-                )
+            _sync_sanitized_log_archive()
+        except Exception:
+            pass
+        prior_fname, prior_path = _find_most_recent_prior_sanitized_log()
+
+        dlg = tk.Toplevel(pf)
+        dlg.withdraw()
+        if os.path.exists(ICON_PATH):
             try:
-                subprocess.Popen(
-                    ["explorer", f"/select,{os.path.normpath(out_path)}"]
-                )
+                dlg.iconbitmap(ICON_PATH)
             except Exception:
                 pass
-            webbrowser.open(BUG_REPORT_FORM_URL)
-        except Exception as e:
-            messagebox.showerror(
-                "Bug Report Error",
-                f"Could not prepare sanitized log for bug report:\n{e}",
-                parent=pf,
+        apply_dark_title_bar(dlg)
+        dlg.title("PnL Enforcer — Report a Bug")
+        dlg.config(bg="#0d1117", padx=24, pady=18)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        dlg.transient(pf)
+
+        sending_state = {"busy": False}
+
+        def _on_cancel(_event=None):
+            if sending_state["busy"]:
+                return "break"
+            _restore_pf_modal_focus(dlg)
+
+        dlg.protocol("WM_DELETE_WINDOW", _on_cancel)
+        dlg.bind("<Escape>", _on_cancel)
+
+        hdr_row = tk.Frame(dlg, bg="#0d1117")
+        hdr_row.pack(fill="x", pady=(0, 4))
+        tk.Label(
+            hdr_row,
+            text="▶  REPORT A BUG OR ISSUE",
+            font=("Arial", 12, "bold"),
+            fg="#7dd3fc",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(side="left")
+        tk.Label(
+            hdr_row,
+            text="🔒 SAFE LOG AUTO-ATTACHED",
+            font=("Arial", 8, "bold"),
+            fg="#6ee7b7",
+            bg="#112a20",
+            padx=8,
+            pady=3,
+        ).pack(side="right", padx=(12, 0))
+
+        tk.Label(
+            dlg,
+            text="Send what happened directly to the developer — today's balance-redacted Safe Log is included automatically.",
+            font=("Arial", 9, "bold"),
+            fg="#94a3b8",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        card_outer = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        card_outer.pack(fill="x", pady=(0, 14))
+        NeonBarCanvas(
+            card_outer, core_color="#38bdf8", card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+
+        card_body = tk.Frame(card_outer, bg="#131922", padx=18, pady=14)
+        card_body.pack(side="left", fill="both", expand=True)
+
+        contact_hdr = tk.Frame(card_body, bg="#131922")
+        contact_hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(
+            contact_hdr,
+            text="Reddit Username, Discord, or Email (Optional):",
+            font=("Arial", 9, "bold"),
+            fg="#cbd5e1",
+            bg="#131922",
+            anchor="w",
+        ).pack(side="left")
+        tk.Label(
+            contact_hdr,
+            text=f"{active_b} · v{APP_VERSION} · ID: {tester_id}",
+            font=("Arial", 8, "bold"),
+            fg="#93c5fd",
+            bg="#162231",
+            padx=7,
+            pady=2,
+        ).pack(side="right")
+
+        var_contact = tk.StringVar(
+            value=str(config.get("bug_report_contact", "") or "")
+        )
+        ent_contact = tk.Entry(
+            card_body,
+            textvariable=var_contact,
+            font=("Arial", 10, "bold"),
+            bg="#132333",
+            fg="#e6eef8",
+            insertbackground="#f1f5f9",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#2e526e",
+            highlightcolor="#38bdf8",
+        )
+        ent_contact.pack(fill="x", ipady=5, pady=(0, 2))
+        tk.Label(
+            card_body,
+            text="Leave blank to send anonymously. Saved locally so you don't have to re-type it.",
+            font=("Arial", 8, "bold"),
+            fg="#64748b",
+            bg="#131922",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        tk.Label(
+            card_body,
+            text="What happened? What did you expect to happen? (Required):",
+            font=("Arial", 9, "bold"),
+            fg="#7dd3fc",
+            bg="#131922",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+
+        desc_txt = tk.Text(
+            card_body,
+            width=68,
+            height=6,
+            bg="#132333",
+            fg="#e6eef8",
+            insertbackground="#f1f5f9",
+            font=("Arial", 10),
+            wrap="word",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#2e526e",
+            highlightcolor="#38bdf8",
+            padx=10,
+            pady=8,
+        )
+        desc_txt.pack(fill="x")
+
+        err_lbl = tk.Label(
+            card_body,
+            text="",
+            font=("Arial", 8, "bold"),
+            fg="#f87171",
+            bg="#131922",
+            anchor="w",
+        )
+        err_lbl.pack(fill="x", pady=(4, 6))
+
+        def _clear_desc_err(_event=None):
+            if err_lbl.cget("text") and not sending_state["busy"]:
+                err_lbl.config(text="", fg="#f87171")
+                desc_txt.config(highlightbackground="#2e526e")
+
+        desc_txt.bind("<KeyRelease>", _clear_desc_err, add="+")
+
+        log_box = tk.Frame(
+            card_body,
+            bg="#0f151d",
+            highlightthickness=1,
+            highlightbackground="#1e293b",
+            padx=12,
+            pady=9,
+        )
+        log_box.pack(fill="x")
+        log_top = tk.Frame(log_box, bg="#0f151d")
+        log_top.pack(fill="x")
+        tk.Label(
+            log_top,
+            text="✓ Attached: Today's Sanitized Safe Log (Balances $[REDACTED], paths & order IDs removed)",
+            font=("Arial", 8, "bold"),
+            fg="#6ee7b7",
+            bg="#0f151d",
+            anchor="w",
+        ).pack(side="left")
+
+        def _preview_attached_log():
+            try:
+                out_path = _prepare_sanitized_log()
+                os.startfile(out_path)
+            except Exception as e:
+                err_lbl.config(
+                    text=f"Could not open Safe Log preview: {e}", fg="#f87171"
+                )
+
+        make_stadium_button(
+            log_top,
+            text="🔍 Preview Safe Log",
+            font=("Arial", 8, "bold"),
+            fill_color="#141820",
+            fill_top_color="#1c212b",
+            border_color="#2e3746",
+            hover_fill="#181e28",
+            hover_fill_top="#232a36",
+            hover_border="#38bdf8",
+            fg="#7dd3fc",
+            canvas_bg="#0f151d",
+            width=142,
+            height=26,
+            auto_width=False,
+            command=_preview_attached_log,
+        ).pack(side="right")
+
+        var_include_prior = tk.BooleanVar(value=False)
+        if prior_fname and prior_path:
+            make_glass_checkbutton(
+                log_box,
+                text=f"Also include prior-day Safe Log ({prior_fname})",
+                variable=var_include_prior,
+                font=("Arial", 8, "bold"),
+                fg="#94a3b8",
+                bg="#0f151d",
+                anchor="w",
+            ).pack(fill="x", pady=(6, 0))
+
+        btn_row = tk.Frame(dlg, bg="#0d1117")
+        btn_row.pack(fill="x")
+
+        def _open_web_form_fallback():
+            if sending_state["busy"]:
+                return
+            try:
+                contact_s = str(var_contact.get() or "").strip()
+                desc_s = desc_txt.get("1.0", "end-1c").strip()
+                hdr = (
+                    _build_bug_report_header(
+                        tester_id, active_b, contact_s, desc_s
+                    )
+                    if desc_s
+                    else ""
+                )
+                out_path = _prepare_sanitized_log(report_header=hdr)
+                try:
+                    subprocess.Popen(
+                        ["explorer", f"/select,{os.path.normpath(out_path)}"]
+                    )
+                except Exception:
+                    pass
+                webbrowser.open(BUG_REPORT_FORM_URL)
+                err_lbl.config(
+                    text="✓ Opened web form & highlighted Safe Log in Explorer.",
+                    fg="#7dd3fc",
+                )
+            except Exception as e:
+                err_lbl.config(text=f"Could not open web form: {e}", fg="#f87171")
+
+        web_link_lbl = tk.Label(
+            btn_row,
+            text="Open Tally Web Form ↗",
+            font=("Arial", 8, "bold underline"),
+            fg="#64748b",
+            bg="#0d1117",
+            cursor="hand2",
+        )
+        web_link_lbl.pack(side="left")
+        web_link_lbl.bind("<Enter>", lambda _e: web_link_lbl.config(fg="#93c5fd"))
+        web_link_lbl.bind("<Leave>", lambda _e: web_link_lbl.config(fg="#64748b"))
+        web_link_lbl.bind("<Button-1>", lambda _e: _open_web_form_fallback())
+
+        btn_submit = None
+        btn_cancel = None
+
+        def _on_submit(_event=None):
+            if sending_state["busy"]:
+                return "break"
+            desc_str = desc_txt.get("1.0", "end-1c").strip()
+            if not desc_str:
+                desc_txt.config(highlightbackground="#f43f5e")
+                err_lbl.config(
+                    text="Please describe what happened before submitting (at least a brief summary).",
+                    fg="#f87171",
+                )
+                desc_txt.focus_set()
+                return "break"
+
+            contact_str = str(var_contact.get() or "").strip()
+            if contact_str != str(config.get("bug_report_contact", "") or ""):
+                config["bug_report_contact"] = contact_str
+                save_config(config)
+
+            try:
+                if not os.path.exists(LOG_PATH):
+                    init_daily_log()
+                with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                    raw_today = f.read()
+                san_today = sanitize_log_for_export(raw_today)
+                prior_block = ""
+                if var_include_prior.get() and prior_path and os.path.isfile(prior_path):
+                    try:
+                        with open(
+                            prior_path, "r", encoding="utf-8", errors="replace"
+                        ) as pf_log:
+                            prior_txt = pf_log.read().strip()
+                        if prior_txt:
+                            prior_block = (
+                                f"\n\n==================== PRIOR-DAY SAFE LOG ({prior_fname}) ====================\n"
+                                f"{prior_txt}"
+                            )
+                    except Exception:
+                        pass
+
+                report_hdr = _build_bug_report_header(
+                    tester_id, active_b, contact_str, desc_str
+                )
+                combined_body = f"{report_hdr}{san_today}{prior_block}"
+                if len(combined_body) > 900_000:
+                    tail_keep = 900_000 - len(report_hdr) - 120
+                    logs_only = f"{san_today}{prior_block}"
+                    combined_body = (
+                        f"{report_hdr}"
+                        "[...older log lines trimmed cleanly for upload size limit...]\n"
+                        + logs_only[-max(1000, tail_keep):]
+                    )
+
+                upload_fname = f"BUG_REPORT_{get_today_str()}_sanitized.txt"
+                _prepare_sanitized_log(report_header=report_hdr)
+            except Exception as e:
+                err_lbl.config(
+                    text=f"Could not prepare Safe Log for submission: {e}",
+                    fg="#f87171",
+                )
+                return "break"
+
+            sending_state["busy"] = True
+            if btn_submit is not None:
+                btn_submit.config(text="⏳ Sending Report...", state="disabled")
+            if btn_cancel is not None:
+                btn_cancel.config(state="disabled")
+            err_lbl.config(
+                text=f"Uploading bug report & Safe Log (Tester ID: {tester_id})...",
+                fg="#38bdf8",
             )
+            if default_status_lbl is not None:
+                default_status_lbl.config(
+                    text=f"⏳ Uploading bug report & Safe Log (Tester ID: {tester_id})...",
+                    fg="#38bdf8",
+                )
+
+            def _worker():
+                ok = _upload_sanitized_log_to_drive(
+                    upload_fname,
+                    combined_body,
+                    active_b,
+                    tester_id,
+                    extra_fields={
+                        "report_type": "bug_report",
+                        "contact": contact_str,
+                        "description": desc_str,
+                    },
+                )
+
+                def _finish():
+                    sending_state["busy"] = False
+                    if ok:
+                        log_event(
+                            "TELEMETRY",
+                            f"Submitted in-app bug report + sanitized log "
+                            f"({upload_fname}, Tester ID: {tester_id})",
+                        )
+                        try:
+                            if (
+                                default_status_lbl is not None
+                                and default_status_lbl.winfo_exists()
+                            ):
+                                default_status_lbl.config(
+                                    text=f"✓ Bug Report Sent! Attached Safe Log (Tester ID: {tester_id}).",
+                                    fg="#58d68d",
+                                )
+                        except Exception:
+                            pass
+                    else:
+                        log_event(
+                            "WARN",
+                            f"In-app bug report upload failed; saved local copy at {_mask_user_path(SANITIZED_LOG_PATH)}",
+                        )
+                        try:
+                            if (
+                                default_status_lbl is not None
+                                and default_status_lbl.winfo_exists()
+                            ):
+                                default_status_lbl.config(
+                                    text="⚠️ Bug report upload failed — saved Safe Log locally & copied to clipboard.",
+                                    fg="#f5b041",
+                                )
+                        except Exception:
+                            pass
+                    _restore_pf_modal_focus(dlg)
+                    show_telemetry_upload_result_dialog(
+                        ok,
+                        tester_id,
+                        report_mode=True,
+                        contact_str=contact_str,
+                    )
+
+                try:
+                    pf.after(0, _finish)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_worker, daemon=True).start()
+            return "break"
+
+        dlg.bind("<Control-Return>", _on_submit)
+
+        btn_submit = make_stadium_button(
+            btn_row,
+            text="🚀 Submit Bug Report",
+            font=("Arial", 10, "bold"),
+            fill_color="#0d3b20",
+            fill_top_color="#14532d",
+            border_color="#10b981",
+            hover_fill="#114b29",
+            hover_fill_top="#196638",
+            hover_border="#34d399",
+            fg="#ffffff",
+            canvas_bg="#0d1117",
+            width=188,
+            height=34,
+            auto_width=False,
+            command=_on_submit,
+        )
+        btn_submit.pack(side="right")
+
+        btn_cancel = make_stadium_button(
+            btn_row,
+            text="Cancel",
+            font=("Arial", 9, "bold"),
+            fill_color="#141820",
+            fill_top_color="#1c212b",
+            border_color="#475569",
+            hover_fill="#181e28",
+            hover_fill_top="#232a36",
+            hover_border="#64748b",
+            fg="#cbd5e1",
+            canvas_bg="#0d1117",
+            width=96,
+            height=34,
+            auto_width=False,
+            command=_on_cancel,
+        )
+        btn_cancel.pack(side="right", padx=(0, 8))
+
+        center_dialog_over_parent(dlg, parent=pf)
+        dlg.grab_set()
+        desc_txt.focus_set()
+        pf.wait_window(dlg)
+        if pf.winfo_exists():
+            _restore_pf_modal_focus(dlg)
+
+    def report_bug_action():
+        open_bug_report_dialog()
 
     def preview_most_recent_safe_log():
         try:
@@ -14917,7 +15709,10 @@ def show_preflight_window(
         except Exception:
             pass
 
-    def show_telemetry_upload_result_dialog(ok, tester_id):
+    def show_telemetry_upload_result_dialog(
+        ok, tester_id, report_mode=False, contact_str=""
+    ):
+        hide_all_tooltips()
         parent_win = pf
         try:
             if not pf.winfo_exists():
@@ -14937,22 +15732,52 @@ def show_preflight_window(
             except Exception:
                 pass
         apply_dark_title_bar(dlg)
-        dlg.title(
-            "PnL Enforcer — Safe Log Uploaded"
-            if ok
-            else "PnL Enforcer — Safe Log Upload Failed"
-        )
+        if report_mode:
+            dlg.title(
+                "PnL Enforcer — Bug Report Sent"
+                if ok
+                else "PnL Enforcer — Bug Report Saved Locally"
+            )
+            hdr_txt = (
+                "▶  ✅ BUG REPORT SENT — THANK YOU!"
+                if ok
+                else "▶  ⚠️ BUG REPORT COULD NOT UPLOAD"
+            )
+        else:
+            dlg.title(
+                "PnL Enforcer — Safe Log Uploaded"
+                if ok
+                else "PnL Enforcer — Safe Log Upload Failed"
+            )
+            hdr_txt = (
+                "▶  ✅ SAFE LOG SENT — THANK YOU!"
+                if ok
+                else "▶  ⚠️ SAFE LOG UPLOAD COULD NOT COMPLETE"
+            )
         dlg.config(bg="#0d1117", padx=24, pady=18)
         dlg.resizable(False, False)
         dlg.attributes("-topmost", True)
+        dlg.transient(parent_win)
+
+        def _close_res(_event=None):
+            if parent_win is pf:
+                _restore_pf_modal_focus(dlg)
+            else:
+                try:
+                    dlg.grab_release()
+                except Exception:
+                    pass
+                try:
+                    dlg.destroy()
+                except Exception:
+                    pass
+
+        dlg.protocol("WM_DELETE_WINDOW", _close_res)
+        dlg.bind("<Escape>", _close_res)
+        dlg.bind("<Return>", _close_res)
 
         bar_col = "#10b981" if ok else "#f59e0b"
         rim_col = "#1f4d3a" if ok else "#5c3d1e"
-        hdr_txt = (
-            "▶  ✅ SAFE LOG SENT — THANK YOU!"
-            if ok
-            else "▶  ⚠️ SAFE LOG UPLOAD COULD NOT COMPLETE"
-        )
         badge_txt = (
             "🔒 100% BALANCE-REDACTED"
             if ok
@@ -15018,7 +15843,35 @@ def show_preflight_window(
         txt_box.tag_configure(
             "pill_amber", font=("Arial", 10, "bold"), foreground="#fde68a", background="#3b2106"
         )
-        if ok:
+        if report_mode:
+            if ok:
+                c_note = (
+                    f" (contact: {contact_str})"
+                    if contact_str
+                    else " (sent anonymously)"
+                )
+                spans = [
+                    (f"• Your bug description{c_note} and Safe Log were sent to the developer.\n", ("body",)),
+                    ("• All account balances (", ("body",)),
+                    (" $[REDACTED] ", ("body", "pill_green")),
+                    ("), Windows paths (", ("body",)),
+                    (" ~ ", ("body", "pill_blue")),
+                    ("), and order IDs were removed.\n", ("body",)),
+                    ("• Tagged with Tester ID: ", ("body",)),
+                    (f" {tester_id} ", ("body", "pill_amber")),
+                    (" — thank you for helping improve PnL Enforcer!", ("body",)),
+                ]
+            else:
+                spans = [
+                    ("• Could not reach the diagnostic drive right now (network or firewall blocked).\n", ("body",)),
+                    ("• Your bug description + Safe Log were copied to clipboard and saved to ", ("body",)),
+                    (" ~/enforcer_log_sanitized.txt ", ("body", "pill_blue")),
+                    (".\n", ("body",)),
+                    ("• You can click ", ("body",)),
+                    (" 🐞 Report Bug ", ("body", "pill_amber")),
+                    (" and choose 'Open Tally Web Form ↗' anytime to submit manually.", ("body",)),
+                ]
+        elif ok:
             spans = [
                 ("• Your privacy-scrubbed session log was uploaded to the diagnostic drive.\n", ("body",)),
                 ("• All account balances (", ("body",)),
@@ -15064,7 +15917,7 @@ def show_preflight_window(
             width=110,
             height=34,
             auto_width=False,
-            command=dlg.destroy,
+            command=_close_res,
         ).pack(side="right")
 
         center_dialog_over_parent(dlg, parent=parent_win)
@@ -15179,7 +16032,7 @@ def show_preflight_window(
 
         def on_cancel():
             decision["ok"] = False
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         def on_enable():
             decision["ok"] = True
@@ -15443,6 +16296,10 @@ def show_preflight_window(
             label="📤 Send Today's Safe Log Now",
             command=send_today_safe_log_now,
         )
+        logs_dropdown.add_command(
+            label="🐞 Report a Bug (Auto-Attaches Safe Log)...",
+            command=open_bug_report_dialog,
+        )
         logs_dropdown.add_separator()
         logs_dropdown.add_command(
             label="📄 View Today's Log",
@@ -15577,11 +16434,11 @@ def show_preflight_window(
     btn_report_bug.pack(side="left", padx=(0, 5))
     attach_tooltip(
         btn_report_bug,
-        "One-Click Bug Report & Safe Log Prep:\n"
-        "Automatically prepares your sanitized log and opens the Bug Report portal in your browser.\n"
-        "• Copies your privacy-scrubbed log straight to your clipboard (ready to Ctrl+V)\n"
-        "• Saves enforcer_log_sanitized.txt (in ~ and ~/Downloads) and highlights it in Windows Explorer so you can drag-and-drop it straight into the form\n"
-        "• Redacts all total account balances ($[REDACTED]), Windows usernames (~), and order IDs (...1234)."
+        "In-App Bug Report & Safe Log Upload:\n"
+        "Opens a built-in bug report window that automatically attaches your balance-redacted Safe Log.\n"
+        "• Lets you optionally include your Reddit/Discord/Email contact handle or submit anonymously\n"
+        "• Automatically scrubs all total account balances ($[REDACTED]), Windows paths (~), and order IDs (...1234)\n"
+        "• Sends directly to the developer drive (with Preview & Tally Web Form fallback included)."
     )
 
     def _toggle_privacy_mode():
@@ -15993,6 +16850,14 @@ def show_preflight_window(
                 )
             )
         )
+        var_mute_all_audio.set(
+            bool(
+                src.get(
+                    "mute_all_audio",
+                    DEFAULT_CONFIG["mute_all_audio"],
+                )
+            )
+        )
         var_voice_cues.set(
             src.get("enable_voice_cues", DEFAULT_CONFIG["enable_voice_cues"])
         )
@@ -16049,8 +16914,61 @@ def show_preflight_window(
             )
             default_status_lbl.config(text=msg, fg="#5dade2")
 
+    _pf_numeric_field_specs = []
+
+    def _validate_preflight_numeric_inputs(action_label="saving"):
+        bad_items = []
+        first_entry = None
+        for var_obj, label_txt, widget_ref, hint_txt in _pf_numeric_field_specs:
+            raw_s = str(var_obj.get()).strip()
+            is_ok = False
+            if raw_s:
+                try:
+                    num_v = float(raw_s)
+                    is_ok = math.isfinite(num_v)
+                except Exception:
+                    is_ok = False
+            if not is_ok:
+                shown_raw = f"'{raw_s}'" if raw_s else "empty"
+                bad_items.append(
+                    f"• {label_txt}\n   (Currently {shown_raw} — expected {hint_txt})"
+                )
+                if isinstance(widget_ref, tk.Entry) and widget_ref.winfo_exists():
+                    try:
+                        widget_ref.config(highlightbackground="#f43f5e")
+                    except Exception:
+                        pass
+                    if first_entry is None:
+                        first_entry = widget_ref
+        if not bad_items:
+            return True
+        hide_all_tooltips()
+        shown_lines = bad_items[:6]
+        extra_cnt = len(bad_items) - len(shown_lines)
+        extra_note = (
+            f"\n...and {extra_cnt} more field(s)." if extra_cnt > 0 else ""
+        )
+        messagebox.showerror(
+            "Invalid Numeric Value",
+            f"Please fix the highlighted field(s) before {action_label}:\n\n"
+            + "\n\n".join(shown_lines)
+            + extra_note,
+            parent=pf,
+        )
+        if first_entry is not None and first_entry.winfo_exists():
+            try:
+                if str(first_entry.cget("state")) == "normal":
+                    first_entry.focus_set()
+                    first_entry.selection_range(0, "end")
+                    first_entry.icursor("end")
+            except Exception:
+                pass
+        return False
+
     def save_as_user_defaults():
         if is_in_trade_tamper_locked():
+            return
+        if not _validate_preflight_numeric_inputs("saving defaults"):
             return
         try:
             custom_def = {
@@ -16074,6 +16992,7 @@ def show_preflight_window(
                 "check_updates_on_startup": bool(
                     var_check_updates_on_startup.get()
                 ),
+                "mute_all_audio": bool(var_mute_all_audio.get()),
                 "enable_voice_cues": bool(var_voice_cues.get()),
                 "tts_voice": TTS_LABEL_TO_ID.get(var_tts_voice.get(), "Zira"),
                 "enable_upside_chime": bool(var_upside_chime.get()),
@@ -16106,9 +17025,11 @@ def show_preflight_window(
                     fg="#58d68d"
                 )
         except ValueError:
+            if not _validate_preflight_numeric_inputs("saving defaults"):
+                return
             messagebox.showerror(
-                "Invalid Input",
-                "Please ensure all fields contain valid numbers before saving defaults.",
+                "Invalid Numeric Value",
+                "Please check your numeric fields for a valid number before saving defaults.",
                 parent=pf
             )
 
@@ -16145,6 +17066,7 @@ def show_preflight_window(
             new_cfg = json.loads(json.dumps(config))
             new_cfg["hud_columns"] = list(selected_hud_columns)
             new_cfg["poll_interval"] = new_poll
+            new_cfg["mute_all_audio"] = bool(var_mute_all_audio.get())
             new_cfg["enable_voice_cues"] = bool(var_voice_cues.get())
             new_cfg["tts_voice"] = TTS_LABEL_TO_ID.get(
                 var_tts_voice.get(), "Zira"
@@ -16177,6 +17099,9 @@ def show_preflight_window(
             settings_win_open = False
             _cancel_pf_timers()
             pf.destroy()
+            return
+
+        if not _validate_preflight_numeric_inputs("launching"):
             return
 
         try:
@@ -16319,9 +17244,13 @@ def show_preflight_window(
             new_cfg["anonymous_tester_id"] = config.get(
                 "anonymous_tester_id", ""
             )
+            new_cfg["bug_report_contact"] = config.get(
+                "bug_report_contact", ""
+            )
             new_cfg["seen_layout_tour_version"] = config.get(
                 "seen_layout_tour_version", ""
             )
+            new_cfg["mute_all_audio"] = bool(var_mute_all_audio.get())
             new_cfg["enable_voice_cues"] = bool(var_voice_cues.get())
             new_cfg["tts_voice"] = TTS_LABEL_TO_ID.get(
                 var_tts_voice.get(), "Zira"
@@ -16496,9 +17425,11 @@ def show_preflight_window(
             _cancel_pf_timers()
             pf.destroy()
         except ValueError:
+            if not _validate_preflight_numeric_inputs("launching"):
+                return
             messagebox.showerror(
-                "Invalid Input",
-                "Please ensure all fields contain valid numbers.",
+                "Invalid Numeric Value",
+                "Please check your numeric fields and enter valid numbers.",
                 parent=pf
             )
 
@@ -16583,13 +17514,22 @@ def show_preflight_window(
             )
         return card
 
+    signed_var_ids = {
+        id(dollar_vars[k]) for k in SIGNED_DOLLAR_KEYS if k in dollar_vars
+    }
     loss_var_ids = {id(dollar_vars[k]) for k in loss_display_keys}
+    pos_int_var_mins = {
+        id(var_tilt_count): 2,
+        id(var_poll): 1,
+    }
     green_var_ids = {
         id(dollar_vars[k])
         for k in (
             "consec_win_reset_dollars",
             "pm_lock_trigger",
             "pm_trail_cushion",
+            "t2_trigger",
+            "t3_trigger",
             "t4_trigger",
             "t4_trail",
         )
@@ -16630,8 +17570,15 @@ def show_preflight_window(
             highlightcolor=e_focus
         )
         ent._orig_rim = e_rim
-        if vid in loss_var_ids:
-            ent.bind("<FocusOut>", _bind_loss_sign_normalizer(var))
+        if vid in signed_var_ids:
+            n_mode, n_min = "signed_float", None
+        elif vid in loss_var_ids:
+            n_mode, n_min = "loss_float", None
+        elif vid in pos_int_var_mins:
+            n_mode, n_min = "pos_int", pos_int_var_mins[vid]
+        else:
+            n_mode, n_min = "pos_float", None
+        _attach_numeric_entry_behavior(ent, var, mode=n_mode, min_val=n_min)
         return ent
 
     def make_dual_field_row(
@@ -16864,6 +17811,7 @@ def show_preflight_window(
 
     def open_tilt_filter_dialog():
         hide_all_tooltips()
+        _stop_control_pulse()
         is_locked = is_in_trade_tamper_locked() or is_tilt_streak_tamper_locked()
         dlg = tk.Toplevel(pf)
         dlg.withdraw()
@@ -16965,8 +17913,9 @@ def show_preflight_window(
             highlightbackground="#b45309" if is_locked else "#632d3b",
             highlightcolor="#f43f5e",
         )
+        ent_m._orig_rim = "#b45309" if is_locked else "#632d3b"
         ent_m.pack(side="right")
-        ent_m.bind("<FocusOut>", _bind_loss_sign_normalizer(tmp_min))
+        _attach_numeric_entry_behavior(ent_m, tmp_min, mode="loss_float")
 
         row2 = tk.Frame(card_body, bg="#131922")
         row2.pack(fill="x", pady=4)
@@ -16994,7 +17943,9 @@ def show_preflight_window(
             highlightbackground="#b45309" if is_locked else "#266149",
             highlightcolor="#10b981",
         )
+        ent_w._orig_rim = "#b45309" if is_locked else "#266149"
         ent_w.pack(side="right")
+        _attach_numeric_entry_behavior(ent_w, tmp_win, mode="pos_float")
 
         err_lbl = tk.Label(
             card_body,
@@ -17015,11 +17966,11 @@ def show_preflight_window(
             )
 
         def _on_cancel():
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         def _on_apply(*_):
             if is_locked:
-                dlg.destroy()
+                _restore_pf_modal_focus(dlg)
                 return
             try:
                 m_val = abs(float(tmp_min.get().strip()))
@@ -17034,7 +17985,7 @@ def show_preflight_window(
             w_fmt = f"{int(w_val)}" if w_val.is_integer() else f"{w_val:g}"
             dollar_vars["consec_loss_min_dollars"].set(m_fmt)
             dollar_vars["consec_win_reset_dollars"].set(w_fmt)
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         dlg.protocol("WM_DELETE_WINDOW", _on_cancel)
         dlg.bind("<Escape>", lambda _e: _on_cancel())
@@ -17109,6 +18060,7 @@ def show_preflight_window(
             except Exception:
                 pass
         pf.wait_window(dlg)
+        _restore_pf_modal_focus(dlg)
 
     r_tilt_sub = tk.Frame(c1, bg="#131922")
     r_tilt_sub.pack(fill="x", pady=2)
@@ -17206,7 +18158,7 @@ def show_preflight_window(
 
         def on_cancel():
             decision["ok"] = False
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         def on_confirm():
             decision["ok"] = True
@@ -17436,7 +18388,7 @@ def show_preflight_window(
 
         def on_cancel():
             decision["ok"] = False
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         def on_confirm():
             decision["ok"] = True
@@ -17669,7 +18621,7 @@ def show_preflight_window(
 
         def on_cancel():
             decision["ok"] = False
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         def on_confirm():
             decision["ok"] = True
@@ -18392,6 +19344,56 @@ def show_preflight_window(
                 lbl_sl.config(text="🔒 Locked In Trade" if in_tr_lk else "")
             except Exception:
                 pass
+        muted_all = bool(var_mute_all_audio.get())
+        cb_ma = _prefs_modal_refs.get("cb_mute_all")
+        if cb_ma is not None:
+            try:
+                cb_ma.config(
+                    fg="#fbbf24" if muted_all else "#e2e8f0"
+                )
+            except Exception:
+                pass
+        lbl_sb = _prefs_modal_refs.get("lbl_silent_badge")
+        if lbl_sb is not None:
+            try:
+                if muted_all:
+                    lbl_sb.config(
+                        text="SILENT MODE ACTIVE",
+                        fg="#fde68a",
+                        bg="#451a03",
+                        padx=7,
+                        pady=2,
+                    )
+                else:
+                    lbl_sb.config(
+                        text="",
+                        fg="#64748b",
+                        bg="#131922",
+                        padx=0,
+                        pady=0,
+                    )
+            except Exception:
+                pass
+        cb_vc = _prefs_modal_refs.get("cb_voice_cues")
+        if cb_vc is not None:
+            try:
+                cb_vc.config(
+                    state="disabled" if muted_all else "normal",
+                    fg="#dce4ee",
+                    disabledforeground="#526070",
+                )
+            except Exception:
+                pass
+        cb_uc = _prefs_modal_refs.get("cb_upside_chime")
+        if cb_uc is not None:
+            try:
+                cb_uc.config(
+                    state="disabled" if muted_all else "normal",
+                    fg="#4ec994",
+                    disabledforeground="#526070",
+                )
+            except Exception:
+                pass
         btn_ta = _prefs_modal_refs.get("btn_test_audio")
         if btn_ta is not None:
             try:
@@ -18437,7 +19439,7 @@ def show_preflight_window(
 
         def on_cancel():
             decision["ok"] = False
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         def on_start():
             decision["ok"] = True
@@ -18602,10 +19604,11 @@ def show_preflight_window(
             threading.Thread(target=_siren_sample, daemon=True).start()
         elif choice == "Connection Lost Tone (2-Tone)":
             threading.Thread(
-                target=play_disconnect_tone_once, daemon=True
+                target=lambda: play_disconnect_tone_once(force=True),
+                daemon=True,
             ).start()
         elif choice == "Upside Tier Chime":
-            play_upside_tier_chime()
+            play_upside_tier_chime(force=True)
         elif choice == "Voice: Lockout Alert":
             speak_async(
                 "Open P and L stop triggered. Locked out for 2 minutes. Initial flat check passed.",
@@ -18635,7 +19638,9 @@ def show_preflight_window(
                 interrupt=True,
             )
         elif choice == "Unlock Chime (3-Tone)":
-            threading.Thread(target=play_unlock_chimes, daemon=True).start()
+            threading.Thread(
+                target=lambda: play_unlock_chimes(force=True), daemon=True
+            ).start()
         elif choice == "Full 10s Dry-Run Lockout":
             if dry_run_lock_active or cooldown_active:
                 return
@@ -18752,7 +19757,7 @@ def show_preflight_window(
                                 )
                         time.sleep(0.20)
                     stop_active_tts()
-                    play_unlock_chimes()
+                    play_unlock_chimes(force=True)
                     speak_async(
                         "Dry run lockout complete. You may unlock your screen.",
                         force=True,
@@ -18787,6 +19792,7 @@ def show_preflight_window(
 
     def open_preferences_audio_dialog():
         hide_all_tooltips()
+        _stop_control_pulse()
         existing_dlg = _prefs_modal_refs.get("dlg")
         if existing_dlg is not None:
             try:
@@ -18867,37 +19873,110 @@ def show_preflight_window(
 
         cb_reset925 = make_glass_checkbutton(
             sec1,
-            text="Start Fresh on Rulebook Switch (9:30 AM & 4:00 PM)",
+            text="Reset Profit Ratchets at 9:30 AM & 4:00 PM Session Switch (Start at Base Tier 1)",
             variable=var_reset925,
             font=("Arial", 10, "bold"),
             fg="#dce4ee",
             bg="#131922",
             anchor="w",
         )
-        cb_reset925.pack(fill="x", pady=2)
-        attach_tooltip(
-            cb_reset925,
-            "If checked, at 9:30 AM ET (RTH Open) and 4:00 PM ET (After-Hours Open) your active Rulebook\n"
-            "starts fresh from current flat equity so an earlier session's profit peak won't immediately\n"
-            "trigger a tier ratchet or trailing stop. (Your SESSION HIGH column still preserves your full-day peak.)"
+        cb_reset925.pack(fill="x", pady=(2, 0))
+        lbl_reset925_hint = tk.Label(
+            sec1,
+            text="└─ Prevents Pre-Market profits from pre-triggering RTH profit tiers at 9:30 AM (full-day PnL & High stay intact).",
+            font=("Arial", 8),
+            fg="#8b9bb0",
+            bg="#131922",
+            anchor="w",
         )
+        lbl_reset925_hint.pack(fill="x", padx=(22, 0), pady=(0, 6))
+        r925_tip = (
+            "Session Ratchet Reset at 9:30 AM & 4:00 PM ET (Recommended — Default ON):\n"
+            "• Why It Exists: Card 4 (Extended Hours) and Card 5 (Regular Hours) each track realized\n"
+            "  profit peaks to unlock Profit Ratchet Tiers. Suppose you make +$600 in Pre-Market:\n"
+            "  without this checked, the moment 9:30 AM hits your +$600 morning profit would immediately\n"
+            "  activate RTH Tier 3 (+$500 trigger) before you even take a Regular Hours trade.\n"
+            "• When Checked (Reset): At 9:30 AM ET and 4:00 PM ET (when flat), your new Rulebook\n"
+            "  starts back at Base Tier 1 anchored to current equity so RTH tiers only unlock from\n"
+            "  new RTH profits (open positions carry across the bell seamlessly until flat).\n"
+            "• What Never Resets: Your total daily REALIZED PnL, NET PnL, W/L counter, and SESSION HIGH\n"
+            "  on the HUD always keep your full-day totals intact.\n"
+            "• Uncheck (Carry): Combine Pre-Market and RTH profit peaks into one continuous ratchet."
+        )
+        attach_tooltip(cb_reset925, r925_tip)
+        attach_tooltip(lbl_reset925_hint, r925_tip)
         _prefs_modal_refs["cb_reset925"] = cb_reset925
 
         cb_ignore_prepos = make_glass_checkbutton(
             sec1,
-            text="Ignore Pre-Existing Positions on Launch",
+            text="Ignore Pre-Existing Positions (Swing / Long-Term Filter)",
             variable=var_ignore_preexisting,
             font=("Arial", 10, "bold"),
             fg="#dce4ee",
             bg="#131922",
             anchor="w",
         )
-        cb_ignore_prepos.pack(fill="x", pady=2)
+        cb_ignore_prepos.pack(fill="x", pady=(2, 0))
+        lbl_ig_hint = tk.Label(
+            sec1,
+            text="└─ Excludes overnight swings or holds so only new daytrades affect your PnL & Auto-Flatten.",
+            font=("Arial", 8),
+            fg="#8b9bb0",
+            bg="#131922",
+            anchor="w",
+        )
+        lbl_ig_hint.pack(fill="x", padx=(22, 0), pady=(0, 2))
         attach_tooltip(cb_ignore_prepos, prepos_tip)
+        attach_tooltip(lbl_ig_hint, prepos_tip)
         _prefs_modal_refs["cb_ignore_prepos"] = cb_ignore_prepos
 
         # Section 2: Audio & Voice Cues
-        sec2, _sec2_hdr = _make_prefs_section("AUDIO & VOICE CUES", "#10b981")
+        sec2, sec2_hdr = _make_prefs_section("AUDIO & VOICE CUES", "#10b981")
+        lbl_silent_badge = tk.Label(
+            sec2_hdr,
+            text="",
+            font=("Arial", 8, "bold"),
+            fg="#64748b",
+            bg="#131922",
+        )
+        lbl_silent_badge.pack(side="right")
+        _prefs_modal_refs["lbl_silent_badge"] = lbl_silent_badge
+
+        cb_mute_all = make_glass_checkbutton(
+            sec2,
+            text="Mute All Sounds & Voice Callouts (Silent Mode — Work Calls / Quiet Room)",
+            variable=var_mute_all_audio,
+            font=("Arial", 10, "bold"),
+            fg="#e2e8f0",
+            bg="#131922",
+            accent_hex="#b45309",
+            check_hex="#fbbf24",
+            anchor="w",
+        )
+        cb_mute_all.pack(fill="x", pady=(2, 0))
+        lbl_mute_hint = tk.Label(
+            sec2,
+            text="└─ Silences warning sirens, connection-loss tones, chimes & voice alerts (visual HUD alerts stay active).",
+            font=("Arial", 8),
+            fg="#8b9bb0",
+            bg="#131922",
+            anchor="w",
+        )
+        lbl_mute_hint.pack(fill="x", padx=(22, 0), pady=(0, 6))
+        mute_all_tip = (
+            "Silent Mode (Mute All Sounds & Voice Callouts):\n"
+            "Ideal for work calls, shared offices, or quiet environments:\n"
+            "• Immediately silences ALL automated audio: Warning Sirens, Connection-Loss 2-tone alerts,\n"
+            "  Upside Tier Chimes, Unlock Chimes, and Verbal Voice Callouts.\n"
+            "• Visual HUD alarm banners, emerald floor-raised glows, and all risk guardrails continue\n"
+            "  working 100% normally.\n"
+            "• Your Verbal Voice & Upside Chime preferences are remembered when you uncheck Silent Mode.\n"
+            "• Manual '🔊 Test' previews still play on demand so you can check audio levels anytime."
+        )
+        attach_tooltip(cb_mute_all, mute_all_tip)
+        attach_tooltip(lbl_mute_hint, mute_all_tip)
+        _prefs_modal_refs["cb_mute_all"] = cb_mute_all
+
         r_audio = tk.Frame(sec2, bg="#131922")
         r_audio.pack(fill="x", pady=2)
         cb_voice = make_glass_checkbutton(
@@ -18910,6 +19989,7 @@ def show_preflight_window(
             anchor="w",
         )
         cb_voice.pack(side="left", padx=(0, 18))
+        _prefs_modal_refs["cb_voice_cues"] = cb_voice
         attach_tooltip(
             cb_voice,
             "Uses Windows Speech Synthesis to speak the lockout reason, duration, and 2s/15s\n"
@@ -18928,6 +20008,7 @@ def show_preflight_window(
             anchor="w",
         )
         cb_chime.pack(side="left")
+        _prefs_modal_refs["cb_upside_chime"] = cb_chime
         attach_tooltip(
             cb_chime,
             "When you close a winning trade (100% flat) that unlocks a higher profit ratchet tier\n"
@@ -19175,15 +20256,7 @@ def show_preflight_window(
                     pass
             for k in list(_prefs_modal_refs.keys()):
                 _prefs_modal_refs[k] = None
-            try:
-                dlg.grab_release()
-            except Exception:
-                pass
-            try:
-                if dlg.winfo_exists():
-                    dlg.destroy()
-            except Exception:
-                pass
+            _restore_pf_modal_focus(dlg)
 
         _prefs_modal_refs["cleanup_fn"] = lambda: _cleanup_prefs_modal(
             restore_invalid_poll=True
@@ -19278,8 +20351,21 @@ def show_preflight_window(
         fg="#94a3b8",
         bg="#131922",
         anchor="w",
+        cursor="hand2",
     )
     lbl_prefs_summary.pack(fill="x", pady=(0, 4))
+    lbl_prefs_summary.bind(
+        "<Enter>", lambda _e: lbl_prefs_summary.config(fg="#cbd5e1")
+    )
+    lbl_prefs_summary.bind(
+        "<Leave>",
+        lambda _e: lbl_prefs_summary.config(
+            fg="#fbbf24" if var_mute_all_audio.get() else "#94a3b8"
+        ),
+    )
+    lbl_prefs_summary.bind(
+        "<Button-1>", lambda _e: open_preferences_audio_dialog()
+    )
 
     def _refresh_card3_prefs_summary(*_):
         if pf_timer_state.get("closing"):
@@ -19291,7 +20377,10 @@ def show_preflight_window(
             return
         sw_txt = "Reset" if var_reset925.get() else "Carry"
         pos_txt = "Ignored" if var_ignore_preexisting.get() else "Tracked"
-        vc_txt = "ON" if var_voice_cues.get() else "OFF"
+        if var_mute_all_audio.get():
+            audio_txt = "Audio: MUTED"
+        else:
+            audio_txt = f"Voice: {'ON' if var_voice_cues.get() else 'OFF'}"
         raw_p = str(var_poll.get()).strip()
         try:
             p_sec = max(1, int(float(raw_p))) if raw_p else "?"
@@ -19301,9 +20390,10 @@ def show_preflight_window(
         try:
             lbl_prefs_summary.config(
                 text=(
-                    f"Rulebook Switch: {sw_txt} · Swings: {pos_txt} · "
-                    f"Voice: {vc_txt} · Poll: {p_sec}s · Safe Logs: {log_txt}"
-                )
+                    f"9:30/4:00 Ratchets: {sw_txt} · Swings: {pos_txt} · "
+                    f"{audio_txt} · Poll: {p_sec}s · Safe Logs: {log_txt}"
+                ),
+                fg="#fbbf24" if var_mute_all_audio.get() else "#94a3b8",
             )
         except Exception:
             pass
@@ -19311,6 +20401,7 @@ def show_preflight_window(
     for _pv in (
         var_reset925,
         var_ignore_preexisting,
+        var_mute_all_audio,
         var_voice_cues,
         var_upside_chime,
         var_poll,
@@ -19320,8 +20411,8 @@ def show_preflight_window(
     _refresh_card3_prefs_summary()
     attach_tooltip(
         lbl_prefs_summary,
-        "Quick summary of active Session Behavior, Voice Cue, Poll Rate, and Beta Log preferences.\n"
-        "Click '⚙ Preferences & Audio...' below to customize them."
+        "Quick summary of active 9:30/4:00 Ratchet Reset, Swing Filter, Audio / Silent Mode, Poll Rate, and Beta Log preferences.\n"
+        "Click here or '⚙ Preferences & Audio...' below to customize them."
     )
 
     r_c3_actions = tk.Frame(c3, bg="#131922")
@@ -19368,9 +20459,9 @@ def show_preflight_window(
     attach_tooltip(
         btn_prefs_card3,
         "Open Preferences & Audio Settings:\n"
-        "• Session Behavior: Start Fresh on Rulebook Switch & Ignore Pre-Existing Positions\n"
-        "• Audio & Voice Cues: Voice Cues, Upside Chime, Voice Selector & Sound/Dry-Run Tester\n"
-        "• System & Telemetry: API Poll Interval (s) & Auto-Share Daily Safe Logs"
+        "• Session Behavior: Reset Profit Ratchets at 9:30 AM & 4:00 PM Switch & Swing Filter\n"
+        "• Audio & Voice Cues: Silent Mode (Mute All), Voice Cues, Upside Chime & Sound/Dry-Run Tester\n"
+        "• System & Telemetry: API Poll Interval (s), Debug Terminal, Startup Update Check & Safe Logs"
     )
 
     # ==========================================================
@@ -19742,6 +20833,143 @@ def show_preflight_window(
             (t_cb_var, cb_t, lbl_trig, ent_trig, lbl_arrow, lbl_fl, ent_fl, cb_fg_col)
         )
 
+    _pf_numeric_field_specs.extend(
+        [
+            (
+                dollar_vars["open_max_loss"],
+                "Card 1 — Max Open Loss ($)",
+                ent_open_loss,
+                "a negative dollar amount or 0, e.g. -300",
+            ),
+            (
+                var_tilt_count,
+                "Card 1 — Consecutive Loss Cooldown 'Losses'",
+                ent_tilt_count,
+                "a whole number >= 2, e.g. 3",
+            ),
+            (
+                var_tilt_window,
+                "Card 1 — Consecutive Loss Cooldown 'In (Mins)'",
+                ent_tilt_window,
+                "minutes >= 0.5, e.g. 15",
+            ),
+            (
+                dollar_vars["consec_loss_min_dollars"],
+                "Card 1 — Qualifying Trade Filter 'Min Loss ($)' (click Filter button)",
+                btn_tilt_filter,
+                "a dollar amount, e.g. -25",
+            ),
+            (
+                dollar_vars["consec_win_reset_dollars"],
+                "Card 1 — Qualifying Trade Filter 'Min Win ($)' (click Filter button)",
+                btn_tilt_filter,
+                "a dollar amount, e.g. 10",
+            ),
+            (
+                var_cd_mins,
+                "Card 1 — Penalty Box 'Lock Duration (Mins)'",
+                ent_cd_mins,
+                "minutes >= 0.1, e.g. 15",
+            ),
+            (
+                var_daily_lock_mins,
+                "Card 2 — Daily Stop 'Lock Duration (Mins)'",
+                ent_daily_lock_mins,
+                "minutes >= 0, e.g. 60",
+            ),
+            (
+                dollar_vars["pm_max_loss"],
+                "Card 4 (Extended Hours) — Starting Max Loss ($)",
+                ent_pm_max,
+                "a negative dollar amount, e.g. -1000",
+            ),
+            (
+                dollar_vars["pm_warn_1"],
+                "Card 4 (Extended Hours) — Warning Alarm 1 ($)",
+                ent_pm_w1,
+                "a negative dollar amount, e.g. -400",
+            ),
+            (
+                dollar_vars["pm_warn_2"],
+                "Card 4 (Extended Hours) — Warning Alarm 2 ($)",
+                ent_pm_w2,
+                "a negative dollar amount, e.g. -750",
+            ),
+            (
+                dollar_vars["pm_lock_trigger"],
+                "Card 4 (Extended Hours) — Trailing Profit Lock 'At Profit ($)'",
+                ent_pm_trig,
+                "a dollar amount, e.g. 500",
+            ),
+            (
+                dollar_vars["pm_trail_cushion"],
+                "Card 4 (Extended Hours) — Trailing Profit Lock 'Trail Peak By ($)'",
+                ent_pm_trail,
+                "a dollar amount, e.g. 750",
+            ),
+            (
+                dollar_vars["t1_max_loss"],
+                "Card 5 (Regular Hours) — Base Tier 1 Starting Max Loss ($)",
+                ent_t1_max,
+                "a negative dollar amount, e.g. -1500",
+            ),
+            (
+                dollar_vars["t1_warn_1"],
+                "Card 5 (Regular Hours) — Base Tier 1 Warning Alarm 1 ($)",
+                ent_t1_w1,
+                "a negative dollar amount, e.g. -400",
+            ),
+            (
+                dollar_vars["t1_warn_2"],
+                "Card 5 (Regular Hours) — Base Tier 1 Warning Alarm 2 ($)",
+                ent_t1_w2,
+                "a negative dollar amount, e.g. -750",
+            ),
+            (
+                dollar_vars["t2_trigger"],
+                "Card 5 (Regular Hours) — Tier 2 'At Profit ($)'",
+                tier_widget_refs[0][3],
+                "a dollar amount, e.g. 250",
+            ),
+            (
+                dollar_vars["t2_max_loss"],
+                "Card 5 (Regular Hours) — Tier 2 'Stop Level ($)'",
+                tier_widget_refs[0][6],
+                "negative, 0, or positive, e.g. -1000, 0, or 100",
+            ),
+            (
+                dollar_vars["t3_trigger"],
+                "Card 5 (Regular Hours) — Tier 3 'At Profit ($)'",
+                tier_widget_refs[1][3],
+                "a dollar amount, e.g. 500",
+            ),
+            (
+                dollar_vars["t3_max_loss"],
+                "Card 5 (Regular Hours) — Tier 3 'Stop Level ($)'",
+                tier_widget_refs[1][6],
+                "negative, 0, or positive, e.g. -500, 0, or 250",
+            ),
+            (
+                dollar_vars["t4_trigger"],
+                "Card 5 (Regular Hours) — Tier 4 'At Profit ($)'",
+                tier_widget_refs[2][3],
+                "a dollar amount, e.g. 1000",
+            ),
+            (
+                dollar_vars["t4_trail"],
+                "Card 5 (Regular Hours) — Tier 4 'Trail Peak By ($)'",
+                tier_widget_refs[2][6],
+                "a dollar amount, e.g. 500",
+            ),
+            (
+                var_poll,
+                "Preferences & Audio — API Poll Interval (s) (click Preferences & Audio...)",
+                btn_prefs_card3,
+                "whole seconds >= 1, e.g. 2",
+            ),
+        ]
+    )
+
     def _parse_ui_dollar_num(var_obj, default=0.0):
         try:
             raw = str(var_obj.get()).replace("$", "").replace(",", "").strip()
@@ -19749,12 +20977,17 @@ def show_preflight_window(
         except Exception:
             return default
 
-    def _apply_dynamic_stop_box_style(ent_w, locks_in_green):
-        if locks_in_green:
+    def _apply_dynamic_stop_box_style(ent_w, state_mode):
+        if state_mode == "green":
             e_bg = "#10261e"
             e_rim = "#266149"
             e_focus = "#10b981"
             e_fg = "#e2f7ec"
+        elif state_mode == "red":
+            e_bg = "#24141a"
+            e_rim = "#632d3b"
+            e_focus = "#f43f5e"
+            e_fg = "#f8e4e7"
         else:
             e_bg = "#132333"
             e_rim = "#2e526e"
@@ -19771,6 +21004,17 @@ def show_preflight_window(
                 highlightcolor=e_focus,
             )
 
+    def _signed_stop_visual_state(var_obj):
+        raw_s = str(var_obj.get()).strip()
+        if raw_s.startswith("-"):
+            return "red"
+        val = _parse_ui_dollar_num(var_obj, 0.0)
+        if val > 0.0:
+            return "green"
+        if val < 0.0:
+            return "red"
+        return "blue"
+
     def _refresh_dynamic_stop_box_colors(*_):
         if pf_timer_state.get("closing"):
             return
@@ -19781,19 +21025,25 @@ def show_preflight_window(
             return
         pm_trig_v = abs(_parse_ui_dollar_num(dollar_vars["pm_lock_trigger"], 0.0))
         pm_trail_v = abs(_parse_ui_dollar_num(dollar_vars["pm_trail_cushion"], 0.0))
-        _apply_dynamic_stop_box_style(ent_pm_trail, (pm_trig_v - pm_trail_v) > 0.0)
+        _apply_dynamic_stop_box_style(
+            ent_pm_trail, "green" if (pm_trig_v - pm_trail_v) > 0.0 else "blue"
+        )
 
         if len(tier_widget_refs) >= 3:
-            t2_stop_v = _parse_ui_dollar_num(dollar_vars["t2_max_loss"], 0.0)
-            _apply_dynamic_stop_box_style(tier_widget_refs[0][6], t2_stop_v > 0.0)
-
-            t3_stop_v = _parse_ui_dollar_num(dollar_vars["t3_max_loss"], 0.0)
-            _apply_dynamic_stop_box_style(tier_widget_refs[1][6], t3_stop_v > 0.0)
+            _apply_dynamic_stop_box_style(
+                tier_widget_refs[0][6],
+                _signed_stop_visual_state(dollar_vars["t2_max_loss"]),
+            )
+            _apply_dynamic_stop_box_style(
+                tier_widget_refs[1][6],
+                _signed_stop_visual_state(dollar_vars["t3_max_loss"]),
+            )
 
             t4_trig_v = abs(_parse_ui_dollar_num(dollar_vars["t4_trigger"], 0.0))
             t4_trail_v = abs(_parse_ui_dollar_num(dollar_vars["t4_trail"], 0.0))
             _apply_dynamic_stop_box_style(
-                tier_widget_refs[2][6], (t4_trig_v - t4_trail_v) > 0.0
+                tier_widget_refs[2][6],
+                "green" if (t4_trig_v - t4_trail_v) > 0.0 else "blue",
             )
 
     for _dyn_k in (
@@ -19805,6 +21055,7 @@ def show_preflight_window(
         "t4_trail",
     ):
         dollar_vars[_dyn_k].trace_add("write", _refresh_dynamic_stop_box_colors)
+    _refresh_dynamic_stop_box_colors()
 
     # --- INTERACTIVE SMART DIMMING LOGIC ---
     _tamper_sync_guard = {"busy": False}
@@ -19868,6 +21119,121 @@ def show_preflight_window(
             disabledforeground="#475569",
             highlightbackground=getattr(ent, "_orig_rim", "#2e526e"),
         )
+
+    def _refresh_alarms_only_btn_style(in_trade_locked=None, tamper_locked=None):
+        if btn_alarms_only is None or not btn_alarms_only.winfo_exists():
+            return
+        if in_trade_locked is None:
+            in_trade_locked = is_in_trade_tamper_locked()
+        if tamper_locked is None:
+            tamper_locked = is_tilt_streak_tamper_locked()
+        ao_on_btn = bool(var_alarms_only.get())
+        ao_locked_btn = in_trade_locked or (tamper_locked and not ao_on_btn)
+        if ao_on_btn:
+            btn_alarms_only.config(
+                text=(
+                    "🔒 🔔 Alarms Only: ON"
+                    if ao_locked_btn
+                    else "🔔 Alarms Only: ON"
+                ),
+                fill_color="#78350f",
+                fill_top_color="#92400e",
+                border_color="#f59e0b",
+                hover_fill="#92400e",
+                hover_fill_top="#b45309",
+                hover_border="#fbbf24",
+                fg="#fef3c7",
+                disabledforeground="#fde68a",
+                state="disabled" if ao_locked_btn else "normal",
+            )
+        else:
+            btn_alarms_only.config(
+                text=(
+                    "🔒 🔔 Alarms Only: OFF"
+                    if ao_locked_btn
+                    else "🔔 Alarms Only: OFF"
+                ),
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#475569",
+                hover_fill="#261f14",
+                hover_fill_top="#362b1a",
+                hover_border="#f59e0b",
+                fg="#cbd5e1",
+                disabledforeground="#526070",
+                state="disabled" if ao_locked_btn else "normal",
+            )
+
+    def _refresh_tilt_filter_btn_style(in_trade_locked=None, tamper_locked=None):
+        if btn_tilt_filter is None or not btn_tilt_filter.winfo_exists():
+            return
+        if in_trade_locked is None:
+            in_trade_locked = is_in_trade_tamper_locked()
+        if tamper_locked is None:
+            tamper_locked = is_tilt_streak_tamper_locked()
+        ao_on = bool(var_alarms_only.get())
+        if in_trade_locked:
+            t_on = not ao_on and bool(var_tilt_cd.get())
+            if t_on:
+                btn_tilt_filter.config(
+                    state="normal",
+                    fill_color="#2a1f10",
+                    fill_top_color="#382814",
+                    border_color="#b45309",
+                    hover_fill="#332512",
+                    hover_fill_top="#443016",
+                    hover_border="#f59e0b",
+                    fg="#fde68a",
+                )
+            else:
+                btn_tilt_filter.config(
+                    state="disabled",
+                    fill_color="#11161e",
+                    fill_top_color="#161c26",
+                    border_color="#222d3d",
+                    fg="#526070",
+                    disabledforeground="#526070",
+                )
+        elif ao_on:
+            btn_tilt_filter.config(
+                state="disabled",
+                fill_color="#11161e",
+                fill_top_color="#161c26",
+                border_color="#222d3d",
+                fg="#526070",
+                disabledforeground="#526070",
+            )
+        elif tamper_locked:
+            btn_tilt_filter.config(
+                state="normal",
+                fill_color="#2a1f10",
+                fill_top_color="#382814",
+                border_color="#b45309",
+                hover_fill="#332512",
+                hover_fill_top="#443016",
+                hover_border="#f59e0b",
+                fg="#fde68a",
+            )
+        elif var_tilt_cd.get():
+            btn_tilt_filter.config(
+                state="normal",
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#38bdf8",
+                fg="#cbd5e1",
+            )
+        else:
+            btn_tilt_filter.config(
+                state="disabled",
+                fill_color="#11161e",
+                fill_top_color="#161c26",
+                border_color="#222d3d",
+                fg="#526070",
+                disabledforeground="#526070",
+            )
 
     def refresh_smart_dimming(*_):
         if _tamper_sync_guard["busy"]:
@@ -20010,43 +21376,9 @@ def show_preflight_window(
             btn_save_def.config(
                 state="disabled" if in_trade_locked else "normal"
             )
-        if btn_alarms_only is not None:
-            ao_on_btn = bool(var_alarms_only.get())
-            ao_locked_btn = in_trade_locked or (tamper_locked and not ao_on_btn)
-            if ao_on_btn:
-                btn_alarms_only.config(
-                    text=(
-                        "🔒 🔔 Alarms Only: ON"
-                        if ao_locked_btn
-                        else "🔔 Alarms Only: ON"
-                    ),
-                    fill_color="#78350f",
-                    fill_top_color="#92400e",
-                    border_color="#f59e0b",
-                    hover_fill="#92400e",
-                    hover_fill_top="#b45309",
-                    hover_border="#fbbf24",
-                    fg="#fef3c7",
-                    disabledforeground="#fde68a",
-                    state="disabled" if ao_locked_btn else "normal",
-                )
-            else:
-                btn_alarms_only.config(
-                    text=(
-                        "🔒 🔔 Alarms Only: OFF"
-                        if ao_locked_btn
-                        else "🔔 Alarms Only: OFF"
-                    ),
-                    fill_color="#141820",
-                    fill_top_color="#1c212b",
-                    border_color="#475569",
-                    hover_fill="#261f14",
-                    hover_fill_top="#362b1a",
-                    hover_border="#f59e0b",
-                    fg="#cbd5e1",
-                    disabledforeground="#526070",
-                    state="disabled" if ao_locked_btn else "normal",
-                )
+        _refresh_alarms_only_btn_style(
+            in_trade_locked=in_trade_locked, tamper_locked=tamper_locked
+        )
         if btn_launch is not None:
             if dry_run_lock_active or cooldown_active:
                 btn_launch.config(
@@ -20140,26 +21472,9 @@ def show_preflight_window(
             lbl_tilt_losses.config(fg="#fbbf24" if t_on else "#526070")
             lbl_tilt_filter.config(fg="#fbbf24" if t_on else "#526070")
             lbl_tilt_window.config(fg="#fbbf24" if t_on else "#526070")
-            if t_on:
-                btn_tilt_filter.config(
-                    state="normal",
-                    fill_color="#2a1f10",
-                    fill_top_color="#382814",
-                    border_color="#b45309",
-                    hover_fill="#332512",
-                    hover_fill_top="#443016",
-                    hover_border="#f59e0b",
-                    fg="#fde68a",
-                )
-            else:
-                btn_tilt_filter.config(
-                    state="disabled",
-                    fill_color="#11161e",
-                    fill_top_color="#161c26",
-                    border_color="#222d3d",
-                    fg="#526070",
-                    disabledforeground="#526070",
-                )
+            _refresh_tilt_filter_btn_style(
+                in_trade_locked=True, tamper_locked=tamper_locked
+            )
 
             cd_armed = (
                 not ao_on
@@ -20356,13 +21671,8 @@ def show_preflight_window(
             ent_tilt_count.config(state="disabled")
             lbl_tilt_losses.config(fg="#526070")
             lbl_tilt_filter.config(fg="#526070")
-            btn_tilt_filter.config(
-                state="disabled",
-                fill_color="#11161e",
-                fill_top_color="#161c26",
-                border_color="#222d3d",
-                fg="#526070",
-                disabledforeground="#526070",
+            _refresh_tilt_filter_btn_style(
+                in_trade_locked=False, tamper_locked=tamper_locked
             )
             lbl_tilt_window.config(fg="#526070")
             ent_tilt_window.config(state="disabled")
@@ -20407,15 +21717,8 @@ def show_preflight_window(
                 )
                 lbl_tilt_losses.config(fg="#fbbf24")
                 lbl_tilt_filter.config(fg="#fbbf24")
-                btn_tilt_filter.config(
-                    state="normal",
-                    fill_color="#2a1f10",
-                    fill_top_color="#382814",
-                    border_color="#b45309",
-                    hover_fill="#332512",
-                    hover_fill_top="#443016",
-                    hover_border="#f59e0b",
-                    fg="#fde68a",
+                _refresh_tilt_filter_btn_style(
+                    in_trade_locked=False, tamper_locked=True
                 )
                 lbl_tilt_window.config(fg="#fbbf24")
                 ent_tilt_window.config(
@@ -20437,32 +21740,17 @@ def show_preflight_window(
                     ent_tilt_count.config(state="normal")
                     lbl_tilt_losses.config(fg="#97a7b9")
                     lbl_tilt_filter.config(fg="#97a7b9")
-                    btn_tilt_filter.config(
-                        state="normal",
-                        fill_color="#141820",
-                        fill_top_color="#1c212b",
-                        border_color="#2e3746",
-                        hover_fill="#181e28",
-                        hover_fill_top="#232a36",
-                        hover_border="#38bdf8",
-                        fg="#cbd5e1",
-                    )
                     lbl_tilt_window.config(fg="#97a7b9")
                     ent_tilt_window.config(state="normal")
                 else:
                     ent_tilt_count.config(state="disabled")
                     lbl_tilt_losses.config(fg="#526070")
                     lbl_tilt_filter.config(fg="#526070")
-                    btn_tilt_filter.config(
-                        state="disabled",
-                        fill_color="#11161e",
-                        fill_top_color="#161c26",
-                        border_color="#222d3d",
-                        fg="#526070",
-                        disabledforeground="#526070",
-                    )
                     lbl_tilt_window.config(fg="#526070")
                     ent_tilt_window.config(state="disabled")
+                _refresh_tilt_filter_btn_style(
+                    in_trade_locked=False, tamper_locked=False
+                )
 
             if tamper_locked and config.get("enable_open_cooldown", False):
                 cb_open_cd.config(
@@ -20811,18 +22099,12 @@ def show_preflight_window(
         """Pulses the border and surface glow of the relocated Pre-Flight controls
         (BROKER/ACCOUNT capsule, Privacy Mode, Card 1 Filter, Card 3 Token &
         Preferences & Audio, and Alarms Only) with a warm, cohesive sky-blue
-        spotlight for ~6.8 seconds so the user has plenty of time to scan the window."""
+        spotlight for ~3.2 seconds. Stops automatically on any click."""
+        _stop_control_pulse()
         if not pf.winfo_exists() or pf_timer_state.get("closing"):
             return
-        prev_aid = pf_timer_state.get("pulse_after_id")
-        if prev_aid is not None:
-            pf_timer_state["pulse_after_id"] = None
-            try:
-                pf.after_cancel(prev_aid)
-            except Exception:
-                pass
 
-        # 9 calm, single-hue sky-blue glow cycles (18 steps @ 380ms = ~6.8s total)
+        # 4 calm, single-hue sky-blue glow cycles (8 steps @ 400ms = ~3.2s total)
         spotlight_theme = {
             "border": "#38bdf8",
             "fill": "#13283d",
@@ -20830,7 +22112,7 @@ def show_preflight_window(
             "fg": "#e0f2fe",
         }
         pulse_themes = []
-        for _ in range(9):
+        for _ in range(4):
             pulse_themes.append(spotlight_theme)
             pulse_themes.append(None)
 
@@ -20841,6 +22123,15 @@ def show_preflight_window(
             btn_alarms_only,
         ]
 
+        orig_tok_styles = {}
+        try:
+            if base_sub_lbl is not None and base_sub_lbl.winfo_exists():
+                for ch_w in base_sub_lbl.winfo_children():
+                    if isinstance(ch_w, tk.Label) and "Token:" in str(ch_w.cget("text")):
+                        orig_tok_styles[str(ch_w)] = (ch_w.cget("fg"), ch_w.cget("bg"))
+        except Exception:
+            pass
+
         def _restore_normal_control_styles():
             _capsule_state["pulse_border"] = None
             _capsule_state["pulse_fill"] = None
@@ -20850,6 +22141,7 @@ def show_preflight_window(
                     b_w._hovered = False
             _redraw_broker_acct_capsule()
             _refresh_privacy_mode_ui()
+            _refresh_tilt_filter_btn_style()
             if btn_prefs_card3 is not None and btn_prefs_card3.winfo_exists():
                 btn_prefs_card3.config(
                     fill_color="#141820",
@@ -20857,23 +22149,38 @@ def show_preflight_window(
                     border_color="#2e3746",
                     fg="#cbd5e1",
                 )
-            if btn_tilt_filter is not None and btn_tilt_filter.winfo_exists():
-                btn_tilt_filter.config(
-                    fill_color="#141820",
-                    fill_top_color="#1c212b",
-                    border_color="#2e3746",
-                    fg="#cbd5e1",
-                )
-            _render_card3_telemetry_live(force=True)
-            refresh_smart_dimming()
+            _refresh_alarms_only_btn_style()
+            try:
+                if base_sub_lbl is not None and base_sub_lbl.winfo_exists():
+                    for ch_w in base_sub_lbl.winfo_children():
+                        if isinstance(ch_w, tk.Label) and "Token:" in str(ch_w.cget("text")):
+                            orig_fg, orig_bg = orig_tok_styles.get(str(ch_w), ("#4ade80", "#131922"))
+                            ch_w.config(fg=orig_fg, bg=orig_bg)
+            except Exception:
+                pass
+
+        def _stop_pulse():
+            aid = pf_timer_state.get("pulse_after_id")
+            if aid is not None:
+                pf_timer_state["pulse_after_id"] = None
+                try:
+                    pf.after_cancel(aid)
+                except Exception:
+                    pass
+            pf_timer_state["pulse_stop_fn"] = None
+            if pf.winfo_exists() and not pf_timer_state.get("closing"):
+                _restore_normal_control_styles()
+
+        pf_timer_state["pulse_stop_fn"] = _stop_pulse
 
         def _step_pulse(idx=0):
             pf_timer_state["pulse_after_id"] = None
             try:
                 if not pf.winfo_exists() or pf_timer_state.get("closing"):
+                    pf_timer_state["pulse_stop_fn"] = None
                     return
                 if idx >= len(pulse_themes) or is_in_trade_tamper_locked():
-                    _restore_normal_control_styles()
+                    _stop_pulse()
                     return
                 theme = pulse_themes[idx]
                 if theme is None:
@@ -20884,7 +22191,11 @@ def show_preflight_window(
                     _capsule_state["pulse_fill_top"] = theme["fill_top"]
                     _redraw_broker_acct_capsule()
                     for b_w in target_btns:
-                        if b_w is not None and b_w.winfo_exists():
+                        if (
+                            b_w is not None
+                            and b_w.winfo_exists()
+                            and getattr(b_w, "_state", "normal") == "normal"
+                        ):
                             b_w.config(
                                 fill_color=theme["fill"],
                                 fill_top_color=theme["fill_top"],
@@ -20902,34 +22213,37 @@ def show_preflight_window(
                                     bg=theme["fill"],
                                 )
                 pf_timer_state["pulse_after_id"] = pf.after(
-                    380, lambda: _step_pulse(idx + 1)
+                    400, lambda: _step_pulse(idx + 1)
                 )
             except Exception:
-                pass
+                _stop_pulse()
 
         _step_pulse(0)
 
     def show_layout_tour_dialog(initial_mode=None):
-        """Displays a warm, low-noise first-run / layout-update tour popup tailored
-        to either existing users ('What Moved in This Update — Quick Layout Map')
-        or brand-new users ('Welcome to PnL Enforcer — 60-Second Quick Start'),
-        with a 1-click mode switcher and a calm spotlight pulse on close."""
+        """Displays a cohesive 3-tab Quick Start & Layout Guide covering how PnL Enforcer's
+        rules work, where every control lives, and first-run/live-HUD tips, with an
+        explicit optional control spotlight pulse."""
         hide_all_tooltips()
+        _stop_control_pulse()
         if not pf.winfo_exists():
             return
-        if initial_mode in ("existing", "new"):
-            start_mode = initial_mode
-        else:
-            start_mode = (
-                "existing"
-                if (
-                    _is_existing_user_install
-                    or bool(config.get("account_sessions"))
-                    or bool(config.get("user_defaults"))
-                )
-                else "new"
+        if initial_mode in ("overview", "controls", "checklist"):
+            start_tab = initial_mode
+        elif initial_mode == "existing":
+            start_tab = "controls"
+        elif (
+            initial_mode is None
+            and (
+                _is_existing_user_install
+                or bool(config.get("account_sessions"))
+                or bool(config.get("user_defaults"))
             )
-        tour_state = {"mode": start_mode}
+        ):
+            start_tab = "controls"
+        else:
+            start_tab = "overview"
+        tour_state = {"tab": start_tab}
 
         dlg = tk.Toplevel(pf)
         dlg.withdraw()
@@ -20939,6 +22253,7 @@ def show_preflight_window(
             except Exception:
                 pass
         apply_dark_title_bar(dlg)
+        dlg.title(f"PnL Enforcer v{APP_VERSION} — Quick Start & Layout Guide")
         dlg.configure(bg="#0d1117", padx=24, pady=20)
         dlg.resizable(False, False)
         dlg.attributes("-topmost", True)
@@ -20951,11 +22266,11 @@ def show_preflight_window(
 
         def on_close_plain():
             _mark_tour_seen()
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         def on_got_it_pulse():
             _mark_tour_seen()
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
             pf.after(80, pulse_relocated_controls)
 
         dlg.protocol("WM_DELETE_WINDOW", on_close_plain)
@@ -20993,7 +22308,41 @@ def show_preflight_window(
             bg="#0d1117",
             anchor="w",
         )
-        sub_lbl.pack(fill="x", pady=(0, 10))
+        sub_lbl.pack(fill="x", pady=(0, 8))
+
+        tab_bar = tk.Frame(dlg, bg="#0d1117")
+        tab_bar.pack(fill="x", pady=(0, 10))
+        tab_btns = {}
+
+        def _select_tab(tab_key):
+            if tab_key in ("overview", "controls", "checklist"):
+                tour_state["tab"] = tab_key
+                _render_tour_tab()
+
+        for t_key, t_label, t_w in (
+            ("overview", "1. How Enforcer Works", 192),
+            ("controls", "2. Where Controls Live", 196),
+            ("checklist", "3. First-Run & HUD Tips", 200),
+        ):
+            tb = make_stadium_button(
+                tab_bar,
+                text=t_label,
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#38bdf8",
+                fg="#94a3b8",
+                canvas_bg="#0d1117",
+                width=t_w,
+                height=30,
+                auto_width=False,
+                command=lambda k=t_key: _select_tab(k),
+            )
+            tb.pack(side="left", padx=(0, 8))
+            tab_btns[t_key] = tb
 
         card_outer = tk.Frame(
             dlg,
@@ -21011,7 +22360,7 @@ def show_preflight_window(
         txt_box = tk.Text(
             card_outer,
             width=84,
-            height=17,
+            height=15,
             bg="#131922",
             fg="#cbd5e1",
             font=("Arial", 10, "bold"),
@@ -21055,36 +22404,20 @@ def show_preflight_window(
         btn_row = tk.Frame(dlg, bg="#0d1117")
         btn_row.pack(fill="x")
 
-        tour_geom = {"txt_w": 84, "txt_h": 17, "locked": False}
+        tour_geom = {"txt_w": 84, "txt_h": 15, "locked": False}
 
-        def _toggle_tour_mode():
-            tour_state["mode"] = (
-                "new" if tour_state["mode"] == "existing" else "existing"
-            )
-            _render_tour_mode()
-
-        btn_switch_mode = make_stadium_button(
+        tk.Label(
             btn_row,
-            text="View New-User Quick Start ▸",
-            font=("Arial", 9, "bold"),
-            fill_color="#141820",
-            fill_top_color="#1c212b",
-            border_color="#2e3746",
-            hover_fill="#181e28",
-            hover_fill_top="#232a36",
-            hover_border="#38bdf8",
-            fg="#93c5fd",
-            canvas_bg="#0d1117",
-            width=236,
-            height=34,
-            auto_width=False,
-            command=_toggle_tour_mode,
-        )
-        btn_switch_mode.pack(side="left")
+            text="Tip: Re-open anytime via '✦ Quick Tour' in the footer.",
+            font=("Arial", 8, "bold"),
+            fg="#64748b",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(side="left")
 
         make_stadium_button(
             btn_row,
-            text="Got It — Highlight Controls ✓",
+            text="Done ✓",
             font=("Arial", 10, "bold"),
             fill_color="#0d3b20",
             fill_top_color="#14532d",
@@ -21094,136 +22427,89 @@ def show_preflight_window(
             hover_border="#34d399",
             fg="#ffffff",
             canvas_bg="#0d1117",
-            width=244,
+            width=116,
+            height=34,
+            auto_width=False,
+            command=on_close_plain,
+        ).pack(side="right")
+
+        make_stadium_button(
+            btn_row,
+            text="✦ Highlight Controls",
+            font=("Arial", 9, "bold"),
+            fill_color="#13283d",
+            fill_top_color="#1a3652",
+            border_color="#38bdf8",
+            hover_fill="#163049",
+            hover_fill_top="#1e3e5d",
+            hover_border="#7dd3fc",
+            fg="#e0f2fe",
+            canvas_bg="#0d1117",
+            width=180,
             height=34,
             auto_width=False,
             command=on_got_it_pulse,
-        ).pack(side="right")
+        ).pack(side="right", padx=(0, 8))
 
-        def _render_tour_mode(mode_override=None):
-            mode = mode_override if mode_override in ("existing", "new") else tour_state["mode"]
+        def _render_tour_tab(tab_override=None):
+            active_tab = (
+                tab_override
+                if tab_override in ("overview", "controls", "checklist")
+                else tour_state["tab"]
+            )
+            for t_k, tb in tab_btns.items():
+                if t_k == active_tab:
+                    tb.config(
+                        fill_color="#13283d",
+                        fill_top_color="#1a3652",
+                        border_color="#38bdf8",
+                        hover_fill="#163049",
+                        hover_fill_top="#1e3e5d",
+                        hover_border="#7dd3fc",
+                        fg="#e0f2fe",
+                    )
+                else:
+                    tb.config(
+                        fill_color="#141820",
+                        fill_top_color="#1c212b",
+                        border_color="#2e3746",
+                        hover_fill="#181e28",
+                        hover_fill_top="#232a36",
+                        hover_border="#38bdf8",
+                        fg="#94a3b8",
+                    )
+
             txt_box.config(state="normal")
             txt_box.delete("1.0", "end")
-            if mode == "existing":
-                dlg.title(
-                    f"PnL Enforcer v{APP_VERSION} — What Moved in This Update"
-                )
+            neon_bar.set_neon("#38bdf8", glow_on=True)
+
+            if active_tab == "overview":
                 hdr_title_lbl.config(
-                    text="▶  WHAT MOVED IN THIS UPDATE — QUICK LAYOUT MAP",
+                    text="▶  HOW PNL ENFORCER WORKS — RISK SYSTEM OVERVIEW",
                     fg="#7dd3fc",
                 )
                 hdr_badge_lbl.config(
-                    text=f"UPDATED IN v{APP_VERSION}",
+                    text="STEP-BY-STEP GUIDE",
                     fg="#93c5fd",
                     bg="#162231",
                 )
                 sub_lbl.config(
-                    text="We simplified the Pre-Flight screen so your daily risk limits stand out. Here is where relocated settings live:"
+                    text="How your intraday stops, daily stop actions, and session profit ratchets protect every trade:"
                 )
-                neon_bar.set_neon("#38bdf8", glow_on=True)
-                btn_switch_mode.config(text="View New-User Quick Start ▸")
 
                 txt_box.insert(
                     "end",
-                    "1. API KEYS & 7-DAY TOKEN RENEWAL\n",
-                    "hdr_sec",
-                )
-                for s_txt, s_tags in [
-                    ("    • Moved from the separate top-bar API Keys button into the ", ("body",)),
-                    (" BROKER: SCHWAB ▾ ", ("body", "pill")),
-                    (" dropdown.\n", ("body",)),
-                    ("    • You can also click ", ("body",)),
-                    (" Token: X.Xd ↻ ", ("body", "pill")),
-                    (" directly inside Card 3 to renew in one click.\n", ("body",)),
-                ]:
-                    txt_box.insert("end", s_txt, s_tags)
-
-                txt_box.insert("end", "─" * 76 + "\n", "div_line")
-
-                txt_box.insert(
-                    "end",
-                    "2. AUDIO, VOICE, POLL INTERVAL & SESSION PREFERENCES\n",
-                    "hdr_sec",
-                )
-                for s_txt, s_tags in [
-                    ("    • Grouped inside ", ("body",)),
-                    (" ⚙ Preferences & Audio... ", ("body", "pill")),
-                    (" in the bottom-right corner of Card 3.\n", ("body",)),
-                    ("    • Holds Voice Cues, Sound & 10s Dry-Run Tester, Poll Rate, and Rulebook Switch / Swing Ignore.\n", ("body",)),
-                ]:
-                    txt_box.insert("end", s_txt, s_tags)
-
-                txt_box.insert("end", "─" * 76 + "\n", "div_line")
-
-                txt_box.insert(
-                    "end",
-                    "3. QUALIFYING TRADE FILTER, ALARMS ONLY & PRIVACY MODE\n",
-                    "hdr_sec",
-                )
-                for s_txt, s_tags in [
-                    ("    • ", ("body",)),
-                    (" ⚙ Filter (-$25 / +$10) ▸ ", ("body", "pill")),
-                    (" in Card 1 sets Min Loss to Count & Min Win to Reset your loss streak.\n", ("body",)),
-                    ("    • ", ("body",)),
-                    (" 🔔 Alarms Only: OFF ", ("body", "pill")),
-                    (" (bottom bar) disables all orders & OS locks globally for passive siren mode.\n", ("body",)),
-                    ("    • ", ("body",)),
-                    (" 👁 Privacy: OFF ", ("body", "pill")),
-                    (" (top bar) masks your account number and dollar baseline for screenshots.", ("body",)),
-                ]:
-                    txt_box.insert("end", s_txt, s_tags)
-            else:
-                dlg.title(
-                    f"Welcome to PnL Enforcer v{APP_VERSION} — 60-Second Quick Start"
-                )
-                hdr_title_lbl.config(
-                    text="▶  WELCOME TO PNL ENFORCER — 60-SECOND QUICK START",
-                    fg="#7dd3fc",
-                )
-                hdr_badge_lbl.config(
-                    text="QUICK START GUIDE",
-                    fg="#93c5fd",
-                    bg="#162231",
-                )
-                sub_lbl.config(
-                    text="A quick overview of how your Pre-Flight & Risk Rulebook screen is organized:"
-                )
-                neon_bar.set_neon("#38bdf8", glow_on=True)
-                btn_switch_mode.config(text="◂ View 'What Moved' Layout Map")
-
-                txt_box.insert(
-                    "end",
-                    "1. TOP BAR — BROKER CONNECTION, LOGS & PRIVACY\n",
-                    "hdr_sec",
-                )
-                for s_txt, s_tags in [
-                    ("    • Click ", ("body",)),
-                    (" BROKER: SCHWAB ▾ ", ("body", "pill")),
-                    (" to connect Schwab or Webull, or ", ("body",)),
-                    (" ACCOUNT ▾ ", ("body", "pill")),
-                    (" to pick an account.\n", ("body",)),
-                    ("    • Use ", ("body",)),
-                    (" HUD Columns ", ("body", "pill")),
-                    (" to customize your HUD, and ", ("body",)),
-                    (" 👁 Privacy: OFF ", ("body", "pill")),
-                    (" to hide balances in screenshots.\n", ("body",)),
-                ]:
-                    txt_box.insert("end", s_txt, s_tags)
-
-                txt_box.insert("end", "─" * 76 + "\n", "div_line")
-
-                txt_box.insert(
-                    "end",
-                    "2. LEFT COLUMN (CARDS 1 & 2) — INTRADAY vs. DAILY STOP ACTIONS\n",
+                    "1. CARDS 1 & 2 — INTRADAY TILT STOPS vs. DAILY STOP ACTIONS\n",
                     "hdr_sec",
                 )
                 for s_txt, s_tags in [
                     ("    • ", ("body",)),
                     (" Card 1 (Trade & Tilt Stops) ", ("body", "pill")),
-                    (" stops single-trade blowups (Max Open Loss) and rapid loss streaks.\n", ("body",)),
+                    (" watches single-trade Open PnL and rapid loss streaks.\n", ("body",)),
+                    ("    • Tripping Card 1 flattens that position (or opens a Penalty Box) without ending your day.\n", ("body",)),
                     ("    • ", ("body",)),
                     (" Card 2 (Daily Stop Actions) ", ("body", "pill")),
-                    (" chooses what fires when your Daily Stop hits (Flatten / Kill Apps / OS Lock).\n", ("body",)),
+                    (" executes Flatten / Kill Apps / OS Lock if a Daily Stop hits.\n", ("body",)),
                 ]:
                     txt_box.insert("end", s_txt, s_tags)
 
@@ -21231,7 +22517,7 @@ def show_preflight_window(
 
                 txt_box.insert(
                     "end",
-                    "3. RIGHT COLUMN (CARDS 4 & 5) & CARD 3 — RULEBOOKS & LAUNCH\n",
+                    "2. CARDS 4 & 5 — EXTENDED HOURS & 9:30–4:00 ET RULEBOOKS\n",
                     "hdr_sec",
                 )
                 for s_txt, s_tags in [
@@ -21239,15 +22525,154 @@ def show_preflight_window(
                     (" Card 4 (Extended Hours) ", ("body", "pill")),
                     (" & ", ("body",)),
                     (" Card 5 (9:30–4:00 ET) ", ("body", "pill")),
-                    (" switch automatically and ratchet your stop upward.\n", ("body",)),
-                    ("    • Card 3 shows your $0.00 baseline, ", ("body",)),
+                    (" switch automatically on schedule.\n", ("body",)),
+                    ("    • As realized profits climb, Profit Ratchets raise your Daily Stop above zero or trail your peak.\n", ("body",)),
+                    ("    • Enabling 9:30 / 4:00 Ratchet Reset starts each new session clean at Base Tier 1.\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "3. CARD 3 — TODAY'S BASELINE, RE-ZERO & SWING FILTER\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • Card 3 anchors your flat cash equity as $0.00 Net PnL so live gains and losses stay clear.\n", ("body",)),
+                    ("    • Use ", ("body",)),
+                    (" ↺ Re-Zero Baseline ", ("body", "pill")),
+                    (" only for mid-day resets, or ", ("body",)),
                     (" Positions ", ("body", "pill")),
-                    (" (to ignore swings), and ", ("body",)),
+                    (" to exclude swing holds.", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+            elif active_tab == "controls":
+                hdr_title_lbl.config(
+                    text="▶  WHERE CONTROLS LIVE — PRE-FLIGHT LAYOUT MAP",
+                    fg="#7dd3fc",
+                )
+                hdr_badge_lbl.config(
+                    text=f"LAYOUT IN v{APP_VERSION}",
+                    fg="#93c5fd",
+                    bg="#162231",
+                )
+                sub_lbl.config(
+                    text="Every setting has a dedicated home. Click '✦ Highlight Controls' below to spotlight them:"
+                )
+
+                txt_box.insert(
+                    "end",
+                    "1. TOP BAR — BROKER, ACCOUNTS, COLUMNS, LOGS & PRIVACY\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • ", ("body",)),
+                    (" BROKER: SCHWAB ▾ ", ("body", "pill")),
+                    (" manages API Keys; ", ("body",)),
+                    (" ACCOUNT ▾ ", ("body", "pill")),
+                    (" switches between funded accounts.\n", ("body",)),
+                    ("    • Customize your bar via ", ("body",)),
+                    (" HUD Columns ", ("body", "pill")),
+                    (", mask balances with ", ("body",)),
+                    (" 👁 Privacy: OFF ", ("body", "pill")),
+                    (", or inspect Logs.\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "2. CARD 3 — TOKEN RENEWAL, PREFERENCES & SILENT MODE\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • Click ", ("body",)),
+                    (" Token: X.Xd ↻ ", ("body", "pill")),
+                    (" directly inside Card 3 to refresh expiring Schwab auth tokens.\n", ("body",)),
+                    ("    • ", ("body",)),
                     (" ⚙ Preferences & Audio... ", ("body", "pill")),
-                    (".\n", ("body",)),
-                    ("    • Want to test with zero orders first? Toggle ", ("body",)),
+                    (" holds Silent Mode, Voice/Sirens, 10s Dry-Run, Poll Rate, & Ratchet Reset.\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "3. CARD 1 & BOTTOM BAR — STREAK FILTER, PRESETS & DRY-RUNS\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • ", ("body",)),
+                    (" ⚙ Filter (-$25 / +$10) ▸ ", ("body", "pill")),
+                    (" in Card 1 ignores tiny scratches when counting loss streaks.\n", ("body",)),
+                    ("    • Switch ", ("body",)),
+                    (" Standard Full Risk ", ("body", "pill")),
+                    (" / 50% Presets, Save Default, or toggle ", ("body",)),
+                    (" 🔔 Alarms Only: OFF ", ("body", "pill")),
+                    (".", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+            else:
+                hdr_title_lbl.config(
+                    text="▶  FIRST-RUN CHECKLIST & LIVE HUD TIPS",
+                    fg="#7dd3fc",
+                )
+                hdr_badge_lbl.config(
+                    text="QUICK CHECKLIST",
+                    fg="#93c5fd",
+                    bg="#162231",
+                )
+                sub_lbl.config(
+                    text="Recommended steps before launching live and handy shortcuts on the floating HUD:"
+                )
+
+                txt_box.insert(
+                    "end",
+                    "1. VERIFY BROKER CONNECTION, BASELINE & SWING POSITIONS\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • Confirm a green status dot beside ", ("body",)),
+                    (" ACCOUNT ▾ ", ("body", "pill")),
+                    (" and check that your Card 3 Baseline looks right.\n", ("body",)),
+                    ("    • Holding overnight shares or options? Review ", ("body",)),
+                    (" Positions ", ("body", "pill")),
+                    (" or arm Ignore Pre-Existing Positions first.\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "2. TEST AUDIO OR ARM SILENT / ALARMS-ONLY MODE\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • Open ", ("body",)),
+                    (" ⚙ Preferences & Audio... ", ("body", "pill")),
+                    (" to test Voice/Sirens — or check Silent Mode for quiet calls.\n", ("body",)),
+                    ("    • New to Enforcer? Practice with ", ("body",)),
                     (" 🔔 Alarms Only: ON ", ("body", "pill")),
-                    (" beside SAVE & LAUNCH.", ("body",)),
+                    (" first (visual/audio warnings active, zero orders placed).\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "3. LIVE HUD SHORTCUTS & IN-TRADE TAMPER LOCK\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • Click the HUD Account/Badge pill to cycle metrics; right-click the HUD to open Settings or Mute Siren.\n", ("body",)),
+                    ("    • Risk stops lock automatically while a position is open (anti-tamper guard) — wait until flat to loosen.", ("body",)),
                 ]:
                     txt_box.insert("end", s_txt, s_tags)
 
@@ -21263,11 +22688,11 @@ def show_preflight_window(
                 )
             txt_box.config(state="disabled")
 
-        # Measure both modes while withdrawn so switching modes never resizes the window
+        # Measure all 3 tabs while withdrawn so switching tabs never resizes the window
         max_txt_w, max_txt_h = 84, 15
         max_dlg_w, max_dlg_h = 0, 0
-        for probe_mode in ("existing", "new"):
-            _render_tour_mode(mode_override=probe_mode)
+        for probe_tab in ("overview", "controls", "checklist"):
+            _render_tour_tab(tab_override=probe_tab)
             dlg.update_idletasks()
             max_txt_w = max(max_txt_w, int(txt_box.cget("width")))
             max_txt_h = max(max_txt_h, int(txt_box.cget("height")))
@@ -21277,7 +22702,7 @@ def show_preflight_window(
         tour_geom["txt_h"] = max_txt_h
         tour_geom["locked"] = True
 
-        _render_tour_mode()
+        _render_tour_tab()
         dlg.update_idletasks()
         final_w = max(max_dlg_w, int(dlg.winfo_reqwidth()))
         final_h = max(max_dlg_h, int(dlg.winfo_reqheight()))
@@ -21285,6 +22710,8 @@ def show_preflight_window(
         dlg.grab_set()
         dlg.focus_set()
         pf.wait_window(dlg)
+        if pf.winfo_exists():
+            _restore_pf_modal_focus(dlg)
 
     quick_tour_lbl = tk.Label(
         ver_frame,
@@ -21302,11 +22729,11 @@ def show_preflight_window(
         "<Leave>", lambda e: quick_tour_lbl.config(fg="#38bdf8")
     )
     quick_tour_lbl.bind(
-        "<Button-1>", lambda e: (hide_all_tooltips(), show_layout_tour_dialog())
+        "<Button-1>", lambda e: (hide_all_tooltips(), show_layout_tour_dialog("overview"))
     )
     attach_tooltip(
         quick_tour_lbl,
-        "Open the Quick Layout Tour ('What Moved' map & New-User Quick Start) and highlight relocated controls."
+        "Open the Quick Start & Layout Guide (How Enforcer Works, Where Controls Live, & First-Run Tips)."
     )
 
     tk.Label(
@@ -21380,6 +22807,7 @@ def show_preflight_window(
         or leave it as-is in BREACHED (DISARMED) mode so a new trade does not
         immediately stop them out on entry."""
         hide_all_tooltips()
+        _stop_control_pulse()
         if not pf.winfo_exists():
             return
         ref_eq = (
@@ -21416,16 +22844,16 @@ def show_preflight_window(
         dlg.grab_set()
 
         def on_keep_watching():
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         def on_close_keep_as_is():
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
             on_close()
 
         def on_arm_rezero():
             if not is_tilt_streak_tamper_locked():
                 var_reanchor.set(True)
-            dlg.destroy()
+            _restore_pf_modal_focus(dlg)
 
         dlg.protocol("WM_DELETE_WINDOW", on_keep_watching)
 
@@ -21685,6 +23113,8 @@ def show_preflight_window(
         center_dialog_over_parent(dlg, parent=pf)
 
         pf.wait_window(dlg)
+        if pf.winfo_exists():
+            _restore_pf_modal_focus(dlg)
 
     try:
         pf.update_idletasks()
