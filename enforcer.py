@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.58"
+APP_VERSION = "0.9.60"
 
 import os
 import sys
@@ -2089,6 +2089,8 @@ DEFAULT_CONFIG = {
     "saved_win_trades": 0,
     "saved_loss_trades": 0,
     "saved_account_id": "",
+    "active_cooldown_end_epoch": 0.0,
+    "active_cooldown_label": "",
     "bug_report_contact": ""
 }
 
@@ -2224,6 +2226,7 @@ _launch_fee_drift_checked = False
 alarm_active = False
 cooldown_active = False
 dry_run_lock_active = False
+breach_visual_sim_active = False
 consecutive_api_failures = 0
 api_disconnect_alerted = False
 cooldown_end_time = 0.0
@@ -2247,6 +2250,15 @@ RECOVERY_BUFFER_DOLLARS = 150.0
 
 settings_win_open = False
 broker_reconfig_in_progress = False
+_in_flight_poll_lock = threading.Lock()
+_config_io_lock = threading.RLock()
+_flatten_exec_lock = threading.RLock()
+_config_load_corrupt = False
+active_session_date = None
+_uncloseable_fractional_syms = set()
+_initial_positions_verified = False
+last_data_loop_heartbeat = 0.0
+_calendar_table_warned = False
 active_preflight_close_fn = None
 active_preflight_win = None
 last_preflight_pos = None
@@ -2254,6 +2266,25 @@ log_lock = threading.Lock()
 prev_pos_snapshot = {}
 ignored_positions = {}
 active_adapter = None
+
+
+def mark_uncloseable_fractional_sym(account_id, symbol):
+    if account_id and symbol:
+        _uncloseable_fractional_syms.add((str(account_id), str(symbol).strip()))
+
+
+def is_uncloseable_fractional_qty(account_id, symbol, qty):
+    """Returns True ONLY when (account_id, symbol) had a sub-1-share fractional
+    liquidation rejected by the broker AND the current open quantity is strictly
+    between 0 and 1 share (0 < abs(qty) < 1.0). Whole shares (>= 1.0) on that
+    same symbol are NEVER excluded."""
+    try:
+        q = abs(float(qty or 0.0))
+    except Exception:
+        return False
+    if q <= 1e-6 or q >= 1.0:
+        return False
+    return (str(account_id or ""), str(symbol or "").strip()) in _uncloseable_fractional_syms
 
 
 def get_eastern_now():
@@ -3333,12 +3364,13 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     Returns True if a valid baseline for today was found, False otherwise."""
     global start_equity, max_equity, daily_max_equity
     global last_flat_equity, anchor_cash_flow, _last_logged_unanchored_cash_flow
-    global has_reset_at_open, has_reset_at_close
+    global has_reset_at_open, has_reset_at_close, is_locked_down
     global win_trades, loss_trades, prev_flat_realized_pnl
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
     global current_upside_tier, first_poll_of_launch, _launch_fee_drift_checked
     global recent_loss_timestamps, ignored_positions, pending_halt_breach
+    global active_session_date
 
     _launch_fee_drift_checked = False
     recent_loss_timestamps.clear()
@@ -3348,6 +3380,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     in_trade_desync_streak = 0
     pending_scale_out_tol = 0.0
     today_str = get_today_str()
+    active_session_date = today_str
     s_key = get_session_key(broker_name, account_id)
     acct_sessions = config.get("account_sessions", {})
 
@@ -3375,6 +3408,10 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             )
             has_reset_at_close = bool(
                 s_data.get("has_reset_at_close", False)
+            )
+            is_locked_down = bool(
+                s_data.get("is_locked_down", False)
+                and s_data.get("breach_date") == today_str
             )
             win_trades = int(s_data.get("win_trades", 0) or 0)
             loss_trades = int(s_data.get("loss_trades", 0) or 0)
@@ -3445,6 +3482,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
         )
         has_reset_at_open = bool(config.get("saved_has_reset_at_open", False))
         has_reset_at_close = bool(config.get("saved_has_reset_at_close", False))
+        is_locked_down = False
         win_trades = int(config.get("saved_win_trades", 0) or 0)
         loss_trades = int(config.get("saved_loss_trades", 0) or 0)
         prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
@@ -3478,6 +3516,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     anchor_cash_flow = 0.0
     has_reset_at_open = False
     has_reset_at_close = False
+    is_locked_down = False
     win_trades = 0
     loss_trades = 0
     prev_flat_realized_pnl = 0.0
@@ -3487,24 +3526,73 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     return False
 
 
+def _load_json_dict_from_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Config root is not a JSON object")
+    return data
+
+
 def load_config(log_restore=False):
-    global config, _is_existing_user_install
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                saved = json.load(f)
+    global config, _is_existing_user_install, _config_load_corrupt
+    with _config_io_lock:
+        bak_path = CONFIG_PATH + ".bak"
+        saved = None
+        recovered_from_bak = False
+        if os.path.exists(CONFIG_PATH):
+            try:
+                saved = _load_json_dict_from_file(CONFIG_PATH)
+                _config_load_corrupt = False
+            except Exception as e:
+                print(f"Could not load saved config ({e}); checking backup...")
+                corrupt_dest = f"{CONFIG_PATH}.corrupt_{int(time.time())}"
+                try:
+                    os.replace(CONFIG_PATH, corrupt_dest)
+                    log_event(
+                        "WARN",
+                        f"Primary config file was corrupted and moved aside to {os.path.basename(corrupt_dest)}.",
+                    )
+                except Exception:
+                    pass
+                if os.path.exists(bak_path):
+                    try:
+                        saved = _load_json_dict_from_file(bak_path)
+                        recovered_from_bak = True
+                        _config_load_corrupt = False
+                    except Exception as bak_e:
+                        print(f"Could not load backup config: {bak_e}")
+                        _config_load_corrupt = True
+                else:
+                    _config_load_corrupt = True
+        elif os.path.exists(bak_path):
+            try:
+                saved = _load_json_dict_from_file(bak_path)
+                recovered_from_bak = True
+                _config_load_corrupt = False
+            except Exception:
+                pass
+
+        if isinstance(saved, dict):
+            try:
                 was_signed = bool(saved.get("signed_tier_stops", False))
                 saved_brokers = saved.pop("brokers", {})
                 saved_sessions = saved.pop("account_sessions", {})
                 saved_user_defs = saved.pop("user_defaults", {})
                 config.update(saved)
                 for b_name in ("SCHWAB", "WEBULL"):
-                    if b_name in saved_brokers:
+                    if b_name in saved_brokers and isinstance(saved_brokers[b_name], dict):
                         config["brokers"][b_name].update(saved_brokers[b_name])
                 if isinstance(saved_sessions, dict):
                     config["account_sessions"].update(saved_sessions)
                 if isinstance(saved_user_defs, dict):
                     config["user_defaults"] = saved_user_defs
+                try:
+                    config["poll_interval"] = min(
+                        10, max(1, int(float(config.get("poll_interval", 2))))
+                    )
+                except Exception:
+                    config["poll_interval"] = 2
                 _is_existing_user_install = bool(
                     any(
                         str(config["brokers"].get(b, {}).get("app_key", "")).strip()
@@ -3514,8 +3602,6 @@ def load_config(log_restore=False):
                     or config.get("user_defaults")
                 )
 
-                # One-time migration: convert legacy unsigned t2_max_loss /
-                # t3_max_loss values (where 1000 meant -$1000) to signed values.
                 if not was_signed:
                     for sk in SIGNED_DOLLAR_KEYS:
                         if sk in config and float(config[sk]) > 0:
@@ -3530,94 +3616,130 @@ def load_config(log_restore=False):
                             )
                     config["signed_tier_stops"] = True
                     save_config(config)
-        except Exception as e:
-            print(f"Could not load saved config: {e}")
+                elif recovered_from_bak:
+                    save_config(config)
+                    log_event(
+                        "WARN",
+                        "Restored enforcer_config.json from valid .bak backup.",
+                    )
+            except Exception as e:
+                print(f"Could not apply saved config fields: {e}")
 
-    tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
-    if not tester_id:
-        config["anonymous_tester_id"] = uuid.uuid4().hex[:6]
-        save_config(config)
+        tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
+        if not tester_id:
+            config["anonymous_tester_id"] = uuid.uuid4().hex[:6]
+            if not _config_load_corrupt:
+                save_config(config)
 
-    active_b = config.get("active_broker", "SCHWAB")
-    sel_acct = (
-        config["brokers"].get(active_b, {}).get("selected_account_id", "")
-    )
-    if (start_equity is None or log_restore) and sel_acct:
-        restore_account_session(active_b, sel_acct, log_restore=log_restore)
+        active_b = config.get("active_broker", "SCHWAB")
+        sel_acct = (
+            config["brokers"].get(active_b, {}).get("selected_account_id", "")
+        )
+        if (start_equity is None or log_restore) and sel_acct:
+            restore_account_session(active_b, sel_acct, log_restore=log_restore)
 
 
 def save_config(new_cfg):
-    global config
-    config = json.loads(json.dumps(new_cfg))
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4)
-    except Exception as e:
-        print(f"Error saving config file: {e}")
+    global config, _config_load_corrupt
+    with _config_io_lock:
+        cfg_copy = json.loads(json.dumps(new_cfg))
+        try:
+            cfg_copy["poll_interval"] = min(
+                10, max(1, int(float(cfg_copy.get("poll_interval", 2))))
+            )
+        except Exception:
+            cfg_copy["poll_interval"] = 2
+        config = cfg_copy
+        _config_load_corrupt = False
+        try:
+            raw_json = json.dumps(config, indent=4)
+            tmp_path = f"{CONFIG_PATH}.{threading.get_ident()}.tmp"
+            bak_path = CONFIG_PATH + ".bak"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(raw_json)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp_path, CONFIG_PATH)
+            try:
+                with open(bak_path, "w", encoding="utf-8") as bf:
+                    bf.write(raw_json)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Error saving config file: {e}")
 
 
 def save_session_state():
-    today_str = get_today_str()
-    active_b = (
-        active_adapter.name
-        if active_adapter is not None
-        else config.get("active_broker", "SCHWAB")
-    )
-    sel_acct = (
-        active_adapter.account_id
-        if active_adapter is not None and active_adapter.account_id
-        else config["brokers"].get(active_b, {}).get("selected_account_id", "")
-    )
-    s_key = get_session_key(active_b, sel_acct)
+    global active_session_date
+    with _config_io_lock:
+        today_str = active_session_date or get_today_str()
+        if active_session_date is None:
+            active_session_date = today_str
+        active_b = (
+            active_adapter.name
+            if active_adapter is not None
+            else config.get("active_broker", "SCHWAB")
+        )
+        sel_acct = (
+            active_adapter.account_id
+            if active_adapter is not None and active_adapter.account_id
+            else config["brokers"].get(active_b, {}).get("selected_account_id", "")
+        )
+        s_key = get_session_key(active_b, sel_acct)
 
-    if "account_sessions" not in config or not isinstance(
-        config["account_sessions"], dict
-    ):
-        config["account_sessions"] = {}
+        if "account_sessions" not in config or not isinstance(
+            config["account_sessions"], dict
+        ):
+            config["account_sessions"] = {}
 
-    new_entry = {
-        "session_date": today_str,
-        "start_equity": start_equity,
-        "max_equity": max_equity,
-        "daily_max_equity": daily_max_equity,
-        "last_flat_equity": last_flat_equity,
-        "anchor_cash_flow": round(float(anchor_cash_flow or 0.0), 2),
-        "has_reset_at_open": has_reset_at_open,
-        "has_reset_at_close": has_reset_at_close,
-        "win_trades": win_trades,
-        "loss_trades": loss_trades,
-        "loss_timestamps": [round(float(t), 2) for t in recent_loss_timestamps],
-        "ignored_positions": json.loads(json.dumps(ignored_positions)),
-    }
+        new_entry = {
+            "session_date": today_str,
+            "start_equity": start_equity,
+            "max_equity": max_equity,
+            "daily_max_equity": daily_max_equity,
+            "last_flat_equity": last_flat_equity,
+            "anchor_cash_flow": round(float(anchor_cash_flow or 0.0), 2),
+            "has_reset_at_open": has_reset_at_open,
+            "has_reset_at_close": has_reset_at_close,
+            "is_locked_down": bool(is_locked_down),
+            "breach_date": today_str if is_locked_down else "",
+            "win_trades": win_trades,
+            "loss_trades": loss_trades,
+            "loss_timestamps": [round(float(t), 2) for t in recent_loss_timestamps],
+            "ignored_positions": json.loads(json.dumps(ignored_positions)),
+        }
 
-    old_entry = config["account_sessions"].get(s_key)
-    changed = (
-        old_entry != new_entry
-        or config.get("session_date") != today_str
-        or config.get("saved_start_equity") != start_equity
-        or config.get("saved_max_equity") != max_equity
-        or config.get("saved_daily_max_equity") != daily_max_equity
-        or config.get("saved_last_flat_equity") != last_flat_equity
-        or config.get("saved_has_reset_at_open") != has_reset_at_open
-        or config.get("saved_has_reset_at_close") != has_reset_at_close
-        or config.get("saved_win_trades") != win_trades
-        or config.get("saved_loss_trades") != loss_trades
-        or config.get("saved_account_id") != sel_acct
-    )
-    if changed:
-        if s_key:
-            config["account_sessions"][s_key] = new_entry
-        config["session_date"] = today_str
-        config["saved_start_equity"] = start_equity
-        config["saved_max_equity"] = max_equity
-        config["saved_daily_max_equity"] = daily_max_equity
-        config["saved_last_flat_equity"] = last_flat_equity
-        config["saved_has_reset_at_open"] = has_reset_at_open
-        config["saved_has_reset_at_close"] = has_reset_at_close
-        config["saved_win_trades"] = win_trades
-        config["saved_loss_trades"] = loss_trades
-        config["saved_account_id"] = sel_acct
-        save_config(config)
+        old_entry = config["account_sessions"].get(s_key)
+        changed = (
+            old_entry != new_entry
+            or config.get("session_date") != today_str
+            or config.get("saved_start_equity") != start_equity
+            or config.get("saved_max_equity") != max_equity
+            or config.get("saved_daily_max_equity") != daily_max_equity
+            or config.get("saved_last_flat_equity") != last_flat_equity
+            or config.get("saved_has_reset_at_open") != has_reset_at_open
+            or config.get("saved_has_reset_at_close") != has_reset_at_close
+            or config.get("saved_win_trades") != win_trades
+            or config.get("saved_loss_trades") != loss_trades
+            or config.get("saved_account_id") != sel_acct
+        )
+        if changed:
+            if s_key:
+                config["account_sessions"][s_key] = new_entry
+            config["session_date"] = today_str
+            config["saved_start_equity"] = start_equity
+            config["saved_max_equity"] = max_equity
+            config["saved_daily_max_equity"] = daily_max_equity
+            config["saved_last_flat_equity"] = last_flat_equity
+            config["saved_has_reset_at_open"] = has_reset_at_open
+            config["saved_has_reset_at_close"] = has_reset_at_close
+            config["saved_win_trades"] = win_trades
+            config["saved_loss_trades"] = loss_trades
+            config["saved_account_id"] = sel_acct
+            save_config(config)
 
 
 def get_unanchored_cash_flow(intraday_cf):
@@ -3789,6 +3911,7 @@ def _apply_ignored_positions_to_snapshot(
     sum_ignored_impact = 0.0
     state_mutated = False
     mutated_igs = []
+    mutated_notional = 0.0
     transition_notes = []
 
     for tag, ig in list(ignored_positions.items()):
@@ -3828,8 +3951,9 @@ def _apply_ignored_positions_to_snapshot(
                     locked_impact + ref_qty * (exit_lp - ref_price) * mult, 2
                 )
                 transition_notes.append(
-                    f"{tag}: {int(ref_qty):+d} -> 0 (Ignored position closed @ ~${exit_lp:.4f})"
+                    f"{tag}: {ref_qty:+g} -> 0 (Ignored position closed @ ~${exit_lp:.4f})"
                 )
+                mutated_notional += abs(ref_qty) * max(exit_lp, ref_price, 1.0) * mult
                 ig["ref_qty"] = 0.0
                 ig["ref_price"] = round(exit_lp, 4)
                 ig["ref_avg"] = 0.0
@@ -3885,7 +4009,12 @@ def _apply_ignored_positions_to_snapshot(
                     2,
                 )
             transition_notes.append(
-                f"{tag}: {int(ref_qty):+d} -> {int(curr_qty):+d} (Ignored ticker)"
+                f"{tag}: {ref_qty:+g} -> {curr_qty:+g} (Ignored ticker)"
+            )
+            mutated_notional += (
+                max(abs(curr_qty - ref_qty), abs(ref_qty), abs(curr_qty))
+                * max(curr_lp, ref_price, 1.0)
+                * mult
             )
             ig["ref_qty"] = curr_qty
             ig["ref_price"] = round(curr_lp, 4)
@@ -3926,12 +4055,20 @@ def _apply_ignored_positions_to_snapshot(
                     (float(raw_adj_eq) - tot_open_pnl) - float(ref_flat_eq), 2
                 )
                 drift = round(target_sum_ignored - sum_ignored_impact, 2)
-                if abs(drift) >= 0.01 and abs(drift) <= 50000.0:
-                    last_ig = mutated_igs[-1]
-                    last_ig["locked_impact"] = round(
-                        float(last_ig.get("locked_impact", 0.0)) + drift, 2
-                    )
-                    sum_ignored_impact = round(sum_ignored_impact + drift, 2)
+                max_drift_cap = max(250.0, mutated_notional * 0.10)
+                if abs(drift) >= 0.01:
+                    if abs(drift) <= max_drift_cap:
+                        last_ig = mutated_igs[-1]
+                        last_ig["locked_impact"] = round(
+                            float(last_ig.get("locked_impact", 0.0)) + drift, 2
+                        )
+                        sum_ignored_impact = round(sum_ignored_impact + drift, 2)
+                    else:
+                        log_event(
+                            "WARN",
+                            f"Ignored position fill drift ({format_dollar(drift)}) exceeded "
+                            f"proportional cap (${max_drift_cap:,.2f}); not absorbing excess drift.",
+                        )
         save_session_state()
         if transition_notes:
             log_event(
@@ -3956,19 +4093,80 @@ def _apply_ignored_positions_to_snapshot(
     )
 
 
+NYSE_EARLY_CLOSE_DATES = {
+    "2025-07-03",
+    "2025-11-28",
+    "2025-12-24",
+    "2026-11-27",
+    "2026-12-24",
+    "2027-11-26",
+}
+
+NYSE_FULL_HOLIDAY_DATES = {
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
+    "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+}
+
+
+def get_rth_close_time(now_et=None):
+    global _calendar_table_warned
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    if dt_et.year > 2027 and not _calendar_table_warned:
+        _calendar_table_warned = True
+        try:
+            log_event(
+                "WARN",
+                f"NYSE early-close calendar table ends in 2027 (current year: {dt_et.year}); "
+                f"defaulting RTH close to 4:00 PM ET.",
+            )
+        except Exception:
+            pass
+    d_str = dt_et.strftime("%Y-%m-%d")
+    if d_str in NYSE_EARLY_CLOSE_DATES:
+        return dt_time(13, 0)
+    return dt_time(16, 0)
+
+
 def is_rth():
-    now = get_eastern_now().time()
-    return dt_time(9, 30) <= now < dt_time(16, 0)
+    now_et = get_eastern_now()
+    return dt_time(9, 30) <= now_et.time() < get_rth_close_time(now_et)
 
 
 def is_after_hours():
-    now = get_eastern_now().time()
-    return now >= dt_time(16, 0)
+    now_et = get_eastern_now()
+    return now_et.time() >= get_rth_close_time(now_et)
 
 
 def is_market_hours():
-    now = get_eastern_now().time()
-    return dt_time(9, 30) <= now < dt_time(16, 0)
+    now_et = get_eastern_now()
+    return dt_time(9, 30) <= now_et.time() < get_rth_close_time(now_et)
+
+
+def is_any_equity_session_open(broker_name=None):
+    """Returns True when either Regular Trading Hours or the broker's Extended
+    Hours equity session is open (weekdays not in NYSE_FULL_HOLIDAY_DATES;
+    7:00 AM–8:00 PM ET for Schwab, 4:00 AM–8:00 PM ET for Webull, closing at
+    5:00 PM ET on NYSE early-close dates)."""
+    now_et = get_eastern_now()
+    if now_et.weekday() >= 5:
+        return False
+    d_str = now_et.strftime("%Y-%m-%d")
+    if d_str in NYSE_FULL_HOLIDAY_DATES:
+        return False
+    b_up = str(
+        broker_name
+        or (active_adapter.name if active_adapter is not None else "")
+        or config.get("active_broker", "SCHWAB")
+    ).upper()
+    open_t = dt_time(4, 0) if "WEBULL" in b_up else dt_time(7, 0)
+    close_t = (
+        dt_time(17, 0) if d_str in NYSE_EARLY_CLOSE_DATES else dt_time(20, 0)
+    )
+    return open_t <= now_et.time() < close_t
 
 
 def calc_ext_limit_price(ref_price, is_sell=True):
@@ -4429,6 +4627,8 @@ class SchwabAdapter:
         self._last_intraday_cash_flow = {}
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
+        self._pending_flatten_cids = {}
+        self._logged_short_sign_syms = set()
         self._rate_limit_until = 0.0
         self._last_429_log_ts = 0.0
         self._fast_auth_deferred = False
@@ -4480,7 +4680,16 @@ class SchwabAdapter:
                 if os.path.exists(cand_py):
                     py_cli = cand_py
             subprocess.run(
-                [py_cli, "-m", "pip", "install", "--upgrade", "schwab-py"],
+                [
+                    py_cli,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--upgrade",
+                    "schwab-py==1.5.1",
+                    "authlib==1.8.0",
+                    "httpx==0.28.1",
+                ],
                 check=False
             )
             from schwab.auth import client_from_manual_flow, client_from_token_file
@@ -4658,7 +4867,140 @@ class SchwabAdapter:
         if self.accounts and not self.account_id:
             self.account_id = self.accounts[0]["id"]
 
-    def cancel_all_working_orders(self, preserve_market_close_map=None):
+    @staticmethod
+    def _extract_schwab_order_id(resp):
+        try:
+            hdrs = getattr(resp, "headers", None) or {}
+            loc = str(
+                hdrs.get("location") or hdrs.get("Location") or ""
+            ).strip()
+            if loc:
+                m = re.search(r"/orders/([^/?#]+)", loc)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _order_ts_to_epoch(raw_ts):
+        s = str(raw_ts or "").strip()
+        if not s:
+            return 0.0
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            elif re.search(r"[+-]\d{4}$", s):
+                s = s[:-2] + ":" + s[-2:]
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return float(dt.timestamp())
+        except Exception:
+            return 0.0
+
+    def get_recent_exit_order_coverage(
+        self, symbol, is_short=False, since_epoch=None, is_opt=False
+    ):
+        """Checks Schwab orders in UTC over the last 5 minutes for `symbol` in the
+        closing direction. Returns (working_qty, recent_filled_qty) so post-timeout
+        sweeps never double-submit an exit order that is already working or filled."""
+        if not self.client or not self.account_id or not symbol:
+            return 0.0, 0.0
+        now_utc = datetime.now(timezone.utc)
+        from_utc = now_utc - timedelta(minutes=5)
+        try:
+            try:
+                resp = self.client.get_orders_for_account(
+                    self.account_id,
+                    from_entered_datetime=from_utc,
+                    to_entered_datetime=now_utc,
+                )
+            except TypeError:
+                resp = self.client.get_orders_for_account(self.account_id)
+            if resp.status_code != 200:
+                return 0.0, 0.0
+            orders = resp.json()
+            if not isinstance(orders, list):
+                return 0.0, 0.0
+        except Exception:
+            return 0.0, 0.0
+
+        active_statuses = {
+            "WORKING",
+            "QUEUED",
+            "PENDING_ACTIVATION",
+            "ACCEPTED",
+            "NEW",
+            "AWAITING_PARENT_ORDER",
+            "AWAITING_CONDITION",
+            "AWAITING_STOP_CONDITION",
+            "AWAITING_MANUAL_REVIEW",
+            "AWAITING_UR_OUT",
+            "PENDING_ACKNOWLEDGEMENT",
+        }
+        closing_instrs = (
+            {"BUY", "BUY_TO_COVER", "BUY_TO_CLOSE"}
+            if is_short
+            else {"SELL", "SELL_TO_CLOSE"}
+        )
+        cutoff_epoch = (
+            float(since_epoch) - 5.0
+            if since_epoch is not None
+            else (time.time() - 180.0)
+        )
+        working_qty = 0.0
+        filled_qty = 0.0
+        target_sym = str(symbol).strip()
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            st = str(o.get("status") or "").upper()
+            legs = o.get("orderLegCollection") or []
+            if len(legs) != 1 or not isinstance(legs[0], dict):
+                continue
+            lg = legs[0]
+            inst = lg.get("instrument") or {}
+            leg_sym = str(inst.get("symbol") or "").strip()
+            if leg_sym != target_sym:
+                continue
+            leg_atype = str(inst.get("assetType") or "").upper()
+            if is_opt and leg_atype != "OPTION":
+                continue
+            if not is_opt and leg_atype == "OPTION":
+                continue
+            instr = str(lg.get("instruction") or "").upper()
+            if instr not in closing_instrs:
+                continue
+            try:
+                f_q = float(o.get("filledQuantity") or 0.0)
+            except Exception:
+                f_q = 0.0
+            try:
+                rem_q = float(
+                    o.get("remainingQuantity")
+                    if o.get("remainingQuantity") is not None
+                    else max(
+                        0.0,
+                        float(lg.get("quantity") or o.get("quantity") or 0.0)
+                        - f_q,
+                    )
+                )
+            except Exception:
+                rem_q = 0.0
+            if st in active_statuses and rem_q > 0:
+                working_qty += rem_q
+            if f_q > 0:
+                ent_ep = self._order_ts_to_epoch(
+                    o.get("closeTime") or o.get("enteredTime")
+                )
+                if ent_ep <= 0.0 or ent_ep >= cutoff_epoch:
+                    filled_qty += f_q
+        return working_qty, filled_qty
+
+    def cancel_all_working_orders(
+        self, preserve_market_close_map=None, cancel_options=True
+    ):
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
         preserve_map = (
@@ -4667,27 +5009,51 @@ class SchwabAdapter:
             else {}
         )
         try:
-            today_start = datetime.combine(
-                get_eastern_now().date() - timedelta(days=2), dt_time(0, 0)
+            now_utc = datetime.now(timezone.utc)
+            lookback_start = now_utc - timedelta(days=58)
+            try:
+                orders_resp = self.client.get_orders_for_account(
+                    self.account_id,
+                    from_entered_datetime=lookback_start,
+                    to_entered_datetime=now_utc,
+                )
+            except (TypeError, ValueError):
+                orders_resp = self.client.get_orders_for_account(self.account_id)
+        except Exception as e:
+            log_event(
+                "ERROR",
+                f"Schwab get_orders_for_account exception during cancel: {e}",
             )
-            orders_resp = self.client.get_orders_for_account(
-                self.account_id, from_entered_datetime=today_start
-            )
-        except TypeError:
-            orders_resp = self.client.get_orders_for_account(self.account_id)
+            return False
 
         if orders_resp.status_code == 200:
-            active_statuses = [
-                "WORKING", "QUEUED", "PENDING_ACTIVATION", "ACCEPTED"
-            ]
+            active_statuses = {
+                "WORKING",
+                "QUEUED",
+                "PENDING_ACTIVATION",
+                "ACCEPTED",
+                "NEW",
+                "AWAITING_PARENT_ORDER",
+                "AWAITING_CONDITION",
+                "AWAITING_STOP_CONDITION",
+                "AWAITING_MANUAL_REVIEW",
+                "AWAITING_UR_OUT",
+                "PENDING_ACKNOWLEDGEMENT",
+            }
             cancelled_any = False
             preserved_any = False
             for order in orders_resp.json():
-                status = order.get("status")
+                if not isinstance(order, dict):
+                    continue
+                status = str(order.get("status") or "").upper()
                 if status in active_statuses:
                     order_id = order.get("orderId")
                     masked_oid = _mask_last4(order_id)
-                    legs = order.get("orderLegCollection") or []
+                    legs = [
+                        lg
+                        for lg in (order.get("orderLegCollection") or [])
+                        if isinstance(lg, dict)
+                    ]
                     if legs and all(
                         is_position_ignored(
                             (lg.get("instrument") or {}).get("symbol", ""),
@@ -4701,12 +5067,10 @@ class SchwabAdapter:
                             ),
                         )
                         for lg in legs
-                        if isinstance(lg, dict)
                     ):
                         leg_syms = [
                             (lg.get("instrument") or {}).get("symbol", "")
                             for lg in legs
-                            if isinstance(lg, dict)
                         ]
                         log_event(
                             "FLATTEN",
@@ -4714,12 +5078,29 @@ class SchwabAdapter:
                         )
                         continue
 
+                    if not cancel_options and legs:
+                        all_opt_closing = all(
+                            str(
+                                (lg.get("instrument") or {}).get(
+                                    "assetType", ""
+                                )
+                            ).upper()
+                            == "OPTION"
+                            and str(lg.get("instruction") or "").upper()
+                            in ("SELL_TO_CLOSE", "BUY_TO_CLOSE")
+                            for lg in legs
+                        )
+                        if all_opt_closing:
+                            preserved_any = True
+                            log_event(
+                                "FLATTEN",
+                                f"Preserving protective/closing option order {masked_oid} ({status}) — "
+                                f"Options Auto-Flatten not active for this sweep.",
+                            )
+                            continue
+
                     order_type = str(order.get("orderType") or "").upper()
-                    single_leg = (
-                        legs[0]
-                        if len(legs) == 1 and isinstance(legs[0], dict)
-                        else None
-                    )
+                    single_leg = legs[0] if len(legs) == 1 else None
                     leg_sym = (
                         str(
                             (single_leg.get("instrument") or {}).get(
@@ -4773,7 +5154,7 @@ class SchwabAdapter:
                         log_event(
                             "FLATTEN",
                             f"Preserving working Schwab RTH Market close order {masked_oid} "
-                            f"({leg_instr} {int(eff_q)} {leg_sym}, {status}) — "
+                            f"({leg_instr} {eff_q:g} {leg_sym}, {status}) — "
                             f"keeping halt/auction queue priority.",
                         )
                         continue
@@ -4782,23 +5163,32 @@ class SchwabAdapter:
                         "FLATTEN",
                         f"Canceling Schwab order ID: {masked_oid} ({status})"
                     )
-                    c_resp = self.client.cancel_order(self.account_id, order_id)
-                    log_event(
-                        "FLATTEN",
-                        f"Cancel response {masked_oid}: HTTP {c_resp.status_code}"
-                    )
-                    if c_resp.status_code in (200, 201, 202, 204):
-                        cancelled_any = True
-                    else:
+                    cancel_ok = False
+                    try:
+                        c_resp = self.client.cancel_order(
+                            order_id, self.account_id
+                        )
+                        log_event(
+                            "FLATTEN",
+                            f"Cancel response {masked_oid}: HTTP {c_resp.status_code}"
+                        )
+                        if c_resp.status_code in (200, 201, 202, 204):
+                            cancelled_any = True
+                            cancel_ok = True
+                    except Exception as ce:
+                        log_event(
+                            "ERROR",
+                            f"Schwab cancel_order {masked_oid} exception: {ce}",
+                        )
+                    if not cancel_ok:
                         for lg in legs:
-                            if isinstance(lg, dict):
-                                s_nm = str(
-                                    (lg.get("instrument") or {}).get(
-                                        "symbol", ""
-                                    )
-                                ).strip()
-                                if s_nm:
-                                    self.last_cancel_failed_syms.add(s_nm)
+                            s_nm = str(
+                                (lg.get("instrument") or {}).get(
+                                    "symbol", ""
+                                )
+                            ).strip()
+                            if s_nm:
+                                self.last_cancel_failed_syms.add(s_nm)
                         if is_closing_dir and leg_sym:
                             eff_q = (
                                 rem_q
@@ -4864,11 +5254,9 @@ class SchwabAdapter:
             if c_val or (now_ts - c_ts) < 30.0:
                 return bool(c_val)
         try:
-            now_et = get_eastern_now()
-            from_dt = now_et.replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ) - timedelta(days=1)
-            to_dt = now_et + timedelta(days=1)
+            now_utc = datetime.now(timezone.utc)
+            from_dt = now_utc - timedelta(days=2)
+            to_dt = now_utc + timedelta(hours=1)
             resp = self.client.get_orders_for_account(
                 self.account_id,
                 from_entered_datetime=from_dt,
@@ -4911,7 +5299,7 @@ class SchwabAdapter:
         except Exception:
             return True
 
-    def get_open_equity_positions(self):
+    def get_open_equity_positions(self, allow_stale_cache=True):
         """Returns ONLY Equity positions for Auto-Flatten, or None on API error."""
         try:
             try:
@@ -4948,6 +5336,8 @@ class SchwabAdapter:
                         sym = inst.get("symbol", "")
                         if a_type in ("EQUITY", "COLLECTIVE_INVESTMENT") and not is_position_ignored(
                             sym, is_opt=False
+                        ) and not is_uncloseable_fractional_qty(
+                            self.account_id, sym, qty
                         ):
                             open_eq.append((sym, qty))
                         elif a_type == "OPTION" and not is_position_ignored(
@@ -4971,7 +5361,12 @@ class SchwabAdapter:
                 f"Schwab get_open_equity_positions exception: {e}"
             )
         cached = self._last_open_eq.get(self.account_id)
-        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+        if (
+            allow_stale_cache
+            and cached
+            and (time.time() - cached[0]) <= 10.0
+            and cached[1]
+        ):
             log_event(
                 "FLATTEN",
                 "Using cached Schwab open equity snapshot (<10s) after API error."
@@ -4980,14 +5375,17 @@ class SchwabAdapter:
                 item
                 for item in cached[1]
                 if not is_position_ignored(item[0], is_opt=False)
+                and not is_uncloseable_fractional_qty(
+                    self.account_id, item[0], item[1]
+                )
             ]
         return None
 
-    def get_open_option_positions(self):
+    def get_open_option_positions(self, allow_stale_cache=True):
         """Returns ONLY Option positions (symbol, qty) sorted with short legs
         (qty < 0) first for BETA Options Auto-Flatten, or None on API error."""
         cached = self._last_open_opt.get(self.account_id)
-        if cached and (time.time() - cached[0]) < 0.45:
+        if allow_stale_cache and cached and (time.time() - cached[0]) < 0.45:
             return [
                 item
                 for item in cached[1]
@@ -5028,6 +5426,8 @@ class SchwabAdapter:
                         sym = inst.get("symbol", "")
                         if a_type in ("EQUITY", "COLLECTIVE_INVESTMENT") and not is_position_ignored(
                             sym, is_opt=False
+                        ) and not is_uncloseable_fractional_qty(
+                            self.account_id, sym, qty
                         ):
                             open_eq.append((sym, qty))
                         elif a_type == "OPTION" and not is_position_ignored(
@@ -5050,7 +5450,12 @@ class SchwabAdapter:
                 "ERROR",
                 f"Schwab get_open_option_positions exception: {e}"
             )
-        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+        if (
+            allow_stale_cache
+            and cached
+            and (time.time() - cached[0]) <= 10.0
+            and cached[1]
+        ):
             log_event(
                 "FLATTEN",
                 "Using cached Schwab open option snapshot (<10s) after API error."
@@ -5089,6 +5494,7 @@ class SchwabAdapter:
             abs_q = int(abs(qty))
             if abs_q <= 0:
                 continue
+            attempt_ts = time.time()
             try:
                 if qty < 0:
                     log_event(
@@ -5098,9 +5504,10 @@ class SchwabAdapter:
                     )
                     spec = option_buy_to_close_market(symbol, abs_q).build()
                     r = self.client.place_order(self.account_id, spec)
+                    oid = _mask_last4(self._extract_schwab_order_id(r))
                     log_event(
                         "ORDER_RESP",
-                        f"Schwab Option Buy-to-Close {symbol} -> HTTP {r.status_code}"
+                        f"Schwab Option Buy-to-Close {symbol} ({oid}) -> HTTP {r.status_code}"
                     )
                     if r.status_code in (200, 201, 202):
                         submitted_ok[symbol] = float(abs_q)
@@ -5112,9 +5519,10 @@ class SchwabAdapter:
                     )
                     spec = option_sell_to_close_market(symbol, abs_q).build()
                     r = self.client.place_order(self.account_id, spec)
+                    oid = _mask_last4(self._extract_schwab_order_id(r))
                     log_event(
                         "ORDER_RESP",
-                        f"Schwab Option Sell-to-Close {symbol} -> HTTP {r.status_code}"
+                        f"Schwab Option Sell-to-Close {symbol} ({oid}) -> HTTP {r.status_code}"
                     )
                     if r.status_code in (200, 201, 202):
                         submitted_ok[symbol] = float(abs_q)
@@ -5123,6 +5531,19 @@ class SchwabAdapter:
                     "ERROR",
                     f"Schwab option place_order exception ({symbol}): {e}"
                 )
+                w_q, f_q = self.get_recent_exit_order_coverage(
+                    symbol,
+                    is_short=(qty < 0),
+                    since_epoch=attempt_ts,
+                    is_opt=True,
+                )
+                if (w_q + f_q) > 0:
+                    log_event(
+                        "FLATTEN",
+                        f"Verified timed-out Schwab option close on {symbol} is live/filled "
+                        f"(working={w_q:g}, filled={f_q:g}); suppressing duplicate.",
+                    )
+                    submitted_ok[symbol] = float(w_q + f_q)
         return submitted_ok
 
     def submit_liquidation_batch(self, open_positions):
@@ -5150,109 +5571,203 @@ class SchwabAdapter:
                 log_event("ERROR", f"Quote lookup error during flatten: {e}")
 
         for symbol, qty in open_positions:
-            if use_market:
-                if qty > 0:
+            try:
+                f_qty = float(qty)
+            except Exception:
+                continue
+            if abs(f_qty) <= 1e-9:
+                continue
+            if is_uncloseable_fractional_qty(self.account_id, symbol, f_qty):
+                continue
+
+            abs_total = abs(f_qty)
+            whole_q = int(abs_total)
+            is_pure_fractional = (whole_q == 0 and 0.0 < abs_total < 1.0)
+
+            if is_pure_fractional and not use_market:
+                mark_uncloseable_fractional_sym(self.account_id, symbol, f_qty)
+                continue
+
+            order_qty = round(abs_total, 4) if is_pure_fractional else whole_q
+            if order_qty <= 0:
+                continue
+
+            attempt_ts = time.time()
+            try:
+                if use_market:
+                    if f_qty > 0:
+                        log_event(
+                            "ORDER_OUT",
+                            f"Submitting RTH DAY Market Sell: {order_qty:g} {symbol}"
+                        )
+                        spec = equity_sell_market(symbol, order_qty).build()
+                        r = self.client.place_order(self.account_id, spec)
+                        oid = _mask_last4(self._extract_schwab_order_id(r))
+                        log_event(
+                            "ORDER_RESP",
+                            f"Market Sell {symbol} ({oid}) -> HTTP {r.status_code}"
+                        )
+                        if r.status_code in (200, 201, 202):
+                            submitted_ok[symbol] = float(order_qty)
+                        elif is_pure_fractional:
+                            mark_uncloseable_fractional_sym(
+                                self.account_id, symbol, f_qty
+                            )
+                    elif f_qty < 0:
+                        log_event(
+                            "ORDER_OUT",
+                            f"Submitting RTH DAY Buy-to-Cover: {order_qty:g} {symbol}"
+                        )
+                        spec = equity_buy_to_cover_market(
+                            symbol, order_qty
+                        ).build()
+                        r = self.client.place_order(self.account_id, spec)
+                        oid = _mask_last4(self._extract_schwab_order_id(r))
+                        log_event(
+                            "ORDER_RESP",
+                            f"Buy-to-Cover {symbol} ({oid}) -> HTTP {r.status_code}"
+                        )
+                        if r.status_code in (200, 201, 202):
+                            submitted_ok[symbol] = float(order_qty)
+                        elif is_pure_fractional:
+                            mark_uncloseable_fractional_sym(
+                                self.account_id, symbol, f_qty
+                            )
+                else:
+                    q_info = quotes_data.get(symbol, {}).get("quote", {})
+                    if f_qty > 0:
+                        bid = (
+                            q_info.get("bidPrice")
+                            or q_info.get("lastPrice")
+                            or q_info.get("mark")
+                        )
+                        if not bid or bid <= 0:
+                            log_event(
+                                "ERROR", f"No valid bid found for {symbol}!"
+                            )
+                            continue
+                        lim_price = calc_ext_limit_price(
+                            float(bid), is_sell=True
+                        )
+                        lim_price_str = format_limit_price_str(lim_price)
+                        log_event(
+                            "ORDER_OUT",
+                            f"Submitting EXT DAY_EXT Limit Sell: {whole_q} {symbol} "
+                            f"@ ${lim_price_str} (Live Bid: ${bid})"
+                        )
+                        spec = (
+                            equity_sell_limit(symbol, whole_q, lim_price_str)
+                            .set_session(Session.SEAMLESS)
+                            .set_duration(Duration.DAY)
+                            .build()
+                        )
+                        r = self.client.place_order(self.account_id, spec)
+                        if r.status_code == 400:
+                            spec_gtc = (
+                                equity_sell_limit(
+                                    symbol, whole_q, lim_price_str
+                                )
+                                .set_session(Session.SEAMLESS)
+                                .set_duration(Duration.GOOD_TILL_CANCEL)
+                                .build()
+                            )
+                            r = self.client.place_order(
+                                self.account_id, spec_gtc
+                            )
+                        oid = _mask_last4(self._extract_schwab_order_id(r))
+                        log_event(
+                            "ORDER_RESP",
+                            f"EXT Limit Sell {symbol} ({oid}) -> HTTP {r.status_code}"
+                        )
+                        if r.status_code in (200, 201, 202):
+                            submitted_ok[symbol] = float(whole_q)
+                    elif f_qty < 0:
+                        ask = (
+                            q_info.get("askPrice")
+                            or q_info.get("lastPrice")
+                            or q_info.get("mark")
+                        )
+                        if not ask or ask <= 0:
+                            log_event(
+                                "ERROR", f"No valid ask found for {symbol}!"
+                            )
+                            continue
+                        lim_price = calc_ext_limit_price(
+                            float(ask), is_sell=False
+                        )
+                        lim_price_str = format_limit_price_str(lim_price)
+                        log_event(
+                            "ORDER_OUT",
+                            f"Submitting EXT DAY_EXT Limit Cover: {whole_q} {symbol} "
+                            f"@ ${lim_price_str} (Live Ask: ${ask})"
+                        )
+                        spec = (
+                            equity_buy_to_cover_limit(
+                                symbol, whole_q, lim_price_str
+                            )
+                            .set_session(Session.SEAMLESS)
+                            .set_duration(Duration.DAY)
+                            .build()
+                        )
+                        r = self.client.place_order(self.account_id, spec)
+                        if r.status_code == 400:
+                            spec_gtc = (
+                                equity_buy_to_cover_limit(
+                                    symbol, whole_q, lim_price_str
+                                )
+                                .set_session(Session.SEAMLESS)
+                                .set_duration(Duration.GOOD_TILL_CANCEL)
+                                .build()
+                            )
+                            r = self.client.place_order(
+                                self.account_id, spec_gtc
+                            )
+                        oid = _mask_last4(self._extract_schwab_order_id(r))
+                        log_event(
+                            "ORDER_RESP",
+                            f"EXT Limit Cover {symbol} ({oid}) -> HTTP {r.status_code}"
+                        )
+                        if r.status_code in (200, 201, 202):
+                            submitted_ok[symbol] = float(whole_q)
+            except Exception as e:
+                log_event(
+                    "ERROR",
+                    f"Schwab equity place_order exception ({symbol}): {e}"
+                )
+                if is_pure_fractional:
+                    mark_uncloseable_fractional_sym(
+                        self.account_id, symbol, f_qty
+                    )
+                    continue
+                w_q, f_q = self.get_recent_exit_order_coverage(
+                    symbol,
+                    is_short=(f_qty < 0),
+                    since_epoch=attempt_ts,
+                    is_opt=False,
+                )
+                if (w_q + f_q) > 0:
                     log_event(
-                        "ORDER_OUT",
-                        f"Submitting RTH DAY Market Sell: {int(qty)} {symbol}"
+                        "FLATTEN",
+                        f"Verified timed-out Schwab exit order on {symbol} is live/filled "
+                        f"(working={w_q:g}, filled={f_q:g}); suppressing duplicate.",
                     )
-                    spec = equity_sell_market(symbol, int(qty)).build()
-                    r = self.client.place_order(self.account_id, spec)
-                    log_event(
-                        "ORDER_RESP", f"Market Sell {symbol} -> HTTP {r.status_code}"
-                    )
-                    if r.status_code in (200, 201, 202):
-                        submitted_ok[symbol] = float(abs(qty))
-                elif qty < 0:
-                    abs_q = int(abs(qty))
-                    log_event(
-                        "ORDER_OUT",
-                        f"Submitting RTH DAY Buy-to-Cover: {abs_q} {symbol}"
-                    )
-                    spec = equity_buy_to_cover_market(symbol, abs_q).build()
-                    r = self.client.place_order(self.account_id, spec)
-                    log_event(
-                        "ORDER_RESP",
-                        f"Buy-to-Cover {symbol} -> HTTP {r.status_code}"
-                    )
-                    if r.status_code in (200, 201, 202):
-                        submitted_ok[symbol] = float(abs_q)
-            else:
-                q_info = quotes_data.get(symbol, {}).get("quote", {})
-                if qty > 0:
-                    bid = (
-                        q_info.get("bidPrice")
-                        or q_info.get("lastPrice")
-                        or q_info.get("mark")
-                    )
-                    if not bid or bid <= 0:
-                        log_event("ERROR", f"No valid bid found for {symbol}!")
-                        continue
-                    lim_price = calc_ext_limit_price(float(bid), is_sell=True)
-                    lim_price_str = format_limit_price_str(lim_price)
-                    log_event(
-                        "ORDER_OUT",
-                        f"Submitting EXT GTC_EXT Limit Sell: {int(qty)} {symbol} "
-                        f"@ ${lim_price_str} (Live Bid: ${bid})"
-                    )
-                    spec = (
-                        equity_sell_limit(symbol, int(qty), lim_price_str)
-                        .set_session(Session.SEAMLESS)
-                        .set_duration(Duration.GOOD_TILL_CANCEL)
-                        .build()
-                    )
-                    r = self.client.place_order(self.account_id, spec)
-                    log_event(
-                        "ORDER_RESP",
-                        f"GTC_EXT Limit Sell {symbol} -> HTTP {r.status_code}"
-                    )
-                    if r.status_code in (200, 201, 202):
-                        submitted_ok[symbol] = float(abs(qty))
-                elif qty < 0:
-                    abs_q = int(abs(qty))
-                    ask = (
-                        q_info.get("askPrice")
-                        or q_info.get("lastPrice")
-                        or q_info.get("mark")
-                    )
-                    if not ask or ask <= 0:
-                        log_event("ERROR", f"No valid ask found for {symbol}!")
-                        continue
-                    lim_price = calc_ext_limit_price(float(ask), is_sell=False)
-                    lim_price_str = format_limit_price_str(lim_price)
-                    log_event(
-                        "ORDER_OUT",
-                        f"Submitting EXT GTC_EXT Limit Cover: {abs_q} {symbol} "
-                        f"@ ${lim_price_str} (Live Ask: ${ask})"
-                    )
-                    spec = (
-                        equity_buy_to_cover_limit(symbol, abs_q, lim_price_str)
-                        .set_session(Session.SEAMLESS)
-                        .set_duration(Duration.GOOD_TILL_CANCEL)
-                        .build()
-                    )
-                    r = self.client.place_order(self.account_id, spec)
-                    log_event(
-                        "ORDER_RESP",
-                        f"GTC_EXT Limit Cover {symbol} -> HTTP {r.status_code}"
-                    )
-                    if r.status_code in (200, 201, 202):
-                        submitted_ok[symbol] = float(abs_q)
+                    submitted_ok[symbol] = float(w_q + f_q)
         return submitted_ok
 
     def fetch_account_data(self):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         tracking BOTH Equities (1x) and Options (100x)."""
+        start_acct_id = self.account_id
         now_ts = time.time()
         if now_ts < self._rate_limit_until:
-            cached_snap = self._last_good_snapshot.get(self.account_id)
+            cached_snap = self._last_good_snapshot.get(start_acct_id)
             if cached_snap and (now_ts - cached_snap[0]) <= 15.0:
                 return cached_snap[1]
 
         try:
             try:
                 resp = self.client.get_account(
-                    self.account_id, fields=self.client.Account.Fields.POSITIONS
+                    start_acct_id, fields=self.client.Account.Fields.POSITIONS
                 )
             except Exception as inner_e:
                 if (
@@ -5264,11 +5779,13 @@ class SchwabAdapter:
                         "Schwab in-memory token refreshed from disk after token_invalid."
                     )
                     resp = self.client.get_account(
-                        self.account_id,
+                        start_acct_id,
                         fields=self.client.Account.Fields.POSITIONS
                     )
                 else:
                     raise
+            if self.account_id != start_acct_id or broker_reconfig_in_progress:
+                return None, True, 0.0, {}, False
             if resp.status_code == 200:
                 self.last_error = ""
                 data = resp.json().get("securitiesAccount", {})
@@ -5287,7 +5804,7 @@ class SchwabAdapter:
                     else max(cr_delta, new_pend),
                     2,
                 )
-                self._last_intraday_cash_flow[self.account_id] = intraday_cf
+                self._last_intraday_cash_flow[start_acct_id] = intraday_cf
                 raw_eq = round(
                     raw_eq - get_unanchored_cash_flow(intraday_cf), 2
                 )
@@ -5305,15 +5822,16 @@ class SchwabAdapter:
                             - pos.get("shortQuantity", 0)
                         )
                         if net_q != 0:
+                            sym_p = pos.get("instrument", {}).get("symbol", "")
+                            if a_type != "OPTION" and is_uncloseable_fractional_qty(
+                                start_acct_id, sym_p, net_q
+                            ):
+                                continue
                             if a_type == "OPTION":
                                 has_options = True
-                                open_opt_cache.append(
-                                    (pos["instrument"]["symbol"], net_q)
-                                )
+                                open_opt_cache.append((sym_p, net_q))
                             else:
-                                open_eq_cache.append(
-                                    (pos["instrument"]["symbol"], net_q)
-                                )
+                                open_eq_cache.append((sym_p, net_q))
                             open_assets.append((pos, net_q, a_type))
 
                 open_opt_cache.sort(
@@ -5322,8 +5840,13 @@ class SchwabAdapter:
                 now_snap_t = time.time()
 
                 if not open_assets:
-                    self._last_raw_pos_details[self.account_id] = {}
-                    self._last_raw_adj_eq[self.account_id] = raw_eq
+                    if (
+                        self.account_id != start_acct_id
+                        or broker_reconfig_in_progress
+                    ):
+                        return None, True, 0.0, {}, False
+                    self._last_raw_pos_details[start_acct_id] = {}
+                    self._last_raw_adj_eq[start_acct_id] = raw_eq
                     (
                         adj_eq,
                         is_flat,
@@ -5335,13 +5858,13 @@ class SchwabAdapter:
                     ) = _apply_ignored_positions_to_snapshot(
                         raw_eq, {}, [], []
                     )
-                    self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
-                    self._last_open_opt[self.account_id] = (
+                    self._last_open_eq[start_acct_id] = (now_snap_t, filt_eq)
+                    self._last_open_opt[start_acct_id] = (
                         now_snap_t,
                         filt_opt,
                     )
                     flat_res = (adj_eq, is_flat, tot_open_pnl, filt_pos, has_opt)
-                    self._last_good_snapshot[self.account_id] = (
+                    self._last_good_snapshot[start_acct_id] = (
                         time.time(), flat_res
                     )
                     return flat_res
@@ -5362,6 +5885,12 @@ class SchwabAdapter:
                 except Exception as qe:
                     log_event("ERROR", f"Live quote fetch error: {qe}")
                     q_data = {}
+
+                if (
+                    self.account_id != start_acct_id
+                    or broker_reconfig_in_progress
+                ):
+                    return None, True, 0.0, {}, False
 
                 for pos, net_q, a_type in open_assets:
                     sym = pos["instrument"]["symbol"]
@@ -5490,10 +6019,16 @@ class SchwabAdapter:
                     raw_eq + (total_live_mkt_val - ref_bal_mkt_val), 2
                 )
 
-                self._last_raw_pos_details[self.account_id] = json.loads(
+                if (
+                    self.account_id != start_acct_id
+                    or broker_reconfig_in_progress
+                ):
+                    return None, True, 0.0, {}, False
+
+                self._last_raw_pos_details[start_acct_id] = json.loads(
                     json.dumps(pos_details)
                 )
-                self._last_raw_adj_eq[self.account_id] = adj_eq
+                self._last_raw_adj_eq[start_acct_id] = adj_eq
                 (
                     adj_eq,
                     is_flat,
@@ -5505,8 +6040,8 @@ class SchwabAdapter:
                 ) = _apply_ignored_positions_to_snapshot(
                     adj_eq, pos_details, open_eq_cache, open_opt_cache
                 )
-                self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
-                self._last_open_opt[self.account_id] = (now_snap_t, filt_opt)
+                self._last_open_eq[start_acct_id] = (now_snap_t, filt_eq)
+                self._last_open_opt[start_acct_id] = (now_snap_t, filt_opt)
 
                 open_res = (
                     adj_eq,
@@ -5515,7 +6050,7 @@ class SchwabAdapter:
                     filt_pos,
                     has_opt
                 )
-                self._last_good_snapshot[self.account_id] = (
+                self._last_good_snapshot[start_acct_id] = (
                     time.time(), open_res
                 )
                 return open_res
@@ -5576,6 +6111,8 @@ class WebullAdapter:
         self._last_intraday_cash_flow = {}
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
+        self._pending_flatten_cids = {}
+        self._logged_short_sign_syms = set()
         self._rate_limit_until = 0.0
         self._last_429_log_ts = 0.0
         self._fast_auth_deferred = False
@@ -5661,7 +6198,7 @@ class WebullAdapter:
                 [
                     py_cli, "-m", "pip", "install", "--upgrade",
                     "--no-deps", "--ignore-requires-python",
-                    "webull-openapi-python-sdk"
+                    "webull-openapi-python-sdk==3.0.4"
                 ],
                 check=False
             )
@@ -5677,6 +6214,8 @@ class WebullAdapter:
             )
         except TypeError:
             self.api_client = ApiClient(self.app_key, self.app_secret, "us")
+            self.api_client._connect_timeout = 3.5
+            self.api_client._read_timeout = 4.5
         self.api_client._stream_logger_set = True
         self.api_client._file_logger_set = True
         if hasattr(self.api_client, "set_token_dir"):
@@ -5760,6 +6299,8 @@ class WebullAdapter:
                 )
             except TypeError:
                 new_api = ApiClient(self.app_key, self.app_secret, "us")
+                new_api._connect_timeout = 3.5
+                new_api._read_timeout = 4.5
             new_api._stream_logger_set = True
             new_api._file_logger_set = True
             if hasattr(new_api, "set_token_dir"):
@@ -5770,6 +6311,7 @@ class WebullAdapter:
             new_trade = TradeClient(new_api)
             self.api_client = new_api
             self.trade_client = new_trade
+            self.data_client = None
             return True
         except Exception as e:
             self.last_error = str(e)
@@ -5780,21 +6322,275 @@ class WebullAdapter:
             return self.trade_client.account_v2.get_account_list()
         return self.trade_client.get_account_list()
 
-    def _call_get_balance(self):
+    def _call_get_balance(self, acct_id=None):
+        target_id = acct_id or self.account_id
         if hasattr(self.trade_client, "account_v2"):
-            return self.trade_client.account_v2.get_account_balance(
-                self.account_id
-            )
-        return self.trade_client.get_account_balance(self.account_id)
+            return self.trade_client.account_v2.get_account_balance(target_id)
+        return self.trade_client.get_account_balance(target_id)
 
-    def _call_get_positions(self):
+    def _call_get_positions(self, acct_id=None):
+        target_id = acct_id or self.account_id
         if hasattr(self.trade_client, "account_v2"):
-            return self.trade_client.account_v2.get_account_position(
-                self.account_id
-            )
-        return self.trade_client.get_account_position(self.account_id)
+            return self.trade_client.account_v2.get_account_position(target_id)
+        return self.trade_client.get_account_position(target_id)
 
-    def cancel_all_working_orders(self, preserve_market_close_map=None):
+    def _normalize_webull_equity_qty(self, p, sym=""):
+        try:
+            qty = float(p.get("quantity") or p.get("position") or 0.0)
+        except Exception:
+            qty = 0.0
+        side_hint = str(
+            p.get("side") or p.get("position_side") or ""
+        ).upper()
+        if qty > 0 and side_hint in ("SHORT", "SELL"):
+            qty = -abs(qty)
+            if sym and sym not in self._logged_short_sign_syms:
+                self._logged_short_sign_syms.add(sym)
+                log_event(
+                    "GUARDRAIL",
+                    f"Normalized Webull short equity quantity sign via side='{side_hint}' for {sym}: {qty:g}",
+                )
+        return qty
+
+    def _fetch_all_open_orders_webull(self):
+        """Fetches all open orders on Webull (using list_order_open pagination
+        up to 10 pages before canceling, with fallback to get_order_open)."""
+        if not self.trade_client or not self.account_id:
+            return None
+        collected = []
+        seen_ids = set()
+
+        def _append_from_payload(payload):
+            items = (
+                payload
+                if isinstance(payload, list)
+                else payload.get("data", payload.get("orders", []))
+                if isinstance(payload, dict)
+                else []
+            )
+            if not isinstance(items, list):
+                return [], None
+            added = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                oid = str(
+                    item.get("client_order_id")
+                    or item.get("order_id")
+                    or id(item)
+                )
+                if oid not in seen_ids:
+                    seen_ids.add(oid)
+                    collected.append(item)
+                    added.append(item)
+            next_k = None
+            if isinstance(payload, dict):
+                next_k = (
+                    payload.get("pagination_key")
+                    or payload.get("next_pagination_key")
+                    or payload.get("next_page_token")
+                )
+            return added, next_k
+
+        used_list_v3 = False
+        if hasattr(self.trade_client, "order_v3") and hasattr(
+            self.trade_client.order_v3, "list_order_open"
+        ):
+            try:
+                page_key = None
+                seen_page_keys = set()
+                for _ in range(10):
+                    if page_key:
+                        if page_key in seen_page_keys:
+                            break
+                        seen_page_keys.add(page_key)
+                        r_p = self.trade_client.order_v3.list_order_open(
+                            self.account_id, pagination_key=page_key
+                        )
+                    else:
+                        r_p = self.trade_client.order_v3.list_order_open(
+                            self.account_id
+                        )
+                    if r_p is None or getattr(r_p, "status_code", None) != 200:
+                        break
+                    used_list_v3 = True
+                    added_page, next_k = _append_from_payload(r_p.json())
+                    if not added_page:
+                        break
+                    if not next_k and len(added_page) >= 20:
+                        last_o = added_page[-1]
+                        next_k = last_o.get("pagination_key")
+                    if not next_k:
+                        break
+                    page_key = str(next_k)
+            except Exception:
+                pass
+
+        if used_list_v3:
+            return collected
+
+        res = None
+        if hasattr(self.trade_client, "order_v3") and hasattr(
+            self.trade_client.order_v3, "get_order_open"
+        ):
+            try:
+                res = self.trade_client.order_v3.get_order_open(
+                    account_id=self.account_id, page_size=100
+                )
+            except TypeError:
+                res = self.trade_client.order_v3.get_order_open(
+                    account_id=self.account_id
+                )
+        elif hasattr(self.trade_client, "order_v2") and hasattr(
+            self.trade_client.order_v2, "get_order_open"
+        ):
+            try:
+                res = self.trade_client.order_v2.get_order_open(
+                    account_id=self.account_id, page_size=100
+                )
+            except TypeError:
+                res = self.trade_client.order_v2.get_order_open(
+                    account_id=self.account_id
+                )
+        elif hasattr(self.trade_client, "get_open_orders"):
+            res = self.trade_client.get_open_orders(self.account_id)
+
+        if res is not None and getattr(res, "status_code", None) == 200:
+            _append_from_payload(res.json())
+            return collected
+        return None
+
+    def get_recent_exit_order_coverage(
+        self, symbol, is_short=False, since_epoch=None, is_opt=False
+    ):
+        """Checks Webull open orders and any recent pending client_order_id for
+        `symbol` in the closing direction. Returns (working_qty, recent_filled_qty)."""
+        if not self.trade_client or not self.account_id or not symbol:
+            return 0.0, 0.0
+        target_sym = str(symbol).strip()
+        closing_side = "BUY" if is_short else "SELL"
+        working_qty = 0.0
+        filled_qty = 0.0
+        seen_cids = set()
+
+        try:
+            open_orders = self._fetch_all_open_orders_webull() or []
+            for o in open_orders:
+                if not isinstance(o, dict):
+                    continue
+                o_itype = str(
+                    o.get("instrument_type")
+                    or o.get("asset_type")
+                    or "EQUITY"
+                ).upper()
+                o_is_opt = ("OPT" in o_itype) or bool(o.get("legs"))
+                if is_opt != o_is_opt:
+                    continue
+                if o_is_opt:
+                    o_meta = self._parse_option_contract_meta(o)
+                    o_sym = o_meta.get("display_sym") or o_meta.get(
+                        "raw_symbol", ""
+                    )
+                else:
+                    o_sym = (
+                        o.get("symbol")
+                        or (o.get("ticker") or {}).get("symbol")
+                        or ""
+                    )
+                if str(o_sym or "").strip() != target_sym:
+                    continue
+                o_side = str(o.get("side") or o.get("action") or "").upper()
+                if o_side != closing_side:
+                    continue
+                cid = str(
+                    o.get("client_order_id") or o.get("order_id") or ""
+                ).strip()
+                if cid:
+                    seen_cids.add(cid)
+                try:
+                    rem_q = float(
+                        o.get("remain_quantity")
+                        or o.get("unfilled_quantity")
+                        or o.get("quantity")
+                        or o.get("total_quantity")
+                        or 0.0
+                    )
+                except Exception:
+                    rem_q = 0.0
+                if rem_q > 0:
+                    working_qty += rem_q
+        except Exception:
+            pass
+
+        pend = self._pending_flatten_cids.get((self.account_id, target_sym))
+        cutoff = (
+            float(since_epoch) - 5.0
+            if since_epoch is not None
+            else (time.time() - 180.0)
+        )
+        if pend and pend[0] not in seen_cids and pend[1] >= cutoff:
+            cid = pend[0]
+            try:
+                if hasattr(self.trade_client, "order_v3") and hasattr(
+                    self.trade_client.order_v3, "get_order_detail"
+                ):
+                    d_res = self.trade_client.order_v3.get_order_detail(
+                        self.account_id, cid
+                    )
+                    if (
+                        d_res is not None
+                        and getattr(d_res, "status_code", None) == 200
+                    ):
+                        d_json = d_res.json()
+                        d_obj = (
+                            d_json.get("data", d_json)
+                            if isinstance(d_json, dict)
+                            else {}
+                        )
+                        if isinstance(d_obj, dict):
+                            st = str(
+                                d_obj.get("status")
+                                or d_obj.get("order_status")
+                                or ""
+                            ).upper()
+                            try:
+                                fq = float(
+                                    d_obj.get("filled_quantity")
+                                    or d_obj.get("filled_qty")
+                                    or d_obj.get("total_filled_quantity")
+                                    or 0.0
+                                )
+                            except Exception:
+                                fq = 0.0
+                            try:
+                                rq = float(
+                                    d_obj.get("remain_quantity")
+                                    or d_obj.get("unfilled_quantity")
+                                    or 0.0
+                                )
+                            except Exception:
+                                rq = 0.0
+                            if st in (
+                                "WORKING",
+                                "NEW",
+                                "SUBMITTED",
+                                "PENDING",
+                                "PARTIAL_FILLED",
+                                "PARTIALLY_FILLED",
+                                "QUEUED",
+                            ):
+                                working_qty += (
+                                    rq if rq > 0 else max(0.0, pend[2] - fq)
+                                )
+                            if fq > 0 or st == "FILLED":
+                                filled_qty += fq if fq > 0 else pend[2]
+            except Exception:
+                pass
+        return working_qty, filled_qty
+
+    def cancel_all_working_orders(
+        self, preserve_market_close_map=None, cancel_options=True
+    ):
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
         preserve_map = (
@@ -5803,28 +6599,8 @@ class WebullAdapter:
             else {}
         )
         try:
-            res = None
-            if hasattr(self.trade_client, "order_v3") and hasattr(
-                self.trade_client.order_v3, "get_order_open"
-            ):
-                res = self.trade_client.order_v3.get_order_open(
-                    account_id=self.account_id
-                )
-            elif hasattr(self.trade_client, "order_v2") and hasattr(
-                self.trade_client.order_v2, "get_order_open"
-            ):
-                res = self.trade_client.order_v2.get_order_open(
-                    account_id=self.account_id
-                )
-            elif hasattr(self.trade_client, "get_open_orders"):
-                res = self.trade_client.get_open_orders(self.account_id)
-
-            if res is not None and res.status_code == 200:
-                payload = res.json()
-                orders = (
-                    payload if isinstance(payload, list)
-                    else payload.get("data", payload.get("orders", []))
-                )
+            orders = self._fetch_all_open_orders_webull()
+            if orders is not None:
                 cancelled_any = False
                 preserved_any = False
                 for o in orders:
@@ -5860,6 +6636,37 @@ class WebullAdapter:
                                 f"Skipping working Webull order {masked_cid} on ignored pre-existing ticker: {o_sym}",
                             )
                             continue
+
+                        if not cancel_options and o_is_opt:
+                            o_intent = str(
+                                o.get("position_intent") or ""
+                            ).upper()
+                            o_legs = [
+                                lg
+                                for lg in (o.get("legs") or [])
+                                if isinstance(lg, dict)
+                            ]
+                            if o_legs:
+                                all_opt_closing = all(
+                                    str(
+                                        lg.get("position_intent") or o_intent
+                                    ).upper()
+                                    in ("SELL_TO_CLOSE", "BUY_TO_CLOSE")
+                                    for lg in o_legs
+                                )
+                            else:
+                                all_opt_closing = o_intent in (
+                                    "SELL_TO_CLOSE",
+                                    "BUY_TO_CLOSE",
+                                )
+                            if all_opt_closing:
+                                preserved_any = True
+                                log_event(
+                                    "FLATTEN",
+                                    f"Preserving protective/closing Webull option order {masked_cid} — "
+                                    f"Options Auto-Flatten not active for this sweep.",
+                                )
+                                continue
 
                         o_type = str(
                             o.get("order_type") or o.get("orderType") or ""
@@ -5904,7 +6711,7 @@ class WebullAdapter:
                             log_event(
                                 "FLATTEN",
                                 f"Preserving working Webull RTH Market close order {masked_cid} "
-                                f"({o_side} {int(eff_q)} {o_sym}) — "
+                                f"({o_side} {eff_q:g} {o_sym}) — "
                                 f"keeping halt/auction queue priority.",
                             )
                             continue
@@ -5912,22 +6719,32 @@ class WebullAdapter:
                         log_event(
                             "FLATTEN", f"Canceling Webull order ID: {masked_cid}"
                         )
-                        if hasattr(self.trade_client, "order_v3"):
-                            c_res = self.trade_client.order_v3.cancel_order(
-                                self.account_id, cid
+                        cancel_ok = False
+                        try:
+                            if hasattr(self.trade_client, "order_v3"):
+                                c_res = (
+                                    self.trade_client.order_v3.cancel_order(
+                                        self.account_id, cid
+                                    )
+                                )
+                            else:
+                                c_res = self.trade_client.cancel_order(
+                                    self.account_id, cid
+                                )
+                            code = c_resp_code(c_res)
+                            log_event(
+                                "FLATTEN",
+                                f"Cancel response {masked_cid}: HTTP {code}"
                             )
-                        else:
-                            c_res = self.trade_client.cancel_order(
-                                self.account_id, cid
+                            if code in (200, 201, 202, 204, "OK"):
+                                cancelled_any = True
+                                cancel_ok = True
+                        except Exception as ce:
+                            log_event(
+                                "ERROR",
+                                f"Webull cancel_order {masked_cid} exception: {ce}",
                             )
-                        code = c_resp_code(c_res)
-                        log_event(
-                            "FLATTEN",
-                            f"Cancel response {masked_cid}: HTTP {code}"
-                        )
-                        if code in (200, 201, 202, 204, "OK"):
-                            cancelled_any = True
-                        else:
+                        if not cancel_ok:
                             if o_sym:
                                 self.last_cancel_failed_syms.add(o_sym)
                             if is_closing_dir and o_sym:
@@ -6159,14 +6976,22 @@ class WebullAdapter:
             "raw_symbol": raw_sym,
         }
 
-    def get_open_equity_positions(self):
+    def get_open_equity_positions(self, allow_stale_cache=True):
         """Returns (symbol, qty, last_price) for EQUITIES ONLY, or None on API error."""
         cached = self._last_open_eq.get(self.account_id)
-        if cached and (time.time() - cached[0]) < 0.45 and cached[1]:
+        if (
+            allow_stale_cache
+            and cached
+            and (time.time() - cached[0]) < 0.45
+            and cached[1]
+        ):
             return [
                 item
                 for item in cached[1]
                 if not is_position_ignored(item[0], is_opt=False)
+                and not is_uncloseable_fractional_qty(
+                    self.account_id, item[0], item[1]
+                )
             ]
         try:
             res = self._call_get_positions()
@@ -6195,20 +7020,26 @@ class WebullAdapter:
                                 (meta["display_sym"], meta["qty"], meta)
                             )
                         continue
-                    qty = float(p.get("quantity") or p.get("position") or 0)
+                    sym = (
+                        p.get("symbol")
+                        or p.get("ticker", {}).get("symbol")
+                        or ""
+                    )
+                    qty = self._normalize_webull_equity_qty(p, sym)
                     if qty != 0:
-                        sym = (
-                            p.get("symbol")
-                            or p.get("ticker", {}).get("symbol")
-                            or ""
-                        )
                         lp = float(
                             p.get("last_price")
                             or p.get("market_price")
                             or p.get("cost_price")
                             or 0.0
                         )
-                        if sym and not is_position_ignored(sym, is_opt=False):
+                        if (
+                            sym
+                            and not is_position_ignored(sym, is_opt=False)
+                            and not is_uncloseable_fractional_qty(
+                                self.account_id, sym, qty
+                            )
+                        ):
                             open_eq.append((sym, qty, lp))
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
@@ -6226,7 +7057,12 @@ class WebullAdapter:
                 "ERROR",
                 f"Webull get_open_equity_positions exception: {e}"
             )
-        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+        if (
+            allow_stale_cache
+            and cached
+            and (time.time() - cached[0]) <= 10.0
+            and cached[1]
+        ):
             log_event(
                 "FLATTEN",
                 "Using cached Webull open equity snapshot (<10s) after API error."
@@ -6235,14 +7071,17 @@ class WebullAdapter:
                 item
                 for item in cached[1]
                 if not is_position_ignored(item[0], is_opt=False)
+                and not is_uncloseable_fractional_qty(
+                    self.account_id, item[0], item[1]
+                )
             ]
         return None
 
-    def get_open_option_positions(self):
+    def get_open_option_positions(self, allow_stale_cache=True):
         """Returns (display_sym, qty, meta) for OPTIONS ONLY sorted with short
         legs (qty < 0) first, or None on API error."""
         cached = self._last_open_opt.get(self.account_id)
-        if cached and (time.time() - cached[0]) < 0.45:
+        if allow_stale_cache and cached and (time.time() - cached[0]) < 0.45:
             return [
                 item
                 for item in cached[1]
@@ -6275,20 +7114,26 @@ class WebullAdapter:
                                 (meta["display_sym"], meta["qty"], meta)
                             )
                         continue
-                    qty = float(p.get("quantity") or p.get("position") or 0)
+                    sym = (
+                        p.get("symbol")
+                        or p.get("ticker", {}).get("symbol")
+                        or ""
+                    )
+                    qty = self._normalize_webull_equity_qty(p, sym)
                     if qty != 0:
-                        sym = (
-                            p.get("symbol")
-                            or p.get("ticker", {}).get("symbol")
-                            or ""
-                        )
                         lp = float(
                             p.get("last_price")
                             or p.get("market_price")
                             or p.get("cost_price")
                             or 0.0
                         )
-                        if sym and not is_position_ignored(sym, is_opt=False):
+                        if (
+                            sym
+                            and not is_position_ignored(sym, is_opt=False)
+                            and not is_uncloseable_fractional_qty(
+                                self.account_id, sym, qty
+                            )
+                        ):
                             open_eq.append((sym, qty, lp))
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
@@ -6306,7 +7151,12 @@ class WebullAdapter:
                 "ERROR",
                 f"Webull get_open_option_positions exception: {e}"
             )
-        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+        if (
+            allow_stale_cache
+            and cached
+            and (time.time() - cached[0]) <= 10.0
+            and cached[1]
+        ):
             log_event(
                 "FLATTEN",
                 "Using cached Webull open option snapshot (<10s) after API error."
@@ -6344,6 +7194,26 @@ class WebullAdapter:
             if abs_q <= 0:
                 continue
 
+            attempt_ts = time.time()
+            pend = self._pending_flatten_cids.get(
+                (self.account_id, display_sym)
+            )
+            if pend and (attempt_ts - pend[1]) < 30.0:
+                w_q, f_q = self.get_recent_exit_order_coverage(
+                    display_sym,
+                    is_short=(qty < 0),
+                    since_epoch=pend[1],
+                    is_opt=True,
+                )
+                if (w_q + f_q) > 0:
+                    log_event(
+                        "FLATTEN",
+                        f"Skipping duplicate Webull option close on {display_sym} "
+                        f"(already working={w_q:g}, filled={f_q:g}).",
+                    )
+                    submitted_ok[display_sym] = float(w_q + f_q)
+                    continue
+
             side = "BUY" if qty < 0 else "SELL"
             pos_intent = "BUY_TO_CLOSE" if qty < 0 else "SELL_TO_CLOSE"
             underlying = meta.get("underlying") or display_sym.split()[0]
@@ -6352,6 +7222,11 @@ class WebullAdapter:
             strike_str = meta.get("strike_price") or ""
             inst_id = meta.get("instrument_id") or ""
             client_oid = uuid.uuid4().hex[:24]
+            self._pending_flatten_cids[(self.account_id, display_sym)] = (
+                client_oid,
+                attempt_ts,
+                float(abs_q),
+            )
 
             leg_item = {
                 "instrument_type": "OPTION",
@@ -6390,7 +7265,7 @@ class WebullAdapter:
             log_event(
                 "ORDER_OUT",
                 f"Submitting Webull RTH Option Market {pos_intent} (BETA): "
-                f"{abs_q} {display_sym}"
+                f"{abs_q} {display_sym} ({_mask_last4(client_oid)})"
             )
             try:
                 if hasattr(self.trade_client, "order_v3"):
@@ -6420,7 +7295,7 @@ class WebullAdapter:
                     r = r2
                 log_event(
                     "ORDER_RESP",
-                    f"Webull Option {pos_intent} {display_sym} -> HTTP {code}"
+                    f"Webull Option {pos_intent} {display_sym} ({_mask_last4(client_oid)}) -> HTTP {code}"
                 )
                 if code in (200, 201, 202, "OK"):
                     submitted_ok[display_sym] = float(abs_q)
@@ -6429,6 +7304,19 @@ class WebullAdapter:
                     "ERROR",
                     f"Webull option place_order exception ({display_sym}): {e}"
                 )
+                w_q, f_q = self.get_recent_exit_order_coverage(
+                    display_sym,
+                    is_short=(qty < 0),
+                    since_epoch=attempt_ts,
+                    is_opt=True,
+                )
+                if (w_q + f_q) > 0:
+                    log_event(
+                        "FLATTEN",
+                        f"Verified timed-out Webull option close on {display_sym} is live/filled "
+                        f"(working={w_q:g}, filled={f_q:g}); suppressing duplicate.",
+                    )
+                    submitted_ok[display_sym] = float(w_q + f_q)
         return submitted_ok
 
     def submit_liquidation_batch(self, open_positions):
@@ -6436,18 +7324,100 @@ class WebullAdapter:
         if not open_positions:
             return submitted_ok
         use_market = is_market_hours()
+        ext_quotes = {}
+        if not use_market and self.api_client is not None:
+            try:
+                from webull.data.data_client import DataClient
+                if self.data_client is None:
+                    self.data_client = DataClient(self.api_client)
+                syms_to_quote = [
+                    str(it[0]).strip()
+                    for it in open_positions
+                    if it and it[0]
+                ]
+                if (
+                    syms_to_quote
+                    and hasattr(self.data_client, "market_data")
+                    and hasattr(self.data_client.market_data, "get_snapshot")
+                ):
+                    snap_res = self.data_client.market_data.get_snapshot(
+                        syms_to_quote, "US_STOCK", extend_hour_required=True
+                    )
+                    if getattr(snap_res, "status_code", None) == 200:
+                        snap_json = snap_res.json()
+                        snap_list = (
+                            snap_json
+                            if isinstance(snap_json, list)
+                            else snap_json.get("data", [])
+                            if isinstance(snap_json, dict)
+                            else []
+                        )
+                        if isinstance(snap_list, list):
+                            for sq in snap_list:
+                                if isinstance(sq, dict) and sq.get("symbol"):
+                                    ext_quotes[str(sq["symbol"]).strip()] = sq
+            except Exception as qe:
+                log_event(
+                    "WARN",
+                    f"Webull DataClient snapshot fallback to position price: {qe}",
+                )
+
         for item in open_positions:
-            symbol = item[0]
-            qty = item[1]
-            ref_lp = item[2] if len(item) > 2 else 0.0
-            side = "SELL" if qty > 0 else "BUY"
-            abs_q = int(abs(qty))
+            symbol = str(item[0]).strip()
+            try:
+                f_qty = float(item[1])
+            except Exception:
+                continue
+            ref_lp = float(item[2]) if len(item) > 2 and item[2] else 0.0
+            if abs(f_qty) <= 1e-9:
+                continue
+            if is_uncloseable_fractional_qty(self.account_id, symbol, f_qty):
+                continue
+
+            abs_total = abs(f_qty)
+            whole_q = int(abs_total)
+            is_pure_fractional = (whole_q == 0 and 0.0 < abs_total < 1.0)
+            if is_pure_fractional and not use_market:
+                mark_uncloseable_fractional_sym(
+                    self.account_id, symbol, f_qty
+                )
+                continue
+
+            order_qty = round(abs_total, 4) if is_pure_fractional else whole_q
+            if order_qty <= 0:
+                continue
+
+            attempt_ts = time.time()
+            pend = self._pending_flatten_cids.get((self.account_id, symbol))
+            if pend and (attempt_ts - pend[1]) < 30.0:
+                w_q, f_q = self.get_recent_exit_order_coverage(
+                    symbol,
+                    is_short=(f_qty < 0),
+                    since_epoch=pend[1],
+                    is_opt=False,
+                )
+                if (w_q + f_q) > 0:
+                    log_event(
+                        "FLATTEN",
+                        f"Skipping duplicate Webull exit order on {symbol} "
+                        f"(already working={w_q:g}, filled={f_q:g}).",
+                    )
+                    submitted_ok[symbol] = float(w_q + f_q)
+                    continue
+
+            side = "SELL" if f_qty > 0 else "BUY"
             client_oid = uuid.uuid4().hex[:24]
+            self._pending_flatten_cids[(self.account_id, symbol)] = (
+                client_oid,
+                attempt_ts,
+                float(order_qty),
+            )
+            qty_str = f"{order_qty:g}"
 
             if use_market:
                 log_event(
                     "ORDER_OUT",
-                    f"Submitting Webull RTH Market {side}: {abs_q} {symbol}"
+                    f"Submitting Webull RTH Market {side}: {qty_str} {symbol} ({_mask_last4(client_oid)})"
                 )
                 order_item = {
                     "client_order_id": client_oid,
@@ -6456,26 +7426,55 @@ class WebullAdapter:
                     "market": "US",
                     "order_type": "MARKET",
                     "side": side,
-                    "quantity": str(abs_q),
+                    "quantity": qty_str,
                     "time_in_force": "DAY",
                     "support_trading_session": "CORE",
                     "entrust_type": "QTY"
                 }
             else:
-                if ref_lp <= 0:
+                sq = ext_quotes.get(symbol, {})
+                live_ref = 0.0
+                for k_q in (
+                    (
+                        "extend_hour_bid_price",
+                        "bid_price",
+                        "bid",
+                        "extend_hour_last_price",
+                        "price",
+                        "close",
+                    )
+                    if f_qty > 0
+                    else (
+                        "extend_hour_ask_price",
+                        "ask_price",
+                        "ask",
+                        "extend_hour_last_price",
+                        "price",
+                        "close",
+                    )
+                ):
+                    try:
+                        v_q = float(sq.get(k_q) or 0.0)
+                        if v_q > 0:
+                            live_ref = v_q
+                            break
+                    except Exception:
+                        pass
+                eff_ref = live_ref if live_ref > 0 else ref_lp
+                if eff_ref <= 0:
                     log_event(
                         "ERROR",
                         f"No valid reference price found for {symbol} on Webull!"
                     )
                     continue
                 lim_price = calc_ext_limit_price(
-                    float(ref_lp), is_sell=(qty > 0)
+                    float(eff_ref), is_sell=(f_qty > 0)
                 )
                 lim_price_str = format_limit_price_str(lim_price)
                 log_event(
                     "ORDER_OUT",
-                    f"Submitting Webull EXT Limit {side}: {abs_q} {symbol} "
-                    f"@ ${lim_price_str} (Ref Last: ${ref_lp})"
+                    f"Submitting Webull EXT Limit {side}: {qty_str} {symbol} "
+                    f"@ ${lim_price_str} (Ref: ${eff_ref}) ({_mask_last4(client_oid)})"
                 )
                 order_item = {
                     "client_order_id": client_oid,
@@ -6485,7 +7484,7 @@ class WebullAdapter:
                     "order_type": "LIMIT",
                     "limit_price": lim_price_str,
                     "side": side,
-                    "quantity": str(abs_q),
+                    "quantity": qty_str,
                     "time_in_force": "DAY",
                     "support_trading_session": "ALL",
                     "extended_hours_trading": True,
@@ -6504,12 +7503,34 @@ class WebullAdapter:
                 code = c_resp_code(r)
                 log_event(
                     "ORDER_RESP",
-                    f"Webull {side} {symbol} -> HTTP {code}"
+                    f"Webull {side} {symbol} ({_mask_last4(client_oid)}) -> HTTP {code}"
                 )
                 if code in (200, 201, 202, "OK"):
-                    submitted_ok[symbol] = float(abs_q)
+                    submitted_ok[symbol] = float(order_qty)
+                elif is_pure_fractional:
+                    mark_uncloseable_fractional_sym(
+                        self.account_id, symbol, f_qty
+                    )
             except Exception as e:
                 log_event("ERROR", f"Webull place_order exception: {e}")
+                if is_pure_fractional:
+                    mark_uncloseable_fractional_sym(
+                        self.account_id, symbol, f_qty
+                    )
+                    continue
+                w_q, f_q = self.get_recent_exit_order_coverage(
+                    symbol,
+                    is_short=(f_qty < 0),
+                    since_epoch=attempt_ts,
+                    is_opt=False,
+                )
+                if (w_q + f_q) > 0:
+                    log_event(
+                        "FLATTEN",
+                        f"Verified timed-out Webull exit order on {symbol} is live/filled "
+                        f"(working={w_q:g}, filled={f_q:g}); suppressing duplicate.",
+                    )
+                    submitted_ok[symbol] = float(w_q + f_q)
         return submitted_ok
 
     @staticmethod
@@ -6600,9 +7621,10 @@ class WebullAdapter:
     def fetch_account_data(self):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         for Webull accounts."""
+        start_acct_id = self.account_id
         now_ts = time.time()
         if now_ts < self._rate_limit_until:
-            cached_snap = self._last_good_snapshot.get(self.account_id)
+            cached_snap = self._last_good_snapshot.get(start_acct_id)
             if cached_snap and (now_ts - cached_snap[0]) <= 15.0:
                 return cached_snap[1]
 
@@ -6610,8 +7632,10 @@ class WebullAdapter:
             elapsed_pos = time.time() - self._last_pos_call_ts
             if 0.0 <= elapsed_pos < 2.10:
                 time.sleep(2.10 - elapsed_pos)
-            p_res = self._call_get_positions()
+            p_res = self._call_get_positions(acct_id=start_acct_id)
             self._last_pos_call_ts = time.time()
+            if self.account_id != start_acct_id or broker_reconfig_in_progress:
+                return None, True, 0.0, {}, False
             if p_res.status_code == 429:
                 self._rate_limit_until = time.time() + 2.5
                 if (time.time() - self._last_429_log_ts) >= 30.0:
@@ -6620,7 +7644,7 @@ class WebullAdapter:
                         "WARN",
                         "Webull rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
                     )
-                cached_snap = self._last_good_snapshot.get(self.account_id)
+                cached_snap = self._last_good_snapshot.get(start_acct_id)
                 if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
                     return cached_snap[1]
                 self.last_error = "HTTP 429"
@@ -6641,7 +7665,9 @@ class WebullAdapter:
                 else p_json.get("data", p_json.get("positions", []))
             )
 
-            b_res = self._call_get_balance()
+            b_res = self._call_get_balance(acct_id=start_acct_id)
+            if self.account_id != start_acct_id or broker_reconfig_in_progress:
+                return None, True, 0.0, {}, False
             if b_res.status_code == 429:
                 self._rate_limit_until = time.time() + 2.5
                 if (time.time() - self._last_429_log_ts) >= 30.0:
@@ -6650,7 +7676,7 @@ class WebullAdapter:
                         "WARN",
                         "Webull balance rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
                     )
-                cached_snap = self._last_good_snapshot.get(self.account_id)
+                cached_snap = self._last_good_snapshot.get(start_acct_id)
                 if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
                     return cached_snap[1]
                 self.last_error = "HTTP 429"
@@ -6699,10 +7725,10 @@ class WebullAdapter:
             except Exception:
                 pass
             wb_dep = round(wb_pos_dep + wb_neg_cf, 2)
-            self._last_intraday_cash_flow[self.account_id] = wb_dep
+            self._last_intraday_cash_flow[start_acct_id] = wb_dep
             raw_eq = round(raw_eq - get_unanchored_cash_flow(wb_dep), 2)
-            if self.account_id not in self._logged_accounts:
-                self._logged_accounts.add(self.account_id)
+            if start_acct_id not in self._logged_accounts:
+                self._logged_accounts.add(start_acct_id)
                 log_event(
                     "SESSION",
                     f"Webull Balance Parsed -> TotalAccountValue=${raw_eq:,.2f} "
@@ -6725,20 +7751,6 @@ class WebullAdapter:
                 ).upper()
                 is_opt = ("OPT" in itype) or bool(p.get("legs"))
                 opt_meta = self._parse_option_contract_meta(p) if is_opt else None
-                qty = (
-                    opt_meta["qty"]
-                    if opt_meta is not None
-                    else float(p.get("quantity") or p.get("position") or 0)
-                )
-                if qty == 0:
-                    continue
-                if is_opt:
-                    has_options = True
-                    open_opt_cache.append(
-                        (opt_meta["display_sym"], qty, opt_meta)
-                    )
-                mult = 100.0 if is_opt else 1.0
-
                 sym = (
                     opt_meta["display_sym"]
                     if opt_meta is not None
@@ -6748,6 +7760,24 @@ class WebullAdapter:
                         or "UNKNOWN"
                     )
                 )
+                qty = (
+                    opt_meta["qty"]
+                    if opt_meta is not None
+                    else self._normalize_webull_equity_qty(p, sym)
+                )
+                if qty == 0:
+                    continue
+                if not is_opt and is_uncloseable_fractional_qty(
+                    start_acct_id, sym, qty
+                ):
+                    continue
+                if is_opt:
+                    has_options = True
+                    open_opt_cache.append(
+                        (opt_meta["display_sym"], qty, opt_meta)
+                    )
+                mult = 100.0 if is_opt else 1.0
+
                 avg_price = float(
                     p.get("cost_price")
                     or p.get("avg_price")
@@ -6840,11 +7870,13 @@ class WebullAdapter:
             open_opt_cache.sort(
                 key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
             )
+            if self.account_id != start_acct_id or broker_reconfig_in_progress:
+                return None, True, 0.0, {}, False
             now_snap_t = time.time()
-            self._last_raw_pos_details[self.account_id] = json.loads(
+            self._last_raw_pos_details[start_acct_id] = json.loads(
                 json.dumps(pos_details)
             )
-            self._prev_pos_qty_map[self.account_id] = {
+            self._prev_pos_qty_map[start_acct_id] = {
                 s_k.replace(" (OPT)", ""): d_v["qty"]
                 for s_k, d_v in pos_details.items()
             }
@@ -6875,7 +7907,7 @@ class WebullAdapter:
                     else round(raw_eq or 0.0, 2)
                 )
 
-            self._last_raw_adj_eq[self.account_id] = adj_eq
+            self._last_raw_adj_eq[start_acct_id] = adj_eq
             (
                 adj_eq,
                 is_flat,
@@ -6887,8 +7919,8 @@ class WebullAdapter:
             ) = _apply_ignored_positions_to_snapshot(
                 adj_eq, pos_details, open_eq_cache, open_opt_cache
             )
-            self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
-            self._last_open_opt[self.account_id] = (now_snap_t, filt_opt)
+            self._last_open_eq[start_acct_id] = (now_snap_t, filt_eq)
+            self._last_open_opt[start_acct_id] = (now_snap_t, filt_opt)
 
             self.last_error = ""
             res_tuple = (
@@ -6898,7 +7930,7 @@ class WebullAdapter:
                 filt_pos,
                 has_opt
             )
-            self._last_good_snapshot[self.account_id] = (
+            self._last_good_snapshot[start_acct_id] = (
                 time.time(), res_tuple
             )
             return res_tuple
@@ -6921,7 +7953,21 @@ class WebullAdapter:
 
 
 def c_resp_code(res):
-    return getattr(res, "status_code", "OK")
+    if res is None:
+        return "ERR"
+    code = getattr(res, "status_code", None)
+    if code is not None:
+        return code
+    if isinstance(res, dict):
+        if (
+            res.get("success") is True
+            or res.get("order_id")
+            or res.get("client_order_id")
+            or ("data" in res and res.get("data") is not None)
+        ):
+            return "OK"
+        return res.get("code") or res.get("status_code") or res.get("msg") or "ERR"
+    return "ERR"
 
 
 # ==========================================
@@ -8112,6 +9158,11 @@ def get_full_idle_button_text():
             f"⏳ HALT WATCH ({w_syms}): EXIT ORDER WORKING — "
             f"OS LOCK DEFERRED UNTIL 100% FLAT"
         )
+    if is_post_breach_force_flatten_active():
+        return (
+            f"🚨 BREACH LOCKOUT ({b_name}): NEW TRADES AUTO-FLATTENED — "
+            f"RAISE LIMITS OR RE-ZERO IN SETTINGS"
+        )
     if config.get("alarms_only_mode", False):
         return f"{b_name} : ALARMS ONLY MODE (OBSERVATION / SIREN ONLY)"
     opt_armed = is_options_flatten_armed(config)
@@ -8171,6 +9222,8 @@ def get_medium_idle_button_text():
             or "OPEN"
         )
         return f"⏳ HALT WATCH ({w_syms}) — LOCK DEFERRED UNTIL FLAT"
+    if is_post_breach_force_flatten_active():
+        return "🚨 BREACH LOCKOUT: NEW TRADES AUTO-FLATTENED"
     if config.get("alarms_only_mode", False):
         return f"{b_name} : ALARMS ONLY MODE (SIREN ONLY)"
     opt_armed = is_options_flatten_armed(config)
@@ -8226,6 +9279,8 @@ def get_idle_button_text():
                 or "OPEN"
             )
             return f"⏳ HALT ({w_syms})"
+        if is_post_breach_force_flatten_active():
+            return "🚨 BREACH (AUTO-FLATTEN)"
         if "ALARM" in full_txt and not full_txt.startswith("ARMED:"):
             return "● ALARMS ONLY"
         if is_locked_down:
@@ -8234,6 +9289,33 @@ def get_idle_button_text():
     if n_cols == 4:
         return get_medium_idle_button_text()
     return full_txt
+
+
+def get_idle_button_style():
+    """Returns (bg, fg, rim, glow) for the HUD middle status pill when idle."""
+    if is_post_breach_force_flatten_active():
+        return ("#7f1d1d", "#ffffff", "#ef4444", "#991b1b")
+    return ("#282c31", "#ffca58", "#6c757d", "#343a40")
+
+
+def apply_idle_button_config(ui_button):
+    """Applies the current idle or Post-Breach Force-Flatten text and color
+    palette to the HUD middle status pill."""
+    if ui_button is None:
+        return
+    try:
+        bg_c, fg_c, rim_c, glow_c = get_idle_button_style()
+        ui_button.config(
+            text=get_idle_button_text(),
+            bg=bg_c,
+            fg=fg_c,
+            disabledforeground=fg_c,
+            rim=rim_c,
+            glow=glow_c,
+            state="disabled",
+        )
+    except Exception:
+        pass
 
 
 def format_alarm_button_text(reason):
@@ -8399,13 +9481,7 @@ def mute_alarm(ui_button):
                 state="disabled",
             )
         else:
-            ui_button.config(
-                text=get_idle_button_text(),
-                bg="#222629",
-                fg="#f5b041",
-                disabledforeground="#f5b041",
-                state="disabled"
-            )
+            apply_idle_button_config(ui_button)
             if is_locked_down and not daily_breach_settings_prompted:
                 ui_button.after(
                     250,
@@ -8619,27 +9695,29 @@ def trigger_upside_tier_glow(
             ui_button.after(500, lambda: _step(idx + 1))
         else:
             if not alarm_active and not cooldown_active:
-                ui_button.config(
-                    text=get_idle_button_text(),
-                    bg="#222629",
-                    fg="#f5b041",
-                    disabledforeground="#f5b041",
-                    state="disabled"
-                )
+                apply_idle_button_config(ui_button)
 
     ui_button.after(0, lambda: _step(0))
 
 
 def is_workstation_locked():
-    """Returns True when the Windows session is locked (WTSSessionInfoEx
-    SessionFlags == WTS_SESSIONSTATE_LOCK [0] on Windows 8/10/11), and False
-    only when the session is unlocked (WTS_SESSIONSTATE_UNLOCK [1])."""
+    """Returns True when the Windows session running Enforcer is locked
+    (WTSSessionInfoEx SessionFlags == WTS_SESSIONSTATE_LOCK [0] on Windows
+    8/10/11), and False only when the session is unlocked
+    (WTS_SESSIONSTATE_UNLOCK [1]). Checks the current process session first
+    so Remote Desktop (RDP) and VPS sessions work alongside local consoles."""
     try:
         wts = ctypes.windll.wtsapi32
         k32 = ctypes.windll.kernel32
         ppbuf = ctypes.c_void_p()
         bytes_ret = ctypes.c_ulong(0)
-        sess_id = k32.WTSGetActiveConsoleSessionId()
+        proc_sess = ctypes.c_ulong(0)
+        if k32.ProcessIdToSessionId(
+            k32.GetCurrentProcessId(), ctypes.byref(proc_sess)
+        ):
+            sess_id = proc_sess.value
+        else:
+            sess_id = k32.WTSGetActiveConsoleSessionId()
         ok = wts.WTSQuerySessionInformationW(
             0, sess_id, 25, ctypes.byref(ppbuf), ctypes.byref(bytes_ret)
         )
@@ -8697,7 +9775,27 @@ def _format_lock_voice_msg(duration_mins, label_prefix, upgraded=False):
     return f"{reason_words}. Locked out for {dur_words}."
 
 
-def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
+def _sound_lock_straggler_alert_burst():
+    """Plays an urgent 5-beep emergency burst and TTS callout even while
+    cooldown_active is True, so a trader whose phone-opened trade failed to
+    flatten during an active OS lock is alerted immediately."""
+    if config.get("mute_all_audio", False):
+        return
+    try:
+        speak_async(
+            "Emergency alert. Unflattened position detected during lockout. Check broker immediately.",
+            interrupt=True,
+        )
+        for _ in range(3):
+            winsound.Beep(2500, 180)
+            winsound.Beep(1800, 180)
+    except Exception:
+        pass
+
+
+def _run_post_lock_watchdog(
+    adapter, ui_button, lock_context="OS LOCK", was_flat_at_lock_start=True
+):
     """Executes a Two-Stage Post-Lock Straggler Watchdog (Stage 1 at T+2.0s and
     Stage 2 at T+15.0s) after Windows OS lock engages, with verbal confirmations."""
     if adapter is None:
@@ -8707,10 +9805,10 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
 
     def _check_or_sweep_stage(stage_num, elapsed_tag):
         global cooldown_active
-        opt_armed = is_options_flatten_armed(config)
-        post_pos = adapter.get_open_equity_positions()
+        opt_armed = is_options_flatten_armed(config) and is_market_hours()
+        post_pos = adapter.get_open_equity_positions(allow_stale_cache=False)
         post_opt = (
-            adapter.get_open_option_positions()
+            adapter.get_open_option_positions(allow_stale_cache=False)
             if opt_armed and hasattr(adapter, "get_open_option_positions")
             else []
         )
@@ -8721,9 +9819,11 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
                 f"Position check returned None; retrying in 1.5s..."
             )
             time.sleep(1.5)
-            post_pos = adapter.get_open_equity_positions()
+            post_pos = adapter.get_open_equity_positions(
+                allow_stale_cache=False
+            )
             post_opt = (
-                adapter.get_open_option_positions()
+                adapter.get_open_option_positions(allow_stale_cache=False)
                 if opt_armed and hasattr(adapter, "get_open_option_positions")
                 else []
             )
@@ -8776,15 +9876,44 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
             speak_async("Emergency flatten complete, account confirmed flat.")
             return True
 
+        if not was_flat_at_lock_start:
+            log_event(
+                "CRITICAL",
+                f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
+                f"Post-lock flatten FAILED on pre-lock straggler! Aborting OS lock and sounding emergency siren!"
+            )
+            cooldown_active = False
+            config["active_cooldown_end_epoch"] = 0.0
+            config["active_cooldown_label"] = ""
+            save_config(config)
+            trigger_alarm(
+                "POST-LOCK FLATTEN FAILED — CHECK POSITIONS!", ui_button
+            )
+            return False
+
         log_event(
             "CRITICAL",
             f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
-            f"Post-lock flatten FAILED! Aborting OS lock and sounding emergency siren!"
+            f"New position opened during active lock failed to flatten! "
+            f"Keeping OS lock active while sounding continuous emergency alert & retrying every 10s!"
         )
-        cooldown_active = False
-        trigger_alarm(
-            "POST-LOCK FLATTEN FAILED — CHECK POSITIONS!", ui_button
-        )
+        while cooldown_active:
+            _sound_lock_straggler_alert_burst()
+            for _ in range(20):
+                if not cooldown_active:
+                    break
+                time.sleep(0.5)
+            if not cooldown_active:
+                break
+            if flatten_equities(
+                adapter, force_flatten=True, include_options=opt_armed
+            ):
+                log_event(
+                    "GUARDRAIL",
+                    f"POST-LOCK WATCHDOG ({lock_context}): Follow-up sweep succeeded — account 100% flat."
+                )
+                speak_async("Emergency flatten complete, account confirmed flat.")
+                return True
         return False
 
     def _watchdog():
@@ -9605,6 +10734,7 @@ def start_cooldown_lock(
     overlay=None,
     reason_text="",
     context_str="",
+    was_flat_at_lock_start=True,
 ):
     global cooldown_active, cooldown_end_time, cooldown_label
     global cooldown_30s_announced, cooldown_announced_mins, alarm_active
@@ -9626,6 +10756,9 @@ def start_cooldown_lock(
             cooldown_label = label_prefix
             cooldown_30s_announced = (duration_sec <= 35)
             cooldown_announced_mins = set(init_announced_mins)
+            config["active_cooldown_end_epoch"] = float(cooldown_end_time)
+            config["active_cooldown_label"] = str(cooldown_label)
+            save_config(config)
             log_event(
                 "COOLDOWN",
                 f"Upgraded active lock to {label_prefix} for {duration_sec}s "
@@ -9635,7 +10768,12 @@ def start_cooldown_lock(
                 _format_lock_voice_msg(duration_mins, label_prefix, upgraded=True),
                 interrupt=True,
             )
-            _run_post_lock_watchdog(adapter, ui_button, label_prefix)
+            _run_post_lock_watchdog(
+                adapter,
+                ui_button,
+                label_prefix,
+                was_flat_at_lock_start=was_flat_at_lock_start,
+            )
         return
 
     cooldown_active = True
@@ -9644,6 +10782,9 @@ def start_cooldown_lock(
     cooldown_30s_announced = (duration_sec <= 35)
     cooldown_announced_mins = set(init_announced_mins)
     alarm_active = False
+    config["active_cooldown_end_epoch"] = float(cooldown_end_time)
+    config["active_cooldown_label"] = str(cooldown_label)
+    save_config(config)
     brief_s = min(15.0, float(duration_sec))
 
     if overlay is None:
@@ -9684,6 +10825,11 @@ def start_cooldown_lock(
         global cooldown_active, cooldown_end_time, cooldown_label
         global cooldown_30s_announced, cooldown_announced_mins, alarm_active
         cooldown_end_time = time.time() + duration_sec
+        tracked_wall_end = cooldown_end_time
+        mono_end = time.monotonic() + duration_sec
+        config["active_cooldown_end_epoch"] = float(cooldown_end_time)
+        config["active_cooldown_label"] = str(cooldown_label)
+        save_config(config)
         log_event(
             "COOLDOWN",
             f"Persistent {cooldown_label} started for {duration_sec}s "
@@ -9697,8 +10843,6 @@ def start_cooldown_lock(
         speak_async(
             _format_lock_voice_msg(duration_mins, cooldown_label, upgraded=False)
         )
-        watchdog_launched = True
-        _run_post_lock_watchdog(adapter, ui_button, cooldown_label)
 
         overlay.wait_out_briefing_or_bypass(
             briefing_sec=brief_s,
@@ -9708,6 +10852,9 @@ def start_cooldown_lock(
             lock_end_time=cooldown_end_time,
         )
         if not cooldown_active:
+            config["active_cooldown_end_epoch"] = 0.0
+            config["active_cooldown_label"] = ""
+            save_config(config)
             log_event(
                 "COOLDOWN",
                 f"{cooldown_label} aborted early by post-lock watchdog."
@@ -9718,14 +10865,27 @@ def start_cooldown_lock(
             ctypes.windll.user32.LockWorkStation()
         except Exception:
             pass
+        watchdog_launched = True
+        _run_post_lock_watchdog(
+            adapter,
+            ui_button,
+            cooldown_label,
+            was_flat_at_lock_start=was_flat_at_lock_start,
+        )
         time.sleep(0.35)
         lock_started_ts = time.time()
         confirmed_locked = is_workstation_locked()
         last_early_unlock_ts = 0.0
-        while cooldown_active and time.time() < cooldown_end_time:
+        while cooldown_active:
+            if cooldown_end_time > tracked_wall_end:
+                mono_end += (cooldown_end_time - tracked_wall_end)
+                tracked_wall_end = cooldown_end_time
+            rem_f = mono_end - time.monotonic()
+            if rem_f <= 0.0:
+                break
             alarm_active = False
             now_ts = time.time()
-            rem = max(0, int(round(cooldown_end_time - now_ts)))
+            rem = max(0, int(round(rem_f)))
             currently_locked = is_workstation_locked()
             if currently_locked:
                 confirmed_locked = True
@@ -9749,7 +10909,7 @@ def start_cooldown_lock(
                         f"({rem_log} remaining) — workstation immediately re-locked."
                     )
                     time.sleep(0.30)
-                    rem_voice = max(1, int(round(cooldown_end_time - time.time())))
+                    rem_voice = max(1, int(round(mono_end - time.monotonic())))
                     speak_async(
                         _format_exact_remaining_voice_msg(rem_voice),
                         interrupt=True,
@@ -9775,22 +10935,34 @@ def start_cooldown_lock(
                 if is_compact_hud()
                 else f"{cooldown_label} ACTIVE: {rem}s REMAINING (DO NOT REVENGE TRADE)"
             )
-            ui_button.after(
-                0,
-                lambda t=txt: ui_button.config(
-                    text=t,
-                    bg="#922b21",
-                    fg="white",
-                    disabledforeground="white",
-                    state="disabled"
-                )
-            )
+            if ui_button is not None:
+                try:
+                    ui_button.after(
+                        0,
+                        lambda t=txt: ui_button.config(
+                            text=t,
+                            bg="#922b21",
+                            fg="white",
+                            disabledforeground="white",
+                            state="disabled"
+                        )
+                    )
+                except Exception:
+                    pass
             if not watchdog_launched:
                 watchdog_launched = True
-                _run_post_lock_watchdog(adapter, ui_button, cooldown_label)
+                _run_post_lock_watchdog(
+                    adapter,
+                    ui_button,
+                    cooldown_label,
+                    was_flat_at_lock_start=was_flat_at_lock_start,
+                )
             time.sleep(0.20)
 
         if not cooldown_active:
+            config["active_cooldown_end_epoch"] = 0.0
+            config["active_cooldown_label"] = ""
+            save_config(config)
             log_event(
                 "COOLDOWN",
                 f"{cooldown_label} aborted early by post-lock watchdog."
@@ -9800,27 +10972,31 @@ def start_cooldown_lock(
         was_daily_breach_lock = "DAILY" in str(cooldown_label).upper()
         cooldown_active = False
         alarm_active = False
+        config["active_cooldown_end_epoch"] = 0.0
+        config["active_cooldown_label"] = ""
+        save_config(config)
         log_event(
             "COOLDOWN",
             f"{cooldown_label} timer expired. Workstation unlocked."
         )
-        ui_button.after(
-            0,
-            lambda: ui_button.config(
-                text=get_idle_button_text(),
-                bg="#222629",
-                fg="#f5b041",
-                disabledforeground="#f5b041",
-                state="disabled"
-            )
-        )
+        if ui_button is not None:
+            try:
+                ui_button.after(
+                    0,
+                    lambda: apply_idle_button_config(ui_button),
+                )
+            except Exception:
+                pass
         stop_active_tts()
         play_unlock_chimes()
-        if was_daily_breach_lock and is_locked_down:
-            ui_button.after(
-                350,
-                lambda: _prompt_daily_breach_settings_on_unlock(ui_button),
-            )
+        if was_daily_breach_lock and is_locked_down and ui_button is not None:
+            try:
+                ui_button.after(
+                    350,
+                    lambda: _prompt_daily_breach_settings_on_unlock(ui_button),
+                )
+            except Exception:
+                pass
 
     threading.Thread(target=cooldown_worker, daemon=True).start()
 
@@ -9832,6 +11008,8 @@ def flatten_equities(
     for EQUITIES (and RTH Market liquidations for OPTIONS when the BETA Options
     Auto-Flatten toggle + waiver are active), and double-confirms (with 0.8s
     settlement delay) that 0 open positions remain."""
+    global last_data_loop_heartbeat
+    last_data_loop_heartbeat = time.time()
     alarms_only = config.get("alarms_only_mode", False)
     should_exec = (not alarms_only) and (
         force_flatten or config.get("enable_auto_flatten", False)
@@ -9858,448 +11036,390 @@ def flatten_equities(
             return "[]"
         return str([(x[0], x[1]) for x in opt_list])
 
-    try:
-        if include_options and not is_market_hours():
-            # US equity options only trade during RTH (9:30 AM - 4:00 PM ET).
-            # Check if any options are open; if none are open, proceed with
-            # standard Extended-Hours equity flatten.
-            eh_opt = (
-                adapter.get_open_option_positions()
-                if hasattr(adapter, "get_open_option_positions")
-                else []
-            )
-            if eh_opt is not None and len(eh_opt) == 0:
-                include_options = False
-            else:
-                # Flatten any open equities first, then return False because
-                # options cannot be market-flattened outside RTH.
-                flatten_equities(
-                    adapter,
-                    force_flatten=force_flatten,
-                    include_options=False,
-                    status_cb=status_cb,
+    with _flatten_exec_lock:
+        try:
+            flatten_wave_start_ts = time.time()
+            if include_options and not is_market_hours():
+                # US equity options only trade during RTH (9:30 AM - 4:00 PM ET).
+                # Check if any options are open; if none are open, proceed with
+                # standard Extended-Hours equity flatten.
+                eh_opt = (
+                    adapter.get_open_option_positions()
+                    if hasattr(adapter, "get_open_option_positions")
+                    else []
                 )
-                log_event(
-                    "GUARDRAIL",
-                    f"Options Auto-Flatten (BETA) is enabled, but US options "
-                    f"market is closed (outside 9:30 AM – 4:00 PM ET). "
-                    f"Open options require manual action: {_fmt_opt_summary(eh_opt)}"
-                )
-                return False
-
-        submitted_close_eq = {}
-        submitted_close_opt = {}
-        ever_seen_eq = set()
-        confirmed_closed_eq = set()
-        ever_seen_opt = set()
-        confirmed_closed_opt = set()
-
-        def _filter_uncovered_positions(pos_list, submitted_map):
-            if not pos_list:
-                return []
-            preserved_map = getattr(adapter, "last_preserved_close_qty", {}) or {}
-            failed_cancels = getattr(adapter, "last_cancel_failed_syms", set()) or set()
-            uncovered = []
-            for item in pos_list:
-                sym = item[0]
-                qty = float(item[1])
-                abs_q = abs(qty)
-                pres_q = float(preserved_map.get(sym, 0.0))
-                sub_q = float(submitted_map.get(sym, 0.0))
-                if pres_q >= (abs_q - 1e-6) or (
-                    is_market_hours()
-                    and sub_q >= (abs_q - 1e-6)
-                    and sym in failed_cancels
-                ):
-                    log_event(
-                        "FLATTEN",
-                        f"Working close order already active for {sym} ({qty:+g}) "
-                        f"— preserving queue priority without duplicate submission.",
-                    )
-                    submitted_map[sym] = max(sub_q, abs_q)
+                if eh_opt is not None and len(eh_opt) == 0:
+                    include_options = False
                 else:
-                    uncovered.append(item)
-            return uncovered
-
-        def _filter_stale_replica_resurrections(
-            pos_list, confirmed_closed_set, is_opt_flag=False
-        ):
-            if not pos_list or not confirmed_closed_set:
-                return pos_list
-            suspect = [x[0] for x in pos_list if x[0] in confirmed_closed_set]
-            if not suspect:
-                return pos_list
-            time.sleep(0.35)
-            re_list = (
-                adapter.get_open_option_positions()
-                if is_opt_flag and hasattr(adapter, "get_open_option_positions")
-                else adapter.get_open_equity_positions()
-            )
-            if re_list is not None:
-                re_syms = {x[0] for x in re_list}
-                vanished = [s for s in suspect if s not in re_syms]
-                if vanished:
-                    log_event(
-                        "FLATTEN",
-                        f"Filtered stale read-replica resurrection of already-closed "
-                        f"{'option' if is_opt_flag else 'equity'} position(s): {vanished}",
+                    # Flatten any open equities first, then return False because
+                    # options cannot be market-flattened outside RTH.
+                    flatten_equities(
+                        adapter,
+                        force_flatten=force_flatten,
+                        include_options=False,
+                        status_cb=status_cb,
                     )
-                return [x for x in re_list if x[0] not in confirmed_closed_set]
-            log_event(
-                "FLATTEN",
-                f"Filtered stale read-replica resurrection of already-closed "
-                f"{'option' if is_opt_flag else 'equity'} position(s): {suspect}",
-            )
-            return [x for x in pos_list if x[0] not in confirmed_closed_set]
+                    log_event(
+                        "GUARDRAIL",
+                        f"Options Auto-Flatten (BETA) is enabled, but US options "
+                        f"market is closed (outside 9:30 AM – 4:00 PM ET). "
+                        f"Open options require manual action: {_fmt_opt_summary(eh_opt)}"
+                    )
+                    return False
 
-        if should_exec:
-            log_event(
-                "FLATTEN",
-                "Starting emergency flatten sequence (Equities + Options BETA)..."
-                if include_options
-                else "Starting emergency equity flatten sequence..."
-            )
-            _notify_status(
-                "⏳  1. Working Orders: Canceling open working orders on tracked daytrade positions...",
-                False,
-                "⏳  2. Daytrade Positions: Inspecting open daytrade positions...",
-                False,
-            )
-            peek_pos = adapter.get_open_equity_positions()
-            peek_opt = (
-                adapter.get_open_option_positions()
-                if include_options and hasattr(adapter, "get_open_option_positions")
-                else []
-            )
-            init_preserve_map = {}
-            for item in (peek_pos or []):
-                init_preserve_map[item[0]] = item[1]
-            for item in (peek_opt or []):
-                init_preserve_map[item[0]] = item[1]
+            submitted_close_eq = {}
+            submitted_close_opt = {}
+            ever_seen_eq = set()
+            confirmed_closed_eq = set()
+            ever_seen_opt = set()
+            confirmed_closed_opt = set()
 
-            adapter.cancel_all_working_orders(
-                preserve_market_close_map=init_preserve_map
-            )
-            _notify_status(
-                "✓  1. Working Orders: Open working orders canceled & cleared",
-                True,
-                "⏳  2. Daytrade Positions: Verifying open daytrade positions with broker API...",
-                False,
-            )
-
-            open_pos = adapter.get_open_equity_positions()
-            if open_pos is None and peek_pos is not None:
-                open_pos = peek_pos
-            open_opt = (
-                adapter.get_open_option_positions()
-                if include_options and hasattr(adapter, "get_open_option_positions")
-                else []
-            )
-            if include_options and open_opt is None and peek_opt is not None:
-                open_opt = peek_opt
-
-            for item in (open_pos or []):
-                ever_seen_eq.add(item[0])
-            for item in (open_opt or []):
-                ever_seen_opt.add(item[0])
-
-            if (
-                open_pos is not None
-                and len(open_pos) == 0
-                and (not include_options or (open_opt is not None and len(open_opt) == 0))
+            def _filter_uncovered_positions(
+                pos_list, submitted_map, is_opt_flag=False
             ):
-                log_event(
-                    "FLATTEN",
-                    "Initial check shows 0 open positions. Running 0.8s "
-                    "settlement double-confirm..."
-                    if include_options
-                    else "Initial check shows 0 open equity shares. Running 0.8s "
-                    "settlement double-confirm..."
+                if not pos_list:
+                    return []
+                preserved_map = (
+                    getattr(adapter, "last_preserved_close_qty", {}) or {}
                 )
-                _notify_status(
-                    "✓  1. Working Orders: Open working orders canceled & cleared",
-                    True,
-                    "⏳  2. Daytrade Positions: 0 open positions reported — running 0.8s settlement double-confirm...",
-                    False,
+                failed_cancels = (
+                    getattr(adapter, "last_cancel_failed_syms", set()) or set()
                 )
-                time.sleep(0.8)
-                open_pos = adapter.get_open_equity_positions()
-                open_opt = (
-                    adapter.get_open_option_positions()
-                    if include_options and hasattr(adapter, "get_open_option_positions")
-                    else []
-                )
-                if (
-                    open_pos is not None
-                    and len(open_pos) == 0
-                    and (not include_options or (open_opt is not None and len(open_opt) == 0))
-                ):
-                    log_event(
-                        "FLATTEN",
-                        "Double-confirmed 0 open equities & 0 open options (no flatten order needed)."
-                        if include_options
-                        else "Double-confirmed 0 open equity shares (no flatten order needed)."
-                    )
-                    return True
-
-            if open_pos:
-                to_sub_eq = _filter_uncovered_positions(
-                    open_pos, submitted_close_eq
-                )
-                if to_sub_eq:
-                    log_event("FLATTEN", f"Equity positions to liquidate: {to_sub_eq}")
-                    syms_str = ", ".join(f"{x[0]} ({x[1]:+g})" for x in to_sub_eq[:4])
-                    _notify_status(
-                        "✓  1. Working Orders: Open working orders canceled & cleared",
-                        True,
-                        f"⏳  2. Daytrade Positions: Submitting exit order(s) for {syms_str}...",
-                        False,
-                    )
-                    sub_ok = adapter.submit_liquidation_batch(to_sub_eq) or {}
-                    submitted_close_eq.update(sub_ok)
-            if include_options and open_opt:
-                to_sub_opt = _filter_uncovered_positions(
-                    open_opt, submitted_close_opt
-                )
-                if to_sub_opt:
-                    log_event(
-                        "FLATTEN",
-                        f"Option positions to liquidate (BETA): {_fmt_opt_summary(to_sub_opt)}"
-                    )
-                    _notify_status(
-                        "✓  1. Working Orders: Open working orders canceled & cleared",
-                        True,
-                        f"⏳  2. Daytrade Positions: Submitting option exit order(s) ({len(to_sub_opt)} leg(s))...",
-                        False,
-                    )
-                    sub_opt_ok = (
-                        adapter.submit_option_liquidation_batch(to_sub_opt)
-                        or {}
-                    )
-                    submitted_close_opt.update(sub_opt_ok)
-            if open_pos is None or (include_options and open_opt is None):
-                log_event(
-                    "WARNING",
-                    "Initial position query failed (None); entering verification polling loop..."
-                )
-        else:
-            _notify_status(
-                "✓  1. Working Orders: Auto-Flatten is OFF (no orders submitted by Enforcer)",
-                True,
-                "⏳  2. Daytrade Positions: Verifying 0 open daytrade positions with broker API...",
-                False,
-            )
-            open_pos = adapter.get_open_equity_positions()
-            open_opt = (
-                adapter.get_open_option_positions()
-                if include_options and hasattr(adapter, "get_open_option_positions")
-                else []
-            )
-            if (
-                open_pos is not None
-                and len(open_pos) == 0
-                and (not include_options or (open_opt is not None and len(open_opt) == 0))
-            ):
-                time.sleep(0.8)
-                open_pos = adapter.get_open_equity_positions()
-                open_opt = (
-                    adapter.get_open_option_positions()
-                    if include_options and hasattr(adapter, "get_open_option_positions")
-                    else []
-                )
-                if (
-                    open_pos is not None
-                    and len(open_pos) == 0
-                    and (not include_options or (open_opt is not None and len(open_opt) == 0))
-                ):
-                    return True
-            log_event(
-                "WARNING",
-                f"Auto-Flatten is OFF, and positions remain open (or unverified): "
-                f"Equities={open_pos}"
-                + (f", Options={_fmt_opt_summary(open_opt)}" if include_options else "")
-            )
-            return False
-
-        log_event(
-            "FLATTEN",
-            "Polling broker API to verify 0 open equities & 0 open options..."
-            if include_options
-            else "Polling broker API to verify 0 open equity shares..."
-        )
-        start_wait = time.time()
-        polls = 0
-        while time.time() - start_wait < 15:
-            time.sleep(0.5 if polls == 0 else 1.5)
-            polls += 1
-            rem_pos = adapter.get_open_equity_positions()
-            rem_opt = (
-                adapter.get_open_option_positions()
-                if include_options and hasattr(adapter, "get_open_option_positions")
-                else []
-            )
-            elapsed = time.time() - start_wait
-            _notify_status(
-                "✓  1. Working Orders: Open working orders canceled & cleared",
-                True,
-                f"⏳  2. Daytrade Positions: Polling broker API to verify 100% flat (Check #{polls}, {elapsed:.1f}s)...",
-                False,
-            )
-            if rem_pos is None or (include_options and rem_opt is None):
-                log_event(
-                    "WARNING",
-                    f"Check #{polls} ({elapsed:.1f}s): Position query returned None; retrying..."
-                )
-                continue
-
-            rem_pos = _filter_stale_replica_resurrections(
-                rem_pos, confirmed_closed_eq, is_opt_flag=False
-            )
-            if include_options and rem_opt:
-                rem_opt = _filter_stale_replica_resurrections(
-                    rem_opt, confirmed_closed_opt, is_opt_flag=True
-                )
-
-            curr_eq_syms = {x[0] for x in rem_pos}
-            for s in list(ever_seen_eq):
-                if s not in curr_eq_syms:
-                    confirmed_closed_eq.add(s)
-            ever_seen_eq.update(curr_eq_syms)
-
-            if include_options:
-                curr_opt_syms = {x[0] for x in (rem_opt or [])}
-                for s in list(ever_seen_opt):
-                    if s not in curr_opt_syms:
-                        confirmed_closed_opt.add(s)
-                ever_seen_opt.update(curr_opt_syms)
-
-            if len(rem_pos) == 0 and (not include_options or len(rem_opt) == 0):
-                log_event(
-                    "FLATTEN",
-                    f"Check #{polls} ({elapsed:.1f}s): 0 open positions reported. "
-                    f"Running 0.8s settlement double-confirm..."
-                    if include_options
-                    else f"Check #{polls} ({elapsed:.1f}s): 0 equity shares reported. "
-                    f"Running 0.8s settlement double-confirm..."
-                )
-                _notify_status(
-                    "✓  1. Working Orders: Open working orders canceled & cleared",
-                    True,
-                    "⏳  2. Daytrade Positions: 0 open positions reported — running 0.8s settlement double-confirm...",
-                    False,
-                )
-                time.sleep(0.8)
-                rem_confirm = adapter.get_open_equity_positions()
-                opt_confirm = (
-                    adapter.get_open_option_positions()
-                    if include_options and hasattr(adapter, "get_open_option_positions")
-                    else []
-                )
-                elapsed_confirm = time.time() - start_wait
-                if (
-                    rem_confirm is not None
-                    and len(rem_confirm) == 0
-                    and (not include_options or (opt_confirm is not None and len(opt_confirm) == 0))
-                ):
-                    log_event(
-                        "FLATTEN",
-                        f"SUCCESS: Double-confirmed 0 equities & 0 options in {elapsed_confirm:.1f}s."
-                        if include_options
-                        else f"SUCCESS: Double-confirmed 0 equity shares in {elapsed_confirm:.1f}s."
-                    )
-                    return True
-                if rem_confirm is None or (include_options and opt_confirm is None):
-                    log_event(
-                        "WARNING",
-                        "0.8s double-confirm query returned None; continuing verification loop..."
-                    )
-                    continue
-                log_event(
-                    "FLATTEN",
-                    f"Straggler positions detected on 0.8s double-confirm: "
-                    f"Equities={rem_confirm}"
-                    + (f", Options={_fmt_opt_summary(opt_confirm)}" if include_options else "")
-                    + " — sweeping..."
-                )
-                if should_exec:
-                    strag_map = {x[0]: x[1] for x in (rem_confirm or [])}
-                    for x in (opt_confirm or []):
-                        strag_map[x[0]] = x[1]
-                    adapter.cancel_all_working_orders(
-                        preserve_market_close_map=strag_map
-                    )
-                    to_s_eq = _filter_uncovered_positions(
-                        rem_confirm, submitted_close_eq
-                    )
-                    if to_s_eq:
-                        sub_ok = adapter.submit_liquidation_batch(to_s_eq) or {}
-                        submitted_close_eq.update(sub_ok)
-                    if include_options and opt_confirm:
-                        to_s_opt = _filter_uncovered_positions(
-                            opt_confirm, submitted_close_opt
+                uncovered = []
+                for item in pos_list:
+                    sym = item[0]
+                    qty = float(item[1])
+                    abs_q = abs(qty)
+                    pres_q = float(preserved_map.get(sym, 0.0))
+                    sub_q = float(submitted_map.get(sym, 0.0))
+                    if pres_q >= (abs_q - 1e-6) or (
+                        is_market_hours()
+                        and sub_q >= (abs_q - 1e-6)
+                        and sym in failed_cancels
+                    ):
+                        log_event(
+                            "FLATTEN",
+                            f"Working close order already active for {sym} ({qty:+g}) "
+                            f"— preserving queue priority without duplicate submission.",
                         )
-                        if to_s_opt:
-                            sub_opt_ok = (
-                                adapter.submit_option_liquidation_batch(to_s_opt)
-                                or {}
+                        submitted_map[sym] = max(sub_q, abs_q)
+                        continue
+                    if (
+                        sub_q > 0
+                        and hasattr(adapter, "get_recent_exit_order_coverage")
+                    ):
+                        w_q, f_q = adapter.get_recent_exit_order_coverage(
+                            sym,
+                            is_short=(qty < 0),
+                            since_epoch=flatten_wave_start_ts,
+                            is_opt=is_opt_flag,
+                        )
+                        if (w_q + f_q) >= (abs_q - 1e-6):
+                            log_event(
+                                "FLATTEN",
+                                f"Verified exit order coverage (working={w_q:g}, filled={f_q:g}) on {sym} "
+                                f"— skipping duplicate submission.",
                             )
-                            submitted_close_opt.update(sub_opt_ok)
-                continue
+                            submitted_map[sym] = max(sub_q, w_q + f_q)
+                            continue
+                    uncovered.append(item)
+                return uncovered
 
-            log_event(
-                "FLATTEN",
-                f"Check #{polls} ({elapsed:.1f}s): Positions still open: "
-                f"Equities={rem_pos}, Options={_fmt_opt_summary(rem_opt)}"
-                if include_options
-                else f"Check #{polls} ({elapsed:.1f}s): Equities still open: {rem_pos}"
-            )
-
-            if should_exec and polls % 2 == 0:
+            def _filter_stale_replica_resurrections(
+                pos_list, confirmed_closed_set, is_opt_flag=False
+            ):
+                if not pos_list or not confirmed_closed_set:
+                    return pos_list
+                suspect = [x[0] for x in pos_list if x[0] in confirmed_closed_set]
+                if not suspect:
+                    return pos_list
+                time.sleep(0.35)
+                re_list = (
+                    adapter.get_open_option_positions(allow_stale_cache=False)
+                    if is_opt_flag and hasattr(adapter, "get_open_option_positions")
+                    else adapter.get_open_equity_positions(
+                        allow_stale_cache=False
+                    )
+                )
+                if re_list is not None:
+                    re_syms = {x[0] for x in re_list}
+                    vanished = [s for s in suspect if s not in re_syms]
+                    if vanished:
+                        log_event(
+                            "FLATTEN",
+                            f"Filtered stale read-replica resurrection of already-closed "
+                            f"{'option' if is_opt_flag else 'equity'} position(s): {vanished}",
+                        )
+                    return [x for x in re_list if x[0] not in confirmed_closed_set]
                 log_event(
                     "FLATTEN",
-                    "Positions still open after 4s — inspecting working orders & sweeping uncovered shares..."
+                    f"Filtered stale read-replica resurrection of already-closed "
+                    f"{'option' if is_opt_flag else 'equity'} position(s): {suspect}",
+                )
+                return [x for x in pos_list if x[0] not in confirmed_closed_set]
+
+            if should_exec:
+                log_event(
+                    "FLATTEN",
+                    "Starting emergency flatten sequence (Equities + Options BETA)..."
                     if include_options
-                    else "Equities still open after 4s — inspecting working orders & sweeping uncovered shares..."
+                    else "Starting emergency equity flatten sequence..."
                 )
-                curr_preserve_map = {x[0]: x[1] for x in (rem_pos or [])}
-                for x in (rem_opt or []):
-                    curr_preserve_map[x[0]] = x[1]
-                adapter.cancel_all_working_orders(
-                    preserve_market_close_map=curr_preserve_map
+                _notify_status(
+                    "⏳  1. Working Orders: Canceling open working orders on tracked daytrade positions...",
+                    False,
+                    "⏳  2. Daytrade Positions: Inspecting open daytrade positions...",
+                    False,
                 )
-                rem_pos = adapter.get_open_equity_positions()
-                rem_opt = (
+                peek_pos = adapter.get_open_equity_positions()
+                peek_opt = (
                     adapter.get_open_option_positions()
                     if include_options and hasattr(adapter, "get_open_option_positions")
                     else []
                 )
-                if rem_pos is not None:
-                    rem_pos = _filter_stale_replica_resurrections(
-                        rem_pos, confirmed_closed_eq, is_opt_flag=False
-                    )
-                    for s in list(ever_seen_eq):
-                        if s not in {x[0] for x in rem_pos}:
-                            confirmed_closed_eq.add(s)
-                if include_options and rem_opt is not None:
-                    rem_opt = _filter_stale_replica_resurrections(
-                        rem_opt, confirmed_closed_opt, is_opt_flag=True
-                    )
-                    for s in list(ever_seen_opt):
-                        if s not in {x[0] for x in rem_opt}:
-                            confirmed_closed_opt.add(s)
+                init_preserve_map = {}
+                for item in (peek_pos or []):
+                    init_preserve_map[item[0]] = item[1]
+                for item in (peek_opt or []):
+                    init_preserve_map[item[0]] = item[1]
+
+                adapter.cancel_all_working_orders(
+                    preserve_market_close_map=init_preserve_map,
+                    cancel_options=include_options,
+                )
+                _notify_status(
+                    "✓  1. Working Orders: Open working orders canceled & cleared",
+                    True,
+                    "⏳  2. Daytrade Positions: Verifying open daytrade positions with broker API...",
+                    False,
+                )
+
+                open_pos = adapter.get_open_equity_positions()
+                if open_pos is None and peek_pos is not None:
+                    open_pos = peek_pos
+                open_opt = (
+                    adapter.get_open_option_positions()
+                    if include_options and hasattr(adapter, "get_open_option_positions")
+                    else []
+                )
+                if include_options and open_opt is None and peek_opt is not None:
+                    open_opt = peek_opt
+
+                for item in (open_pos or []):
+                    ever_seen_eq.add(item[0])
+                for item in (open_opt or []):
+                    ever_seen_opt.add(item[0])
 
                 if (
-                    rem_pos is not None
-                    and len(rem_pos) == 0
-                    and (not include_options or (rem_opt is not None and len(rem_opt) == 0))
+                    open_pos is not None
+                    and len(open_pos) == 0
+                    and (not include_options or (open_opt is not None and len(open_opt) == 0))
                 ):
+                    log_event(
+                        "FLATTEN",
+                        "Initial check shows 0 open positions. Running 0.8s "
+                        "settlement double-confirm..."
+                        if include_options
+                        else "Initial check shows 0 open equity shares. Running 0.8s "
+                        "settlement double-confirm..."
+                    )
+                    _notify_status(
+                        "✓  1. Working Orders: Open working orders canceled & cleared",
+                        True,
+                        "⏳  2. Daytrade Positions: 0 open positions reported — running 0.8s settlement double-confirm...",
+                        False,
+                    )
                     time.sleep(0.8)
-                    rem_confirm = adapter.get_open_equity_positions()
-                    opt_confirm = (
-                        adapter.get_open_option_positions()
+                    open_pos = adapter.get_open_equity_positions(
+                        allow_stale_cache=False
+                    )
+                    open_opt = (
+                        adapter.get_open_option_positions(
+                            allow_stale_cache=False
+                        )
                         if include_options and hasattr(adapter, "get_open_option_positions")
                         else []
                     )
+                    if (
+                        open_pos is not None
+                        and len(open_pos) == 0
+                        and (not include_options or (open_opt is not None and len(open_opt) == 0))
+                    ):
+                        log_event(
+                            "FLATTEN",
+                            "Double-confirmed 0 open equities & 0 open options (no flatten order needed)."
+                            if include_options
+                            else "Double-confirmed 0 open equity shares (no flatten order needed)."
+                        )
+                        return True
+
+                if open_pos:
+                    to_sub_eq = _filter_uncovered_positions(
+                        open_pos, submitted_close_eq, is_opt_flag=False
+                    )
+                    if to_sub_eq:
+                        log_event("FLATTEN", f"Equity positions to liquidate: {to_sub_eq}")
+                        syms_str = ", ".join(f"{x[0]} ({x[1]:+g})" for x in to_sub_eq[:4])
+                        _notify_status(
+                            "✓  1. Working Orders: Open working orders canceled & cleared",
+                            True,
+                            f"⏳  2. Daytrade Positions: Submitting exit order(s) for {syms_str}...",
+                            False,
+                        )
+                        sub_ok = adapter.submit_liquidation_batch(to_sub_eq) or {}
+                        submitted_close_eq.update(sub_ok)
+                if include_options and open_opt:
+                    to_sub_opt = _filter_uncovered_positions(
+                        open_opt, submitted_close_opt, is_opt_flag=True
+                    )
+                    if to_sub_opt:
+                        log_event(
+                            "FLATTEN",
+                            f"Option positions to liquidate (BETA): {_fmt_opt_summary(to_sub_opt)}"
+                        )
+                        _notify_status(
+                            "✓  1. Working Orders: Open working orders canceled & cleared",
+                            True,
+                            f"⏳  2. Daytrade Positions: Submitting option exit order(s) ({len(to_sub_opt)} leg(s))...",
+                            False,
+                        )
+                        sub_opt_ok = (
+                            adapter.submit_option_liquidation_batch(to_sub_opt)
+                            or {}
+                        )
+                        submitted_close_opt.update(sub_opt_ok)
+                if open_pos is None or (include_options and open_opt is None):
+                    log_event(
+                        "WARNING",
+                        "Initial position query failed (None); entering verification polling loop..."
+                    )
+            else:
+                _notify_status(
+                    "✓  1. Working Orders: Auto-Flatten is OFF (no orders submitted by Enforcer)",
+                    True,
+                    "⏳  2. Daytrade Positions: Verifying 0 open daytrade positions with broker API...",
+                    False,
+                )
+                open_pos = adapter.get_open_equity_positions(
+                    allow_stale_cache=False
+                )
+                open_opt = (
+                    adapter.get_open_option_positions(allow_stale_cache=False)
+                    if include_options and hasattr(adapter, "get_open_option_positions")
+                    else []
+                )
+                if (
+                    open_pos is not None
+                    and len(open_pos) == 0
+                    and (not include_options or (open_opt is not None and len(open_opt) == 0))
+                ):
+                    time.sleep(0.8)
+                    open_pos = adapter.get_open_equity_positions(
+                        allow_stale_cache=False
+                    )
+                    open_opt = (
+                        adapter.get_open_option_positions(
+                            allow_stale_cache=False
+                        )
+                        if include_options and hasattr(adapter, "get_open_option_positions")
+                        else []
+                    )
+                    if (
+                        open_pos is not None
+                        and len(open_pos) == 0
+                        and (not include_options or (open_opt is not None and len(open_opt) == 0))
+                    ):
+                        return True
+                log_event(
+                    "WARNING",
+                    f"Auto-Flatten is OFF, and positions remain open (or unverified): "
+                    f"Equities={open_pos}"
+                    + (f", Options={_fmt_opt_summary(open_opt)}" if include_options else "")
+                )
+                return False
+
+            log_event(
+                "FLATTEN",
+                "Polling broker API to verify 0 open equities & 0 open options..."
+                if include_options
+                else "Polling broker API to verify 0 open equity shares..."
+            )
+            start_wait = time.time()
+            polls = 0
+            while time.time() - start_wait < 15:
+                last_data_loop_heartbeat = time.time()
+                time.sleep(0.5 if polls == 0 else 1.5)
+                polls += 1
+                rem_pos = adapter.get_open_equity_positions(
+                    allow_stale_cache=False
+                )
+                rem_opt = (
+                    adapter.get_open_option_positions(allow_stale_cache=False)
+                    if include_options and hasattr(adapter, "get_open_option_positions")
+                    else []
+                )
+                elapsed = time.time() - start_wait
+                _notify_status(
+                    "✓  1. Working Orders: Open working orders canceled & cleared",
+                    True,
+                    f"⏳  2. Daytrade Positions: Polling broker API to verify 100% flat (Check #{polls}, {elapsed:.1f}s)...",
+                    False,
+                )
+                if rem_pos is None or (include_options and rem_opt is None):
+                    log_event(
+                        "WARNING",
+                        f"Check #{polls} ({elapsed:.1f}s): Position query returned None; retrying..."
+                    )
+                    continue
+
+                rem_pos = _filter_stale_replica_resurrections(
+                    rem_pos, confirmed_closed_eq, is_opt_flag=False
+                )
+                if include_options and rem_opt:
+                    rem_opt = _filter_stale_replica_resurrections(
+                        rem_opt, confirmed_closed_opt, is_opt_flag=True
+                    )
+
+                curr_eq_syms = {x[0] for x in rem_pos}
+                for s in list(ever_seen_eq):
+                    if s not in curr_eq_syms:
+                        confirmed_closed_eq.add(s)
+                ever_seen_eq.update(curr_eq_syms)
+
+                if include_options:
+                    curr_opt_syms = {x[0] for x in (rem_opt or [])}
+                    for s in list(ever_seen_opt):
+                        if s not in curr_opt_syms:
+                            confirmed_closed_opt.add(s)
+                    ever_seen_opt.update(curr_opt_syms)
+
+                if len(rem_pos) == 0 and (not include_options or len(rem_opt) == 0):
+                    log_event(
+                        "FLATTEN",
+                        f"Check #{polls} ({elapsed:.1f}s): 0 open positions reported. "
+                        f"Running 0.8s settlement double-confirm..."
+                        if include_options
+                        else f"Check #{polls} ({elapsed:.1f}s): 0 equity shares reported. "
+                        f"Running 0.8s settlement double-confirm..."
+                    )
+                    _notify_status(
+                        "✓  1. Working Orders: Open working orders canceled & cleared",
+                        True,
+                        "⏳  2. Daytrade Positions: 0 open positions reported — running 0.8s settlement double-confirm...",
+                        False,
+                    )
+                    time.sleep(0.8)
+                    rem_confirm = adapter.get_open_equity_positions(
+                        allow_stale_cache=False
+                    )
+                    opt_confirm = (
+                        adapter.get_open_option_positions(
+                            allow_stale_cache=False
+                        )
+                        if include_options and hasattr(adapter, "get_open_option_positions")
+                        else []
+                    )
+                    elapsed_confirm = time.time() - start_wait
                     if (
                         rem_confirm is not None
                         and len(rem_confirm) == 0
@@ -10307,61 +11427,222 @@ def flatten_equities(
                     ):
                         log_event(
                             "FLATTEN",
-                            f"SUCCESS: Double-confirmed 0 positions after sweep "
-                            f"({time.time() - start_wait:.1f}s)."
+                            f"SUCCESS: Double-confirmed 0 equities & 0 options in {elapsed_confirm:.1f}s."
                             if include_options
-                            else f"SUCCESS: Double-confirmed 0 equity shares after sweep "
-                            f"({time.time() - start_wait:.1f}s)."
+                            else f"SUCCESS: Double-confirmed 0 equity shares in {elapsed_confirm:.1f}s."
                         )
                         return True
-                    rem_pos = rem_confirm
-                    rem_opt = opt_confirm
-
-                uncovered_eq = (
-                    _filter_uncovered_positions(rem_pos, submitted_close_eq)
-                    if rem_pos
-                    else []
-                )
-                uncovered_opt = (
-                    _filter_uncovered_positions(rem_opt, submitted_close_opt)
-                    if (include_options and rem_opt)
-                    else []
-                )
-                if uncovered_eq:
-                    sub_ok = adapter.submit_liquidation_batch(uncovered_eq) or {}
-                    submitted_close_eq.update(sub_ok)
-                if include_options and uncovered_opt:
-                    sub_opt_ok = (
-                        adapter.submit_option_liquidation_batch(uncovered_opt)
-                        or {}
-                    )
-                    submitted_close_opt.update(sub_opt_ok)
-
-                if (
-                    not uncovered_eq
-                    and not uncovered_opt
-                    and polls >= 4
-                    and (rem_pos or (include_options and rem_opt))
-                ):
+                    if rem_confirm is None or (include_options and opt_confirm is None):
+                        log_event(
+                            "WARNING",
+                            "0.8s double-confirm query returned None; continuing verification loop..."
+                        )
+                        continue
                     log_event(
                         "FLATTEN",
-                        f"All remaining open position(s) {[(x[0], x[1]) for x in (rem_pos or [])]} "
-                        f"already have working close order(s) queued at broker (likely LULD / trading halt). "
-                        f"Ending active sweep loop to preserve order queue priority.",
+                        f"Straggler positions detected on 0.8s double-confirm: "
+                        f"Equities={rem_confirm}"
+                        + (f", Options={_fmt_opt_summary(opt_confirm)}" if include_options else "")
+                        + " — sweeping..."
                     )
-                    break
+                    if should_exec:
+                        strag_map = {x[0]: x[1] for x in (rem_confirm or [])}
+                        for x in (opt_confirm or []):
+                            strag_map[x[0]] = x[1]
+                        adapter.cancel_all_working_orders(
+                            preserve_market_close_map=strag_map,
+                            cancel_options=include_options,
+                        )
+                        to_s_eq = _filter_uncovered_positions(
+                            rem_confirm, submitted_close_eq, is_opt_flag=False
+                        )
+                        if to_s_eq:
+                            sub_ok = adapter.submit_liquidation_batch(to_s_eq) or {}
+                            submitted_close_eq.update(sub_ok)
+                        if include_options and opt_confirm:
+                            to_s_opt = _filter_uncovered_positions(
+                                opt_confirm,
+                                submitted_close_opt,
+                                is_opt_flag=True,
+                            )
+                            if to_s_opt:
+                                sub_opt_ok = (
+                                    adapter.submit_option_liquidation_batch(to_s_opt)
+                                    or {}
+                                )
+                                submitted_close_opt.update(sub_opt_ok)
+                    continue
 
-        log_event(
-            "CRITICAL",
-            "Flatten 15s timeout reached! Positions (Equities/Options) still open!"
-            if include_options
-            else "Equity flatten 15s timeout reached! Shares still open!"
-        )
-        return False
+                log_event(
+                    "FLATTEN",
+                    f"Check #{polls} ({elapsed:.1f}s): Positions still open: "
+                    f"Equities={rem_pos}, Options={_fmt_opt_summary(rem_opt)}"
+                    if include_options
+                    else f"Check #{polls} ({elapsed:.1f}s): Equities still open: {rem_pos}"
+                )
 
-    except Exception as e:
-        log_event("ERROR", f"Flatten execution exception: {e}")
-        return False
+                if should_exec and polls % 2 == 0:
+                    log_event(
+                        "FLATTEN",
+                        "Positions still open after 4s — inspecting working orders & sweeping uncovered shares..."
+                        if include_options
+                        else "Equities still open after 4s — inspecting working orders & sweeping uncovered shares..."
+                    )
+                    curr_preserve_map = {x[0]: x[1] for x in (rem_pos or [])}
+                    for x in (rem_opt or []):
+                        curr_preserve_map[x[0]] = x[1]
+                    adapter.cancel_all_working_orders(
+                        preserve_market_close_map=curr_preserve_map,
+                        cancel_options=include_options,
+                    )
+                    rem_pos = adapter.get_open_equity_positions(
+                        allow_stale_cache=False
+                    )
+                    rem_opt = (
+                        adapter.get_open_option_positions(
+                            allow_stale_cache=False
+                        )
+                        if include_options and hasattr(adapter, "get_open_option_positions")
+                        else []
+                    )
+                    if rem_pos is not None:
+                        rem_pos = _filter_stale_replica_resurrections(
+                            rem_pos, confirmed_closed_eq, is_opt_flag=False
+                        )
+                        for s in list(ever_seen_eq):
+                            if s not in {x[0] for x in rem_pos}:
+                                confirmed_closed_eq.add(s)
+                    if include_options and rem_opt is not None:
+                        rem_opt = _filter_stale_replica_resurrections(
+                            rem_opt, confirmed_closed_opt, is_opt_flag=True
+                        )
+                        for s in list(ever_seen_opt):
+                            if s not in {x[0] for x in rem_opt}:
+                                confirmed_closed_opt.add(s)
+
+                    if (
+                        rem_pos is not None
+                        and len(rem_pos) == 0
+                        and (not include_options or (rem_opt is not None and len(rem_opt) == 0))
+                    ):
+                        time.sleep(0.8)
+                        rem_confirm = adapter.get_open_equity_positions(
+                            allow_stale_cache=False
+                        )
+                        opt_confirm = (
+                            adapter.get_open_option_positions(
+                                allow_stale_cache=False
+                            )
+                            if include_options and hasattr(adapter, "get_open_option_positions")
+                            else []
+                        )
+                        if (
+                            rem_confirm is not None
+                            and len(rem_confirm) == 0
+                            and (not include_options or (opt_confirm is not None and len(opt_confirm) == 0))
+                        ):
+                            log_event(
+                                "FLATTEN",
+                                f"SUCCESS: Double-confirmed 0 positions after sweep "
+                                f"({time.time() - start_wait:.1f}s)."
+                                if include_options
+                                else f"SUCCESS: Double-confirmed 0 equity shares after sweep "
+                                f"({time.time() - start_wait:.1f}s)."
+                            )
+                            return True
+                        rem_pos = rem_confirm
+                        rem_opt = opt_confirm
+
+                    uncovered_eq = (
+                        _filter_uncovered_positions(
+                            rem_pos, submitted_close_eq, is_opt_flag=False
+                        )
+                        if rem_pos
+                        else []
+                    )
+                    uncovered_opt = (
+                        _filter_uncovered_positions(
+                            rem_opt, submitted_close_opt, is_opt_flag=True
+                        )
+                        if (include_options and rem_opt)
+                        else []
+                    )
+                    if uncovered_eq:
+                        sub_ok = adapter.submit_liquidation_batch(uncovered_eq) or {}
+                        submitted_close_eq.update(sub_ok)
+                    if include_options and uncovered_opt:
+                        sub_opt_ok = (
+                            adapter.submit_option_liquidation_batch(uncovered_opt)
+                            or {}
+                        )
+                        submitted_close_opt.update(sub_opt_ok)
+
+                    if (
+                        not uncovered_eq
+                        and not uncovered_opt
+                        and polls >= 4
+                        and (rem_pos or (include_options and rem_opt))
+                    ):
+                        log_event(
+                            "FLATTEN",
+                            f"All remaining open position(s) {[(x[0], x[1]) for x in (rem_pos or [])]} "
+                            f"already have working close order(s) queued at broker (likely LULD / trading halt). "
+                            f"Ending active sweep loop to preserve order queue priority.",
+                        )
+                        break
+
+            rem_final_eq = (
+                adapter.get_open_equity_positions(allow_stale_cache=False) or []
+            )
+            rem_final_opt = (
+                adapter.get_open_option_positions(allow_stale_cache=False) or []
+                if include_options
+                and hasattr(adapter, "get_open_option_positions")
+                else []
+            )
+            if (rem_final_eq or rem_final_opt) and hasattr(
+                adapter, "get_recent_exit_order_coverage"
+            ):
+                unfilled_final = []
+                for item in rem_final_eq:
+                    sym, qty = item[0], float(item[1])
+                    _wq, fq = adapter.get_recent_exit_order_coverage(
+                        sym,
+                        is_short=(qty < 0),
+                        since_epoch=flatten_wave_start_ts,
+                        is_opt=False,
+                    )
+                    if fq < (abs(qty) - 1e-6):
+                        unfilled_final.append((sym, qty))
+                for item in rem_final_opt:
+                    sym, qty = item[0], float(item[1])
+                    _wq, fq = adapter.get_recent_exit_order_coverage(
+                        sym,
+                        is_short=(qty < 0),
+                        since_epoch=flatten_wave_start_ts,
+                        is_opt=True,
+                    )
+                    if fq < (abs(qty) - 1e-6):
+                        unfilled_final.append((sym, qty))
+                if not unfilled_final:
+                    log_event(
+                        "FLATTEN",
+                        "Post-timeout verification confirmed 100% of remaining position(s) "
+                        "have FILLED exit orders at broker (position endpoint lagging) — treating as flat.",
+                    )
+                    return True
+
+            log_event(
+                "CRITICAL",
+                "Flatten 15s timeout reached! Positions (Equities/Options) still open!"
+                if include_options
+                else "Equity flatten 15s timeout reached! Shares still open!"
+            )
+            return False
+
+        except Exception as e:
+            log_event("ERROR", f"Flatten execution exception: {e}")
+            return False
 
 
 def _close_active_settings_window_on_breach(ui_button=None):
@@ -10420,13 +11701,16 @@ def _enter_halt_breach_watch(
         if (prev_type == "DAILY" and breach_type != "DAILY" and isinstance(pending_halt_breach, dict))
         else reason
     )
+    now_hb_init = time.time()
     pending_halt_breach = {
         "type": eff_type,
         "reason": eff_reason,
         "context_str": context_str,
         "has_options": bool(has_options),
         "watched_positions": watched,
-        "started_ts": time.time(),
+        "started_ts": now_hb_init,
+        "last_reprice_ts": now_hb_init,
+        "last_remind_ts": now_hb_init,
     }
     syms_label = ", ".join(watched.keys()) if watched else "OPEN SHARES"
     log_event(
@@ -10676,6 +11960,22 @@ def terminate_selected_apps():
             )
 
 
+def is_post_breach_force_flatten_active(cfg=None):
+    """Returns True when the Daily Stop has been breached today, Auto-Flatten
+    is ON, and Alarms-Only Mode is OFF (or when local HUD Breach Mode visual
+    simulation is toggled ON) — meaning any new tracked position opened before
+    the user raises their Daily Stop or Re-Zeros their baseline will be
+    immediately force-flattened."""
+    if breach_visual_sim_active:
+        return True
+    c = cfg if isinstance(cfg, dict) else config
+    return bool(
+        is_locked_down
+        and not c.get("alarms_only_mode", False)
+        and c.get("enable_auto_flatten", False)
+    )
+
+
 def trigger_lockdown(
     adapter, reason, ui_button, has_options=False, context_str=""
 ):
@@ -10695,6 +11995,7 @@ def trigger_lockdown(
     if not flat_on and not kill_tos and not kill_wb and not lock_on:
         is_locked_down = True
         daily_breach_settings_prompted = False
+        save_session_state()
         trigger_alarm(reason, ui_button, context_str)
         mode_desc = (
             "Alarms Only Mode is ON"
@@ -10859,16 +12160,16 @@ def log_position_transitions(
             if new_q != 0:
                 info = pos_details[sym]
                 changes.append(
-                    f"{sym}: {old_q:+d} -> {new_q:+d} "
+                    f"{sym}: {old_q:+g} -> {new_q:+g} "
                     f"(Avg: ${info['avg']:.4f}, Last: ${info['last']:.4f})"
                 )
             else:
-                changes.append(f"{sym}: {old_q:+d} -> 0 (CLOSED FLAT)")
+                changes.append(f"{sym}: {old_q:+g} -> 0 (CLOSED FLAT)")
                 completed_round_trip = True
         elif new_q != 0 and abs(new_avg - old_avg) >= 0.0001:
             info = pos_details[sym]
             changes.append(
-                f"{sym}: {old_q:+d} -> 0 -> {new_q:+d} "
+                f"{sym}: {old_q:+g} -> 0 -> {new_q:+g} "
                 f"(Re-entry Avg: ${old_avg:.4f} -> ${info['avg']:.4f}, "
                 f"Last: ${info['last']:.4f})"
             )
@@ -10879,7 +12180,7 @@ def log_position_transitions(
 
     consec_trigger_reason = None
     streak_note = ""
-    if completed_round_trip and (len(pos_details) == 0 or any("Re-entry Avg:" in c for c in changes)):
+    if completed_round_trip:
         delta = round(realized_pnl - prev_flat_realized_pnl, 2)
         req_losses = max(
             2, int(round(float(config.get("consec_loss_count", 3))))
@@ -11271,6 +12572,663 @@ def _stabilize_mid_fill_realized_and_equity(
     return current_eq, realized_pnl, open_pnl
 
 
+def evaluate_stop_decisions(
+    current_eq,
+    pos_details,
+    cfg=None,
+    state=None,
+    rth_now=None,
+    is_flat=None,
+    realized_pnl=None,
+    open_pnl=None,
+    has_options=None,
+    pre_poll_hwm_profit=None,
+    on_before_stop_checks=None,
+):
+    """Evaluates position transitions, RTH / Extended-Hours tier floors, Open PnL
+    Stop, Consecutive Loss Cooldown, Post-Breach Force-Flatten, Cooldown sweeps,
+    and Warning Sirens for a single poll snapshot.
+
+    Takes the current balance (`current_eq`), open positions (`pos_details`),
+    settings (`cfg`), and session state (`state` or module globals) and returns
+    a dictionary containing `actions` (ordered list of action dicts),
+    `action_types` (list of action type strings), and computed PnL/floor metrics.
+    """
+    global start_equity, max_equity, daily_max_equity, last_flat_equity
+    global prev_pos_snapshot, prev_flat_realized_pnl, settled_realized_pnl
+    global is_locked_down, daily_breach_settings_prompted
+    global cooldown_active, pending_halt_breach
+    global first_poll_of_launch, last_rth_mode, current_upside_tier
+    global win_trades, loss_trades, recent_loss_timestamps, triggered_alarms
+
+    if cfg is None:
+        cfg = config
+
+    if isinstance(state, dict):
+        if "start_equity" in state:
+            start_equity = state["start_equity"]
+        if "max_equity" in state:
+            max_equity = state["max_equity"]
+        if "daily_max_equity" in state:
+            daily_max_equity = state["daily_max_equity"]
+        if "last_flat_equity" in state:
+            last_flat_equity = state["last_flat_equity"]
+        if "prev_pos_snapshot" in state:
+            prev_pos_snapshot = dict(state["prev_pos_snapshot"])
+        if "prev_flat_realized_pnl" in state:
+            prev_flat_realized_pnl = float(state["prev_flat_realized_pnl"])
+        if "settled_realized_pnl" in state:
+            settled_realized_pnl = float(state["settled_realized_pnl"])
+        if "is_locked_down" in state:
+            is_locked_down = bool(state["is_locked_down"])
+        if "cooldown_active" in state:
+            cooldown_active = bool(state["cooldown_active"])
+        if "pending_halt_breach" in state:
+            pending_halt_breach = state["pending_halt_breach"]
+        if "first_poll_of_launch" in state:
+            first_poll_of_launch = bool(state["first_poll_of_launch"])
+        if "last_rth_mode" in state:
+            last_rth_mode = state["last_rth_mode"]
+        if "current_upside_tier" in state:
+            current_upside_tier = int(state["current_upside_tier"])
+        if "win_trades" in state:
+            win_trades = int(state["win_trades"])
+        if "loss_trades" in state:
+            loss_trades = int(state["loss_trades"])
+        if "recent_loss_timestamps" in state:
+            recent_loss_timestamps[:] = list(state["recent_loss_timestamps"])
+        if "triggered_alarms" in state:
+            triggered_alarms.clear()
+            triggered_alarms.update(state["triggered_alarms"])
+
+    if pos_details is None:
+        pos_details = {}
+    if rth_now is None:
+        rth_now = is_rth()
+    if is_flat is None:
+        is_flat = len(pos_details) == 0
+    if has_options is None:
+        has_options = any(
+            d.get("asset_type") == "OPTION" for d in pos_details.values()
+        )
+    if open_pnl is None:
+        open_pnl = round(
+            sum(float(d.get("open_pnl", 0.0)) for d in pos_details.values()),
+            2,
+        )
+    if pre_poll_hwm_profit is None:
+        pre_poll_hwm_profit = round((max_equity or 0.0) - (start_equity or 0.0), 2)
+
+    if realized_pnl is None:
+        current_eq, realized_pnl, open_pnl = (
+            _stabilize_mid_fill_realized_and_equity(
+                current_eq, is_flat, open_pnl, pos_details
+            )
+        )
+
+    net_pnl = round(current_eq - start_equity, 2)
+    max_realized_profit = round(max_equity - start_equity, 2)
+    session_high_pnl = round(daily_max_equity - start_equity, 2)
+
+    alarms_only = cfg.get("alarms_only_mode", False)
+    open_flat_on = (not alarms_only) and cfg.get("enable_open_flatten", False)
+    open_max = cfg.get("open_max_loss", 500.0)
+
+    pm_w1 = cfg["pm_warn_1"]
+    pm_w2 = cfg["pm_warn_2"]
+    pm_max = cfg["pm_max_loss"]
+    pm_trig = cfg["pm_lock_trigger"]
+    pm_trail = cfg["pm_trail_cushion"]
+    pm_w1_on = cfg.get("enable_pm_warn_1", True) and (pm_w1 > 0)
+    pm_w2_on = cfg.get("enable_pm_warn_2", True) and (pm_w2 > 0)
+    pm_lock_on = cfg.get("enable_pm_lock", True)
+
+    t1_w1 = cfg["t1_warn_1"]
+    t1_w2 = cfg["t1_warn_2"]
+    t1_max = cfg["t1_max_loss"]
+    t2_trig = cfg["t2_trigger"]
+    t2_max = cfg["t2_max_loss"]
+    t3_trig = cfg["t3_trigger"]
+    t3_max = cfg["t3_max_loss"]
+    t4_trig = cfg["t4_trigger"]
+    t4_trail = cfg["t4_trail"]
+    t1_w1_on = cfg.get("enable_t1_warn_1", True) and (t1_w1 > 0)
+    t1_w2_on = cfg.get("enable_t1_warn_2", True) and (t1_w2 > 0)
+    t2_on = cfg.get("enable_t2", True)
+    t3_on = cfg.get("enable_t3", True)
+    t4_on = cfg.get("enable_t4", True)
+    base_t1_stop, eff_t2_max, eff_t3_max = _get_effective_rth_tier_stops(
+        t1_max, t2_on, t2_max, t3_on, t3_max
+    )
+    prior_rth_stop = (
+        eff_t3_max
+        if (t3_on and max_realized_profit >= t3_trig)
+        else (
+            eff_t2_max
+            if (t2_on and max_realized_profit >= t2_trig)
+            else base_t1_stop
+        )
+    )
+
+    consec_reason = log_position_transitions(
+        pos_details,
+        realized_pnl,
+        open_pnl,
+        net_pnl,
+        session_high_pnl,
+    )
+
+    if first_poll_of_launch or last_rth_mode != rth_now:
+        is_mode_switch = last_rth_mode is not None and last_rth_mode != rth_now
+        if is_mode_switch:
+            first_poll_of_launch = True
+        last_rth_mode = rth_now
+        ref_hwm_for_init = (
+            max_realized_profit if is_mode_switch else pre_poll_hwm_profit
+        )
+        current_upside_tier = compute_upside_tier(
+            rth_now, ref_hwm_for_init, cfg
+        )
+
+    if first_poll_of_launch and is_flat:
+        first_poll_of_launch = False
+        if pm_w1_on and net_pnl <= -pm_w1:
+            triggered_alarms[f"Ext-Hours -${pm_w1:,.0f} Warn 1"] = time.time()
+        if pm_w2_on and net_pnl <= -pm_w2:
+            triggered_alarms[f"Ext-Hours -${pm_w2:,.0f} Warn 2"] = time.time()
+        if (
+            t2_on
+            and max_realized_profit >= t2_trig
+            and eff_t2_max < 0
+            and current_eq <= start_equity
+        ):
+            triggered_alarms["Hit $0 (Tier 2)"] = time.time()
+        if (
+            t3_on
+            and max_realized_profit >= t3_trig
+            and eff_t3_max < 0
+            and current_eq <= start_equity
+        ):
+            triggered_alarms["Hit $0 (Tier 3)"] = time.time()
+        if t1_w1_on and current_eq <= (start_equity - t1_w1):
+            triggered_alarms[f"Hit -${t1_w1:,.0f} (Tier 1)"] = time.time()
+        if t1_w2_on and current_eq <= (start_equity - t1_w2):
+            triggered_alarms[f"Hit -${t1_w2:,.0f} (Tier 1)"] = time.time()
+        active_floor = (
+            (
+                max(start_equity - pm_max, max_equity - pm_trail)
+                if (pm_lock_on and max_realized_profit >= pm_trig)
+                else start_equity - pm_max
+            )
+            if not rth_now
+            else (
+                max(start_equity + prior_rth_stop, max_equity - t4_trail)
+                if (t4_on and max_realized_profit >= t4_trig)
+                else start_equity + eff_t3_max
+                if (t3_on and max_realized_profit >= t3_trig)
+                else start_equity + eff_t2_max
+                if (t2_on and max_realized_profit >= t2_trig)
+                else start_equity - t1_max
+            )
+        )
+        if current_eq <= active_floor:
+            is_locked_down = True
+    else:
+        first_poll_of_launch = False
+
+    ctx = (
+        f"Realized={format_dollar(realized_pnl)}, "
+        f"Open={format_dollar(open_pnl)}, "
+        f"Net={format_dollar(net_pnl)}"
+    )
+
+    if callable(on_before_stop_checks):
+        on_before_stop_checks(ctx)
+
+    actions = []
+    post_breach_ff = bool(
+        is_locked_down
+        and not cfg.get("alarms_only_mode", False)
+        and cfg.get("enable_auto_flatten", False)
+    )
+
+    if pending_halt_breach is None and not is_flat:
+        has_eq_open = any(
+            d.get("asset_type") != "OPTION"
+            and abs(float(d.get("qty", 0.0))) > 1e-6
+            for d in pos_details.values()
+        )
+        opt_can_flatten = (
+            has_options
+            and is_options_flatten_armed(cfg)
+            and bool(rth_now)
+        )
+        if cooldown_active and not alarms_only:
+            if has_eq_open or opt_can_flatten:
+                actions.append(
+                    {
+                        "action": "COOLDOWN_FLATTEN",
+                        "include_options": opt_can_flatten,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                        "symbols": list(pos_details.keys()),
+                    }
+                )
+            elif has_options:
+                actions.append(
+                    {
+                        "action": "COOLDOWN_STRAGGLER_ALERT",
+                        "ctx": ctx,
+                    }
+                )
+        elif post_breach_ff:
+            if has_eq_open or opt_can_flatten:
+                actions.append(
+                    {
+                        "action": "POST_BREACH_FLATTEN",
+                        "include_options": opt_can_flatten,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                        "symbols": list(pos_details.keys()),
+                    }
+                )
+            elif has_options:
+                actions.append(
+                    {
+                        "action": "ALARM",
+                        "reason": "DAILY STOP BREACHED — CLOSE OPTIONS MANUALLY!",
+                        "ctx": ctx,
+                    }
+                )
+
+    if not rth_now:
+        r_pm_max = f"Ext-Hours -${pm_max:,.0f} Breach"
+        r_pm_w2 = f"Ext-Hours -${pm_w2:,.0f} Warn 2"
+        r_pm_w1 = f"Ext-Hours -${pm_w1:,.0f} Warn 1"
+        r_pm_tr = "Ext-Hours Trailing Floor Breach"
+
+        check_alarm_rearm(r_pm_max, net_pnl, -pm_max)
+        if pm_w2_on:
+            check_alarm_rearm(r_pm_w2, net_pnl, -pm_w2)
+        if pm_w1_on:
+            check_alarm_rearm(r_pm_w1, net_pnl, -pm_w1)
+
+        if pm_lock_on and max_realized_profit >= pm_trig:
+            floor_equity = max(start_equity - pm_max, max_equity - pm_trail)
+            check_alarm_rearm(r_pm_tr, current_eq, floor_equity)
+        else:
+            floor_equity = start_equity - pm_max
+
+        if pending_halt_breach is not None:
+            pass
+        elif (
+            not is_locked_down
+            and pm_lock_on
+            and max_realized_profit >= pm_trig
+            and current_eq <= floor_equity
+        ):
+            actions.append(
+                {
+                    "action": "LOCKDOWN",
+                    "reason": r_pm_tr,
+                    "has_options": has_options,
+                    "ctx": ctx,
+                }
+            )
+        elif not is_locked_down and net_pnl <= -pm_max:
+            triggered_alarms.setdefault(r_pm_w1, time.time())
+            triggered_alarms.setdefault(r_pm_w2, time.time())
+            actions.append(
+                {
+                    "action": "LOCKDOWN",
+                    "reason": r_pm_max,
+                    "has_options": has_options,
+                    "ctx": ctx,
+                }
+            )
+        elif open_flat_on and not is_flat and open_pnl <= -open_max:
+            if pm_w2_on and net_pnl <= -pm_w2:
+                triggered_alarms.setdefault(r_pm_w2, time.time())
+            if pm_w1_on and net_pnl <= -pm_w1:
+                triggered_alarms.setdefault(r_pm_w1, time.time())
+            r_open = f"Open PnL -${open_max:,.0f} Stop"
+            actions.append(
+                {
+                    "action": "OPEN_PNL_FLATTEN",
+                    "reason": r_open,
+                    "has_options": has_options,
+                    "ctx": ctx,
+                }
+            )
+        elif not is_locked_down and pm_w2_on and net_pnl <= -pm_w2:
+            triggered_alarms.setdefault(r_pm_w1, time.time())
+            actions.append({"action": "ALARM", "reason": r_pm_w2, "ctx": ctx})
+        elif not is_locked_down and pm_w1_on and net_pnl <= -pm_w1:
+            actions.append({"action": "ALARM", "reason": r_pm_w1, "ctx": ctx})
+
+    else:
+        if t4_on and max_realized_profit >= t4_trig:
+            floor_equity = max(
+                start_equity + prior_rth_stop,
+                max_equity - t4_trail,
+            )
+            if pending_halt_breach is not None:
+                pass
+            elif not is_locked_down and current_eq <= floor_equity:
+                msg = (
+                    f"Breached ${t4_trail:,.0f} Trailing Floor"
+                    if (max_equity - t4_trail) >= (start_equity + prior_rth_stop)
+                    else f"Breached Tier 4 Clamped Floor ({format_dollar(round(floor_equity - start_equity, 2))})"
+                )
+                actions.append(
+                    {
+                        "action": "LOCKDOWN",
+                        "reason": msg,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                    }
+                )
+            elif open_flat_on and not is_flat and open_pnl <= -open_max:
+                r_open = f"Open PnL -${open_max:,.0f} Stop"
+                actions.append(
+                    {
+                        "action": "OPEN_PNL_FLATTEN",
+                        "reason": r_open,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                    }
+                )
+
+        elif t3_on and max_realized_profit >= t3_trig:
+            floor_equity = start_equity + eff_t3_max
+            r_t3 = "Hit $0 (Tier 3)"
+            if eff_t3_max < 0:
+                check_alarm_rearm(r_t3, current_eq, start_equity)
+            if pending_halt_breach is not None:
+                pass
+            elif not is_locked_down and current_eq <= floor_equity:
+                msg = f"Breached Tier 3 Stop ({format_dollar(eff_t3_max)})"
+                actions.append(
+                    {
+                        "action": "LOCKDOWN",
+                        "reason": msg,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                    }
+                )
+            elif open_flat_on and not is_flat and open_pnl <= -open_max:
+                if eff_t3_max < 0 and current_eq <= start_equity:
+                    triggered_alarms.setdefault(r_t3, time.time())
+                r_open = f"Open PnL -${open_max:,.0f} Stop"
+                actions.append(
+                    {
+                        "action": "OPEN_PNL_FLATTEN",
+                        "reason": r_open,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                    }
+                )
+            elif (
+                not is_locked_down
+                and eff_t3_max < 0
+                and current_eq <= start_equity
+            ):
+                actions.append({"action": "ALARM", "reason": r_t3, "ctx": ctx})
+
+        elif t2_on and max_realized_profit >= t2_trig:
+            floor_equity = start_equity + eff_t2_max
+            r_t2 = "Hit $0 (Tier 2)"
+            if eff_t2_max < 0:
+                check_alarm_rearm(r_t2, current_eq, start_equity)
+            if pending_halt_breach is not None:
+                pass
+            elif not is_locked_down and current_eq <= floor_equity:
+                msg = f"Breached Tier 2 Stop ({format_dollar(eff_t2_max)})"
+                actions.append(
+                    {
+                        "action": "LOCKDOWN",
+                        "reason": msg,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                    }
+                )
+            elif open_flat_on and not is_flat and open_pnl <= -open_max:
+                if eff_t2_max < 0 and current_eq <= start_equity:
+                    triggered_alarms.setdefault(r_t2, time.time())
+                r_open = f"Open PnL -${open_max:,.0f} Stop"
+                actions.append(
+                    {
+                        "action": "OPEN_PNL_FLATTEN",
+                        "reason": r_open,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                    }
+                )
+            elif (
+                not is_locked_down
+                and eff_t2_max < 0
+                and current_eq <= start_equity
+            ):
+                actions.append({"action": "ALARM", "reason": r_t2, "ctx": ctx})
+
+        else:
+            floor_equity = start_equity - t1_max
+            r_t1_w2 = f"Hit -${t1_w2:,.0f} (Tier 1)"
+            r_t1_w1 = f"Hit -${t1_w1:,.0f} (Tier 1)"
+
+            if t1_w2_on:
+                check_alarm_rearm(r_t1_w2, current_eq, start_equity - t1_w2)
+            if t1_w1_on:
+                check_alarm_rearm(r_t1_w1, current_eq, start_equity - t1_w1)
+
+            if pending_halt_breach is not None:
+                pass
+            elif not is_locked_down and current_eq <= floor_equity:
+                msg = f"Breached Tier 1 Floor (-${t1_max:,.0f})"
+                actions.append(
+                    {
+                        "action": "LOCKDOWN",
+                        "reason": msg,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                    }
+                )
+            elif open_flat_on and not is_flat and open_pnl <= -open_max:
+                if t1_w2_on and current_eq <= (start_equity - t1_w2):
+                    triggered_alarms.setdefault(r_t1_w2, time.time())
+                if t1_w1_on and current_eq <= (start_equity - t1_w1):
+                    triggered_alarms.setdefault(r_t1_w1, time.time())
+                r_open = f"Open PnL -${open_max:,.0f} Stop"
+                actions.append(
+                    {
+                        "action": "OPEN_PNL_FLATTEN",
+                        "reason": r_open,
+                        "has_options": has_options,
+                        "ctx": ctx,
+                    }
+                )
+            elif (
+                not is_locked_down
+                and t1_w2_on
+                and current_eq <= (start_equity - t1_w2)
+            ):
+                triggered_alarms.setdefault(r_t1_w1, time.time())
+                actions.append(
+                    {"action": "ALARM", "reason": r_t1_w2, "ctx": ctx}
+                )
+            elif (
+                not is_locked_down
+                and t1_w1_on
+                and current_eq <= (start_equity - t1_w1)
+            ):
+                actions.append(
+                    {"action": "ALARM", "reason": r_t1_w1, "ctx": ctx}
+                )
+
+    if (
+        consec_reason
+        and not cooldown_active
+        and pending_halt_breach is None
+    ):
+        actions.append(
+            {
+                "action": "CONSEC_LOSS_COOLDOWN",
+                "reason": consec_reason,
+                "has_options": has_options,
+                "ctx": ctx,
+            }
+        )
+
+    if (
+        is_locked_down
+        and is_flat
+        and not post_breach_ff
+        and current_eq >= (floor_equity + RECOVERY_BUFFER_DOLLARS)
+    ):
+        is_locked_down = False
+        daily_breach_settings_prompted = False
+        actions.append(
+            {
+                "action": "REARM_DAILY_STOP",
+                "floor_equity": floor_equity,
+                "net_pnl": net_pnl,
+            }
+        )
+
+    terminate_pnl_level = round(floor_equity - start_equity, 2)
+    distance_to_terminate = round(current_eq - floor_equity, 2)
+
+    if not rth_now:
+        full_leash = (
+            max(1.0, float(pm_trail), float(pm_max))
+            if (pm_lock_on and max_realized_profit >= pm_trig)
+            else max(1.0, float(pm_max))
+        )
+    else:
+        if t4_on and max_realized_profit >= t4_trig:
+            full_leash = max(1.0, float(t4_trail))
+        elif t3_on and max_realized_profit >= t3_trig:
+            full_leash = max(
+                1.0,
+                float(max_realized_profit - eff_t3_max),
+                float(t1_max),
+            )
+        elif t2_on and max_realized_profit >= t2_trig:
+            full_leash = max(
+                1.0,
+                float(max_realized_profit - eff_t2_max),
+                float(t1_max),
+            )
+        else:
+            full_leash = max(1.0, float(t1_max))
+    leash_pct = (
+        0.0
+        if is_locked_down
+        else max(0.0, min(1.0, distance_to_terminate / full_leash))
+    )
+
+    new_upside_tier = compute_upside_tier(rth_now, max_realized_profit, cfg)
+    if is_flat and new_upside_tier > current_upside_tier:
+        current_upside_tier = new_upside_tier
+        fl_str = format_dollar(terminate_pnl_level)
+        if not rth_now:
+            ext_clamped = (
+                pm_lock_on
+                and max_realized_profit >= pm_trig
+                and (max_equity - pm_trail) < (start_equity - pm_max)
+            )
+            if ext_clamped:
+                raw_ext_pnl = round(
+                    (max_equity - pm_trail) - start_equity, 2
+                )
+                banner_txt = (
+                    f"★ EXT-HOURS PROFIT LOCK UNLOCKED — "
+                    f"FLOOR HELD AT {fl_str} ★"
+                )
+                log_txt = (
+                    f"Extended-Hours Profit Lock unlocked at "
+                    f"{format_dollar(max_realized_profit)} — "
+                    f"Floor held at {fl_str} (clamped; trailing stop "
+                    f"{format_dollar(raw_ext_pnl)} is below base floor "
+                    f"-${pm_max:,.0f})"
+                )
+            else:
+                banner_txt = (
+                    f"★ EXT-HOURS PROFIT LOCK UNLOCKED — "
+                    f"FLOOR RAISED TO {fl_str} ★"
+                )
+                log_txt = (
+                    f"Extended-Hours Profit Lock unlocked at "
+                    f"{format_dollar(max_realized_profit)} — "
+                    f"Floor raised to {fl_str}"
+                )
+        else:
+            tier_clamped = False
+            raw_tier_stop = None
+            if new_upside_tier == 2 and eff_t2_max > float(t2_max):
+                tier_clamped = True
+                raw_tier_stop = float(t2_max)
+            elif new_upside_tier == 3 and eff_t3_max > float(t3_max):
+                tier_clamped = True
+                raw_tier_stop = float(t3_max)
+            elif new_upside_tier == 4 and (
+                (max_equity - t4_trail) < (start_equity + prior_rth_stop)
+            ):
+                tier_clamped = True
+                raw_tier_stop = round(
+                    (max_equity - t4_trail) - start_equity, 2
+                )
+
+            if tier_clamped and raw_tier_stop is not None:
+                banner_txt = (
+                    f"★ TIER {new_upside_tier} UNLOCKED — "
+                    f"DAILY FLOOR HELD AT {fl_str} ★"
+                )
+                log_txt = (
+                    f"RTH Tier {new_upside_tier} unlocked at "
+                    f"{format_dollar(max_realized_profit)} — "
+                    f"Daily Floor held at {fl_str} (clamped; "
+                    f"configured Tier {new_upside_tier} stop "
+                    f"{format_dollar(raw_tier_stop)} is below prior floor)"
+                )
+            else:
+                banner_txt = (
+                    f"★ TIER {new_upside_tier} UNLOCKED — "
+                    f"DAILY FLOOR RAISED TO {fl_str} ★"
+                )
+                log_txt = (
+                    f"RTH Tier {new_upside_tier} unlocked at "
+                    f"{format_dollar(max_realized_profit)} — "
+                    f"Daily Floor raised to {fl_str}"
+                )
+        actions.append(
+            {
+                "action": "UPSIDE_TIER_GLOW",
+                "new_tier": new_upside_tier,
+                "banner_txt": banner_txt,
+                "log_txt": log_txt,
+            }
+        )
+
+    return {
+        "actions": actions,
+        "action_types": [a["action"] for a in actions],
+        "current_eq": current_eq,
+        "realized_pnl": realized_pnl,
+        "open_pnl": open_pnl,
+        "net_pnl": net_pnl,
+        "max_realized_profit": max_realized_profit,
+        "session_high_pnl": session_high_pnl,
+        "floor_equity": floor_equity,
+        "terminate_pnl_level": terminate_pnl_level,
+        "distance_to_terminate": distance_to_terminate,
+        "leash_pct": leash_pct,
+        "consec_reason": consec_reason,
+        "is_locked_down": is_locked_down,
+        "ctx": ctx,
+    }
+
+
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global start_equity, max_equity, daily_max_equity, last_flat_equity
     global anchor_cash_flow, _last_logged_unanchored_cash_flow
@@ -11283,23 +13241,47 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global in_trade_desync_streak, pending_scale_out_tol
     global consecutive_api_failures, api_disconnect_alerted
     global alarm_active, last_alarm_reason, daily_breach_settings_prompted
-    global pending_halt_breach
+    global pending_halt_breach, active_session_date
+    global _initial_positions_verified, last_data_loop_heartbeat
 
     consecutive_api_failures = 0
     api_disconnect_alerted = False
+    last_data_loop_heartbeat = time.time()
 
     while True:
-        poll_sec = max(1, int(config.get("poll_interval", 2)))
+        last_data_loop_heartbeat = time.time()
+        poll_sec = 2
         try:
+            try:
+                poll_sec = min(
+                    10, max(1, int(float(config.get("poll_interval", 2))))
+                )
+            except Exception:
+                poll_sec = 2
+
             if active_adapter is None or broker_reconfig_in_progress:
                 time.sleep(0.5)
                 continue
 
-            current_eq, is_flat, live_open_pnl, pos_details, has_options = (
-                active_adapter.fetch_account_data()
-            )
+            with _in_flight_poll_lock:
+                if active_adapter is None or broker_reconfig_in_progress:
+                    time.sleep(0.25)
+                    continue
+                poll_broker = getattr(active_adapter, "name", "")
+                poll_acct = getattr(active_adapter, "account_id", "")
+                current_eq, is_flat, live_open_pnl, pos_details, has_options = (
+                    active_adapter.fetch_account_data()
+                )
+                if (
+                    active_adapter is None
+                    or broker_reconfig_in_progress
+                    or getattr(active_adapter, "name", "") != poll_broker
+                    or getattr(active_adapter, "account_id", "") != poll_acct
+                ):
+                    continue
 
             if current_eq is not None and current_eq > 0:
+                _initial_positions_verified = True
                 if consecutive_api_failures > 0 or api_disconnect_alerted:
                     recovered_attempts = max(1, consecutive_api_failures)
                     was_alerted = api_disconnect_alerted
@@ -11332,13 +13314,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             if not alarm_active and not cooldown_active:
                                 mute_btn.after(
                                     0,
-                                    lambda: mute_btn.config(
-                                        text=get_idle_button_text(),
-                                        bg="#222629",
-                                        fg="#f5b041",
-                                        disabledforeground="#f5b041",
-                                        state="disabled",
-                                    ),
+                                    lambda: apply_idle_button_config(mute_btn),
                                 )
                     else:
                         log_event(
@@ -11348,21 +13324,62 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         if not alarm_active and not cooldown_active:
                             mute_btn.after(
                                 0,
-                                lambda: mute_btn.config(
-                                    text=get_idle_button_text(),
-                                    bg="#222629",
-                                    fg="#f5b041",
-                                    disabledforeground="#f5b041",
-                                    state="disabled",
-                                ),
+                                lambda: apply_idle_button_config(mute_btn),
                             )
                 current_is_flat = is_flat
+
+                today_now = get_today_str()
+                if (
+                    active_session_date is not None
+                    and today_now != active_session_date
+                ):
+                    old_session_date = active_session_date
+                    active_session_date = today_now
+                    init_daily_log()
+                    anchor_eq = round(current_eq - live_open_pnl, 2)
+                    start_equity = anchor_eq
+                    max_equity = anchor_eq
+                    daily_max_equity = max(anchor_eq, current_eq)
+                    last_flat_equity = anchor_eq
+                    anchor_cash_flow = (
+                        active_adapter.get_last_intraday_cash_flow()
+                        if active_adapter is not None
+                        else 0.0
+                    )
+                    _last_logged_unanchored_cash_flow = 0.0
+                    has_reset_at_open = is_rth() or is_after_hours()
+                    has_reset_at_close = is_after_hours()
+                    force_reanchor = False
+                    is_locked_down = False
+                    daily_breach_settings_prompted = False
+                    pending_halt_breach = None
+                    win_trades = 0
+                    loss_trades = 0
+                    prev_flat_realized_pnl = 0.0
+                    settled_realized_pnl = 0.0
+                    flat_desync_streak = 0
+                    in_trade_desync_streak = 0
+                    pending_scale_out_tol = 0.0
+                    recent_loss_timestamps.clear()
+                    triggered_alarms.clear()
+                    _uncloseable_fractional_syms.clear()
+                    prev_pos_snapshot = {}
+                    reanchor_ignored_positions_to_live()
+                    first_poll_of_launch = True
+                    save_session_state()
+                    log_event(
+                        "SESSION",
+                        f"Midnight ET date rollover ({old_session_date} -> {today_now}): "
+                        f"New trading day session initialized at ${start_equity:,.2f} "
+                        f"({active_adapter.name}).",
+                    )
 
                 if (
                     start_equity is None
                     or start_equity <= 0.0
                     or force_reanchor
                 ):
+                    active_session_date = today_now
                     anchor_eq = round(current_eq - live_open_pnl, 2)
                     start_equity = anchor_eq
                     max_equity = anchor_eq
@@ -11752,89 +13769,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                     f"(Initial: {spike_ctx} -> Verified: {v_ctx})."
                                 )
 
-                consec_reason = log_position_transitions(
-                    pos_details,
-                    realized_pnl,
-                    open_pnl,
-                    net_pnl,
-                    session_high_pnl
-                )
-
-                # Prevent immediate siren blast or flat re-lock on startup,
-                # at the 9:30 AM / 4:00 PM transitions, or right after saving Settings
-                if first_poll_of_launch or last_rth_mode != rth_now:
-                    is_mode_switch = (
-                        last_rth_mode is not None and last_rth_mode != rth_now
-                    )
-                    if is_mode_switch:
-                        first_poll_of_launch = True
-                    last_rth_mode = rth_now
-                    # Use pre_poll_hwm_profit on launch/resume so if a new profit
-                    # tier was reached while Enforcer was closed or in Pre-Flight,
-                    # the [RATCHET] log, upside chime, and emerald HUD banner
-                    # still fire on the first poll.
-                    ref_hwm_for_init = (
-                        max_realized_profit
-                        if is_mode_switch
-                        else pre_poll_hwm_profit
-                    )
-                    current_upside_tier = compute_upside_tier(
-                        rth_now, ref_hwm_for_init, config
-                    )
-
-                if first_poll_of_launch and is_flat:
-                    first_poll_of_launch = False
-                    if pm_w1_on and net_pnl <= -pm_w1:
-                        triggered_alarms[f"Ext-Hours -${pm_w1:,.0f} Warn 1"] = time.time()
-                    if pm_w2_on and net_pnl <= -pm_w2:
-                        triggered_alarms[f"Ext-Hours -${pm_w2:,.0f} Warn 2"] = time.time()
-                    if (
-                        t2_on
-                        and max_realized_profit >= t2_trig
-                        and eff_t2_max < 0
-                        and current_eq <= start_equity
-                    ):
-                        triggered_alarms["Hit $0 (Tier 2)"] = time.time()
-                    if (
-                        t3_on
-                        and max_realized_profit >= t3_trig
-                        and eff_t3_max < 0
-                        and current_eq <= start_equity
-                    ):
-                        triggered_alarms["Hit $0 (Tier 3)"] = time.time()
-                    if t1_w1_on and current_eq <= (start_equity - t1_w1):
-                        triggered_alarms[f"Hit -${t1_w1:,.0f} (Tier 1)"] = time.time()
-                    if t1_w2_on and current_eq <= (start_equity - t1_w2):
-                        triggered_alarms[f"Hit -${t1_w2:,.0f} (Tier 1)"] = time.time()
-                    active_floor = (
-                        (
-                            max(start_equity - pm_max, max_equity - pm_trail)
-                            if (pm_lock_on and max_realized_profit >= pm_trig)
-                            else start_equity - pm_max
-                        )
-                        if not is_rth() else
-                        (
-                            max(start_equity + prior_rth_stop, max_equity - t4_trail)
-                            if (t4_on and max_realized_profit >= t4_trig)
-                            else start_equity + eff_t3_max
-                            if (t3_on and max_realized_profit >= t3_trig)
-                            else start_equity + eff_t2_max
-                            if (t2_on and max_realized_profit >= t2_trig)
-                            else start_equity - t1_max
-                        )
-                    )
-                    if current_eq <= active_floor:
-                        is_locked_down = True
-                else:
-                    first_poll_of_launch = False
-
-                ctx = (
-                    f"Realized={format_dollar(realized_pnl)}, "
-                    f"Open={format_dollar(open_pnl)}, "
-                    f"Net={format_dollar(net_pnl)}"
-                )
-
-                if pending_halt_breach is not None:
+                def _handle_pending_halt_breach(ctx):
+                    global pending_halt_breach, alarm_active
+                    if pending_halt_breach is None:
+                        return
                     hb = pending_halt_breach
                     hb_type = hb.get("type", "DAILY")
                     hb_reason = hb.get("reason", "Daily Stop Breach")
@@ -11983,358 +13921,213 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 pass
                             if refreshed_w:
                                 hb["watched_positions"] = refreshed_w
-
-                if not is_rth():
-                    r_pm_max = f"Ext-Hours -${pm_max:,.0f} Breach"
-                    r_pm_w2 = f"Ext-Hours -${pm_w2:,.0f} Warn 2"
-                    r_pm_w1 = f"Ext-Hours -${pm_w1:,.0f} Warn 1"
-                    r_pm_tr = "Ext-Hours Trailing Floor Breach"
-
-                    check_alarm_rearm(r_pm_max, net_pnl, -pm_max)
-                    if pm_w2_on:
-                        check_alarm_rearm(r_pm_w2, net_pnl, -pm_w2)
-                    if pm_w1_on:
-                        check_alarm_rearm(r_pm_w1, net_pnl, -pm_w1)
-
-                    if pm_lock_on and max_realized_profit >= pm_trig:
-                        floor_equity = max(start_equity - pm_max, max_equity - pm_trail)
-                        check_alarm_rearm(
-                            r_pm_tr, current_eq, floor_equity
-                        )
-                    else:
-                        floor_equity = start_equity - pm_max
-
-                    if pending_halt_breach is not None:
-                        pass
-                    elif (
-                        not is_locked_down
-                        and pm_lock_on
-                        and max_realized_profit >= pm_trig
-                        and current_eq <= floor_equity
-                    ):
-                        trigger_lockdown(
-                            active_adapter, r_pm_tr, mute_btn, has_options, ctx
-                        )
-                    elif not is_locked_down and net_pnl <= -pm_max:
-                        triggered_alarms.setdefault(r_pm_w1, time.time())
-                        triggered_alarms.setdefault(r_pm_w2, time.time())
-                        trigger_lockdown(
-                            active_adapter, r_pm_max, mute_btn, has_options, ctx
-                        )
-                    elif (
-                        open_flat_on
-                        and not is_flat
-                        and open_pnl <= -open_max
-                    ):
-                        if pm_w2_on and net_pnl <= -pm_w2:
-                            triggered_alarms.setdefault(r_pm_w2, time.time())
-                        if pm_w1_on and net_pnl <= -pm_w1:
-                            triggered_alarms.setdefault(r_pm_w1, time.time())
-                        r_open = f"Open PnL -${open_max:,.0f} Stop"
-                        trigger_open_pnl_flatten(
-                            active_adapter, r_open, mute_btn, has_options, ctx
-                        )
-                    elif not is_locked_down and pm_w2_on and net_pnl <= -pm_w2:
-                        triggered_alarms.setdefault(r_pm_w1, time.time())
-                        trigger_alarm(r_pm_w2, mute_btn, ctx)
-                    elif not is_locked_down and pm_w1_on and net_pnl <= -pm_w1:
-                        trigger_alarm(r_pm_w1, mute_btn, ctx)
-
-                else:
-                    if t4_on and max_realized_profit >= t4_trig:
-                        floor_equity = max(
-                            start_equity + prior_rth_stop,
-                            max_equity - t4_trail,
-                        )
-                        if pending_halt_breach is not None:
-                            pass
-                        elif not is_locked_down and current_eq <= floor_equity:
-                            msg = (
-                                f"Breached ${t4_trail:,.0f} Trailing Floor"
-                                if (max_equity - t4_trail) >= (start_equity + prior_rth_stop)
-                                else f"Breached Tier 4 Clamped Floor ({format_dollar(round(floor_equity - start_equity, 2))})"
-                            )
-                            trigger_lockdown(
-                                active_adapter, msg, mute_btn, has_options, ctx
-                            )
-                        elif (
-                            open_flat_on
-                            and not is_flat
-                            and open_pnl <= -open_max
-                        ):
-                            r_open = f"Open PnL -${open_max:,.0f} Stop"
-                            trigger_open_pnl_flatten(
-                                active_adapter,
-                                r_open,
-                                mute_btn,
-                                has_options,
-                                ctx
-                            )
-
-                    elif t3_on and max_realized_profit >= t3_trig:
-                        floor_equity = start_equity + eff_t3_max
-                        r_t3 = "Hit $0 (Tier 3)"
-                        if eff_t3_max < 0:
-                            check_alarm_rearm(r_t3, current_eq, start_equity)
-                        if pending_halt_breach is not None:
-                            pass
-                        elif not is_locked_down and current_eq <= floor_equity:
-                            msg = f"Breached Tier 3 Stop ({format_dollar(eff_t3_max)})"
-                            trigger_lockdown(
-                                active_adapter, msg, mute_btn, has_options, ctx
-                            )
-                        elif (
-                            open_flat_on
-                            and not is_flat
-                            and open_pnl <= -open_max
-                        ):
-                            if eff_t3_max < 0 and current_eq <= start_equity:
-                                triggered_alarms.setdefault(r_t3, time.time())
-                            r_open = f"Open PnL -${open_max:,.0f} Stop"
-                            trigger_open_pnl_flatten(
-                                active_adapter,
-                                r_open,
-                                mute_btn,
-                                has_options,
-                                ctx
-                            )
-                        elif (
-                            not is_locked_down
-                            and eff_t3_max < 0
-                            and current_eq <= start_equity
-                        ):
-                            trigger_alarm(r_t3, mute_btn, ctx)
-
-                    elif t2_on and max_realized_profit >= t2_trig:
-                        floor_equity = start_equity + eff_t2_max
-                        r_t2 = "Hit $0 (Tier 2)"
-                        if eff_t2_max < 0:
-                            check_alarm_rearm(r_t2, current_eq, start_equity)
-                        if pending_halt_breach is not None:
-                            pass
-                        elif not is_locked_down and current_eq <= floor_equity:
-                            msg = f"Breached Tier 2 Stop ({format_dollar(eff_t2_max)})"
-                            trigger_lockdown(
-                                active_adapter, msg, mute_btn, has_options, ctx
-                            )
-                        elif (
-                            open_flat_on
-                            and not is_flat
-                            and open_pnl <= -open_max
-                        ):
-                            if eff_t2_max < 0 and current_eq <= start_equity:
-                                triggered_alarms.setdefault(r_t2, time.time())
-                            r_open = f"Open PnL -${open_max:,.0f} Stop"
-                            trigger_open_pnl_flatten(
-                                active_adapter,
-                                r_open,
-                                mute_btn,
-                                has_options,
-                                ctx
-                            )
-                        elif (
-                            not is_locked_down
-                            and eff_t2_max < 0
-                            and current_eq <= start_equity
-                        ):
-                            trigger_alarm(r_t2, mute_btn, ctx)
-
-                    else:
-                        floor_equity = start_equity - t1_max
-                        r_t1_w2 = f"Hit -${t1_w2:,.0f} (Tier 1)"
-                        r_t1_w1 = f"Hit -${t1_w1:,.0f} (Tier 1)"
-
-                        if t1_w2_on:
-                            check_alarm_rearm(
-                                r_t1_w2, current_eq, start_equity - t1_w2
-                            )
-                        if t1_w1_on:
-                            check_alarm_rearm(
-                                r_t1_w1, current_eq, start_equity - t1_w1
-                            )
-
-                        if pending_halt_breach is not None:
-                            pass
-                        elif not is_locked_down and current_eq <= floor_equity:
-                            msg = f"Breached Tier 1 Floor (-${t1_max:,.0f})"
-                            trigger_lockdown(
-                                active_adapter, msg, mute_btn, has_options, ctx
-                            )
-                        elif (
-                            open_flat_on
-                            and not is_flat
-                            and open_pnl <= -open_max
-                        ):
-                            if t1_w2_on and current_eq <= (start_equity - t1_w2):
-                                triggered_alarms.setdefault(
-                                    r_t1_w2, time.time()
+                            hb["last_reprice_ts"] = time.time()
+                        else:
+                            now_hb = time.time()
+                            b_name_hb = getattr(active_adapter, "name", "SCHWAB")
+                            sess_open_hb = is_any_equity_session_open(b_name_hb)
+                            remind_iv = 30.0 if sess_open_hb else 900.0
+                            if (
+                                not alarm_active
+                                and not cooldown_active
+                                and (now_hb - float(hb.get("last_remind_ts", 0.0))) >= remind_iv
+                            ):
+                                hb["last_remind_ts"] = now_hb
+                                syms_lbl = ", ".join(new_watched.keys()) if new_watched else "OPEN POSITIONS"
+                                rem_msg = (
+                                    f"{hb_reason} — CHECK OPTIONS MANUALLY!"
+                                    if has_options
+                                    else f"{hb_reason} (UNFILLED: {syms_lbl})"
                                 )
-                            if t1_w1_on and current_eq <= (start_equity - t1_w1):
-                                triggered_alarms.setdefault(
-                                    r_t1_w1, time.time()
+                                trigger_alarm(rem_msg, mute_btn, ctx)
+
+                            if (
+                                sess_open_hb
+                                and not config.get("alarms_only_mode", False)
+                                and (now_hb - float(hb.get("last_reprice_ts", 0.0))) >= 15.0
+                            ):
+                                hb["last_reprice_ts"] = now_hb
+                                opt_armed_hb = (
+                                    has_options
+                                    and is_options_flatten_armed(config)
+                                    and is_market_hours()
                                 )
-                            r_open = f"Open PnL -${open_max:,.0f} Stop"
+                                has_eq_hb = any(
+                                    d.get("asset_type") != "OPTION" and abs(float(d.get("qty", 0.0))) > 1e-6
+                                    for d in pos_details.values()
+                                )
+                                if not is_market_hours():
+                                    if has_eq_hb:
+                                        log_event(
+                                            "GUARDRAIL",
+                                            f"Halt / Unfilled Watch 15s Extended-Hours re-price sweep "
+                                            f"({list(new_watched.keys())})...",
+                                        )
+                                        flatten_equities(
+                                            active_adapter,
+                                            force_flatten=True,
+                                            include_options=False,
+                                        )
+                                else:
+                                    needs_resubmit = False
+                                    for sym_k, d_k in pos_details.items():
+                                        q_k = float(d_k.get("qty", 0.0))
+                                        if abs(q_k) < 1e-6:
+                                            continue
+                                        is_opt_k = d_k.get("asset_type") == "OPTION"
+                                        if is_opt_k and not opt_armed_hb:
+                                            continue
+                                        raw_sym_k = sym_k[:-6].strip() if sym_k.endswith(" (OPT)") else sym_k
+                                        if hasattr(active_adapter, "get_recent_exit_order_coverage"):
+                                            try:
+                                                w_cov, f_cov = active_adapter.get_recent_exit_order_coverage(
+                                                    raw_sym_k,
+                                                    is_short=(q_k < 0),
+                                                    since_epoch=float(hb.get("started_ts", now_hb - 180.0)),
+                                                    is_opt=is_opt_k,
+                                                )
+                                                if (w_cov + f_cov) < abs(q_k) - 1e-6:
+                                                    needs_resubmit = True
+                                                    break
+                                            except Exception:
+                                                needs_resubmit = True
+                                                break
+                                    if needs_resubmit:
+                                        log_event(
+                                            "GUARDRAIL",
+                                            f"Halt / Unfilled Watch detected uncovered RTH position "
+                                            f"({list(new_watched.keys())}) — re-submitting exit order(s)...",
+                                        )
+                                        flatten_equities(
+                                            active_adapter,
+                                            force_flatten=True,
+                                            include_options=opt_armed_hb,
+                                        )
+
+                dec = evaluate_stop_decisions(
+                    current_eq=current_eq,
+                    pos_details=pos_details,
+                    cfg=config,
+                    rth_now=rth_now,
+                    is_flat=is_flat,
+                    realized_pnl=realized_pnl,
+                    open_pnl=open_pnl,
+                    has_options=has_options,
+                    pre_poll_hwm_profit=pre_poll_hwm_profit,
+                    on_before_stop_checks=_handle_pending_halt_breach,
+                )
+                floor_equity = dec["floor_equity"]
+                terminate_pnl_level = dec["terminate_pnl_level"]
+                distance_to_terminate = dec["distance_to_terminate"]
+                leash_pct = dec["leash_pct"]
+                ctx = dec["ctx"]
+
+                for act in dec["actions"]:
+                    act_type = act["action"]
+                    if act_type == "COOLDOWN_FLATTEN":
+                        log_event(
+                            "GUARDRAIL",
+                            f"Position detected in main poll while Cooldown Lock is active "
+                            f"({act['symbols']})! Auto-flattening immediately...",
+                        )
+                        swept_cd = flatten_equities(
+                            active_adapter,
+                            force_flatten=True,
+                            include_options=act["include_options"],
+                        )
+                        if not swept_cd:
+                            _sound_lock_straggler_alert_burst()
+                            _enter_halt_breach_watch(
+                                "DAILY" if is_locked_down else "OPEN_PNL",
+                                "Unfilled Position During Active Cooldown Lock",
+                                act["ctx"],
+                                act["has_options"],
+                                active_adapter,
+                                mute_btn,
+                            )
+                    elif act_type == "COOLDOWN_STRAGGLER_ALERT":
+                        _sound_lock_straggler_alert_burst()
+                    elif act_type == "POST_BREACH_FLATTEN":
+                        log_event(
+                            "GUARDRAIL",
+                            f"POST-BREACH FORCE-FLATTEN: New position detected while Daily Stop "
+                            f"remains breached ({act['symbols']})! Auto-flattening "
+                            f"until Daily Stop limit is raised or baseline is Re-Zeroed...",
+                        )
+                        speak_async(
+                            "Warning. Account is in Daily Breach Lockout. "
+                            "Flattening new position immediately. Raise your Daily Stop in Settings to trade."
+                        )
+                        swept_pb = flatten_equities(
+                            active_adapter,
+                            force_flatten=True,
+                            include_options=act["include_options"],
+                        )
+                        if not swept_pb:
+                            _enter_halt_breach_watch(
+                                "DAILY",
+                                "Post-Breach Force-Flatten Unfilled",
+                                act["ctx"],
+                                act["has_options"],
+                                active_adapter,
+                                mute_btn,
+                            )
+                    elif act_type == "LOCKDOWN":
+                        if pending_halt_breach is None and not is_locked_down:
+                            trigger_lockdown(
+                                active_adapter,
+                                act["reason"],
+                                mute_btn,
+                                act["has_options"],
+                                act["ctx"],
+                            )
+                    elif act_type == "OPEN_PNL_FLATTEN":
+                        if pending_halt_breach is None:
                             trigger_open_pnl_flatten(
                                 active_adapter,
-                                r_open,
+                                act["reason"],
                                 mute_btn,
-                                has_options,
-                                ctx
+                                act["has_options"],
+                                act["ctx"],
                             )
-                        elif (
-                            not is_locked_down
-                            and t1_w2_on
-                            and current_eq <= (start_equity - t1_w2)
-                        ):
-                            triggered_alarms.setdefault(
-                                r_t1_w1, time.time()
+                    elif act_type == "ALARM":
+                        trigger_alarm(act["reason"], mute_btn, act["ctx"])
+                    elif act_type == "CONSEC_LOSS_COOLDOWN":
+                        if not cooldown_active and pending_halt_breach is None:
+                            trigger_consec_loss_cooldown(
+                                active_adapter,
+                                act["reason"],
+                                mute_btn,
+                                act["has_options"],
+                                act["ctx"],
                             )
-                            trigger_alarm(r_t1_w2, mute_btn, ctx)
-                        elif (
-                            not is_locked_down
-                            and t1_w1_on
-                            and current_eq <= (start_equity - t1_w1)
-                        ):
-                            trigger_alarm(r_t1_w1, mute_btn, ctx)
-
-                if (
-                    consec_reason
-                    and not cooldown_active
-                    and pending_halt_breach is None
-                ):
-                    trigger_consec_loss_cooldown(
-                        active_adapter, consec_reason, mute_btn, has_options, ctx
-                    )
-
-                if (
-                    is_locked_down
-                    and is_flat
-                    and current_eq >= (floor_equity + RECOVERY_BUFFER_DOLLARS)
-                ):
-                    is_locked_down = False
-                    daily_breach_settings_prompted = False
-                    log_event(
-                        "SESSION",
-                        f"Daily Stop RE-ARMED after flat recovery above floor + "
-                        f"${RECOVERY_BUFFER_DOLLARS:,.0f} buffer "
-                        f"(Net PnL: {format_dollar(net_pnl)} vs "
-                        f"Daily Stop: {format_dollar(round(floor_equity - start_equity, 2))})."
-                    )
-                    if not alarm_active and not cooldown_active:
-                        mute_btn.after(
-                            0,
-                            lambda: mute_btn.config(text=get_idle_button_text())
+                    elif act_type == "REARM_DAILY_STOP":
+                        save_session_state()
+                        log_event(
+                            "SESSION",
+                            f"Daily Stop RE-ARMED after flat recovery above floor + "
+                            f"${RECOVERY_BUFFER_DOLLARS:,.0f} buffer "
+                            f"(Net PnL: {format_dollar(act['net_pnl'])} vs "
+                            f"Daily Stop: {format_dollar(round(act['floor_equity'] - start_equity, 2))}).",
+                        )
+                        if not alarm_active and not cooldown_active:
+                            mute_btn.after(
+                                0,
+                                lambda: apply_idle_button_config(mute_btn),
+                            )
+                    elif act_type == "UPSIDE_TIER_GLOW":
+                        trigger_upside_tier_glow(
+                            mute_btn, act["banner_txt"], act["log_txt"]
                         )
 
-                terminate_pnl_level = round(floor_equity - start_equity, 2)
-                distance_to_terminate = round(current_eq - floor_equity, 2)
-
-                if not rth_now:
-                    full_leash = (
-                        max(1.0, float(pm_trail), float(pm_max))
-                        if (pm_lock_on and max_realized_profit >= pm_trig)
-                        else max(1.0, float(pm_max))
-                    )
-                else:
-                    if t4_on and max_realized_profit >= t4_trig:
-                        full_leash = max(1.0, float(t4_trail))
-                    elif t3_on and max_realized_profit >= t3_trig:
-                        full_leash = max(
-                            1.0,
-                            float(max_realized_profit - eff_t3_max),
-                            float(t1_max)
-                        )
-                    elif t2_on and max_realized_profit >= t2_trig:
-                        full_leash = max(
-                            1.0,
-                            float(max_realized_profit - eff_t2_max),
-                            float(t1_max)
-                        )
-                    else:
-                        full_leash = max(1.0, float(t1_max))
+                hud_breach_active = bool(
+                    is_locked_down or breach_visual_sim_active
+                )
                 leash_pct = (
                     0.0
-                    if is_locked_down
-                    else max(0.0, min(1.0, distance_to_terminate / full_leash))
+                    if hud_breach_active
+                    else dec["leash_pct"]
                 )
-
-                new_upside_tier = compute_upside_tier(
-                    rth_now, max_realized_profit, config
-                )
-                if is_flat and new_upside_tier > current_upside_tier:
-                    current_upside_tier = new_upside_tier
-                    fl_str = format_dollar(terminate_pnl_level)
-                    if not rth_now:
-                        ext_clamped = (
-                            pm_lock_on
-                            and max_realized_profit >= pm_trig
-                            and (max_equity - pm_trail) < (start_equity - pm_max)
-                        )
-                        if ext_clamped:
-                            raw_ext_pnl = round(
-                                (max_equity - pm_trail) - start_equity, 2
-                            )
-                            banner_txt = (
-                                f"★ EXT-HOURS PROFIT LOCK UNLOCKED — "
-                                f"FLOOR HELD AT {fl_str} ★"
-                            )
-                            log_txt = (
-                                f"Extended-Hours Profit Lock unlocked at "
-                                f"{format_dollar(max_realized_profit)} — "
-                                f"Floor held at {fl_str} (clamped; trailing stop "
-                                f"{format_dollar(raw_ext_pnl)} is below base floor "
-                                f"-${pm_max:,.0f})"
-                            )
-                        else:
-                            banner_txt = (
-                                f"★ EXT-HOURS PROFIT LOCK UNLOCKED — "
-                                f"FLOOR RAISED TO {fl_str} ★"
-                            )
-                            log_txt = (
-                                f"Extended-Hours Profit Lock unlocked at "
-                                f"{format_dollar(max_realized_profit)} — "
-                                f"Floor raised to {fl_str}"
-                            )
-                    else:
-                        tier_clamped = False
-                        raw_tier_stop = None
-                        if new_upside_tier == 2 and eff_t2_max > float(t2_max):
-                            tier_clamped = True
-                            raw_tier_stop = float(t2_max)
-                        elif new_upside_tier == 3 and eff_t3_max > float(t3_max):
-                            tier_clamped = True
-                            raw_tier_stop = float(t3_max)
-                        elif new_upside_tier == 4 and (
-                            (max_equity - t4_trail) < (start_equity + prior_rth_stop)
-                        ):
-                            tier_clamped = True
-                            raw_tier_stop = round(
-                                (max_equity - t4_trail) - start_equity, 2
-                            )
-
-                        if tier_clamped and raw_tier_stop is not None:
-                            banner_txt = (
-                                f"★ TIER {new_upside_tier} UNLOCKED — "
-                                f"DAILY FLOOR HELD AT {fl_str} ★"
-                            )
-                            log_txt = (
-                                f"RTH Tier {new_upside_tier} unlocked at "
-                                f"{format_dollar(max_realized_profit)} — "
-                                f"Daily Floor held at {fl_str} (clamped; "
-                                f"configured Tier {new_upside_tier} stop "
-                                f"{format_dollar(raw_tier_stop)} is below prior floor)"
-                            )
-                        else:
-                            banner_txt = (
-                                f"★ TIER {new_upside_tier} UNLOCKED — "
-                                f"DAILY FLOOR RAISED TO {fl_str} ★"
-                            )
-                            log_txt = (
-                                f"RTH Tier {new_upside_tier} unlocked at "
-                                f"{format_dollar(max_realized_profit)} — "
-                                f"Daily Floor raised to {fl_str}"
-                            )
-                    trigger_upside_tier_glow(mute_btn, banner_txt, log_txt)
 
                 c1_bg = (
                     "#1e8449" if realized_pnl > 0
@@ -12350,7 +14143,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 )
                 c3_bg = "#1e8449" if terminate_pnl_level > 0 else "#1f538d"
                 c4_bg = (
-                    "#b03a2e" if (is_locked_down or distance_to_terminate <= 0)
+                    "#b03a2e" if (hud_breach_active or distance_to_terminate <= 0)
                     else ("#d35400" if distance_to_terminate <= 500 else "#2c3e50")
                 )
                 c5_bg = "#1e8449" if session_high_pnl > 0 else "#2c3e50"
@@ -12375,7 +14168,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     "terminate_lvl": (format_dollar(terminate_pnl_level), c3_bg),
                     "dist_to_term": (
                         format_dist_to_stop_hud(
-                            distance_to_terminate, is_locked_down
+                            -142.50
+                            if (breach_visual_sim_active and not is_locked_down and distance_to_terminate > 0)
+                            else distance_to_terminate,
+                            hud_breach_active,
                         ),
                         c4_bg,
                     ),
@@ -12444,7 +14240,6 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             ),
                         )
                 elif is_tok_exp or consecutive_api_failures >= 2:
-                    current_is_flat = True
                     if not is_tok_exp and hasattr(active_adapter, "reconnect_session"):
                         if (
                             consecutive_api_failures == 2
@@ -12472,8 +14267,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             err_cols.append(("---", "#444444"))
                     root.after(
                         0,
-                        lambda d=err_cols: update_gui(
-                            ui_labels, d, True, settings_btn, close_btn
+                        lambda d=err_cols, f=current_is_flat: update_gui(
+                            ui_labels, d, f, settings_btn, close_btn
                         )
                     )
                     if not api_disconnect_alerted:
@@ -12547,7 +14342,12 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
         except Exception as e:
             log_event("ERROR", f"Main data_loop error: {e}")
 
-        time.sleep(poll_sec)
+        rem_sleep = float(poll_sec)
+        while rem_sleep > 0:
+            sl_step = min(0.25, rem_sleep)
+            time.sleep(sl_step)
+            rem_sleep -= sl_step
+            last_data_loop_heartbeat = time.time()
 
 
 # ==========================================
@@ -13267,6 +15067,9 @@ def show_preflight_window(
             "remaining Schwab 7-day token lifetime (click Token to renew), and today's completed Win/Loss trade count."
         )
         in_tr_lk = is_in_trade_tamper_locked()
+        allow_key_edit = (not in_tr_lk) or (
+            consecutive_api_failures >= 2 or api_disconnect_alerted
+        )
         for span_item in spans:
             seg_txt = span_item[0]
             seg_col = span_item[1]
@@ -13276,7 +15079,7 @@ def show_preflight_window(
                 if (len(span_item) > 3 and span_item[3])
                 else base_tip
             )
-            is_clickable = bool(act_key == "edit_api_keys" and not in_tr_lk)
+            is_clickable = bool(act_key == "edit_api_keys" and allow_key_edit)
             lbl = tk.Label(
                 base_sub_lbl,
                 text=seg_txt,
@@ -13627,7 +15430,20 @@ def show_preflight_window(
                     (float(raw_eq_now) - tracked_opnl) - float(ref_flat_eq), 2
                 )
                 ig_drift = round(target_ig_sum - cur_ig_sum, 2)
-                if abs(ig_drift) >= 0.01 and abs(ig_drift) <= 50000.0:
+                new_ig_notional = 0.0
+                for ig_e in newly_ignored_igs:
+                    m_e = (
+                        100.0
+                        if str(ig_e.get("asset_type", "EQUITY")).upper() == "OPTION"
+                        else 1.0
+                    )
+                    new_ig_notional += (
+                        abs(float(ig_e.get("ref_qty", 0.0)))
+                        * max(0.01, float(ig_e.get("ref_price", 0.0)))
+                        * m_e
+                    )
+                max_ig_drift = max(250.0, new_ig_notional * 0.10)
+                if abs(ig_drift) >= 0.01 and abs(ig_drift) <= max_ig_drift:
                     newly_ignored_igs[-1]["locked_impact"] = round(
                         float(newly_ignored_igs[-1].get("locked_impact", 0.0))
                         + ig_drift,
@@ -13655,6 +15471,7 @@ def show_preflight_window(
         match the currently selected Broker + Account."""
         global start_equity, last_flat_equity, prev_flat_realized_pnl
         global settled_realized_pnl, anchor_cash_flow, force_reanchor
+        global _initial_positions_verified, current_is_flat
         if base_sub_lbl is None:
             return
         if active_adapter is None or not active_adapter.account_id:
@@ -13714,11 +15531,15 @@ def show_preflight_window(
                     _pf_initial_shown["needs_bg_sync"] = True
                 elif (
                     parent is None
+                    or force_restore
                     or not active_adapter.get_last_raw_pos_details()
                 ):
                     eq_now, is_fl_now, _, _, _ = (
                         active_adapter.fetch_account_data()
                     )
+                    if eq_now is not None and eq_now > 0:
+                        _initial_positions_verified = True
+                        current_is_flat = bool(is_fl_now)
                     if (
                         parent is None
                         and eq_now is not None
@@ -13739,7 +15560,10 @@ def show_preflight_window(
                 _pf_initial_shown["needs_bg_sync"] = True
                 eq_str = "Syncing live balance..."
             else:
-                eq, _, live_opnl, _, _ = active_adapter.fetch_account_data()
+                eq, is_fl_live, live_opnl, _, _ = active_adapter.fetch_account_data()
+                if eq is not None and eq > 0:
+                    _initial_positions_verified = True
+                    current_is_flat = bool(is_fl_live)
                 _preexisting_state["raw_eq"] = eq
                 raw_pos = active_adapter.get_last_raw_pos_details()
                 if var_ignore_preexisting.get() and raw_pos:
@@ -13749,6 +15573,7 @@ def show_preflight_window(
                             tag, d, lock_existing_open_pnl=False
                         )
                     live_opnl = 0.0
+                    current_is_flat = True
                 if eq is not None and eq > 0:
                     start_equity = round(eq - live_opnl, 2)
                     anchor_cash_flow = (
@@ -14227,8 +16052,8 @@ def show_preflight_window(
         tk.Label(
             rules_box,
             text=(
-                "• 🛡️ Ignored Ticker Rule: Price swings, adding shares, trimming, or closing an Ignored ticker has $0.00 impact on your\n"
-                "  daytrade Realized/Open/Net PnL, never locks Settings/Close, and is skipped by Auto-Flatten & Order Cancellation.\n"
+                "• 🛡️ Ignored Ticker Rule: Ignoring a swing ticker excludes ALL shares, options, and working orders on that ticker symbol\n"
+                "  for the rest of the session ($0.00 daytrade PnL impact, never locks Settings/Close, and skipped by Auto-Flatten).\n"
                 "• ⚡ Tracked Daytrade Rule: Monitored live for Open PnL, Daily Stop, and Auto-Flatten (starting at $0.00 Realized PnL)."
             ),
             font=("Arial", 8, "bold"),
@@ -14648,7 +16473,12 @@ def show_preflight_window(
     def _on_capsule_click(event):
         hide_all_tooltips()
         _stop_control_pulse()
-        if is_in_trade_tamper_locked():
+        offline_allow_keys = (
+            consecutive_api_failures >= 2 or api_disconnect_alerted
+        )
+        if is_in_trade_tamper_locked() and not (
+            offline_allow_keys and event.x < _capsule_state["divider_x"]
+        ):
             if default_status_lbl is not None:
                 default_status_lbl.config(
                     text="🔒 Broker & Account selection are locked while a daytrade is open.",
@@ -14708,15 +16538,23 @@ def show_preflight_window(
     var_account_label.trace_add("write", _sync_broker_acct_pills)
 
     def on_account_select(chosen_lbl):
+        global broker_reconfig_in_progress, _initial_positions_verified
         if is_in_trade_tamper_locked():
             return
         var_account_label.set(chosen_lbl)
         if active_adapter is not None:
             chosen_id = account_label_to_id.get(chosen_lbl)
             if chosen_id and chosen_id != active_adapter.account_id:
-                active_adapter.account_id = chosen_id
-                config["brokers"][active_adapter.name]["selected_account_id"] = chosen_id
-                refresh_baseline_preview(force_restore=True)
+                broker_reconfig_in_progress = True
+                try:
+                    with _in_flight_poll_lock:
+                        _initial_positions_verified = False
+                        active_adapter.account_id = chosen_id
+                        config["brokers"][active_adapter.name]["selected_account_id"] = chosen_id
+                        broker_reconfig_in_progress = False
+                        refresh_baseline_preview(force_restore=True)
+                finally:
+                    broker_reconfig_in_progress = False
 
     def populate_account_dropdown():
         account_label_to_id.clear()
@@ -14749,7 +16587,7 @@ def show_preflight_window(
         _sync_broker_acct_pills()
 
     def on_broker_change(*_):
-        global active_adapter, broker_reconfig_in_progress
+        global active_adapter, broker_reconfig_in_progress, _initial_positions_verified
         if is_in_trade_tamper_locked():
             if active_adapter is not None and var_broker.get() != active_adapter.name:
                 var_broker.set(active_adapter.name)
@@ -14762,21 +16600,26 @@ def show_preflight_window(
                 new_ad = connect_broker_adapter(
                     chosen, parent=pf, force_wizard=False
                 )
+                if new_ad is not None:
+                    with _in_flight_poll_lock:
+                        _initial_positions_verified = False
+                        active_adapter = new_ad
+                        config["active_broker"] = chosen
+                        populate_account_dropdown()
+                        broker_reconfig_in_progress = False
+                        refresh_baseline_preview(force_restore=True)
+                else:
+                    if active_adapter is not None:
+                        var_broker.set(active_adapter.name)
+                        _sync_broker_acct_pills()
             finally:
                 broker_reconfig_in_progress = False
-            if new_ad is not None:
-                active_adapter = new_ad
-                config["active_broker"] = chosen
-                populate_account_dropdown()
-                refresh_baseline_preview(force_restore=True)
-            else:
-                if active_adapter is not None:
-                    var_broker.set(active_adapter.name)
-                    _sync_broker_acct_pills()
 
     def edit_api_keys():
-        global active_adapter, broker_reconfig_in_progress
-        if is_in_trade_tamper_locked():
+        global active_adapter, broker_reconfig_in_progress, _initial_positions_verified
+        if is_in_trade_tamper_locked() and not (
+            consecutive_api_failures >= 2 or api_disconnect_alerted
+        ):
             return
         chosen = var_broker.get()
         broker_reconfig_in_progress = True
@@ -14784,13 +16627,16 @@ def show_preflight_window(
             new_ad = connect_broker_adapter(
                 chosen, parent=pf, force_wizard=True
             )
+            if new_ad is not None:
+                with _in_flight_poll_lock:
+                    _initial_positions_verified = False
+                    active_adapter = new_ad
+                    config["active_broker"] = chosen
+                    populate_account_dropdown()
+                    broker_reconfig_in_progress = False
+                    refresh_baseline_preview(force_restore=True)
         finally:
             broker_reconfig_in_progress = False
-        if new_ad is not None:
-            active_adapter = new_ad
-            config["active_broker"] = chosen
-            populate_account_dropdown()
-            refresh_baseline_preview(force_restore=True)
 
     def open_hud_columns_dialog():
         hide_all_tooltips()
@@ -17142,7 +18988,7 @@ def show_preflight_window(
                 "enable_t3": bool(var_t3_on.get()),
                 "enable_t4": bool(var_t4_on.get()),
                 "hud_columns": list(selected_hud_columns),
-                "poll_interval": max(1, int(float(var_poll.get())))
+                "poll_interval": min(10, max(1, int(float(var_poll.get()))))
             }
             for k in dollar_keys:
                 raw_v = float(dollar_vars[k].get())
@@ -17173,7 +19019,7 @@ def show_preflight_window(
     def save_and_launch():
         global settings_win_open, triggered_alarms, first_poll_of_launch
         global force_reanchor, is_locked_down, current_is_flat, active_adapter
-        global active_preflight_close_fn
+        global active_preflight_close_fn, breach_visual_sim_active
 
         if dry_run_lock_active or cooldown_active:
             log_event(
@@ -17192,7 +19038,7 @@ def show_preflight_window(
 
         if is_in_trade_tamper_locked():
             try:
-                new_poll = max(1, int(float(var_poll.get())))
+                new_poll = min(10, max(1, int(float(var_poll.get()))))
             except ValueError:
                 messagebox.showerror(
                     "Invalid Input",
@@ -17228,7 +19074,7 @@ def show_preflight_window(
                         )
                     )
                 elif not cooldown_active:
-                    mute_btn.config(text=get_idle_button_text())
+                    apply_idle_button_config(mute_btn)
             launched["status"] = True
             _remember_pf_pos()
             active_preflight_close_fn = None
@@ -17402,7 +19248,7 @@ def show_preflight_window(
             new_cfg["enable_t3"] = bool(var_t3_on.get())
             new_cfg["enable_t4"] = bool(var_t4_on.get())
             new_cfg["hud_columns"] = list(selected_hud_columns)
-            new_cfg["poll_interval"] = max(1, int(float(var_poll.get())))
+            new_cfg["poll_interval"] = min(10, max(1, int(float(var_poll.get()))))
 
             for k in dollar_keys:
                 raw_v = float(dollar_vars[k].get())
@@ -17463,6 +19309,7 @@ def show_preflight_window(
             if var_reanchor.get() and not is_tilt_streak_tamper_locked():
                 force_reanchor = True
                 is_locked_down = False
+                breach_visual_sim_active = False
                 daily_breach_settings_prompted = False
                 recent_loss_timestamps.clear()
                 triggered_alarms.clear()
@@ -17477,6 +19324,19 @@ def show_preflight_window(
                 new_cfg["saved_daily_max_equity"] = None
                 log_event("CONFIG", "User checked Force Re-Anchor Baseline.")
             else:
+                if breach_visual_sim_active:
+                    old_st_pnl = describe_active_floor(config)[1]
+                    new_st_pnl = describe_active_floor(new_cfg)[1]
+                    if (
+                        new_st_pnl < old_st_pnl
+                        or new_cfg.get("alarms_only_mode", False)
+                        or not new_cfg.get("enable_auto_flatten", False)
+                    ):
+                        breach_visual_sim_active = False
+                        log_event(
+                            "SESSION",
+                            "Simulated HUD Breach Mode cleared after raising Daily Stop limit in Settings.",
+                        )
                 s_key = get_session_key(chosen_b, active_adapter.account_id)
                 if (
                     s_key
@@ -17517,7 +19377,16 @@ def show_preflight_window(
                     is_locked_down = True
                     log_event(
                         "GUARDRAIL",
-                        f"Daily Stop remains BREACHED / DISARMED after Settings save "
+                        f"Daily Stop remains BREACHED after Settings save "
+                        f"(Net PnL {format_dollar(round(ref_eq - start_equity, 2))} <= "
+                        f"Daily Stop {format_dollar(round(new_floor - start_equity, 2))} "
+                        f"[{new_tier_short}]). "
+                        f"New positions will be force-flattened until Daily Stop is raised or Re-Zeroed."
+                        if (
+                            not new_cfg.get("alarms_only_mode", False)
+                            and new_cfg.get("enable_auto_flatten", False)
+                        )
+                        else f"Daily Stop remains BREACHED / DISARMED after Settings save "
                         f"(Net PnL {format_dollar(round(ref_eq - start_equity, 2))} <= "
                         f"Daily Stop {format_dollar(round(new_floor - start_equity, 2))} "
                         f"[{new_tier_short}]). "
@@ -17539,6 +19408,15 @@ def show_preflight_window(
                             f"[{new_tier_short}] "
                             f"({format_dollar(round(ref_eq - new_floor, 2))} buffer to stop)."
                         )
+                if (
+                    s_key
+                    and isinstance(new_cfg.get("account_sessions"), dict)
+                    and s_key in new_cfg["account_sessions"]
+                ):
+                    new_cfg["account_sessions"][s_key]["is_locked_down"] = bool(is_locked_down)
+                    new_cfg["account_sessions"][s_key]["breach_date"] = (
+                        get_today_str() if is_locked_down else ""
+                    )
 
             save_config(new_cfg)
             log_event("CONFIG", format_config_summary(new_cfg))
@@ -17552,7 +19430,7 @@ def show_preflight_window(
                         )
                     )
                 elif not cooldown_active:
-                    mute_btn.config(text=get_idle_button_text())
+                    apply_idle_button_config(mute_btn)
 
             launched["status"] = True
             _remember_pf_pos()
@@ -19441,6 +21319,8 @@ def show_preflight_window(
         "Voice: 30s Warning",
         "Unlock Chime (3-Tone)",
         "Full 10s Dry-Run Lockout",
+        "Preview: Post-Breach Lockout Popup",
+        "Simulate: HUD Breach Mode (Toggle ON/OFF)",
     ]
     for _mk in list(_prefs_modal_refs.keys()):
         _prefs_modal_refs[_mk] = None
@@ -19926,6 +21806,52 @@ def show_preflight_window(
                         pass
 
             threading.Thread(target=_dry_run_seq, daemon=True).start()
+        elif choice == "Preview: Post-Breach Lockout Popup":
+            prefs_dlg = _prefs_modal_refs.get("dlg")
+            if prefs_dlg is not None:
+                try:
+                    if prefs_dlg.winfo_exists():
+                        _restore_pf_modal_focus(prefs_dlg)
+                except Exception:
+                    pass
+                for _mk in list(_prefs_modal_refs.keys()):
+                    _prefs_modal_refs[_mk] = None
+            log_event(
+                "SESSION",
+                "User opened Post-Breach Lockout Popup preview from Preferences & Audio.",
+            )
+            pf.after(40, lambda: show_daily_breach_return_notice(is_preview=True))
+        elif choice == "Simulate: HUD Breach Mode (Toggle ON/OFF)":
+            global breach_visual_sim_active
+            breach_visual_sim_active = not bool(breach_visual_sim_active)
+            sim_on = bool(breach_visual_sim_active)
+            log_event(
+                "SESSION",
+                f"User toggled HUD Breach Mode visual simulation {'ON' if sim_on else 'OFF'} "
+                f"(safe visual preview — 0 orders).",
+            )
+            _sync_hud_breach_banner(current_is_flat)
+            if mute_btn is not None and not alarm_active and not cooldown_active:
+                apply_idle_button_config(mute_btn)
+            if sim_on:
+                prefs_dlg = _prefs_modal_refs.get("dlg")
+                if prefs_dlg is not None:
+                    try:
+                        if prefs_dlg.winfo_exists():
+                            _restore_pf_modal_focus(prefs_dlg)
+                    except Exception:
+                        pass
+                    for _mk in list(_prefs_modal_refs.keys()):
+                        _prefs_modal_refs[_mk] = None
+                pf.after(
+                    40, lambda: show_daily_breach_return_notice(is_preview=True)
+                )
+            else:
+                if default_status_lbl is not None:
+                    default_status_lbl.config(
+                        text="✓ HUD Breach Mode visual simulation turned OFF.",
+                        fg="#58d68d",
+                    )
 
     def open_preferences_audio_dialog():
         hide_all_tooltips()
@@ -20379,8 +22305,8 @@ def show_preflight_window(
                 raw_p = str(var_poll.get()).strip()
                 try:
                     p_chk = float(raw_p)
-                    if not raw_p or p_chk < 1.0:
-                        var_poll.set(initial_poll_str)
+                    if not raw_p or p_chk < 1.0 or p_chk > 10.0:
+                        var_poll.set(str(min(10, max(1, int(float(initial_poll_str or 2))))))
                 except Exception:
                     var_poll.set(initial_poll_str)
             for _var_obj, _tid in (
@@ -20407,12 +22333,12 @@ def show_preflight_window(
                 if not raw_p:
                     raise ValueError("empty")
                 p_num = float(raw_p)
-                if p_num < 1.0:
-                    raise ValueError("lt1")
-                p_val = int(p_num)
+                if p_num < 1.0 or p_num > 10.0:
+                    raise ValueError("range")
+                p_val = min(10, max(1, int(p_num)))
             except Exception:
                 lbl_poll_err.config(
-                    text="API Poll Interval must be a number >= 1 second."
+                    text="API Poll Interval must be between 1 and 10 seconds."
                 )
                 if not lbl_poll_err.winfo_manager():
                     lbl_poll_err.pack(fill="x", pady=(4, 0))
@@ -22937,12 +24863,12 @@ def show_preflight_window(
         "Open the public GitHub Gist bundle in your browser to inspect or download the full source code."
     )
 
-    def show_daily_breach_return_notice():
-        """Displays a friendly dark-glass notice after a Daily Stop breach
-        lockout finishes (or siren is muted), reminding the trader to raise
-        their Daily Stop or Re-Zero Baseline if they want an active Daily Stop,
-        or leave it as-is in BREACHED (DISARMED) mode so a new trade does not
-        immediately stop them out on entry."""
+    def show_daily_breach_return_notice(is_preview=False):
+        """Displays a high-visibility dark-glass notice after a Daily Stop breach
+        lockout finishes (or siren is muted), warning the trader in prominent
+        crimson text that any new positions will be immediately force-flattened
+        until they raise their Daily Stop limit or Re-Zero their baseline."""
+        global breach_visual_sim_active
         hide_all_tooltips()
         _stop_control_pulse()
         if not pf.winfo_exists():
@@ -22952,29 +24878,53 @@ def show_preflight_window(
         )
         (
             act_fl,
-            _,
+            st_pnl_val,
             _,
             tier_short_label,
             tier_full_desc,
             setting_field_hint,
         ) = describe_active_floor(config)
+        is_sim = bool(
+            is_preview
+            or (
+                breach_visual_sim_active
+                and not is_locked_down
+            )
+        )
         if (
-            ref_eq is not None
+            not is_sim
+            and ref_eq is not None
             and start_equity is not None
             and act_fl is not None
+            and ref_eq <= act_fl
         ):
             cur_net_str = format_dollar(round(ref_eq - start_equity, 2))
             stop_lvl_str = format_dollar(round(act_fl - start_equity, 2))
             over_val = abs(round(ref_eq - act_fl, 2))
             over_str = f"-${over_val:,.2f} OVER"
         else:
-            cur_net_str = "below floor"
-            stop_lvl_str = "Daily Stop"
-            over_str = "BREACHED"
+            sim_stop = float(st_pnl_val if st_pnl_val is not None else -1500.0)
+            sim_net = round(sim_stop - 142.50, 2)
+            cur_net_str = format_dollar(sim_net)
+            stop_lvl_str = format_dollar(sim_stop)
+            over_str = "-$142.50 OVER"
+
+        ff_armed = bool(
+            is_sim
+            or (
+                not config.get("alarms_only_mode", False)
+                and config.get("enable_auto_flatten", False)
+            )
+        )
+        reset_on = bool(config.get("reset_at_925", True))
 
         dlg = tk.Toplevel(pf)
         dlg.withdraw()
-        dlg.title("PnL Enforcer — Daily Stop Breached")
+        dlg.title(
+            "PnL Enforcer — Daily Stop Breached (Preview)"
+            if is_sim
+            else "PnL Enforcer — Daily Stop Breached (Force-Flatten Active)"
+        )
         dlg.configure(bg="#0d1117", padx=24, pady=20)
         dlg.resizable(False, False)
         dlg.transient(pf)
@@ -22984,10 +24934,28 @@ def show_preflight_window(
             _restore_pf_modal_focus(dlg)
 
         def on_close_keep_as_is():
+            global breach_visual_sim_active
+            if is_sim:
+                breach_visual_sim_active = True
+                _sync_hud_breach_banner(current_is_flat)
+                if mute_btn is not None and not alarm_active and not cooldown_active:
+                    apply_idle_button_config(mute_btn)
             _restore_pf_modal_focus(dlg)
-            on_close()
+            if parent is not None or not is_sim:
+                on_close()
+            elif default_status_lbl is not None:
+                default_status_lbl.config(
+                    text="🚨 HUD Breach Mode simulation is armed — click 'SAVE & LAUNCH ENFORCER >>' to view on HUD.",
+                    fg="#fca5a5",
+                )
 
         def on_arm_rezero():
+            global breach_visual_sim_active
+            if is_sim:
+                breach_visual_sim_active = False
+                _sync_hud_breach_banner(current_is_flat)
+                if mute_btn is not None and not alarm_active and not cooldown_active:
+                    apply_idle_button_config(mute_btn)
             if not is_tilt_streak_tamper_locked():
                 var_reanchor.set(True)
             _restore_pf_modal_focus(dlg)
@@ -23008,22 +24976,58 @@ def show_preflight_window(
 
         tk.Label(
             hdr_row,
-            text="⚠️ DAILY STOP DISARMED",
+            text=(
+                "🚨 NEW TRADES AUTO-FLATTENED"
+                if ff_armed
+                else "⚠️ DAILY STOP BREACHED"
+            ),
             font=("Arial", 8, "bold"),
-            fg="#fecdd3",
-            bg="#4c0519",
+            fg="#ffffff" if ff_armed else "#fecdd3",
+            bg="#991b1b" if ff_armed else "#4c0519",
             padx=8,
             pady=3,
         ).pack(side="right", padx=(12, 0))
 
-        tk.Label(
-            dlg,
-            text="Your Daily Stop lockout has finished. Before placing another trade, please review your Daily Stop:",
-            font=("Arial", 9, "bold"),
-            fg="#94a3b8",
-            bg="#0d1117",
-            anchor="w",
-        ).pack(fill="x", pady=(0, 10))
+        if ff_armed:
+            warn_banner = tk.Frame(
+                dlg,
+                bg="#991b1b",
+                bd=0,
+                highlightthickness=2,
+                highlightbackground="#ff4d4d",
+                padx=18,
+                pady=12,
+            )
+            warn_banner.pack(fill="x", pady=(4, 12))
+            tk.Label(
+                warn_banner,
+                text="🚨 ANY NEW POSITIONS WILL BE IMMEDIATELY FORCE-FLATTENED!",
+                font=("Arial", 12, "bold"),
+                fg="#ffffff",
+                bg="#991b1b",
+                anchor="w",
+            ).pack(fill="x")
+            tk.Label(
+                warn_banner,
+                text=(
+                    "Your account is in Post-Breach Lockout Mode. Until you raise your Daily Stop limit below\n"
+                    "or Re-Zero your baseline (or close PnL Enforcer), any new tracked position opened will be closed immediately."
+                ),
+                font=("Arial", 10, "bold"),
+                fg="#fee2e2",
+                bg="#991b1b",
+                justify="left",
+                anchor="w",
+            ).pack(fill="x", pady=(4, 0))
+        else:
+            tk.Label(
+                dlg,
+                text="Your Daily Stop lockout has finished. Before placing another trade, please review your Daily Stop:",
+                font=("Arial", 9, "bold"),
+                fg="#94a3b8",
+                bg="#0d1117",
+                anchor="w",
+            ).pack(fill="x", pady=(0, 10))
 
         card_outer = tk.Frame(
             dlg,
@@ -23129,10 +25133,15 @@ def show_preflight_window(
             ("    Active Rule: ", ("body",)),
             (f" {tier_full_desc} ", ("body", "pill_amber")),
             ("\n", ("body",)),
-            ("    To prevent an instant stop-out on your next entry, your Daily Stop is held in\n", ("body",)),
-            ("    ", ("body",)),
-            (" DAY STOP: BREACHED (DISARMED) ", ("body", "pill_red")),
-            (" mode until you adjust it or recover above the floor.\n", ("body",)),
+            (
+                "    To enforce your daily rulebook, your account is held in ",
+                ("body",),
+            ),
+            (
+                " POST-BREACH FORCE-FLATTEN " if ff_armed else " DAY STOP: BREACHED ",
+                ("body", "pill_red"),
+            ),
+            (" mode until you adjust your limits.\n", ("body",)),
         ]
         for s_txt, s_tags in s1_spans:
             txt_box.insert("end", s_txt, s_tags)
@@ -23141,7 +25150,7 @@ def show_preflight_window(
 
         txt_box.insert(
             "end",
-            "✔  2. TO RE-ARM YOUR DAILY STOP FOR THE REST OF TODAY\n",
+            "✔  2. TO UNLOCK & RESUME TRADING TODAY\n",
             "hdr_green",
         )
         s2_spans = [
@@ -23157,6 +25166,15 @@ def show_preflight_window(
             (" ↺ Arm Re-Zero Baseline ($0.00) ", ("body", "pill_amber")),
             (" below to start a fresh $0.00 session baseline.\n", ("body",)),
         ]
+        if reset_on:
+            s2_spans.extend(
+                [
+                    (
+                        "    • Note: Because 9:30 AM / 4:00 PM Ratchet Reset is ON, the next session switch also resets ratchets to Base Tier 1.\n",
+                        ("body",),
+                    )
+                ]
+            )
         for s_txt, s_tags in s2_spans:
             txt_box.insert("end", s_txt, s_tags)
 
@@ -23164,25 +25182,31 @@ def show_preflight_window(
 
         txt_box.insert(
             "end",
-            "🛡️  3. IF YOU KEEP TRADING WITHOUT CHANGING IT\n",
-            "hdr_amber",
+            "🚨  3. IF YOU KEEP SETTINGS AS-IS (POST-BREACH LOCKOUT)\n",
+            "hdr_red" if ff_armed else "hdr_amber",
         )
-        s3_spans = [
-            ("    • If you close Settings or save without raising your limit, the HUD displays ", ("body",)),
-            (" BREACHED ", ("body", "pill_red")),
-            ("\n", ("body",)),
-            ("      in ", ("body",)),
-            (" $ TO STOP ", ("body", "pill_blue")),
-            (" and ", ("body",)),
-            (" DAY STOP: BREACHED ", ("body", "pill_amber")),
-            (" in the status pill.\n", ("body",)),
-            ("    • New trades will NOT immediately flatten on the old Daily Stop, while Card 1\n", ("body",)),
-            ("      (", ("body",)),
-            (" Open PnL Auto-Flatten ", ("body", "pill_blue")),
-            (" & ", ("body",)),
-            (" Consecutive Loss Cooldown ", ("body", "pill_blue")),
-            (") stays 100% active.", ("body",)),
-        ]
+        if ff_armed:
+            s3_spans = [
+                ("    • If you close Settings without raising your limit, the entire HUD turns crimson:\n", ("body",)),
+                ("      ", ("body",)),
+                (" 🚨 DAILY STOP BREACHED — NEW POSITIONS WILL BE FORCE-FLATTENED ", ("body", "pill_red")),
+                (".\n", ("body",)),
+                ("    • ", ("body",)),
+                (" ANY NEW POSITION YOU OPEN WILL BE IMMEDIATELY AUTO-FLATTENED ", ("body", "pill_red")),
+                (" until you raise your Daily Stop in ", ("body",)),
+                (" ⚙ Settings ", ("body", "pill_blue")),
+                (".\n", ("body",)),
+                ("    • Pre-existing Ignored Swing positions remain untouched.", ("body",)),
+            ]
+        else:
+            s3_spans = [
+                ("    • If you close Settings or save without raising your limit, the HUD displays ", ("body",)),
+                (" BREACHED ", ("body", "pill_red")),
+                (" in ", ("body",)),
+                (" $ TO STOP ", ("body", "pill_blue")),
+                (".\n", ("body",)),
+                ("    • Because Auto-Flatten is OFF (or Alarms Only Mode is ON), Enforcer will remain in observation mode.", ("body",)),
+            ]
         for s_txt, s_tags in s3_spans:
             txt_box.insert("end", s_txt, s_tags)
 
@@ -23332,6 +25356,7 @@ def show_preflight_window(
                 def _finish_bg_sync_on_ui():
                     global start_equity, last_flat_equity, prev_flat_realized_pnl
                     global settled_realized_pnl, anchor_cash_flow, force_reanchor
+                    global _initial_positions_verified, current_is_flat
                     if pf_timer_state.get("closing"):
                         return
                     try:
@@ -23364,6 +25389,9 @@ def show_preflight_window(
                     if snap is None:
                         return
                     eq_now, is_fl_now, live_opnl, _, _ = snap
+                    if eq_now is not None and eq_now > 0:
+                        _initial_positions_verified = True
+                        current_is_flat = bool(is_fl_now)
                     had_svd = bool(_preexisting_state.get("had_saved", False))
                     if (
                         had_svd
@@ -23395,6 +25423,7 @@ def show_preflight_window(
                                     )
                                 )
                             live_opnl = 0.0
+                            current_is_flat = True
                         if eq_now is not None and eq_now > 0:
                             start_equity = round(eq_now - live_opnl, 2)
                             anchor_cash_flow = ad.get_last_intraday_cash_flow()
@@ -23448,6 +25477,115 @@ hud_last_leash_bg = "#262a2e"
 hud_start_move_fn = None
 hud_do_move_fn = None
 hud_end_move_fn = None
+hud_breach_banner_frame = None
+hud_breach_banner_title_lbl = None
+hud_breach_banner_sub_lbl = None
+hud_settings_btn = None
+hud_close_btn = None
+
+
+def _get_hud_breach_banner_text(n_cols):
+    """Returns (title_txt, title_font, sub_txt, sub_font) scaled to fit the
+    active HUD column count (2 to 9 columns) when Post-Breach Force-Flatten
+    is active and the account is flat."""
+    if n_cols <= 2:
+        return (
+            "🚨 DAILY BREACH MODE",
+            ("Arial", 10, "bold"),
+            "NEW TRADES AUTO-FLATTENED · RAISE LIMITS",
+            ("Arial", 8, "bold"),
+        )
+    if n_cols == 3:
+        return (
+            "🚨 DAILY STOP BREACHED — LOCKOUT MODE",
+            ("Arial", 10, "bold"),
+            "NEW POSITIONS AUTO-FLATTENED UNTIL LIMITS RAISED IN SETTINGS",
+            ("Arial", 8, "bold"),
+        )
+    if n_cols == 4:
+        return (
+            "🚨 DAILY STOP BREACHED — NEW POSITIONS WILL BE AUTO-FLATTENED",
+            ("Arial", 11, "bold"),
+            "Click '⚙ RAISE LIMITS' below to raise your Daily Stop or Re-Zero Baseline",
+            ("Arial", 8, "bold"),
+        )
+    return (
+        "🚨 DAILY STOP BREACHED — ANY NEW POSITIONS WILL BE IMMEDIATELY FORCE-FLATTENED",
+        ("Arial", 11, "bold"),
+        "Post-Breach Lockout Active  ·  Click '⚙ RAISE LIMITS' below to raise your Daily Stop or Re-Zero ($0.00)",
+        ("Arial", 9, "bold"),
+    )
+
+
+def _sync_hud_breach_banner(is_flat_now=None):
+    """Shows or hides the full-width crimson Post-Breach Force-Flatten HUD
+    banner. Only displayed when Post-Breach Force-Flatten is active, the
+    account is flat, and the broker API is online (so live Open PnL or OFFLINE
+    telemetry is never obscured)."""
+    if (
+        hud_breach_banner_frame is None
+        or not hud_breach_banner_frame.winfo_exists()
+    ):
+        return
+    if is_flat_now is None:
+        is_flat_now = current_is_flat
+    show_banner = bool(
+        is_post_breach_force_flatten_active()
+        and is_flat_now
+        and consecutive_api_failures < 2
+        and not api_disconnect_alerted
+    )
+    n_cols = len(get_active_hud_columns(config))
+    if show_banner:
+        b_title_txt, b_title_fnt, b_sub_txt, b_sub_fnt = (
+            _get_hud_breach_banner_text(n_cols)
+        )
+        if hud_breach_banner_title_lbl is not None:
+            hud_breach_banner_title_lbl.config(
+                text=b_title_txt, font=b_title_fnt
+            )
+        if hud_breach_banner_sub_lbl is not None:
+            hud_breach_banner_sub_lbl.config(text=b_sub_txt, font=b_sub_fnt)
+        if not hud_breach_banner_frame.winfo_ismapped():
+            hud_breach_banner_frame.place(
+                relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0
+            )
+        hud_breach_banner_frame.lift()
+    else:
+        if hud_breach_banner_frame.winfo_ismapped():
+            hud_breach_banner_frame.place_forget()
+
+    if (
+        hud_settings_btn is not None
+        and hud_settings_btn.winfo_exists()
+        and not cooldown_active
+        and is_flat_now
+    ):
+        if is_post_breach_force_flatten_active():
+            s_txt = "⚙ LIMITS" if n_cols <= 2 else "⚙ RAISE LIMITS"
+            hud_settings_btn.config(
+                text=s_txt,
+                fill_color="#7f1d1d",
+                fill_top_color="#991b1b",
+                border_color="#ef4444",
+                hover_fill="#991b1b",
+                hover_fill_top="#b91c1c",
+                hover_border="#f87171",
+                fg="#ffffff",
+                state="normal",
+            )
+        else:
+            hud_settings_btn.config(
+                text="⚙ SETTINGS",
+                fill_color="#141922",
+                fill_top_color="#1c2430",
+                border_color="#2e3d4f",
+                hover_fill="#1e293b",
+                hover_fill_top="#293548",
+                hover_border="#38bdf8",
+                fg="#e2e8f0",
+                state="normal",
+            )
 
 
 def get_saved_hud_position(w_px, h_px=88, fallback_widget=None):
@@ -23566,6 +25704,7 @@ def rebuild_hud_columns():
     """Dynamically builds or rebuilds the HUD columns inside hud_grid_frame
     and adjusts the HUD window width while preserving screen position."""
     global hud_ui_labels, hud_leash_bar, hud_leash_col_frame, hud_leash_idx
+    global hud_breach_banner_frame, hud_breach_banner_title_lbl, hud_breach_banner_sub_lbl
     if hud_grid_frame is None or hud_root is None:
         return
 
@@ -23581,6 +25720,9 @@ def rebuild_hud_columns():
     hud_leash_bar = None
     hud_leash_col_frame = None
     hud_leash_idx = None
+    hud_breach_banner_frame = None
+    hud_breach_banner_title_lbl = None
+    hud_breach_banner_sub_lbl = None
 
     for i, col_id in enumerate(active_cols):
         title = HUD_COL_HEADERS.get(col_id, col_id.upper())
@@ -23659,6 +25801,48 @@ def rebuild_hud_columns():
 
         hud_ui_labels.append(val_lbl)
 
+    hud_breach_banner_frame = tk.Frame(
+        hud_grid_frame,
+        bg="#7f1d1d",
+        bd=0,
+        highlightthickness=2,
+        highlightbackground="#ef4444",
+    )
+    b_title_txt, b_title_fnt, b_sub_txt, b_sub_fnt = _get_hud_breach_banner_text(
+        len(active_cols)
+    )
+    hud_breach_banner_title_lbl = tk.Label(
+        hud_breach_banner_frame,
+        text=b_title_txt,
+        font=b_title_fnt,
+        fg="#ffffff",
+        bg="#7f1d1d",
+        justify="center",
+        pady=2,
+    )
+    hud_breach_banner_title_lbl.pack(fill="x", pady=(6, 0))
+    hud_breach_banner_sub_lbl = tk.Label(
+        hud_breach_banner_frame,
+        text=b_sub_txt,
+        font=b_sub_fnt,
+        fg="#fecaca",
+        bg="#7f1d1d",
+        justify="center",
+    )
+    hud_breach_banner_sub_lbl.pack(fill="x", pady=(1, 4))
+    if hud_start_move_fn and hud_do_move_fn:
+        for bw in (
+            hud_breach_banner_frame,
+            hud_breach_banner_title_lbl,
+            hud_breach_banner_sub_lbl,
+        ):
+            bw.bind("<Button-1>", hud_start_move_fn)
+            bw.bind("<B1-Motion>", hud_do_move_fn)
+            if hud_end_move_fn is not None:
+                bw.bind("<ButtonRelease-1>", hud_end_move_fn)
+
+    _sync_hud_breach_banner(current_is_flat)
+
     w_px = compute_hud_width(len(active_cols))
     try:
         if (
@@ -23730,6 +25914,7 @@ def update_gui(
         _redraw_hud_leash_canvas()
 
     refresh_acct_badge()
+    _sync_hud_breach_banner(is_flat)
 
     if cooldown_active:
         settings_btn.config(
@@ -23751,17 +25936,31 @@ def update_gui(
             state="disabled",
         )
     elif is_flat:
-        settings_btn.config(
-            text="⚙ SETTINGS",
-            fill_color="#141922",
-            fill_top_color="#1c2430",
-            border_color="#2e3d4f",
-            hover_fill="#1e293b",
-            hover_fill_top="#293548",
-            hover_border="#38bdf8",
-            fg="#e2e8f0",
-            state="normal",
-        )
+        if is_post_breach_force_flatten_active():
+            s_txt = "⚙ LIMITS" if len(active_cols) <= 2 else "⚙ RAISE LIMITS"
+            settings_btn.config(
+                text=s_txt,
+                fill_color="#7f1d1d",
+                fill_top_color="#991b1b",
+                border_color="#ef4444",
+                hover_fill="#991b1b",
+                hover_fill_top="#b91c1c",
+                hover_border="#f87171",
+                fg="#ffffff",
+                state="normal",
+            )
+        else:
+            settings_btn.config(
+                text="⚙ SETTINGS",
+                fill_color="#141922",
+                fill_top_color="#1c2430",
+                border_color="#2e3d4f",
+                hover_fill="#1e293b",
+                hover_fill_top="#293548",
+                hover_border="#38bdf8",
+                fg="#e2e8f0",
+                state="normal",
+            )
         close_btn.config(
             text="✕",
             fill_color="#180f13",
@@ -23782,15 +25981,25 @@ def update_gui(
             fg="#fde68a",
             state="normal",
         )
-        close_btn.config(
-            text="🔒",
-            fill_color="#1e2228",
-            fill_top_color="#262a30",
-            border_color="#4b5563",
-            fg="#9ca3af",
-            disabledforeground="#9ca3af",
-            state="disabled",
-        )
+        if consecutive_api_failures >= 2 or api_disconnect_alerted:
+            close_btn.config(
+                text="✕",
+                fill_color="#180f13",
+                fill_top_color="#24161c",
+                border_color="#5c2836",
+                fg="#fda4af",
+                state="normal",
+            )
+        else:
+            close_btn.config(
+                text="🔒",
+                fill_color="#1e2228",
+                fill_top_color="#262a30",
+                border_color="#4b5563",
+                fg="#9ca3af",
+                disabledforeground="#9ca3af",
+                state="disabled",
+            )
 
     if not settings_win_open and ui_labels:
         top = ui_labels[0].winfo_toplevel()
@@ -23872,11 +26081,17 @@ def attach_hud_mute_tooltip(widget, hud_win):
             _, st_pnl, _, tier_short_tip, _, hint_tip = describe_active_floor(
                 config
             )
-            if is_locked_down:
-                ld_txt = (
-                    f"⚠️ DAILY STOP BREACHED ({format_dollar(st_pnl)} · {tier_short_tip} — DISARMED): "
-                    f"Adjust {hint_tip} or Re-Zero Baseline in Settings (Card 1 Trade/Tilt Stops remain active)."
-                )
+            if is_locked_down or breach_visual_sim_active:
+                if is_post_breach_force_flatten_active():
+                    ld_txt = (
+                        f"🚨 POST-BREACH FORCE-FLATTEN ACTIVE ({format_dollar(st_pnl)} · {tier_short_tip}): "
+                        f"Any new tracked position will be immediately flattened! Raise {hint_tip} or Re-Zero in Settings."
+                    )
+                else:
+                    ld_txt = (
+                        f"⚠️ DAILY STOP BREACHED ({format_dollar(st_pnl)} · {tier_short_tip} — DISARMED): "
+                        f"Adjust {hint_tip} or Re-Zero Baseline in Settings (Card 1 Trade/Tilt Stops remain active)."
+                    )
                 tk.Label(
                     inner,
                     text=ld_txt,
@@ -23999,6 +26214,7 @@ def attach_hud_mute_tooltip(widget, hud_win):
 def start_gui():
     global acct_badge_lbl, hud_root, hud_grid_frame
     global hud_ui_labels, hud_start_move_fn, hud_do_move_fn, hud_end_move_fn
+    global hud_settings_btn, hud_close_btn
     root = tk.Tk()
     hud_root = root
     root.title(f"PnL Enforcer v{APP_VERSION}")
@@ -24068,7 +26284,9 @@ def start_gui():
                 "BLOCKED: Attempted to close HUD during an active lockout cooldown!",
             )
             return "break"
-        if not current_is_flat:
+        if not current_is_flat and not (
+            consecutive_api_failures >= 2 or api_disconnect_alerted
+        ):
             log_event(
                 "GUARDRAIL",
                 "BLOCKED: Attempted to close HUD while in a position!"
@@ -24144,15 +26362,17 @@ def start_gui():
         command=close_app,
     )
     close_btn.pack(side="right", padx=(2, 2))
+    hud_close_btn = close_btn
 
+    init_bg, init_fg, init_rim, init_glow = get_idle_button_style()
     mute_btn = HudCapsulePill(
         bottom_bar,
         text=get_idle_button_text(),
         font=("Arial", 8, "bold"),
-        bg="#282c31",
-        fg="#ffca58",
-        rim="#6c757d",
-        glow="#343a40",
+        bg=init_bg,
+        fg=init_fg,
+        rim=init_rim,
+        glow=init_glow,
         width=80,
         height=24,
         state="disabled",
@@ -24179,6 +26399,8 @@ def start_gui():
         command=lambda: show_preflight_window(parent=root, mute_btn=mute_btn),
     )
     settings_btn.pack(side="right", padx=(0, 2))
+    hud_settings_btn = settings_btn
+    _sync_hud_breach_banner(current_is_flat)
 
     mute_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
     attach_hud_mute_tooltip(mute_btn, root)
@@ -24213,8 +26435,19 @@ def start_gui():
                         save_session_state()
                 if not alarm_active and not cooldown_active:
                     new_idle = get_idle_button_text()
-                    if getattr(mute_btn, "_text", "") != new_idle:
-                        mute_btn.config(text=new_idle)
+                    new_bg, new_fg, new_rim, new_glow = get_idle_button_style()
+                    if (
+                        getattr(mute_btn, "_text", "") != new_idle
+                        or getattr(mute_btn, "_bg", "") != new_bg
+                    ):
+                        mute_btn.config(
+                            text=new_idle,
+                            bg=new_bg,
+                            fg=new_fg,
+                            disabledforeground=new_fg,
+                            rim=new_rim,
+                            glow=new_glow,
+                        )
         except Exception:
             pass
         try:
@@ -24225,11 +26458,90 @@ def start_gui():
 
     root.after(200, _tick_loss_streak_hud)
 
+    hb_state = {"warned": False}
+
+    def _check_data_loop_heartbeat():
+        """Monitors last_data_loop_heartbeat from the Tk mainloop every 5s and
+        surfaces a non-destructive stall warning if the polling loop has not
+        advanced for >45 seconds (never spawns a second data_loop thread)."""
+        try:
+            if not root.winfo_exists():
+                return
+            if last_data_loop_heartbeat > 0:
+                age = time.time() - last_data_loop_heartbeat
+                if age > 45.0:
+                    if not hb_state["warned"]:
+                        hb_state["warned"] = True
+                        log_event(
+                            "WARN",
+                            f"Data loop heartbeat stalled ({age:.1f}s since last poll iteration).",
+                        )
+                    if not cooldown_active and not alarm_active:
+                        st_txt = (
+                            "⚠️ POLL STALLED"
+                            if is_compact_hud()
+                            else "⚠️ DATA LOOP STALLED (>45s) — CHECK NETWORK OR RESTART"
+                        )
+                        mute_btn.config(
+                            text=st_txt,
+                            bg="#78350f",
+                            fg="#fde68a",
+                            disabledforeground="#fde68a",
+                            state="disabled",
+                        )
+                elif hb_state["warned"]:
+                    hb_state["warned"] = False
+                    log_event(
+                        "SESSION",
+                        "Data loop heartbeat recovered and resumed polling.",
+                    )
+                    if not cooldown_active and not alarm_active:
+                        apply_idle_button_config(mute_btn)
+        except Exception:
+            pass
+        try:
+            root.after(5000, _check_data_loop_heartbeat)
+        except Exception:
+            pass
+
+    root.after(5000, _check_data_loop_heartbeat)
+
     threading.Thread(
         target=data_loop,
         args=(ui_labels, mute_btn, settings_btn, close_btn, root),
         daemon=True
     ).start()
+
+    try:
+        saved_cd_end = float(config.get("active_cooldown_end_epoch", 0.0) or 0.0)
+        rem_cd_sec = saved_cd_end - time.time()
+        if rem_cd_sec > 2.0:
+            rem_cd_mins = max(0.08, rem_cd_sec / 60.0)
+            saved_cd_lbl = str(
+                config.get("active_cooldown_label") or "RESUMED LOCKOUT"
+            )
+            log_event(
+                "GUARDRAIL",
+                f"Resuming unfinished OS lockout timer from disk "
+                f"({rem_cd_sec:.0f}s remaining · {saved_cd_lbl}).",
+            )
+            root.after(
+                150,
+                lambda m=rem_cd_mins, lbl=saved_cd_lbl: start_cooldown_lock(
+                    m,
+                    mute_btn,
+                    label_prefix=lbl,
+                    adapter=active_adapter,
+                    was_flat_at_lock_start=current_is_flat,
+                ),
+            )
+        elif saved_cd_end > 0.0:
+            config["active_cooldown_end_epoch"] = 0.0
+            config["active_cooldown_label"] = ""
+            save_config(config)
+    except Exception:
+        pass
+
     root.mainloop()
 
 

@@ -77,14 +77,14 @@ echo Checking required broker libraries (Schwab ^& Webull)...
 "!PY_CMD!" -c "import schwab" >nul 2>&1
 if !errorlevel! neq 0 (
     echo Installing schwab-py...
-    "!PY_CMD!" -m pip install --upgrade schwab-py
+    "!PY_CMD!" -m pip install --upgrade "schwab-py==1.5.1" "authlib==1.8.0" "httpx==0.28.1"
 )
 
 "!PY_CMD!" -c "import six, jmespath, requests, urllib3, certifi, cryptography, cachetools; from webull.core.client import ApiClient; from webull.trade.trade_client import TradeClient" >nul 2>&1
 if !errorlevel! neq 0 (
     echo Installing Webull OpenAPI SDK and dependencies...
     "!PY_CMD!" -m pip install --upgrade six jmespath protobuf paho-mqtt requests urllib3 certifi cryptography cachetools
-    "!PY_CMD!" -m pip install --upgrade --no-deps --ignore-requires-python webull-openapi-python-sdk
+    "!PY_CMD!" -m pip install --upgrade --no-deps --ignore-requires-python "webull-openapi-python-sdk==3.0.4"
 )
 
 :: 4. Bootstrap missing files if user only downloaded Launch_Enforcer.bat, then check for updates
