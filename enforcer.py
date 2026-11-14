@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.56"
+APP_VERSION = "0.9.57"
 
 import os
 import sys
@@ -24268,11 +24268,30 @@ def _insert_formatted_changelog(txt_box, markdown_text):
         spacing1=0,
         spacing3=10,
     )
+    import tkinter.font as tkfont
+
+    ver_tab_px = 340
+    try:
+        _ver_font = tkfont.Font(font=(bold_fam, 11, "bold"))
+        _base_tab_px = _ver_font.measure("  ▼  v0.9.56 — 2026-11-14" + (" " * 42))
+        _longest_hdr_px = 0
+        for _hdr_ln in str(markdown_text or "").splitlines():
+            _hdr_st = _hdr_ln.strip()
+            if _hdr_st.startswith("## "):
+                _hdr_clean = _hdr_st[3:].strip().replace("[", "").replace("]", "")
+                _longest_hdr_px = max(
+                    _longest_hdr_px, _ver_font.measure(f"  ▼  {_hdr_clean}") + 28
+                )
+        ver_tab_px = max(340, int(_base_tab_px), int(_longest_hdr_px))
+    except Exception:
+        ver_tab_px = 340
+
     txt_box.tag_configure(
         "ver_hdr",
         font=(bold_fam, 11, "bold"),
         foreground="#00e676",
         background="#142e24",
+        tabs=(ver_tab_px,),
         spacing1=12,
         spacing3=8,
     )
@@ -24437,8 +24456,7 @@ def _insert_formatted_changelog(txt_box, markdown_text):
     def _format_ver_hdr_line(ver_label, collapsed):
         arrow = "▶" if collapsed else "▼"
         hint = "[Click to Expand]" if collapsed else "[Click to Collapse]"
-        pad_len = max(4, 62 - len(ver_label))
-        return f"  {arrow}  {ver_label}" + (" " * pad_len), f"{hint}  \n"
+        return f"  {arrow}  {ver_label}\t", f"{hint}  \n"
 
     def _format_det_hdr_line(sec_title, collapsed):
         arrow = "▸" if collapsed else "▼"

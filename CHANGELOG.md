@@ -4,6 +4,16 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.57] — 2026-11-14
+### ⚡ Quick Summary
+- **Pixel-Aligned `[Click to Expand]` / `[Click to Collapse]` Release Notes Headers:** Replaced character-count space padding with a DPI-aware pixel tab stop on Release Notes version headers so merged version ranges (`v0.9.46 – v0.9.53`, `v0.9.43 & v0.9.44`) and single-version headers align `[Click to Expand]` / `[Click to Collapse]` to the exact same column.
+
+### 🔍 Detailed Breakdown
+- **Release Notes Header Tab Stop Alignment (`_insert_formatted_changelog`, `_format_ver_hdr_line`):**
+  - Configured a pixel tab stop (`tabs=(ver_tab_px,)`) on the `ver_hdr` tag measured via `tkinter.font.Font` in proportional `Arial 11 bold` and formatted `_format_ver_hdr_line()` with `\t` so all version header hints line up at the exact same pixel X coordinate across both collapsed (`▶`) and expanded (`▼`) states.
+
+---
+
 ## [v0.9.56] — 2026-11-14
 ### ⚡ Quick Summary
 - **Built-In In-App `🐞 Report Bug` Dialog with Auto-Attached Safe Log:** Clicking **`🐞 Report Bug`** now opens an in-app bug report modal with an optional contact field (persisted locally), a required description box, and automatic attachment of today's balance-redacted Safe Log (plus a **`🔍 Preview Safe Log`** button, optional prior-day Safe Log checkbox, and an **`Open Tally Web Form ↗`** fallback link).
