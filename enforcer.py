@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.57"
+APP_VERSION = "0.9.58"
 
 import os
 import sys
@@ -3194,6 +3194,10 @@ def _install_tcl_bgerror_hook(tk_obj):
             except Exception:
                 err_info = ""
             detail = err_info or str(msg or "")
+            # Ignore benign orphaned Tkinter after/after_idle callbacks whose
+            # widget was destroyed right before the scheduled timer fired.
+            if "invalid command name" in detail and '("after" script)' in detail:
+                return
             flat = " | ".join(ln.strip() for ln in detail.splitlines() if ln.strip())
             if flat:
                 log_event("TCL_ERR", flat)
@@ -4285,7 +4289,10 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
                     fg="#eb7067"
                 )
 
+    clip_after_state = {"id": None}
+
     def poll_clipboard():
+        clip_after_state["id"] = None
         if not dlg.winfo_exists():
             return
         curr = url_entry.get().strip()
@@ -4301,9 +4308,26 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
                     )
             except Exception:
                 pass
-        dlg.after(450, poll_clipboard)
+        if dlg.winfo_exists():
+            clip_after_state["id"] = dlg.after(450, poll_clipboard)
 
-    dlg.after(450, poll_clipboard)
+    clip_after_state["id"] = dlg.after(450, poll_clipboard)
+
+    def _close_schwab_dlg(_event=None):
+        aid = clip_after_state.get("id")
+        clip_after_state["id"] = None
+        if aid is not None:
+            try:
+                dlg.after_cancel(aid)
+            except Exception:
+                pass
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+
+    cancel_login = _close_schwab_dlg
+    dlg.protocol("WM_DELETE_WINDOW", cancel_login)
 
     def submit_url(event=None):
         val = url_entry.get().strip()
@@ -4316,7 +4340,7 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
             )
             return
         result["url"] = val
-        dlg.destroy()
+        _close_schwab_dlg()
 
     url_entry.bind("<Return>", submit_url)
 
@@ -4337,7 +4361,7 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
         height=36,
         pad_x=28,
         glow_strength=0.38,
-        command=dlg.destroy,
+        command=cancel_login,
     ).pack(side="left")
 
     make_stadium_button(
@@ -15106,7 +15130,7 @@ def show_preflight_window(
                 parent=pf
             )
 
-    def _prepare_sanitized_log(report_header=""):
+    def _prepare_sanitized_log(report_header="", extra_tail=""):
         """Generates ~/enforcer_log_sanitized.txt (and a convenience copy in
         ~/Downloads if present) and copies the sanitized text to the clipboard."""
         if not os.path.exists(LOG_PATH):
@@ -15116,6 +15140,8 @@ def show_preflight_window(
         sanitized_txt = sanitize_log_for_export(raw_txt)
         if report_header:
             sanitized_txt = f"{report_header}{sanitized_txt}"
+        if extra_tail:
+            sanitized_txt = f"{sanitized_txt}{extra_tail}"
         with open(SANITIZED_LOG_PATH, "w", encoding="utf-8") as sf:
             sf.write(sanitized_txt)
         try:
@@ -15156,7 +15182,10 @@ def show_preflight_window(
                 parent=pf,
             )
 
-    def _build_bug_report_header(tester_id, active_b, contact_str, desc_str):
+    def _build_bug_report_header(
+        tester_id, active_b, contact_str, desc_str, attached_logs_label=""
+    ):
+        logs_lbl = attached_logs_label or f"Today ({get_today_str()})"
         return (
             "========================================================\n"
             "  PNL ENFORCER — USER BUG REPORT\n"
@@ -15165,6 +15194,7 @@ def show_preflight_window(
             f"App Version   : v{APP_VERSION}\n"
             f"Tester ID     : {tester_id}\n"
             f"Broker        : {active_b}\n"
+            f"Attached Logs : {logs_lbl}\n"
             f"Contact       : {contact_str or '(Anonymous / Not provided)'}\n"
             f"Environment   : {_get_os_env_summary()}\n"
             f"Config        : {format_config_summary(config)}\n"
@@ -15352,6 +15382,33 @@ def show_preflight_window(
 
         desc_txt.bind("<KeyRelease>", _clear_desc_err, add="+")
 
+        var_include_prior = tk.BooleanVar(value=False)
+
+        def _get_selected_prior_block():
+            if not (
+                var_include_prior.get()
+                and prior_fname
+                and prior_path
+                and os.path.isfile(prior_path)
+            ):
+                return "", ""
+            try:
+                with open(
+                    prior_path, "r", encoding="utf-8", errors="replace"
+                ) as pf_log:
+                    prior_txt = pf_log.read().strip()
+            except Exception:
+                return "", ""
+            if not prior_txt:
+                return "", ""
+            m_dt = re.search(r"(\d{4}-\d{2}-\d{2})", str(prior_fname))
+            p_date = m_dt.group(1) if m_dt else "prior-day"
+            p_block = (
+                f"\n\n==================== PRIOR-DAY SAFE LOG ({prior_fname}) ====================\n"
+                f"{prior_txt}"
+            )
+            return p_block, p_date
+
         log_box = tk.Frame(
             card_body,
             bg="#0f151d",
@@ -15363,18 +15420,37 @@ def show_preflight_window(
         log_box.pack(fill="x")
         log_top = tk.Frame(log_box, bg="#0f151d")
         log_top.pack(fill="x")
-        tk.Label(
+        lbl_attached = tk.Label(
             log_top,
             text="✓ Attached: Today's Sanitized Safe Log (Balances $[REDACTED], paths & order IDs removed)",
             font=("Arial", 8, "bold"),
             fg="#6ee7b7",
             bg="#0f151d",
             anchor="w",
-        ).pack(side="left")
+        )
+        lbl_attached.pack(side="left")
+
+        def _refresh_attached_badge(*_):
+            try:
+                if not lbl_attached.winfo_exists():
+                    return
+                if var_include_prior.get() and prior_fname and prior_path:
+                    m_dt = re.search(r"(\d{4}-\d{2}-\d{2})", str(prior_fname))
+                    p_date = m_dt.group(1) if m_dt else prior_fname
+                    lbl_attached.config(
+                        text=f"✓ Attached: Today's + Prior-Day Safe Logs ({get_today_str()} & {p_date} — Balances $[REDACTED])"
+                    )
+                else:
+                    lbl_attached.config(
+                        text="✓ Attached: Today's Sanitized Safe Log (Balances $[REDACTED], paths & order IDs removed)"
+                    )
+            except Exception:
+                pass
 
         def _preview_attached_log():
             try:
-                out_path = _prepare_sanitized_log()
+                p_block, _ = _get_selected_prior_block()
+                out_path = _prepare_sanitized_log(extra_tail=p_block)
                 os.startfile(out_path)
             except Exception as e:
                 err_lbl.config(
@@ -15399,8 +15475,8 @@ def show_preflight_window(
             command=_preview_attached_log,
         ).pack(side="right")
 
-        var_include_prior = tk.BooleanVar(value=False)
         if prior_fname and prior_path:
+            var_include_prior.trace_add("write", _refresh_attached_badge)
             make_glass_checkbutton(
                 log_box,
                 text=f"Also include prior-day Safe Log ({prior_fname})",
@@ -15420,14 +15496,26 @@ def show_preflight_window(
             try:
                 contact_s = str(var_contact.get() or "").strip()
                 desc_s = desc_txt.get("1.0", "end-1c").strip()
+                p_block, _ = _get_selected_prior_block()
+                att_lbl = (
+                    f"Today ({get_today_str()}) + Prior Day ({prior_fname})"
+                    if p_block
+                    else f"Today ({get_today_str()})"
+                )
                 hdr = (
                     _build_bug_report_header(
-                        tester_id, active_b, contact_s, desc_s
+                        tester_id,
+                        active_b,
+                        contact_s,
+                        desc_s,
+                        attached_logs_label=att_lbl,
                     )
                     if desc_s
                     else ""
                 )
-                out_path = _prepare_sanitized_log(report_header=hdr)
+                out_path = _prepare_sanitized_log(
+                    report_header=hdr, extra_tail=p_block
+                )
                 try:
                     subprocess.Popen(
                         ["explorer", f"/select,{os.path.normpath(out_path)}"]
@@ -15482,36 +15570,68 @@ def show_preflight_window(
                 with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
                     raw_today = f.read()
                 san_today = sanitize_log_for_export(raw_today)
-                prior_block = ""
-                if var_include_prior.get() and prior_path and os.path.isfile(prior_path):
-                    try:
-                        with open(
-                            prior_path, "r", encoding="utf-8", errors="replace"
-                        ) as pf_log:
-                            prior_txt = pf_log.read().strip()
-                        if prior_txt:
-                            prior_block = (
-                                f"\n\n==================== PRIOR-DAY SAFE LOG ({prior_fname}) ====================\n"
-                                f"{prior_txt}"
-                            )
-                    except Exception:
-                        pass
+                prior_block, prior_date_str = _get_selected_prior_block()
+                att_lbl = (
+                    f"Today ({get_today_str()}) + Prior Day ({prior_fname})"
+                    if prior_block
+                    else f"Today ({get_today_str()})"
+                )
 
                 report_hdr = _build_bug_report_header(
-                    tester_id, active_b, contact_str, desc_str
+                    tester_id,
+                    active_b,
+                    contact_str,
+                    desc_str,
+                    attached_logs_label=att_lbl,
                 )
-                combined_body = f"{report_hdr}{san_today}{prior_block}"
-                if len(combined_body) > 900_000:
-                    tail_keep = 900_000 - len(report_hdr) - 120
-                    logs_only = f"{san_today}{prior_block}"
-                    combined_body = (
-                        f"{report_hdr}"
-                        "[...older log lines trimmed cleanly for upload size limit...]\n"
-                        + logs_only[-max(1000, tail_keep):]
-                    )
+                san_today_kept = san_today
+                prior_kept = prior_block
+                if len(report_hdr) + len(san_today_kept) + len(prior_kept) > 900_000:
+                    if prior_kept:
+                        if len(san_today_kept) > 450_000:
+                            san_today_kept = (
+                                "[...older today log lines trimmed cleanly for upload size limit...]\n"
+                                + san_today_kept[-449_900:]
+                            )
+                        prior_hdr = (
+                            f"\n\n==================== PRIOR-DAY SAFE LOG ({prior_fname}) ====================\n"
+                        )
+                        prior_body_only = (
+                            prior_kept[len(prior_hdr):]
+                            if prior_kept.startswith(prior_hdr)
+                            else prior_kept
+                        )
+                        rem_budget = max(
+                            1000,
+                            900_000
+                            - len(report_hdr)
+                            - len(san_today_kept)
+                            - len(prior_hdr)
+                            - 90,
+                        )
+                        if len(prior_body_only) > rem_budget:
+                            prior_kept = (
+                                prior_hdr
+                                + "[...older prior-day log lines trimmed cleanly for upload size limit...]\n"
+                                + prior_body_only[-rem_budget:]
+                            )
+                    else:
+                        today_budget = max(1000, 900_000 - len(report_hdr) - 90)
+                        san_today_kept = (
+                            "[...older log lines trimmed cleanly for upload size limit...]\n"
+                            + san_today_kept[-today_budget:]
+                        )
 
-                upload_fname = f"BUG_REPORT_{get_today_str()}_sanitized.txt"
-                _prepare_sanitized_log(report_header=report_hdr)
+                combined_body = f"{report_hdr}{san_today_kept}{prior_kept}"
+                upload_fname = (
+                    f"BUG_REPORT_{get_today_str()}_PLUS_{prior_date_str}_sanitized.txt"
+                    if prior_block
+                    else f"BUG_REPORT_{get_today_str()}_sanitized.txt"
+                )
+                included_prior_name = prior_fname if prior_block else ""
+                _prepare_sanitized_log(
+                    report_header=report_hdr, extra_tail=prior_block
+                )
             except Exception as e:
                 err_lbl.config(
                     text=f"Could not prepare Safe Log for submission: {e}",
@@ -15552,7 +15672,8 @@ def show_preflight_window(
                     if ok:
                         log_event(
                             "TELEMETRY",
-                            f"Submitted in-app bug report + sanitized log "
+                            f"Submitted in-app bug report + sanitized log"
+                            f"{' + ' + included_prior_name if included_prior_name else ''} "
                             f"({upload_fname}, Tester ID: {tester_id})",
                         )
                         try:
@@ -15560,8 +15681,13 @@ def show_preflight_window(
                                 default_status_lbl is not None
                                 and default_status_lbl.winfo_exists()
                             ):
+                                sent_suffix = (
+                                    f" + {included_prior_name}"
+                                    if included_prior_name
+                                    else ""
+                                )
                                 default_status_lbl.config(
-                                    text=f"✓ Bug Report Sent! Attached Safe Log (Tester ID: {tester_id}).",
+                                    text=f"✓ Bug Report Sent! Attached Safe Log{sent_suffix} (Tester ID: {tester_id}).",
                                     fg="#58d68d",
                                 )
                         except Exception:
@@ -15588,6 +15714,7 @@ def show_preflight_window(
                         tester_id,
                         report_mode=True,
                         contact_str=contact_str,
+                        included_prior_name=included_prior_name,
                     )
 
                 try:
@@ -15710,7 +15837,7 @@ def show_preflight_window(
             pass
 
     def show_telemetry_upload_result_dialog(
-        ok, tester_id, report_mode=False, contact_str=""
+        ok, tester_id, report_mode=False, contact_str="", included_prior_name=""
     ):
         hide_all_tooltips()
         parent_win = pf
@@ -15850,8 +15977,13 @@ def show_preflight_window(
                     if contact_str
                     else " (sent anonymously)"
                 )
+                logs_sent_desc = (
+                    f"today's Safe Log + {included_prior_name}"
+                    if included_prior_name
+                    else "Safe Log"
+                )
                 spans = [
-                    (f"• Your bug description{c_note} and Safe Log were sent to the developer.\n", ("body",)),
+                    (f"• Your bug description{c_note} and {logs_sent_desc} were sent to the developer.\n", ("body",)),
                     ("• All account balances (", ("body",)),
                     (" $[REDACTED] ", ("body", "pill_green")),
                     ("), Windows paths (", ("body",)),
@@ -15862,9 +15994,14 @@ def show_preflight_window(
                     (" — thank you for helping improve PnL Enforcer!", ("body",)),
                 ]
             else:
+                logs_saved_desc = (
+                    f"today's + prior-day Safe Logs ({included_prior_name})"
+                    if included_prior_name
+                    else "Safe Log"
+                )
                 spans = [
                     ("• Could not reach the diagnostic drive right now (network or firewall blocked).\n", ("body",)),
-                    ("• Your bug description + Safe Log were copied to clipboard and saved to ", ("body",)),
+                    (f"• Your bug description + {logs_saved_desc} were copied to clipboard and saved to ", ("body",)),
                     (" ~/enforcer_log_sanitized.txt ", ("body", "pill_blue")),
                     (".\n", ("body",)),
                     ("• You can click ", ("body",)),

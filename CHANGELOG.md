@@ -4,6 +4,21 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.58] — 2026-11-14
+### ⚡ Quick Summary
+- **Prior-Day Safe Log Attachment Fix & Preview Sync (Bug Report Modal):** Fixed an issue where checking *"Include yesterday's sanitized log"* updated the cloud upload without including the prior-day file in the live preview, attached badge, fallback exports, or upload filename.
+- **Benign Post-Destroy Timer Cleanup:** Eliminated harmless orphaned `after` timer tracebacks in the background console when closing the Schwab OAuth login dialog or short-lived modals.
+
+### 🔍 Detailed Breakdown
+- **Full Two-Day Safe Log Parity (`open_bug_report_dialog` & `_prepare_sanitized_log`):**
+  - Toggling the prior-day checkbox now immediately updates the green `✓ Attached:` badge and feeds the combined log into *"Preview Attached Log"*, *"Copy Safe Log & Open Backup Web Form"*, and local fallback exports (`~/enforcer_log_sanitized.txt`, `~/Downloads/enforcer_log_sanitized.txt`, and clipboard).
+  - Dual-log Bug Report uploads now include both dates in the uploaded filename (`BUG_REPORT_<today>_PLUS_<prior_date>_sanitized.txt`), list both files in the report header (`Attached Logs : Today (...) + Prior Day (...)`) and confirmation popup, and trim Today's log (up to `450,000` chars) before appending the prior-day block under the `900,000`-char upload cap so the prior-day section is never truncated off.
+- **Schwab OAuth Timer & `bgerror` Hardening (`prompt_schwab_oauth_url_dialog` & `_install_tcl_bgerror_hook`):**
+  - `poll_clipboard()` now tracks its scheduled `after()` handle in `clip_after_state` and cancels it cleanly across Submit, Cancel, and window close (`WM_DELETE_WINDOW`).
+  - `_install_tcl_bgerror_hook()` now suppresses benign orphaned `invalid command name ... ("after" script)` callbacks while continuing to log real Tcl/Tk background errors to `[TCL_ERR]`.
+
+---
+
 ## [v0.9.57] — 2026-11-14
 ### ⚡ Quick Summary
 - **Pixel-Aligned `[Click to Expand]` / `[Click to Collapse]` Release Notes Headers:** Replaced character-count space padding with a DPI-aware pixel tab stop on Release Notes version headers so merged version ranges (`v0.9.46 – v0.9.53`, `v0.9.43 & v0.9.44`) and single-version headers align `[Click to Expand]` / `[Click to Collapse]` to the exact same column.
