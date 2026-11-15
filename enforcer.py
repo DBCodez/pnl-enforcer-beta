@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.60"
+APP_VERSION = "0.9.61"
 
 import os
 import sys
@@ -29,6 +29,10 @@ import traceback
 import warnings
 import subprocess
 from datetime import datetime, time as dt_time, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 # Ensure sys.stdout and sys.stderr are always valid stream objects even when
 # launched windowless via pythonw.exe (where standard streams are None).
@@ -2268,9 +2272,30 @@ ignored_positions = {}
 active_adapter = None
 
 
-def mark_uncloseable_fractional_sym(account_id, symbol):
+def mark_uncloseable_fractional_sym(account_id, symbol, qty=None):
     if account_id and symbol:
-        _uncloseable_fractional_syms.add((str(account_id), str(symbol).strip()))
+        key = (str(account_id), str(symbol).strip())
+        is_new = key not in _uncloseable_fractional_syms
+        _uncloseable_fractional_syms.add(key)
+        if is_new:
+            q_sfx = f" ({qty:g} sh)" if isinstance(qty, (int, float)) else ""
+            try:
+                log_event(
+                    "GUARDRAIL",
+                    f"Marked sub-1-share fractional remainder on {symbol}{q_sfx} "
+                    f"as uncloseable for this session.",
+                )
+            except Exception:
+                pass
+
+
+def format_order_qty_str(order_qty):
+    """Formats an order quantity as a plain decimal string (never scientific
+    notation like '1e+06' for 1,000,000 shares)."""
+    q = float(order_qty)
+    if abs(q - round(q)) <= 1e-6:
+        return str(int(round(q)))
+    return f"{q:.4f}".rstrip("0").rstrip(".")
 
 
 def is_uncloseable_fractional_qty(account_id, symbol, qty):
@@ -3828,11 +3853,37 @@ def build_ignored_position_entry(tag, d, lock_existing_open_pnl=False):
     }
 
 
-def reanchor_ignored_positions_to_live(raw_pos_details):
+def reanchor_ignored_positions_to_live(raw_pos_details=None):
     """Re-anchors all currently tracked ignored_positions entries to their
     current live price with locked_impact = 0.0 when start_equity is freshly
     anchored or re-zeroed."""
-    if not ignored_positions or not isinstance(raw_pos_details, dict):
+    if not ignored_positions:
+        return
+    if not isinstance(raw_pos_details, dict):
+        adp = (
+            raw_pos_details
+            if (
+                hasattr(raw_pos_details, "get_last_raw_pos_details")
+                or hasattr(raw_pos_details, "get_last_raw_positions_snapshot")
+            )
+            else active_adapter
+        )
+        if adp is not None and hasattr(adp, "get_last_raw_pos_details"):
+            raw_pos_details = adp.get_last_raw_pos_details()
+        elif adp is not None and hasattr(adp, "get_last_raw_positions_snapshot"):
+            snap_res = adp.get_last_raw_positions_snapshot()
+            raw_pos_details = (
+                snap_res[0]
+                if isinstance(snap_res, tuple) and len(snap_res) > 0
+                else snap_res
+            )
+        elif adp is not None and hasattr(adp, "_last_raw_pos_details"):
+            raw_pos_details = (
+                getattr(adp, "_last_raw_pos_details", {}).get(
+                    getattr(adp, "account_id", ""), {}
+                )
+            )
+    if not isinstance(raw_pos_details, dict):
         return
     for tag, ig in list(ignored_positions.items()):
         if not isinstance(ig, dict):
@@ -4012,7 +4063,7 @@ def _apply_ignored_positions_to_snapshot(
                 f"{tag}: {ref_qty:+g} -> {curr_qty:+g} (Ignored ticker)"
             )
             mutated_notional += (
-                max(abs(curr_qty - ref_qty), abs(ref_qty), abs(curr_qty))
+                abs(curr_qty - ref_qty)
                 * max(curr_lp, ref_price, 1.0)
                 * mult
             )
@@ -4055,7 +4106,7 @@ def _apply_ignored_positions_to_snapshot(
                     (float(raw_adj_eq) - tot_open_pnl) - float(ref_flat_eq), 2
                 )
                 drift = round(target_sum_ignored - sum_ignored_impact, 2)
-                max_drift_cap = max(250.0, mutated_notional * 0.10)
+                max_drift_cap = min(5000.0, max(250.0, mutated_notional * 0.05))
                 if abs(drift) >= 0.01:
                     if abs(drift) <= max_drift_cap:
                         last_ig = mutated_igs[-1]
@@ -4100,6 +4151,8 @@ NYSE_EARLY_CLOSE_DATES = {
     "2026-11-27",
     "2026-12-24",
     "2027-11-26",
+    "2028-07-03",
+    "2028-11-24",
 }
 
 NYSE_FULL_HOLIDAY_DATES = {
@@ -4109,24 +4162,30 @@ NYSE_FULL_HOLIDAY_DATES = {
     "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
     "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
     "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+    "2028-01-17", "2028-02-21", "2028-04-14", "2028-05-29", "2028-06-19",
+    "2028-07-04", "2028-09-04", "2028-11-23", "2028-12-25",
 }
+
+
+def is_nyse_early_close_day(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    return dt_et.strftime("%Y-%m-%d") in NYSE_EARLY_CLOSE_DATES
 
 
 def get_rth_close_time(now_et=None):
     global _calendar_table_warned
     dt_et = now_et if now_et is not None else get_eastern_now()
-    if dt_et.year > 2027 and not _calendar_table_warned:
+    if dt_et.year > 2028 and not _calendar_table_warned:
         _calendar_table_warned = True
         try:
             log_event(
                 "WARN",
-                f"NYSE early-close calendar table ends in 2027 (current year: {dt_et.year}); "
+                f"NYSE early-close calendar table ends in 2028 (current year: {dt_et.year}); "
                 f"defaulting RTH close to 4:00 PM ET.",
             )
         except Exception:
             pass
-    d_str = dt_et.strftime("%Y-%m-%d")
-    if d_str in NYSE_EARLY_CLOSE_DATES:
+    if is_nyse_early_close_day(dt_et):
         return dt_time(13, 0)
     return dt_time(16, 0)
 
@@ -4627,6 +4686,9 @@ class SchwabAdapter:
         self._last_intraday_cash_flow = {}
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
+        self.last_coverage_lookup_failed = False
+        self._last_cov_saw_dead_pend = False
+        self.last_positions_fetch_ok = False
         self._pending_flatten_cids = {}
         self._logged_short_sign_syms = set()
         self._rate_limit_until = 0.0
@@ -4634,10 +4696,30 @@ class SchwabAdapter:
         self._fast_auth_deferred = False
         self.last_error = ""
 
+    def _prune_pending_flatten_cids(self, acct_id, live_qty_map):
+        if not acct_id or not self._pending_flatten_cids:
+            return
+        now_ts = time.time()
+        for k in list(self._pending_flatten_cids.keys()):
+            if k[0] != acct_id:
+                continue
+            sym = k[1]
+            pend = self._pending_flatten_cids.get(k)
+            if not pend or (now_ts - float(pend[1])) >= 15.0:
+                self._pending_flatten_cids.pop(k, None)
+                continue
+            pre_pos_q = float(pend[3]) if len(pend) > 3 else float(pend[2])
+            curr_q = float(live_qty_map.get(sym, 0.0))
+            if abs(curr_q) > 1e-6 and abs(curr_q - pre_pos_q) > 1e-6:
+                self._pending_flatten_cids.pop(k, None)
+
     def get_last_raw_pos_details(self):
         return json.loads(
             json.dumps(self._last_raw_pos_details.get(self.account_id, {}))
         )
+
+    def get_last_raw_positions_snapshot(self):
+        return self.get_last_raw_pos_details(), self.get_last_raw_adj_eq()
 
     def get_last_raw_adj_eq(self):
         val = self._last_raw_adj_eq.get(self.account_id)
@@ -4905,10 +4987,18 @@ class SchwabAdapter:
         """Checks Schwab orders in UTC over the last 5 minutes for `symbol` in the
         closing direction. Returns (working_qty, recent_filled_qty) so post-timeout
         sweeps never double-submit an exit order that is already working or filled."""
+        self.last_coverage_lookup_failed = False
+        self._last_cov_saw_dead_pend = False
         if not self.client or not self.account_id or not symbol:
+            self.last_coverage_lookup_failed = True
             return 0.0, 0.0
         now_utc = datetime.now(timezone.utc)
-        from_utc = now_utc - timedelta(minutes=5)
+        lookback_sec = (
+            max(1800.0, (time.time() - float(since_epoch)) + 120.0)
+            if since_epoch is not None
+            else 1800.0
+        )
+        from_utc = now_utc - timedelta(seconds=lookback_sec)
         try:
             try:
                 resp = self.client.get_orders_for_account(
@@ -4919,11 +5009,14 @@ class SchwabAdapter:
             except TypeError:
                 resp = self.client.get_orders_for_account(self.account_id)
             if resp.status_code != 200:
+                self.last_coverage_lookup_failed = True
                 return 0.0, 0.0
             orders = resp.json()
             if not isinstance(orders, list):
+                self.last_coverage_lookup_failed = True
                 return 0.0, 0.0
         except Exception:
+            self.last_coverage_lookup_failed = True
             return 0.0, 0.0
 
         active_statuses = {
@@ -4939,23 +5032,33 @@ class SchwabAdapter:
             "AWAITING_UR_OUT",
             "PENDING_ACKNOWLEDGEMENT",
         }
+        dead_statuses = {
+            "CANCELED",
+            "CANCELLED",
+            "REJECTED",
+            "EXPIRED",
+            "REPLACED",
+        }
         closing_instrs = (
             {"BUY", "BUY_TO_COVER", "BUY_TO_CLOSE"}
             if is_short
             else {"SELL", "SELL_TO_CLOSE"}
         )
         cutoff_epoch = (
-            float(since_epoch) - 5.0
+            float(math.floor(float(since_epoch)))
             if since_epoch is not None
             else (time.time() - 180.0)
         )
+        target_sym = str(symbol).strip()
+        pend = self._pending_flatten_cids.get((self.account_id, target_sym))
+        pend_oid = str(pend[0]).strip() if (pend and pend[0]) else ""
         working_qty = 0.0
         filled_qty = 0.0
-        target_sym = str(symbol).strip()
         for o in orders:
             if not isinstance(o, dict):
                 continue
             st = str(o.get("status") or "").upper()
+            oid_str = str(o.get("orderId") or "").strip()
             legs = o.get("orderLegCollection") or []
             if len(legs) != 1 or not isinstance(legs[0], dict):
                 continue
@@ -4972,6 +5075,8 @@ class SchwabAdapter:
             instr = str(lg.get("instruction") or "").upper()
             if instr not in closing_instrs:
                 continue
+            if pend_oid and oid_str == pend_oid and st in dead_statuses:
+                self._last_cov_saw_dead_pend = True
             try:
                 f_q = float(o.get("filledQuantity") or 0.0)
             except Exception:
@@ -4994,7 +5099,11 @@ class SchwabAdapter:
                 ent_ep = self._order_ts_to_epoch(
                     o.get("closeTime") or o.get("enteredTime")
                 )
-                if ent_ep <= 0.0 or ent_ep >= cutoff_epoch:
+                if (
+                    (pend_oid and oid_str == pend_oid)
+                    or ent_ep <= 0.0
+                    or ent_ep >= cutoff_epoch
+                ):
                     filled_qty += f_q
         return working_qty, filled_qty
 
@@ -5347,6 +5456,11 @@ class SchwabAdapter:
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
+                self._prune_pending_flatten_cids(
+                    self.account_id,
+                    {sym: qty for sym, qty in (open_eq + open_opt)},
+                )
+                self.last_positions_fetch_ok = True
                 now_t = time.time()
                 self._last_open_eq[self.account_id] = (now_t, list(open_eq))
                 self._last_open_opt[self.account_id] = (now_t, list(open_opt))
@@ -5360,6 +5474,7 @@ class SchwabAdapter:
                 "ERROR",
                 f"Schwab get_open_equity_positions exception: {e}"
             )
+        self.last_positions_fetch_ok = False
         cached = self._last_open_eq.get(self.account_id)
         if (
             allow_stale_cache
@@ -5437,6 +5552,11 @@ class SchwabAdapter:
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
+                self._prune_pending_flatten_cids(
+                    self.account_id,
+                    {sym: qty for sym, qty in (open_eq + open_opt)},
+                )
+                self.last_positions_fetch_ok = True
                 now_t = time.time()
                 self._last_open_eq[self.account_id] = (now_t, list(open_eq))
                 self._last_open_opt[self.account_id] = (now_t, list(open_opt))
@@ -5450,6 +5570,7 @@ class SchwabAdapter:
                 "ERROR",
                 f"Schwab get_open_option_positions exception: {e}"
             )
+        self.last_positions_fetch_ok = False
         if (
             allow_stale_cache
             and cached
@@ -5489,12 +5610,49 @@ class SchwabAdapter:
             key=lambda item: (0 if item[1] < 0 else 1, str(item[0])),
         )
         for item in sorted_opts:
-            symbol = item[0]
-            qty = item[1]
+            symbol = str(item[0]).strip()
+            qty = float(item[1])
             abs_q = int(abs(qty))
             if abs_q <= 0:
                 continue
             attempt_ts = time.time()
+            pend = self._pending_flatten_cids.get((self.account_id, symbol))
+            if pend and (attempt_ts - float(pend[1])) < 15.0:
+                pend_sub_q = float(pend[2])
+                pend_pos_q = float(pend[3]) if len(pend) > 3 else pend_sub_q
+                pend_acc = bool(pend[4]) if len(pend) > 4 else False
+                w_q, f_q = self.get_recent_exit_order_coverage(
+                    symbol,
+                    is_short=(qty < 0),
+                    since_epoch=pend[1],
+                    is_opt=True,
+                )
+                same_stale_pos = abs(qty - pend_pos_q) <= 1e-6
+                if w_q >= (abs_q - 1e-6) or (
+                    same_stale_pos
+                    and (
+                        (w_q + f_q) >= (abs_q - 1e-6)
+                        or (
+                            (pend_acc or self.last_coverage_lookup_failed)
+                            and not self._last_cov_saw_dead_pend
+                        )
+                    )
+                ):
+                    log_event(
+                        "FLATTEN",
+                        f"Skipping duplicate Schwab option close on {symbol} "
+                        f"(already working={w_q:g}, filled={f_q:g}).",
+                    )
+                    submitted_ok[symbol] = float(max(w_q + f_q, pend_sub_q))
+                    continue
+
+            self._pending_flatten_cids[(self.account_id, symbol)] = (
+                "",
+                attempt_ts,
+                float(abs_q),
+                float(qty),
+                False,
+            )
             try:
                 if qty < 0:
                     log_event(
@@ -5504,13 +5662,25 @@ class SchwabAdapter:
                     )
                     spec = option_buy_to_close_market(symbol, abs_q).build()
                     r = self.client.place_order(self.account_id, spec)
-                    oid = _mask_last4(self._extract_schwab_order_id(r))
+                    raw_oid = self._extract_schwab_order_id(r)
+                    oid = _mask_last4(raw_oid)
                     log_event(
                         "ORDER_RESP",
                         f"Schwab Option Buy-to-Close {symbol} ({oid}) -> HTTP {r.status_code}"
                     )
                     if r.status_code in (200, 201, 202):
+                        self._pending_flatten_cids[(self.account_id, symbol)] = (
+                            raw_oid,
+                            attempt_ts,
+                            float(abs_q),
+                            float(qty),
+                            True,
+                        )
                         submitted_ok[symbol] = float(abs_q)
+                    else:
+                        self._pending_flatten_cids.pop(
+                            (self.account_id, symbol), None
+                        )
                 else:
                     log_event(
                         "ORDER_OUT",
@@ -5519,13 +5689,25 @@ class SchwabAdapter:
                     )
                     spec = option_sell_to_close_market(symbol, abs_q).build()
                     r = self.client.place_order(self.account_id, spec)
-                    oid = _mask_last4(self._extract_schwab_order_id(r))
+                    raw_oid = self._extract_schwab_order_id(r)
+                    oid = _mask_last4(raw_oid)
                     log_event(
                         "ORDER_RESP",
                         f"Schwab Option Sell-to-Close {symbol} ({oid}) -> HTTP {r.status_code}"
                     )
                     if r.status_code in (200, 201, 202):
+                        self._pending_flatten_cids[(self.account_id, symbol)] = (
+                            raw_oid,
+                            attempt_ts,
+                            float(abs_q),
+                            float(qty),
+                            True,
+                        )
                         submitted_ok[symbol] = float(abs_q)
+                    else:
+                        self._pending_flatten_cids.pop(
+                            (self.account_id, symbol), None
+                        )
             except Exception as e:
                 log_event(
                     "ERROR",
@@ -5544,6 +5726,10 @@ class SchwabAdapter:
                         f"(working={w_q:g}, filled={f_q:g}); suppressing duplicate.",
                     )
                     submitted_ok[symbol] = float(w_q + f_q)
+                elif not self.last_coverage_lookup_failed:
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
         return submitted_ok
 
     def submit_liquidation_batch(self, open_positions):
@@ -5571,6 +5757,7 @@ class SchwabAdapter:
                 log_event("ERROR", f"Quote lookup error during flatten: {e}")
 
         for symbol, qty in open_positions:
+            symbol = str(symbol).strip()
             try:
                 f_qty = float(qty)
             except Exception:
@@ -5593,6 +5780,46 @@ class SchwabAdapter:
                 continue
 
             attempt_ts = time.time()
+            pend = self._pending_flatten_cids.get((self.account_id, symbol))
+            if pend and (attempt_ts - float(pend[1])) < 15.0:
+                pend_sub_q = float(pend[2])
+                pend_pos_q = float(pend[3]) if len(pend) > 3 else pend_sub_q
+                pend_acc = bool(pend[4]) if len(pend) > 4 else False
+                pend_use_mkt = bool(pend[5]) if len(pend) > 5 else use_market
+                w_q, f_q = self.get_recent_exit_order_coverage(
+                    symbol,
+                    is_short=(f_qty < 0),
+                    since_epoch=pend[1],
+                    is_opt=False,
+                )
+                same_stale_pos = abs(f_qty - pend_pos_q) <= 1e-6
+                if w_q >= (order_qty - 1e-6) or (
+                    same_stale_pos
+                    and (
+                        (w_q + f_q) >= (order_qty - 1e-6)
+                        or (
+                            (pend_acc or self.last_coverage_lookup_failed)
+                            and pend_use_mkt == use_market
+                            and not self._last_cov_saw_dead_pend
+                        )
+                    )
+                ):
+                    log_event(
+                        "FLATTEN",
+                        f"Skipping duplicate Schwab exit order on {symbol} "
+                        f"(already working={w_q:g}, filled={f_q:g}).",
+                    )
+                    submitted_ok[symbol] = float(max(w_q + f_q, pend_sub_q))
+                    continue
+
+            self._pending_flatten_cids[(self.account_id, symbol)] = (
+                "",
+                attempt_ts,
+                float(order_qty),
+                float(f_qty),
+                False,
+                bool(use_market),
+            )
             try:
                 if use_market:
                     if f_qty > 0:
@@ -5602,17 +5829,32 @@ class SchwabAdapter:
                         )
                         spec = equity_sell_market(symbol, order_qty).build()
                         r = self.client.place_order(self.account_id, spec)
-                        oid = _mask_last4(self._extract_schwab_order_id(r))
+                        raw_oid = self._extract_schwab_order_id(r)
+                        oid = _mask_last4(raw_oid)
                         log_event(
                             "ORDER_RESP",
                             f"Market Sell {symbol} ({oid}) -> HTTP {r.status_code}"
                         )
                         if r.status_code in (200, 201, 202):
-                            submitted_ok[symbol] = float(order_qty)
-                        elif is_pure_fractional:
-                            mark_uncloseable_fractional_sym(
-                                self.account_id, symbol, f_qty
+                            self._pending_flatten_cids[
+                                (self.account_id, symbol)
+                            ] = (
+                                raw_oid,
+                                attempt_ts,
+                                float(order_qty),
+                                float(f_qty),
+                                True,
+                                bool(use_market),
                             )
+                            submitted_ok[symbol] = float(order_qty)
+                        else:
+                            self._pending_flatten_cids.pop(
+                                (self.account_id, symbol), None
+                            )
+                            if is_pure_fractional:
+                                mark_uncloseable_fractional_sym(
+                                    self.account_id, symbol, f_qty
+                                )
                     elif f_qty < 0:
                         log_event(
                             "ORDER_OUT",
@@ -5622,17 +5864,32 @@ class SchwabAdapter:
                             symbol, order_qty
                         ).build()
                         r = self.client.place_order(self.account_id, spec)
-                        oid = _mask_last4(self._extract_schwab_order_id(r))
+                        raw_oid = self._extract_schwab_order_id(r)
+                        oid = _mask_last4(raw_oid)
                         log_event(
                             "ORDER_RESP",
                             f"Buy-to-Cover {symbol} ({oid}) -> HTTP {r.status_code}"
                         )
                         if r.status_code in (200, 201, 202):
-                            submitted_ok[symbol] = float(order_qty)
-                        elif is_pure_fractional:
-                            mark_uncloseable_fractional_sym(
-                                self.account_id, symbol, f_qty
+                            self._pending_flatten_cids[
+                                (self.account_id, symbol)
+                            ] = (
+                                raw_oid,
+                                attempt_ts,
+                                float(order_qty),
+                                float(f_qty),
+                                True,
+                                bool(use_market),
                             )
+                            submitted_ok[symbol] = float(order_qty)
+                        else:
+                            self._pending_flatten_cids.pop(
+                                (self.account_id, symbol), None
+                            )
+                            if is_pure_fractional:
+                                mark_uncloseable_fractional_sym(
+                                    self.account_id, symbol, f_qty
+                                )
                 else:
                     q_info = quotes_data.get(symbol, {}).get("quote", {})
                     if f_qty > 0:
@@ -5642,6 +5899,9 @@ class SchwabAdapter:
                             or q_info.get("mark")
                         )
                         if not bid or bid <= 0:
+                            self._pending_flatten_cids.pop(
+                                (self.account_id, symbol), None
+                            )
                             log_event(
                                 "ERROR", f"No valid bid found for {symbol}!"
                             )
@@ -5674,13 +5934,28 @@ class SchwabAdapter:
                             r = self.client.place_order(
                                 self.account_id, spec_gtc
                             )
-                        oid = _mask_last4(self._extract_schwab_order_id(r))
+                        raw_oid = self._extract_schwab_order_id(r)
+                        oid = _mask_last4(raw_oid)
                         log_event(
                             "ORDER_RESP",
                             f"EXT Limit Sell {symbol} ({oid}) -> HTTP {r.status_code}"
                         )
                         if r.status_code in (200, 201, 202):
+                            self._pending_flatten_cids[
+                                (self.account_id, symbol)
+                            ] = (
+                                raw_oid,
+                                attempt_ts,
+                                float(whole_q),
+                                float(f_qty),
+                                True,
+                                bool(use_market),
+                            )
                             submitted_ok[symbol] = float(whole_q)
+                        else:
+                            self._pending_flatten_cids.pop(
+                                (self.account_id, symbol), None
+                            )
                     elif f_qty < 0:
                         ask = (
                             q_info.get("askPrice")
@@ -5688,6 +5963,9 @@ class SchwabAdapter:
                             or q_info.get("mark")
                         )
                         if not ask or ask <= 0:
+                            self._pending_flatten_cids.pop(
+                                (self.account_id, symbol), None
+                            )
                             log_event(
                                 "ERROR", f"No valid ask found for {symbol}!"
                             )
@@ -5722,19 +6000,37 @@ class SchwabAdapter:
                             r = self.client.place_order(
                                 self.account_id, spec_gtc
                             )
-                        oid = _mask_last4(self._extract_schwab_order_id(r))
+                        raw_oid = self._extract_schwab_order_id(r)
+                        oid = _mask_last4(raw_oid)
                         log_event(
                             "ORDER_RESP",
                             f"EXT Limit Cover {symbol} ({oid}) -> HTTP {r.status_code}"
                         )
                         if r.status_code in (200, 201, 202):
+                            self._pending_flatten_cids[
+                                (self.account_id, symbol)
+                            ] = (
+                                raw_oid,
+                                attempt_ts,
+                                float(whole_q),
+                                float(f_qty),
+                                True,
+                                bool(use_market),
+                            )
                             submitted_ok[symbol] = float(whole_q)
+                        else:
+                            self._pending_flatten_cids.pop(
+                                (self.account_id, symbol), None
+                            )
             except Exception as e:
                 log_event(
                     "ERROR",
                     f"Schwab equity place_order exception ({symbol}): {e}"
                 )
                 if is_pure_fractional:
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
                     mark_uncloseable_fractional_sym(
                         self.account_id, symbol, f_qty
                     )
@@ -5752,6 +6048,10 @@ class SchwabAdapter:
                         f"(working={w_q:g}, filled={f_q:g}); suppressing duplicate.",
                     )
                     submitted_ok[symbol] = float(w_q + f_q)
+                elif not self.last_coverage_lookup_failed:
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
         return submitted_ok
 
     def fetch_account_data(self):
@@ -5837,6 +6137,11 @@ class SchwabAdapter:
                 open_opt_cache.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
+                self._prune_pending_flatten_cids(
+                    start_acct_id,
+                    {sym: qty for sym, qty in (open_eq_cache + open_opt_cache)},
+                )
+                self.last_positions_fetch_ok = True
                 now_snap_t = time.time()
 
                 if not open_assets:
@@ -6111,6 +6416,9 @@ class WebullAdapter:
         self._last_intraday_cash_flow = {}
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
+        self.last_coverage_lookup_failed = False
+        self._last_cov_saw_dead_pend = False
+        self.last_positions_fetch_ok = False
         self._pending_flatten_cids = {}
         self._logged_short_sign_syms = set()
         self._rate_limit_until = 0.0
@@ -6118,10 +6426,30 @@ class WebullAdapter:
         self._fast_auth_deferred = False
         self.last_error = ""
 
+    def _prune_pending_flatten_cids(self, acct_id, live_qty_map):
+        if not acct_id or not self._pending_flatten_cids:
+            return
+        now_ts = time.time()
+        for k in list(self._pending_flatten_cids.keys()):
+            if k[0] != acct_id:
+                continue
+            sym = k[1]
+            pend = self._pending_flatten_cids.get(k)
+            if not pend or (now_ts - float(pend[1])) >= 15.0:
+                self._pending_flatten_cids.pop(k, None)
+                continue
+            pre_pos_q = float(pend[3]) if len(pend) > 3 else float(pend[2])
+            curr_q = float(live_qty_map.get(sym, 0.0))
+            if abs(curr_q) > 1e-6 and abs(curr_q - pre_pos_q) > 1e-6:
+                self._pending_flatten_cids.pop(k, None)
+
     def get_last_raw_pos_details(self):
         return json.loads(
             json.dumps(self._last_raw_pos_details.get(self.account_id, {}))
         )
+
+    def get_last_raw_positions_snapshot(self):
+        return self.get_last_raw_pos_details(), self.get_last_raw_adj_eq()
 
     def get_last_raw_adj_eq(self):
         val = self._last_raw_adj_eq.get(self.account_id)
@@ -6222,6 +6550,11 @@ class WebullAdapter:
             self.api_client.set_token_dir(os.path.join(USER_HOME, "conf"))
         self.api_client.add_endpoint("us", "api.webull.com")
         self.trade_client = TradeClient(self.api_client)
+        try:
+            from webull.data.data_client import DataClient
+            self.data_client = DataClient(self.api_client)
+        except Exception:
+            self.data_client = None
         logging.getLogger("webull").setLevel(logging.CRITICAL)
         logging.getLogger("webull.core").setLevel(logging.CRITICAL)
 
@@ -6311,7 +6644,11 @@ class WebullAdapter:
             new_trade = TradeClient(new_api)
             self.api_client = new_api
             self.trade_client = new_trade
-            self.data_client = None
+            try:
+                from webull.data.data_client import DataClient
+                self.data_client = DataClient(new_api)
+            except Exception:
+                self.data_client = None
             return True
         except Exception as e:
             self.last_error = str(e)
@@ -6342,7 +6679,7 @@ class WebullAdapter:
         side_hint = str(
             p.get("side") or p.get("position_side") or ""
         ).upper()
-        if qty > 0 and side_hint in ("SHORT", "SELL"):
+        if qty > 0 and side_hint == "SHORT":
             qty = -abs(qty)
             if sym and sym not in self._logged_short_sign_syms:
                 self._logged_short_sign_syms.add(sym)
@@ -6465,16 +6802,24 @@ class WebullAdapter:
     ):
         """Checks Webull open orders and any recent pending client_order_id for
         `symbol` in the closing direction. Returns (working_qty, recent_filled_qty)."""
+        self.last_coverage_lookup_failed = False
+        self._last_cov_saw_dead_pend = False
         if not self.trade_client or not self.account_id or not symbol:
+            self.last_coverage_lookup_failed = True
             return 0.0, 0.0
         target_sym = str(symbol).strip()
         closing_side = "BUY" if is_short else "SELL"
         working_qty = 0.0
         filled_qty = 0.0
         seen_cids = set()
+        open_lookup_ok = False
+        detail_lookup_ok = False
 
         try:
-            open_orders = self._fetch_all_open_orders_webull() or []
+            open_orders_raw = self._fetch_all_open_orders_webull()
+            if open_orders_raw is not None:
+                open_lookup_ok = True
+            open_orders = open_orders_raw or []
             for o in open_orders:
                 if not isinstance(o, dict):
                     continue
@@ -6524,12 +6869,16 @@ class WebullAdapter:
 
         pend = self._pending_flatten_cids.get((self.account_id, target_sym))
         cutoff = (
-            float(since_epoch) - 5.0
+            float(math.floor(float(since_epoch)))
             if since_epoch is not None
             else (time.time() - 180.0)
         )
-        if pend and pend[0] not in seen_cids and pend[1] >= cutoff:
+        need_detail_lookup = bool(
+            pend and pend[0] not in seen_cids and float(pend[1]) >= cutoff
+        )
+        if need_detail_lookup:
             cid = pend[0]
+            d_obj = None
             try:
                 if hasattr(self.trade_client, "order_v3") and hasattr(
                     self.trade_client.order_v3, "get_order_detail"
@@ -6537,55 +6886,119 @@ class WebullAdapter:
                     d_res = self.trade_client.order_v3.get_order_detail(
                         self.account_id, cid
                     )
-                    if (
-                        d_res is not None
-                        and getattr(d_res, "status_code", None) == 200
-                    ):
-                        d_json = d_res.json()
-                        d_obj = (
-                            d_json.get("data", d_json)
-                            if isinstance(d_json, dict)
-                            else {}
-                        )
-                        if isinstance(d_obj, dict):
-                            st = str(
-                                d_obj.get("status")
-                                or d_obj.get("order_status")
-                                or ""
-                            ).upper()
-                            try:
-                                fq = float(
-                                    d_obj.get("filled_quantity")
-                                    or d_obj.get("filled_qty")
-                                    or d_obj.get("total_filled_quantity")
-                                    or 0.0
-                                )
-                            except Exception:
-                                fq = 0.0
-                            try:
-                                rq = float(
-                                    d_obj.get("remain_quantity")
-                                    or d_obj.get("unfilled_quantity")
-                                    or 0.0
-                                )
-                            except Exception:
-                                rq = 0.0
-                            if st in (
-                                "WORKING",
-                                "NEW",
-                                "SUBMITTED",
-                                "PENDING",
-                                "PARTIAL_FILLED",
-                                "PARTIALLY_FILLED",
-                                "QUEUED",
-                            ):
-                                working_qty += (
-                                    rq if rq > 0 else max(0.0, pend[2] - fq)
-                                )
-                            if fq > 0 or st == "FILLED":
-                                filled_qty += fq if fq > 0 else pend[2]
+                elif hasattr(self.trade_client, "order") and hasattr(
+                    self.trade_client.order, "query_order_detail"
+                ):
+                    d_res = self.trade_client.order.query_order_detail(
+                        self.account_id, cid
+                    )
+                else:
+                    d_res = None
+                if (
+                    d_res is not None
+                    and getattr(d_res, "status_code", None) == 200
+                ):
+                    detail_lookup_ok = True
+                    d_json = d_res.json()
+                    cand = (
+                        d_json.get("data", d_json)
+                        if isinstance(d_json, dict)
+                        else {}
+                    )
+                    if isinstance(cand, dict):
+                        d_obj = cand
             except Exception:
                 pass
+
+            if d_obj is None:
+                try:
+                    t_res = None
+                    if hasattr(self.trade_client, "order") and hasattr(
+                        self.trade_client.order, "list_today_orders"
+                    ):
+                        t_res = self.trade_client.order.list_today_orders(
+                            self.account_id, page_size=100
+                        )
+                    elif hasattr(self.trade_client, "order_v3") and hasattr(
+                        self.trade_client.order_v3, "list_order_history"
+                    ):
+                        t_res = self.trade_client.order_v3.list_order_history(
+                            self.account_id
+                        )
+                    if (
+                        t_res is not None
+                        and getattr(t_res, "status_code", None) == 200
+                    ):
+                        detail_lookup_ok = True
+                        t_json = t_res.json()
+                        t_list = (
+                            t_json
+                            if isinstance(t_json, list)
+                            else t_json.get(
+                                "data", t_json.get("orders", [])
+                            )
+                            if isinstance(t_json, dict)
+                            else []
+                        )
+                        if isinstance(t_list, list):
+                            for item_o in t_list:
+                                if not isinstance(item_o, dict):
+                                    continue
+                                if (
+                                    str(
+                                        item_o.get("client_order_id")
+                                        or item_o.get("order_id")
+                                        or ""
+                                    ).strip()
+                                    == str(cid).strip()
+                                ):
+                                    d_obj = item_o
+                                    break
+                except Exception:
+                    pass
+
+            if isinstance(d_obj, dict):
+                st = str(
+                    d_obj.get("status")
+                    or d_obj.get("order_status")
+                    or ""
+                ).upper()
+                if st in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"):
+                    self._last_cov_saw_dead_pend = True
+                try:
+                    fq = float(
+                        d_obj.get("filled_quantity")
+                        or d_obj.get("filled_qty")
+                        or d_obj.get("total_filled_quantity")
+                        or 0.0
+                    )
+                except Exception:
+                    fq = 0.0
+                try:
+                    rq = float(
+                        d_obj.get("remain_quantity")
+                        or d_obj.get("unfilled_quantity")
+                        or 0.0
+                    )
+                except Exception:
+                    rq = 0.0
+                if st in (
+                    "WORKING",
+                    "NEW",
+                    "SUBMITTED",
+                    "PENDING",
+                    "PARTIAL_FILLED",
+                    "PARTIALLY_FILLED",
+                    "QUEUED",
+                ):
+                    working_qty += (
+                        rq if rq > 0 else max(0.0, float(pend[2]) - fq)
+                    )
+                if fq > 0 or st == "FILLED":
+                    filled_qty += fq if fq > 0 else float(pend[2])
+
+        if not open_lookup_ok or (need_detail_lookup and not detail_lookup_ok):
+            self.last_coverage_lookup_failed = True
         return working_qty, filled_qty
 
     def cancel_all_working_orders(
@@ -7044,6 +7457,14 @@ class WebullAdapter:
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
+                self._prune_pending_flatten_cids(
+                    self.account_id,
+                    {
+                        **{sym: qty for sym, qty, _ in open_eq},
+                        **{sym: qty for sym, qty, _ in open_opt},
+                    },
+                )
+                self.last_positions_fetch_ok = True
                 now_t = time.time()
                 self._last_open_eq[self.account_id] = (now_t, list(open_eq))
                 self._last_open_opt[self.account_id] = (now_t, list(open_opt))
@@ -7057,6 +7478,7 @@ class WebullAdapter:
                 "ERROR",
                 f"Webull get_open_equity_positions exception: {e}"
             )
+        self.last_positions_fetch_ok = False
         if (
             allow_stale_cache
             and cached
@@ -7138,6 +7560,14 @@ class WebullAdapter:
                 open_opt.sort(
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
+                self._prune_pending_flatten_cids(
+                    self.account_id,
+                    {
+                        **{sym: qty for sym, qty, _ in open_eq},
+                        **{sym: qty for sym, qty, _ in open_opt},
+                    },
+                )
+                self.last_positions_fetch_ok = True
                 now_t = time.time()
                 self._last_open_eq[self.account_id] = (now_t, list(open_eq))
                 self._last_open_opt[self.account_id] = (now_t, list(open_opt))
@@ -7151,6 +7581,7 @@ class WebullAdapter:
                 "ERROR",
                 f"Webull get_open_option_positions exception: {e}"
             )
+        self.last_positions_fetch_ok = False
         if (
             allow_stale_cache
             and cached
@@ -7187,8 +7618,8 @@ class WebullAdapter:
             key=lambda item: (0 if item[1] < 0 else 1, str(item[0])),
         )
         for item in sorted_opts:
-            display_sym = item[0]
-            qty = item[1]
+            display_sym = str(item[0]).strip()
+            qty = float(item[1])
             meta = item[2] if len(item) > 2 and isinstance(item[2], dict) else {}
             abs_q = int(abs(qty))
             if abs_q <= 0:
@@ -7198,20 +7629,35 @@ class WebullAdapter:
             pend = self._pending_flatten_cids.get(
                 (self.account_id, display_sym)
             )
-            if pend and (attempt_ts - pend[1]) < 30.0:
+            if pend and (attempt_ts - float(pend[1])) < 30.0:
+                pend_sub_q = float(pend[2])
+                pend_pos_q = float(pend[3]) if len(pend) > 3 else pend_sub_q
+                pend_acc = bool(pend[4]) if len(pend) > 4 else False
                 w_q, f_q = self.get_recent_exit_order_coverage(
                     display_sym,
                     is_short=(qty < 0),
                     since_epoch=pend[1],
                     is_opt=True,
                 )
-                if (w_q + f_q) > 0:
+                same_stale_pos = abs(abs(qty) - abs(pend_pos_q)) <= 1e-6 and (
+                    (qty < 0) == (pend_pos_q < 0) if len(pend) > 3 else True
+                )
+                if w_q >= (abs_q - 1e-6) or (
+                    same_stale_pos
+                    and (
+                        (w_q + f_q) >= (abs_q - 1e-6)
+                        or (
+                            (pend_acc or self.last_coverage_lookup_failed)
+                            and not self._last_cov_saw_dead_pend
+                        )
+                    )
+                ):
                     log_event(
                         "FLATTEN",
                         f"Skipping duplicate Webull option close on {display_sym} "
                         f"(already working={w_q:g}, filled={f_q:g}).",
                     )
-                    submitted_ok[display_sym] = float(w_q + f_q)
+                    submitted_ok[display_sym] = float(max(w_q + f_q, pend_sub_q))
                     continue
 
             side = "BUY" if qty < 0 else "SELL"
@@ -7226,6 +7672,8 @@ class WebullAdapter:
                 client_oid,
                 attempt_ts,
                 float(abs_q),
+                float(qty),
+                False,
             )
 
             leg_item = {
@@ -7298,7 +7746,20 @@ class WebullAdapter:
                     f"Webull Option {pos_intent} {display_sym} ({_mask_last4(client_oid)}) -> HTTP {code}"
                 )
                 if code in (200, 201, 202, "OK"):
+                    self._pending_flatten_cids[
+                        (self.account_id, display_sym)
+                    ] = (
+                        client_oid,
+                        attempt_ts,
+                        float(abs_q),
+                        float(qty),
+                        True,
+                    )
                     submitted_ok[display_sym] = float(abs_q)
+                else:
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, display_sym), None
+                    )
             except Exception as e:
                 log_event(
                     "ERROR",
@@ -7317,6 +7778,10 @@ class WebullAdapter:
                         f"(working={w_q:g}, filled={f_q:g}); suppressing duplicate.",
                     )
                     submitted_ok[display_sym] = float(w_q + f_q)
+                elif not self.last_coverage_lookup_failed:
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, display_sym), None
+                    )
         return submitted_ok
 
     def submit_liquidation_batch(self, open_positions):
@@ -7325,11 +7790,8 @@ class WebullAdapter:
             return submitted_ok
         use_market = is_market_hours()
         ext_quotes = {}
-        if not use_market and self.api_client is not None:
+        if not use_market and self.data_client is not None:
             try:
-                from webull.data.data_client import DataClient
-                if self.data_client is None:
-                    self.data_client = DataClient(self.api_client)
                 syms_to_quote = [
                     str(it[0]).strip()
                     for it in open_positions
@@ -7389,20 +7851,37 @@ class WebullAdapter:
 
             attempt_ts = time.time()
             pend = self._pending_flatten_cids.get((self.account_id, symbol))
-            if pend and (attempt_ts - pend[1]) < 30.0:
+            if pend and (attempt_ts - float(pend[1])) < 30.0:
+                pend_sub_q = float(pend[2])
+                pend_pos_q = float(pend[3]) if len(pend) > 3 else pend_sub_q
+                pend_acc = bool(pend[4]) if len(pend) > 4 else False
+                pend_use_mkt = bool(pend[5]) if len(pend) > 5 else use_market
                 w_q, f_q = self.get_recent_exit_order_coverage(
                     symbol,
                     is_short=(f_qty < 0),
                     since_epoch=pend[1],
                     is_opt=False,
                 )
-                if (w_q + f_q) > 0:
+                same_stale_pos = abs(abs(f_qty) - abs(pend_pos_q)) <= 1e-6 and (
+                    (f_qty < 0) == (pend_pos_q < 0) if len(pend) > 3 else True
+                )
+                if w_q >= (order_qty - 1e-6) or (
+                    same_stale_pos
+                    and (
+                        (w_q + f_q) >= (order_qty - 1e-6)
+                        or (
+                            (pend_acc or self.last_coverage_lookup_failed)
+                            and pend_use_mkt == use_market
+                            and not self._last_cov_saw_dead_pend
+                        )
+                    )
+                ):
                     log_event(
                         "FLATTEN",
                         f"Skipping duplicate Webull exit order on {symbol} "
                         f"(already working={w_q:g}, filled={f_q:g}).",
                     )
-                    submitted_ok[symbol] = float(w_q + f_q)
+                    submitted_ok[symbol] = float(max(w_q + f_q, pend_sub_q))
                     continue
 
             side = "SELL" if f_qty > 0 else "BUY"
@@ -7411,8 +7890,11 @@ class WebullAdapter:
                 client_oid,
                 attempt_ts,
                 float(order_qty),
+                float(f_qty),
+                False,
+                bool(use_market),
             )
-            qty_str = f"{order_qty:g}"
+            qty_str = format_order_qty_str(order_qty)
 
             if use_market:
                 log_event(
@@ -7462,6 +7944,9 @@ class WebullAdapter:
                         pass
                 eff_ref = live_ref if live_ref > 0 else ref_lp
                 if eff_ref <= 0:
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
                     log_event(
                         "ERROR",
                         f"No valid reference price found for {symbol} on Webull!"
@@ -7506,14 +7991,29 @@ class WebullAdapter:
                     f"Webull {side} {symbol} ({_mask_last4(client_oid)}) -> HTTP {code}"
                 )
                 if code in (200, 201, 202, "OK"):
-                    submitted_ok[symbol] = float(order_qty)
-                elif is_pure_fractional:
-                    mark_uncloseable_fractional_sym(
-                        self.account_id, symbol, f_qty
+                    self._pending_flatten_cids[(self.account_id, symbol)] = (
+                        client_oid,
+                        attempt_ts,
+                        float(order_qty),
+                        float(f_qty),
+                        True,
+                        bool(use_market),
                     )
+                    submitted_ok[symbol] = float(order_qty)
+                else:
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
+                    if is_pure_fractional:
+                        mark_uncloseable_fractional_sym(
+                            self.account_id, symbol, f_qty
+                        )
             except Exception as e:
                 log_event("ERROR", f"Webull place_order exception: {e}")
                 if is_pure_fractional:
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
                     mark_uncloseable_fractional_sym(
                         self.account_id, symbol, f_qty
                     )
@@ -7531,6 +8031,10 @@ class WebullAdapter:
                         f"(working={w_q:g}, filled={f_q:g}); suppressing duplicate.",
                     )
                     submitted_ok[symbol] = float(w_q + f_q)
+                elif not self.last_coverage_lookup_failed:
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
         return submitted_ok
 
     @staticmethod
@@ -7650,6 +8154,7 @@ class WebullAdapter:
                 self.last_error = "HTTP 429"
                 return None, True, 0.0, {}, False
             if p_res.status_code != 200:
+                self.last_positions_fetch_ok = False
                 self.last_error = (
                     f"HTTP {p_res.status_code}: {getattr(p_res, 'text', '')[:80]}"
                 )
@@ -7872,6 +8377,14 @@ class WebullAdapter:
             )
             if self.account_id != start_acct_id or broker_reconfig_in_progress:
                 return None, True, 0.0, {}, False
+            self._prune_pending_flatten_cids(
+                start_acct_id,
+                {
+                    item[0]: item[1]
+                    for item in (open_eq_cache + open_opt_cache)
+                },
+            )
+            self.last_positions_fetch_ok = True
             now_snap_t = time.time()
             self._last_raw_pos_details[start_acct_id] = json.loads(
                 json.dumps(pos_details)
@@ -9382,9 +9895,24 @@ def sound_alarm_loop():
         time.sleep(0.25)
 
 
-def trigger_alarm(reason, ui_button, context_str=""):
+def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
     global alarm_active, triggered_alarms, last_alarm_reason
-    if reason in triggered_alarms:
+    r_up = str(reason or "").upper()
+    is_repeatable_unfilled = (not alarm_active) and any(
+        k in r_up
+        for k in (
+            "UNFILLED:",
+            "HALT/UNFILLED:",
+            "CHECK OPTIONS MANUALLY",
+            "POST-LOCK FLATTEN FAILED",
+            "FORCE-FLATTEN UNFILLED",
+        )
+    )
+    if (
+        not force_repeat
+        and not is_repeatable_unfilled
+        and reason in triggered_alarms
+    ):
         return
 
     triggered_alarms[reason] = time.time()
@@ -9897,6 +10425,14 @@ def _run_post_lock_watchdog(
             f"New position opened during active lock failed to flatten! "
             f"Keeping OS lock active while sounding continuous emergency alert & retrying every 10s!"
         )
+        if not cooldown_active:
+            _sound_lock_straggler_alert_burst()
+            trigger_alarm(
+                "POST-LOCK FLATTEN FAILED — CHECK POSITIONS!",
+                ui_button,
+                force_repeat=True,
+            )
+            return False
         while cooldown_active:
             _sound_lock_straggler_alert_burst()
             for _ in range(20):
@@ -11069,6 +11605,8 @@ def flatten_equities(
 
             submitted_close_eq = {}
             submitted_close_opt = {}
+            initial_abs_eq = {}
+            initial_abs_opt = {}
             ever_seen_eq = set()
             confirmed_closed_eq = set()
             ever_seen_opt = set()
@@ -11079,6 +11617,9 @@ def flatten_equities(
             ):
                 if not pos_list:
                     return []
+                init_abs_map = (
+                    initial_abs_opt if is_opt_flag else initial_abs_eq
+                )
                 preserved_map = (
                     getattr(adapter, "last_preserved_close_qty", {}) or {}
                 )
@@ -11090,6 +11631,10 @@ def flatten_equities(
                     sym = item[0]
                     qty = float(item[1])
                     abs_q = abs(qty)
+                    init_q = float(init_abs_map.setdefault(sym, abs_q))
+                    if abs_q > init_q:
+                        init_q = abs_q
+                        init_abs_map[sym] = abs_q
                     pres_q = float(preserved_map.get(sym, 0.0))
                     sub_q = float(submitted_map.get(sym, 0.0))
                     if pres_q >= (abs_q - 1e-6) or (
@@ -11114,27 +11659,61 @@ def flatten_equities(
                             since_epoch=flatten_wave_start_ts,
                             is_opt=is_opt_flag,
                         )
-                        if (w_q + f_q) >= (abs_q - 1e-6):
+                        if getattr(
+                            adapter, "last_coverage_lookup_failed", False
+                        ):
+                            log_event(
+                                "WARN",
+                                f"Exit order coverage lookup failed on {sym} — "
+                                f"deferring duplicate submission on this sweep.",
+                            )
+                            continue
+                        already_deducted = max(0.0, init_q - abs_q)
+                        unreflected_f_q = max(0.0, f_q - already_deducted)
+                        true_open_q = max(0.0, abs_q - unreflected_f_q)
+                        uncovered_q = max(0.0, true_open_q - w_q)
+                        if uncovered_q <= 1e-6:
                             log_event(
                                 "FLATTEN",
-                                f"Verified exit order coverage (working={w_q:g}, filled={f_q:g}) on {sym} "
+                                f"Verified exit order coverage (working={w_q:g}, filled={f_q:g}, init={init_q:g}, open={abs_q:g}) on {sym} "
                                 f"— skipping duplicate submission.",
                             )
                             submitted_map[sym] = max(sub_q, w_q + f_q)
                             continue
+                        if uncovered_q < (abs_q - 1e-6):
+                            rem_signed_q = (
+                                uncovered_q if qty > 0 else -uncovered_q
+                            )
+                            if float(rem_signed_q).is_integer():
+                                rem_signed_q = int(round(rem_signed_q))
+                            log_event(
+                                "FLATTEN",
+                                f"Partial exit coverage on {sym} (init={init_q:g}, open={abs_q:g}, filled={f_q:g}, working={w_q:g}) "
+                                f"— submitting uncovered remainder ({rem_signed_q:+g}).",
+                            )
+                            uncovered.append(
+                                (sym, rem_signed_q) + tuple(item[2:])
+                            )
+                            continue
                     uncovered.append(item)
                 return uncovered
+
+            def _clean_pos(p_list):
+                if p_list is None:
+                    return None
+                return [x for x in p_list if abs(float(x[1])) > 1e-9]
 
             def _filter_stale_replica_resurrections(
                 pos_list, confirmed_closed_set, is_opt_flag=False
             ):
+                pos_list = _clean_pos(pos_list)
                 if not pos_list or not confirmed_closed_set:
                     return pos_list
                 suspect = [x[0] for x in pos_list if x[0] in confirmed_closed_set]
                 if not suspect:
                     return pos_list
                 time.sleep(0.35)
-                re_list = (
+                re_list = _clean_pos(
                     adapter.get_open_option_positions(allow_stale_cache=False)
                     if is_opt_flag and hasattr(adapter, "get_open_option_positions")
                     else adapter.get_open_equity_positions(
@@ -11171,8 +11750,8 @@ def flatten_equities(
                     "⏳  2. Daytrade Positions: Inspecting open daytrade positions...",
                     False,
                 )
-                peek_pos = adapter.get_open_equity_positions()
-                peek_opt = (
+                peek_pos = _clean_pos(adapter.get_open_equity_positions())
+                peek_opt = _clean_pos(
                     adapter.get_open_option_positions()
                     if include_options and hasattr(adapter, "get_open_option_positions")
                     else []
@@ -11180,8 +11759,10 @@ def flatten_equities(
                 init_preserve_map = {}
                 for item in (peek_pos or []):
                     init_preserve_map[item[0]] = item[1]
+                    initial_abs_eq.setdefault(item[0], abs(float(item[1])))
                 for item in (peek_opt or []):
                     init_preserve_map[item[0]] = item[1]
+                    initial_abs_opt.setdefault(item[0], abs(float(item[1])))
 
                 adapter.cancel_all_working_orders(
                     preserve_market_close_map=init_preserve_map,
@@ -11194,10 +11775,10 @@ def flatten_equities(
                     False,
                 )
 
-                open_pos = adapter.get_open_equity_positions()
+                open_pos = _clean_pos(adapter.get_open_equity_positions())
                 if open_pos is None and peek_pos is not None:
                     open_pos = peek_pos
-                open_opt = (
+                open_opt = _clean_pos(
                     adapter.get_open_option_positions()
                     if include_options and hasattr(adapter, "get_open_option_positions")
                     else []
@@ -11207,8 +11788,16 @@ def flatten_equities(
 
                 for item in (open_pos or []):
                     ever_seen_eq.add(item[0])
+                    initial_abs_eq[item[0]] = max(
+                        float(initial_abs_eq.get(item[0], 0.0)),
+                        abs(float(item[1])),
+                    )
                 for item in (open_opt or []):
                     ever_seen_opt.add(item[0])
+                    initial_abs_opt[item[0]] = max(
+                        float(initial_abs_opt.get(item[0], 0.0)),
+                        abs(float(item[1])),
+                    )
 
                 if (
                     open_pos is not None
@@ -11230,10 +11819,12 @@ def flatten_equities(
                         False,
                     )
                     time.sleep(0.8)
-                    open_pos = adapter.get_open_equity_positions(
-                        allow_stale_cache=False
+                    open_pos = _clean_pos(
+                        adapter.get_open_equity_positions(
+                            allow_stale_cache=False
+                        )
                     )
-                    open_opt = (
+                    open_opt = _clean_pos(
                         adapter.get_open_option_positions(
                             allow_stale_cache=False
                         )
@@ -11350,10 +11941,12 @@ def flatten_equities(
                 last_data_loop_heartbeat = time.time()
                 time.sleep(0.5 if polls == 0 else 1.5)
                 polls += 1
-                rem_pos = adapter.get_open_equity_positions(
-                    allow_stale_cache=False
+                rem_pos = _clean_pos(
+                    adapter.get_open_equity_positions(
+                        allow_stale_cache=False
+                    )
                 )
-                rem_opt = (
+                rem_opt = _clean_pos(
                     adapter.get_open_option_positions(allow_stale_cache=False)
                     if include_options and hasattr(adapter, "get_open_option_positions")
                     else []
@@ -11409,10 +12002,12 @@ def flatten_equities(
                         False,
                     )
                     time.sleep(0.8)
-                    rem_confirm = adapter.get_open_equity_positions(
-                        allow_stale_cache=False
+                    rem_confirm = _clean_pos(
+                        adapter.get_open_equity_positions(
+                            allow_stale_cache=False
+                        )
                     )
-                    opt_confirm = (
+                    opt_confirm = _clean_pos(
                         adapter.get_open_option_positions(
                             allow_stale_cache=False
                         )
@@ -11495,10 +12090,12 @@ def flatten_equities(
                         preserve_market_close_map=curr_preserve_map,
                         cancel_options=include_options,
                     )
-                    rem_pos = adapter.get_open_equity_positions(
-                        allow_stale_cache=False
+                    rem_pos = _clean_pos(
+                        adapter.get_open_equity_positions(
+                            allow_stale_cache=False
+                        )
                     )
-                    rem_opt = (
+                    rem_opt = _clean_pos(
                         adapter.get_open_option_positions(
                             allow_stale_cache=False
                         )
@@ -11526,10 +12123,12 @@ def flatten_equities(
                         and (not include_options or (rem_opt is not None and len(rem_opt) == 0))
                     ):
                         time.sleep(0.8)
-                        rem_confirm = adapter.get_open_equity_positions(
-                            allow_stale_cache=False
+                        rem_confirm = _clean_pos(
+                            adapter.get_open_equity_positions(
+                                allow_stale_cache=False
+                            )
                         )
-                        opt_confirm = (
+                        opt_confirm = _clean_pos(
                             adapter.get_open_option_positions(
                                 allow_stale_cache=False
                             )
@@ -11592,10 +12191,16 @@ def flatten_equities(
                         break
 
             rem_final_eq = (
-                adapter.get_open_equity_positions(allow_stale_cache=False) or []
+                _clean_pos(
+                    adapter.get_open_equity_positions(allow_stale_cache=False)
+                )
+                or []
             )
             rem_final_opt = (
-                adapter.get_open_option_positions(allow_stale_cache=False) or []
+                _clean_pos(
+                    adapter.get_open_option_positions(allow_stale_cache=False)
+                )
+                or []
                 if include_options
                 and hasattr(adapter, "get_open_option_positions")
                 else []
@@ -11606,23 +12211,37 @@ def flatten_equities(
                 unfilled_final = []
                 for item in rem_final_eq:
                     sym, qty = item[0], float(item[1])
-                    _wq, fq = adapter.get_recent_exit_order_coverage(
+                    init_q = max(
+                        abs(qty), float(initial_abs_eq.get(sym, abs(qty)))
+                    )
+                    wq, fq = adapter.get_recent_exit_order_coverage(
                         sym,
                         is_short=(qty < 0),
                         since_epoch=flatten_wave_start_ts,
                         is_opt=False,
                     )
-                    if fq < (abs(qty) - 1e-6):
+                    if (
+                        getattr(adapter, "last_coverage_lookup_failed", False)
+                        or wq > 1e-6
+                        or fq < (init_q - 1e-6)
+                    ):
                         unfilled_final.append((sym, qty))
                 for item in rem_final_opt:
                     sym, qty = item[0], float(item[1])
-                    _wq, fq = adapter.get_recent_exit_order_coverage(
+                    init_q = max(
+                        abs(qty), float(initial_abs_opt.get(sym, abs(qty)))
+                    )
+                    wq, fq = adapter.get_recent_exit_order_coverage(
                         sym,
                         is_short=(qty < 0),
                         since_epoch=flatten_wave_start_ts,
                         is_opt=True,
                     )
-                    if fq < (abs(qty) - 1e-6):
+                    if (
+                        getattr(adapter, "last_coverage_lookup_failed", False)
+                        or wq > 1e-6
+                        or fq < (init_q - 1e-6)
+                    ):
                         unfilled_final.append((sym, qty))
                 if not unfilled_final:
                     log_event(
@@ -11725,7 +12344,7 @@ def _enter_halt_breach_watch(
         if has_options
         else f"{eff_reason} (HALT/UNFILLED: {syms_label})"
     )
-    trigger_alarm(fail_reason, ui_button, context_str)
+    trigger_alarm(fail_reason, ui_button, context_str, force_repeat=True)
 
 
 def trigger_open_pnl_flatten(
@@ -13245,6 +13864,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global _initial_positions_verified, last_data_loop_heartbeat
 
     consecutive_api_failures = 0
+    consecutive_loop_exceptions = 0
     api_disconnect_alerted = False
     last_data_loop_heartbeat = time.time()
 
@@ -13281,7 +13901,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     continue
 
             if current_eq is not None and current_eq > 0:
-                _initial_positions_verified = True
+                if getattr(active_adapter, "last_positions_fetch_ok", True):
+                    _initial_positions_verified = True
                 if consecutive_api_failures > 0 or api_disconnect_alerted:
                     recovered_attempts = max(1, consecutive_api_failures)
                     was_alerted = api_disconnect_alerted
@@ -13364,7 +13985,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     triggered_alarms.clear()
                     _uncloseable_fractional_syms.clear()
                     prev_pos_snapshot = {}
-                    reanchor_ignored_positions_to_live()
+                    reanchor_ignored_positions_to_live(active_adapter)
                     first_poll_of_launch = True
                     save_session_state()
                     log_event(
@@ -13939,7 +14560,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                     if has_options
                                     else f"{hb_reason} (UNFILLED: {syms_lbl})"
                                 )
-                                trigger_alarm(rem_msg, mute_btn, ctx)
+                                trigger_alarm(
+                                    rem_msg, mute_btn, ctx, force_repeat=True
+                                )
 
                             if (
                                 sess_open_hb
@@ -13986,12 +14609,25 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                                     since_epoch=float(hb.get("started_ts", now_hb - 180.0)),
                                                     is_opt=is_opt_k,
                                                 )
-                                                if (w_cov + f_cov) < abs(q_k) - 1e-6:
+                                                if getattr(
+                                                    active_adapter,
+                                                    "last_coverage_lookup_failed",
+                                                    False,
+                                                ):
+                                                    continue
+                                                if w_cov < abs(q_k) - 1e-6 and (
+                                                    getattr(
+                                                        active_adapter,
+                                                        "_last_cov_saw_dead_pend",
+                                                        False,
+                                                    )
+                                                    or (w_cov + f_cov)
+                                                    < abs(q_k) - 1e-6
+                                                ):
                                                     needs_resubmit = True
                                                     break
                                             except Exception:
-                                                needs_resubmit = True
-                                                break
+                                                continue
                                     if needs_resubmit:
                                         log_event(
                                             "GUARDRAIL",
@@ -14016,6 +14652,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     pre_poll_hwm_profit=pre_poll_hwm_profit,
                     on_before_stop_checks=_handle_pending_halt_breach,
                 )
+                if not _initial_positions_verified:
+                    dec["actions"] = []
+                    dec["action_types"] = []
                 floor_equity = dec["floor_equity"]
                 terminate_pnl_level = dec["terminate_pnl_level"]
                 distance_to_terminate = dec["distance_to_terminate"]
@@ -14338,9 +14977,21 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                         state="disabled",
                                     ),
                                 )
+            consecutive_loop_exceptions = 0
 
         except Exception as e:
-            log_event("ERROR", f"Main data_loop error: {e}")
+            consecutive_loop_exceptions += 1
+            log_event(
+                "ERROR",
+                f"Main data_loop error (#{consecutive_loop_exceptions}): {e}",
+            )
+            if consecutive_loop_exceptions >= 3:
+                trigger_alarm(
+                    "INTERNAL POLL ERROR — CHECK LOGS!",
+                    mute_btn,
+                    str(e)[:80],
+                    force_repeat=(consecutive_loop_exceptions == 3),
+                )
 
         rem_sleep = float(poll_sec)
         while rem_sleep > 0:
