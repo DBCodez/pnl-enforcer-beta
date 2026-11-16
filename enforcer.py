@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.59.1"
+APP_VERSION = "0.9.59.2"
 
 import os
 import sys
@@ -4916,6 +4916,10 @@ class SchwabAdapter:
         self.client = None
         self.account_id = None
         self.accounts = []
+        self._cache_lock = threading.Lock()
+        self._snapshot_gen = 0
+        self.last_snapshot_was_cached = False
+        self._last_flatten_outcome = "FLAT"
         self._last_good_snapshot = {}
         self._last_raw_pos_details = {}
         self._last_raw_adj_eq = {}
@@ -4928,6 +4932,13 @@ class SchwabAdapter:
         self._last_429_log_ts = 0.0
         self._fast_auth_deferred = False
         self.last_error = ""
+
+    def invalidate_cached_snapshots(self):
+        with self._cache_lock:
+            self._snapshot_gen += 1
+            self._last_good_snapshot.clear()
+            self._last_open_eq.clear()
+            self._last_open_opt.clear()
 
     def get_last_raw_pos_details(self):
         return json.loads(
@@ -5406,8 +5417,40 @@ class SchwabAdapter:
         except Exception:
             return True
 
-    def get_open_equity_positions(self):
+    def get_open_equity_positions(
+        self,
+        allow_stale_cache=True,
+        pace_for_verify=False,
+        cache_empty_ok=False,
+    ):
         """Returns ONLY Equity positions for Auto-Flatten, or None on API error."""
+        snap_gen_at_start = self._snapshot_gen
+        with self._cache_lock:
+            cached = self._last_open_eq.get(self.account_id)
+        if (
+            allow_stale_cache
+            and cached
+            and (time.time() - cached[0]) < 0.45
+            and (cached[1] or cache_empty_ok)
+        ):
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=False)
+            ]
+        if (
+            not pace_for_verify
+            and allow_stale_cache
+            and time.time() < self._rate_limit_until
+            and cached
+            and (time.time() - cached[0]) <= 2.5
+            and (cached[1] or cache_empty_ok)
+        ):
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=False)
+            ]
         try:
             try:
                 resp = self.client.get_account(
@@ -5453,36 +5496,76 @@ class SchwabAdapter:
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
                 now_t = time.time()
-                self._last_open_eq[self.account_id] = (now_t, list(open_eq))
-                self._last_open_opt[self.account_id] = (now_t, list(open_opt))
+                with self._cache_lock:
+                    if self._snapshot_gen == snap_gen_at_start:
+                        self._last_open_eq[self.account_id] = (now_t, list(open_eq))
+                        self._last_open_opt[self.account_id] = (now_t, list(open_opt))
                 return open_eq
+            if resp.status_code == 429:
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
             log_event(
                 "ERROR",
                 f"get_open_equity_positions HTTP {resp.status_code}"
             )
         except Exception as e:
+            err_s = str(e)
+            if "429" in err_s or "too many requests" in err_s.lower():
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
             log_event(
                 "ERROR",
                 f"Schwab get_open_equity_positions exception: {e}"
             )
-        cached = self._last_open_eq.get(self.account_id)
-        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
-            log_event(
-                "FLATTEN",
-                "Using cached Schwab open equity snapshot (<10s) after API error."
-            )
+        if allow_stale_cache:
+            with self._cache_lock:
+                cached = (
+                    self._last_open_eq.get(self.account_id)
+                    if self._snapshot_gen == snap_gen_at_start
+                    else None
+                )
+            if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+                log_event(
+                    "FLATTEN",
+                    "Using cached Schwab open equity snapshot (<10s) after API error."
+                )
+                return [
+                    item
+                    for item in cached[1]
+                    if not is_position_ignored(item[0], is_opt=False)
+                ]
+        return None
+
+    def get_open_option_positions(
+        self,
+        allow_stale_cache=True,
+        pace_for_verify=False,
+        reuse_paired_eq_read=False,
+    ):
+        """Returns ONLY Option positions (symbol, qty) sorted with short legs
+        (qty < 0) first for BETA Options Auto-Flatten, or None on API error."""
+        snap_gen_at_start = self._snapshot_gen
+        with self._cache_lock:
+            cached = self._last_open_opt.get(self.account_id)
+        if (
+            (allow_stale_cache or reuse_paired_eq_read)
+            and cached
+            and (time.time() - cached[0]) < 0.50
+        ):
             return [
                 item
                 for item in cached[1]
-                if not is_position_ignored(item[0], is_opt=False)
+                if not is_position_ignored(item[0], is_opt=True)
             ]
-        return None
-
-    def get_open_option_positions(self):
-        """Returns ONLY Option positions (symbol, qty) sorted with short legs
-        (qty < 0) first for BETA Options Auto-Flatten, or None on API error."""
-        cached = self._last_open_opt.get(self.account_id)
-        if cached and (time.time() - cached[0]) < 0.45:
+        if (
+            not pace_for_verify
+            and allow_stale_cache
+            and time.time() < self._rate_limit_until
+            and cached
+            and (time.time() - cached[0]) <= 2.5
+        ):
             return [
                 item
                 for item in cached[1]
@@ -5533,28 +5616,46 @@ class SchwabAdapter:
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
                 now_t = time.time()
-                self._last_open_eq[self.account_id] = (now_t, list(open_eq))
-                self._last_open_opt[self.account_id] = (now_t, list(open_opt))
+                with self._cache_lock:
+                    if self._snapshot_gen == snap_gen_at_start:
+                        self._last_open_eq[self.account_id] = (now_t, list(open_eq))
+                        self._last_open_opt[self.account_id] = (now_t, list(open_opt))
                 return open_opt
+            if resp.status_code == 429:
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
             log_event(
                 "ERROR",
                 f"Schwab get_open_option_positions HTTP {resp.status_code}"
             )
         except Exception as e:
+            err_s = str(e)
+            if "429" in err_s or "too many requests" in err_s.lower():
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
             log_event(
                 "ERROR",
                 f"Schwab get_open_option_positions exception: {e}"
             )
-        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
-            log_event(
-                "FLATTEN",
-                "Using cached Schwab open option snapshot (<10s) after API error."
-            )
-            return [
-                item
-                for item in cached[1]
-                if not is_position_ignored(item[0], is_opt=True)
-            ]
+        if allow_stale_cache:
+            with self._cache_lock:
+                cached = (
+                    self._last_open_opt.get(self.account_id)
+                    if self._snapshot_gen == snap_gen_at_start
+                    else None
+                )
+            if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+                log_event(
+                    "FLATTEN",
+                    "Using cached Schwab open option snapshot (<10s) after API error."
+                )
+                return [
+                    item
+                    for item in cached[1]
+                    if not is_position_ignored(item[0], is_opt=True)
+                ]
         return None
 
     def submit_option_liquidation_batch(self, open_opt_positions):
@@ -5574,6 +5675,7 @@ class SchwabAdapter:
             option_buy_to_close_market,
             option_sell_to_close_market,
         )
+        self.invalidate_cached_snapshots()
         sorted_opts = sorted(
             open_opt_positions,
             key=lambda item: (0 if item[1] < 0 else 1, str(item[0])),
@@ -5618,6 +5720,7 @@ class SchwabAdapter:
                     "ERROR",
                     f"Schwab option place_order exception ({symbol}): {e}"
                 )
+        self.invalidate_cached_snapshots()
         return submitted_ok
 
     def submit_liquidation_batch(self, open_positions):
@@ -5631,6 +5734,7 @@ class SchwabAdapter:
         submitted_ok = {}
         if not open_positions:
             return submitted_ok
+        self.invalidate_cached_snapshots()
 
         use_market = is_market_hours()
         quotes_data = {}
@@ -5733,15 +5837,24 @@ class SchwabAdapter:
                     )
                     if r.status_code in (200, 201, 202):
                         submitted_ok[symbol] = float(abs_q)
+        self.invalidate_cached_snapshots()
         return submitted_ok
 
     def fetch_account_data(self):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         tracking BOTH Equities (1x) and Options (100x)."""
+        self.last_snapshot_was_cached = False
+        snap_gen_at_start = self._snapshot_gen
         now_ts = time.time()
         if now_ts < self._rate_limit_until:
-            cached_snap = self._last_good_snapshot.get(self.account_id)
+            with self._cache_lock:
+                cached_snap = (
+                    self._last_good_snapshot.get(self.account_id)
+                    if self._snapshot_gen == snap_gen_at_start
+                    else None
+                )
             if cached_snap and (now_ts - cached_snap[0]) <= 15.0:
+                self.last_snapshot_was_cached = True
                 return cached_snap[1]
 
         try:
@@ -5830,15 +5943,17 @@ class SchwabAdapter:
                     ) = _apply_ignored_positions_to_snapshot(
                         raw_eq, {}, [], []
                     )
-                    self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
-                    self._last_open_opt[self.account_id] = (
-                        now_snap_t,
-                        filt_opt,
-                    )
                     flat_res = (adj_eq, is_flat, tot_open_pnl, filt_pos, has_opt)
-                    self._last_good_snapshot[self.account_id] = (
-                        time.time(), flat_res
-                    )
+                    with self._cache_lock:
+                        if self._snapshot_gen == snap_gen_at_start:
+                            self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
+                            self._last_open_opt[self.account_id] = (
+                                now_snap_t,
+                                filt_opt,
+                            )
+                            self._last_good_snapshot[self.account_id] = (
+                                time.time(), flat_res
+                            )
                     return flat_res
 
                 symbols = [
@@ -6000,8 +6115,6 @@ class SchwabAdapter:
                 ) = _apply_ignored_positions_to_snapshot(
                     adj_eq, pos_details, open_eq_cache, open_opt_cache
                 )
-                self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
-                self._last_open_opt[self.account_id] = (now_snap_t, filt_opt)
 
                 open_res = (
                     adj_eq,
@@ -6010,20 +6123,32 @@ class SchwabAdapter:
                     filt_pos,
                     has_opt
                 )
-                self._last_good_snapshot[self.account_id] = (
-                    time.time(), open_res
-                )
+                with self._cache_lock:
+                    if self._snapshot_gen == snap_gen_at_start:
+                        self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
+                        self._last_open_opt[self.account_id] = (now_snap_t, filt_opt)
+                        self._last_good_snapshot[self.account_id] = (
+                            time.time(), open_res
+                        )
                 return open_res
             elif resp.status_code == 429:
-                self._rate_limit_until = time.time() + 2.5
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
                 if (time.time() - self._last_429_log_ts) >= 30.0:
                     self._last_429_log_ts = time.time()
                     log_event(
                         "WARN",
                         "Schwab rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
                     )
-                cached_snap = self._last_good_snapshot.get(self.account_id)
+                with self._cache_lock:
+                    cached_snap = (
+                        self._last_good_snapshot.get(self.account_id)
+                        if self._snapshot_gen == snap_gen_at_start
+                        else None
+                    )
                 if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    self.last_snapshot_was_cached = True
                     return cached_snap[1]
                 self.last_error = "HTTP 429"
             else:
@@ -6034,19 +6159,30 @@ class SchwabAdapter:
         except Exception as e:
             err_s = str(e)
             if "429" in err_s or "too many requests" in err_s.lower():
-                self._rate_limit_until = time.time() + 2.5
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
                 if (time.time() - self._last_429_log_ts) >= 30.0:
                     self._last_429_log_ts = time.time()
                     log_event(
                         "WARN",
                         "Schwab rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
                     )
-                cached_snap = self._last_good_snapshot.get(self.account_id)
+                with self._cache_lock:
+                    cached_snap = (
+                        self._last_good_snapshot.get(self.account_id)
+                        if self._snapshot_gen == snap_gen_at_start
+                        else None
+                    )
                 if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    self.last_snapshot_was_cached = True
                     return cached_snap[1]
             self.last_error = err_s
             log_event("ERROR", f"Schwab account fetch exception: {e}")
         return None, True, 0.0, {}, False
+
+
+WEBULL_POS_MIN_INTERVAL_SEC = 1.15
 
 
 class WebullAdapter:
@@ -6063,6 +6199,12 @@ class WebullAdapter:
         self._logged_accounts = set()
         self._prev_pos_qty_map = {}
         self._last_pos_call_ts = 0.0
+        self._pos_pace_lock = threading.Lock()
+        self._next_pos_slot_ts = 0.0
+        self._cache_lock = threading.Lock()
+        self._snapshot_gen = 0
+        self.last_snapshot_was_cached = False
+        self._last_flatten_outcome = "FLAT"
         self._last_good_snapshot = {}
         self._last_raw_pos_details = {}
         self._last_raw_adj_eq = {}
@@ -6075,6 +6217,27 @@ class WebullAdapter:
         self._last_429_log_ts = 0.0
         self._fast_auth_deferred = False
         self.last_error = ""
+
+    def invalidate_cached_snapshots(self):
+        with self._cache_lock:
+            self._snapshot_gen += 1
+            self._last_good_snapshot.clear()
+            self._last_open_eq.clear()
+            self._last_open_opt.clear()
+
+    def _pace_position_verify_call(self):
+        with self._pos_pace_lock:
+            now_p = time.time()
+            earliest = max(
+                now_p,
+                self._next_pos_slot_ts,
+                self._rate_limit_until,
+                self._last_pos_call_ts + WEBULL_POS_MIN_INTERVAL_SEC,
+            )
+            self._next_pos_slot_ts = earliest + WEBULL_POS_MIN_INTERVAL_SEC
+            wait_s = max(0.0, earliest - now_p)
+        if wait_s > 0.0:
+            time.sleep(wait_s)
 
     def get_last_raw_pos_details(self):
         return json.loads(
@@ -6283,11 +6446,14 @@ class WebullAdapter:
         return self.trade_client.get_account_balance(self.account_id)
 
     def _call_get_positions(self):
-        if hasattr(self.trade_client, "account_v2"):
-            return self.trade_client.account_v2.get_account_position(
-                self.account_id
-            )
-        return self.trade_client.get_account_position(self.account_id)
+        try:
+            if hasattr(self.trade_client, "account_v2"):
+                return self.trade_client.account_v2.get_account_position(
+                    self.account_id
+                )
+            return self.trade_client.get_account_position(self.account_id)
+        finally:
+            self._last_pos_call_ts = time.time()
 
     def cancel_all_working_orders(self, preserve_market_close_map=None):
         self.last_preserved_close_qty = {}
@@ -6654,18 +6820,44 @@ class WebullAdapter:
             "raw_symbol": raw_sym,
         }
 
-    def get_open_equity_positions(self):
+    def get_open_equity_positions(
+        self,
+        allow_stale_cache=True,
+        pace_for_verify=False,
+        cache_empty_ok=False,
+    ):
         """Returns (symbol, qty, last_price) for EQUITIES ONLY, or None on API error."""
-        cached = self._last_open_eq.get(self.account_id)
-        if cached and (time.time() - cached[0]) < 0.45 and cached[1]:
+        snap_gen_at_start = self._snapshot_gen
+        with self._cache_lock:
+            cached = self._last_open_eq.get(self.account_id)
+        if (
+            allow_stale_cache
+            and cached
+            and (time.time() - cached[0]) < 0.45
+            and (cached[1] or cache_empty_ok)
+        ):
             return [
                 item
                 for item in cached[1]
                 if not is_position_ignored(item[0], is_opt=False)
             ]
+        if (
+            not pace_for_verify
+            and allow_stale_cache
+            and time.time() < self._rate_limit_until
+            and cached
+            and (time.time() - cached[0]) <= 2.5
+            and (cached[1] or cache_empty_ok)
+        ):
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=False)
+            ]
+        if pace_for_verify:
+            self._pace_position_verify_call()
         try:
             res = self._call_get_positions()
-            self._last_pos_call_ts = time.time()
             if res.status_code == 200:
                 open_eq = []
                 open_opt = []
@@ -6709,43 +6901,85 @@ class WebullAdapter:
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
                 now_t = time.time()
-                self._last_open_eq[self.account_id] = (now_t, list(open_eq))
-                self._last_open_opt[self.account_id] = (now_t, list(open_opt))
+                with self._cache_lock:
+                    if self._snapshot_gen == snap_gen_at_start:
+                        self._last_open_eq[self.account_id] = (now_t, list(open_eq))
+                        self._last_open_opt[self.account_id] = (now_t, list(open_opt))
                 return open_eq
+            if res.status_code == 429:
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
             log_event(
                 "ERROR",
                 f"Webull get_open_equity_positions HTTP {res.status_code}"
             )
         except Exception as e:
+            err_s = str(e)
+            if "429" in err_s or "too many requests" in err_s.lower():
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
             log_event(
                 "ERROR",
                 f"Webull get_open_equity_positions exception: {e}"
             )
-        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
-            log_event(
-                "FLATTEN",
-                "Using cached Webull open equity snapshot (<10s) after API error."
-            )
-            return [
-                item
-                for item in cached[1]
-                if not is_position_ignored(item[0], is_opt=False)
-            ]
+        if allow_stale_cache:
+            with self._cache_lock:
+                cached = (
+                    self._last_open_eq.get(self.account_id)
+                    if self._snapshot_gen == snap_gen_at_start
+                    else None
+                )
+            if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+                log_event(
+                    "FLATTEN",
+                    "Using cached Webull open equity snapshot (<10s) after API error."
+                )
+                return [
+                    item
+                    for item in cached[1]
+                    if not is_position_ignored(item[0], is_opt=False)
+                ]
         return None
 
-    def get_open_option_positions(self):
+    def get_open_option_positions(
+        self,
+        allow_stale_cache=True,
+        pace_for_verify=False,
+        reuse_paired_eq_read=False,
+    ):
         """Returns (display_sym, qty, meta) for OPTIONS ONLY sorted with short
         legs (qty < 0) first, or None on API error."""
-        cached = self._last_open_opt.get(self.account_id)
-        if cached and (time.time() - cached[0]) < 0.45:
+        snap_gen_at_start = self._snapshot_gen
+        with self._cache_lock:
+            cached = self._last_open_opt.get(self.account_id)
+        if (
+            (allow_stale_cache or reuse_paired_eq_read)
+            and cached
+            and (time.time() - cached[0]) < 0.50
+        ):
             return [
                 item
                 for item in cached[1]
                 if not is_position_ignored(item[0], is_opt=True)
             ]
+        if (
+            not pace_for_verify
+            and allow_stale_cache
+            and time.time() < self._rate_limit_until
+            and cached
+            and (time.time() - cached[0]) <= 2.5
+        ):
+            return [
+                item
+                for item in cached[1]
+                if not is_position_ignored(item[0], is_opt=True)
+            ]
+        if pace_for_verify:
+            self._pace_position_verify_call()
         try:
             res = self._call_get_positions()
-            self._last_pos_call_ts = time.time()
             if res.status_code == 200:
                 open_eq = []
                 open_opt = []
@@ -6789,28 +7023,46 @@ class WebullAdapter:
                     key=lambda item: (0 if item[1] < 0 else 1, str(item[0]))
                 )
                 now_t = time.time()
-                self._last_open_eq[self.account_id] = (now_t, list(open_eq))
-                self._last_open_opt[self.account_id] = (now_t, list(open_opt))
+                with self._cache_lock:
+                    if self._snapshot_gen == snap_gen_at_start:
+                        self._last_open_eq[self.account_id] = (now_t, list(open_eq))
+                        self._last_open_opt[self.account_id] = (now_t, list(open_opt))
                 return open_opt
+            if res.status_code == 429:
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
             log_event(
                 "ERROR",
                 f"Webull get_open_option_positions HTTP {res.status_code}"
             )
         except Exception as e:
+            err_s = str(e)
+            if "429" in err_s or "too many requests" in err_s.lower():
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
             log_event(
                 "ERROR",
                 f"Webull get_open_option_positions exception: {e}"
             )
-        if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
-            log_event(
-                "FLATTEN",
-                "Using cached Webull open option snapshot (<10s) after API error."
-            )
-            return [
-                item
-                for item in cached[1]
-                if not is_position_ignored(item[0], is_opt=True)
-            ]
+        if allow_stale_cache:
+            with self._cache_lock:
+                cached = (
+                    self._last_open_opt.get(self.account_id)
+                    if self._snapshot_gen == snap_gen_at_start
+                    else None
+                )
+            if cached and (time.time() - cached[0]) <= 10.0 and cached[1]:
+                log_event(
+                    "FLATTEN",
+                    "Using cached Webull open option snapshot (<10s) after API error."
+                )
+                return [
+                    item
+                    for item in cached[1]
+                    if not is_position_ignored(item[0], is_opt=True)
+                ]
         return None
 
     def submit_option_liquidation_batch(self, open_opt_positions):
@@ -6827,6 +7079,7 @@ class WebullAdapter:
             )
             return submitted_ok
 
+        self.invalidate_cached_snapshots()
         sorted_opts = sorted(
             open_opt_positions,
             key=lambda item: (0 if item[1] < 0 else 1, str(item[0])),
@@ -6924,12 +7177,14 @@ class WebullAdapter:
                     "ERROR",
                     f"Webull option place_order exception ({display_sym}): {e}"
                 )
+        self.invalidate_cached_snapshots()
         return submitted_ok
 
     def submit_liquidation_batch(self, open_positions):
         submitted_ok = {}
         if not open_positions:
             return submitted_ok
+        self.invalidate_cached_snapshots()
         use_market = is_market_hours()
         for item in open_positions:
             symbol = item[0]
@@ -7005,6 +7260,7 @@ class WebullAdapter:
                     submitted_ok[symbol] = float(abs_q)
             except Exception as e:
                 log_event("ERROR", f"Webull place_order exception: {e}")
+        self.invalidate_cached_snapshots()
         return submitted_ok
 
     @staticmethod
@@ -7095,10 +7351,18 @@ class WebullAdapter:
     def fetch_account_data(self):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         for Webull accounts."""
+        self.last_snapshot_was_cached = False
+        snap_gen_at_start = self._snapshot_gen
         now_ts = time.time()
         if now_ts < self._rate_limit_until:
-            cached_snap = self._last_good_snapshot.get(self.account_id)
+            with self._cache_lock:
+                cached_snap = (
+                    self._last_good_snapshot.get(self.account_id)
+                    if self._snapshot_gen == snap_gen_at_start
+                    else None
+                )
             if cached_snap and (now_ts - cached_snap[0]) <= 15.0:
+                self.last_snapshot_was_cached = True
                 return cached_snap[1]
 
         try:
@@ -7106,17 +7370,24 @@ class WebullAdapter:
             if 0.0 <= elapsed_pos < 2.10:
                 time.sleep(2.10 - elapsed_pos)
             p_res = self._call_get_positions()
-            self._last_pos_call_ts = time.time()
             if p_res.status_code == 429:
-                self._rate_limit_until = time.time() + 2.5
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
                 if (time.time() - self._last_429_log_ts) >= 30.0:
                     self._last_429_log_ts = time.time()
                     log_event(
                         "WARN",
                         "Webull rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
                     )
-                cached_snap = self._last_good_snapshot.get(self.account_id)
+                with self._cache_lock:
+                    cached_snap = (
+                        self._last_good_snapshot.get(self.account_id)
+                        if self._snapshot_gen == snap_gen_at_start
+                        else None
+                    )
                 if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    self.last_snapshot_was_cached = True
                     return cached_snap[1]
                 self.last_error = "HTTP 429"
                 return None, True, 0.0, {}, False
@@ -7138,15 +7409,23 @@ class WebullAdapter:
 
             b_res = self._call_get_balance()
             if b_res.status_code == 429:
-                self._rate_limit_until = time.time() + 2.5
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
                 if (time.time() - self._last_429_log_ts) >= 30.0:
                     self._last_429_log_ts = time.time()
                     log_event(
                         "WARN",
                         "Webull balance rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
                     )
-                cached_snap = self._last_good_snapshot.get(self.account_id)
+                with self._cache_lock:
+                    cached_snap = (
+                        self._last_good_snapshot.get(self.account_id)
+                        if self._snapshot_gen == snap_gen_at_start
+                        else None
+                    )
                 if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    self.last_snapshot_was_cached = True
                     return cached_snap[1]
                 self.last_error = "HTTP 429"
                 return None, True, 0.0, {}, False
@@ -7382,8 +7661,6 @@ class WebullAdapter:
             ) = _apply_ignored_positions_to_snapshot(
                 adj_eq, pos_details, open_eq_cache, open_opt_cache
             )
-            self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
-            self._last_open_opt[self.account_id] = (now_snap_t, filt_opt)
 
             self.last_error = ""
             res_tuple = (
@@ -7393,22 +7670,34 @@ class WebullAdapter:
                 filt_pos,
                 has_opt
             )
-            self._last_good_snapshot[self.account_id] = (
-                time.time(), res_tuple
-            )
+            with self._cache_lock:
+                if self._snapshot_gen == snap_gen_at_start:
+                    self._last_open_eq[self.account_id] = (now_snap_t, filt_eq)
+                    self._last_open_opt[self.account_id] = (now_snap_t, filt_opt)
+                    self._last_good_snapshot[self.account_id] = (
+                        time.time(), res_tuple
+                    )
             return res_tuple
         except Exception as e:
             err_s = str(e)
             if "429" in err_s or "too many requests" in err_s.lower():
-                self._rate_limit_until = time.time() + 2.5
+                self._rate_limit_until = max(
+                    self._rate_limit_until, time.time() + 2.5
+                )
                 if (time.time() - self._last_429_log_ts) >= 30.0:
                     self._last_429_log_ts = time.time()
                     log_event(
                         "WARN",
                         "Webull rate limit (HTTP 429) — backing off 2.5s and holding last snapshot."
                     )
-                cached_snap = self._last_good_snapshot.get(self.account_id)
+                with self._cache_lock:
+                    cached_snap = (
+                        self._last_good_snapshot.get(self.account_id)
+                        if self._snapshot_gen == snap_gen_at_start
+                        else None
+                    )
                 if cached_snap and (time.time() - cached_snap[0]) <= 15.0:
+                    self.last_snapshot_was_cached = True
                     return cached_snap[1]
             self.last_error = err_s
             log_event("ERROR", f"Webull account fetch exception: {e}")
@@ -9192,41 +9481,114 @@ def _format_lock_voice_msg(duration_mins, label_prefix, upgraded=False):
     return f"{reason_words}. Locked out for {dur_words}."
 
 
-def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
+_post_lock_wd_lock = threading.Lock()
+_post_lock_wd_state = {}
+
+
+def _run_post_lock_watchdog(
+    adapter, ui_button, lock_context="OS LOCK", was_flat_at_lock_start=True
+):
     """Executes a Two-Stage Post-Lock Straggler Watchdog (Stage 1 at T+2.0s and
     Stage 2 at T+15.0s) after Windows OS lock engages, with verbal confirmations."""
     if adapter is None:
         return
 
     is_one_shot = "ONE-SHOT" in str(lock_context).upper()
+    wd_key = (
+        str(getattr(adapter, "name", "")),
+        str(getattr(adapter, "account_id", "") or ""),
+    )
+    with _post_lock_wd_lock:
+        prev_st = _post_lock_wd_state.get(wd_key) or {
+            "gen": 0,
+            "unconfirmed_pre_lock": False,
+        }
+        my_gen = int(prev_st.get("gen", 0)) + 1
+        inherited_unconfirmed = bool(
+            cooldown_active and prev_st.get("unconfirmed_pre_lock", False)
+        )
+        effective_flat_at_start = bool(
+            was_flat_at_lock_start and not inherited_unconfirmed
+        )
+        _post_lock_wd_state[wd_key] = {
+            "gen": my_gen,
+            "unconfirmed_pre_lock": (not effective_flat_at_start),
+        }
 
-    def _check_or_sweep_stage(stage_num, elapsed_tag):
-        global cooldown_active
-        opt_armed = is_options_flatten_armed(config)
-        post_pos = adapter.get_open_equity_positions()
-        post_opt = (
-            adapter.get_open_option_positions()
+    def _is_wd_superseded():
+        with _post_lock_wd_lock:
+            cur = _post_lock_wd_state.get(wd_key)
+            return bool(cur and cur.get("gen") != my_gen)
+
+    def _mark_wd_flat_confirmed():
+        nonlocal effective_flat_at_start
+        effective_flat_at_start = True
+        with _post_lock_wd_lock:
+            cur = _post_lock_wd_state.get(wd_key)
+            if cur and cur.get("gen") == my_gen:
+                cur["unconfirmed_pre_lock"] = False
+
+    def _query_live_watchdog_positions(opt_armed):
+        p_eq = adapter.get_open_equity_positions(
+            allow_stale_cache=False, pace_for_verify=True
+        )
+        p_opt = (
+            adapter.get_open_option_positions(
+                allow_stale_cache=False,
+                pace_for_verify=True,
+                reuse_paired_eq_read=True,
+            )
             if opt_armed and hasattr(adapter, "get_open_option_positions")
             else []
         )
-        if post_pos is None or (opt_armed and post_opt is None):
+        return p_eq, p_opt
+
+    def _check_or_sweep_stage(stage_num, elapsed_tag):
+        global cooldown_active
+        if _is_wd_superseded() or (not is_one_shot and not cooldown_active):
+            return False
+        opt_armed = is_options_flatten_armed(config)
+        post_pos, post_opt = _query_live_watchdog_positions(opt_armed)
+
+        retry_idx = 0
+        while (
+            retry_idx < 3
+            and (post_pos is None or (opt_armed and post_opt is None))
+        ):
+            retry_idx += 1
+            if _is_wd_superseded() or (not is_one_shot and not cooldown_active):
+                return False
             log_event(
                 "WARNING",
                 f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
-                f"Position check returned None; retrying in 1.5s..."
+                f"Position check returned None (retry {retry_idx}/3 in 2.6s)..."
             )
-            time.sleep(1.5)
-            post_pos = adapter.get_open_equity_positions()
-            post_opt = (
-                adapter.get_open_option_positions()
-                if opt_armed and hasattr(adapter, "get_open_option_positions")
-                else []
-            )
+            time.sleep(2.6)
+            if _is_wd_superseded() or (not is_one_shot and not cooldown_active):
+                return False
+            if post_pos is None:
+                post_pos = adapter.get_open_equity_positions(
+                    allow_stale_cache=False, pace_for_verify=True
+                )
+            if (
+                opt_armed
+                and post_opt is None
+                and hasattr(adapter, "get_open_option_positions")
+            ):
+                post_opt = adapter.get_open_option_positions(
+                    allow_stale_cache=False,
+                    pace_for_verify=True,
+                    reuse_paired_eq_read=True,
+                )
+
+        if _is_wd_superseded() or (not is_one_shot and not cooldown_active):
+            return False
 
         eq_ok = (post_pos is not None and len(post_pos) == 0)
         opt_ok = (not opt_armed) or (post_opt is not None and len(post_opt) == 0)
 
         if eq_ok and opt_ok:
+            _mark_wd_flat_confirmed()
             if stage_num == 1:
                 log_event(
                     "GUARDRAIL",
@@ -9236,7 +9598,8 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
                 )
                 if not is_one_shot:
                     time.sleep(1.8)
-                speak_async("Initial flat check passed.")
+                if not _is_wd_superseded() and (is_one_shot or cooldown_active):
+                    speak_async("Initial flat check passed.")
             else:
                 log_event(
                     "GUARDRAIL",
@@ -9244,8 +9607,83 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
                     f"15-second sweep clear — confirmed 0 open equity shares"
                     + (" and 0 open option contracts." if opt_armed else ".")
                 )
-                speak_async("15 second sweep clear, account confirmed flat.")
+                if not _is_wd_superseded() and (is_one_shot or cooldown_active):
+                    speak_async("15 second sweep clear, account confirmed flat.")
             return True
+
+        api_unverified = (post_pos is None) or (opt_armed and post_opt is None)
+        if api_unverified:
+            if effective_flat_at_start:
+                log_event(
+                    "WARN",
+                    f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
+                    f"Broker API rate-limited/unreachable (None) after retries; "
+                    f"account was confirmed flat prior to lock — keeping lock active without blind sweep."
+                )
+                if stage_num == 1:
+                    return "UNVERIFIED"
+
+                for quiet_i in range(2):
+                    time.sleep(5.0)
+                    if _is_wd_superseded() or (not is_one_shot and not cooldown_active):
+                        return False
+                    q_pos, q_opt = _query_live_watchdog_positions(opt_armed)
+                    q_eq_ok = (q_pos is not None and len(q_pos) == 0)
+                    q_opt_ok = (not opt_armed) or (q_opt is not None and len(q_opt) == 0)
+                    if q_eq_ok and q_opt_ok:
+                        _mark_wd_flat_confirmed()
+                        log_event(
+                            "GUARDRAIL",
+                            f"POST-LOCK WATCHDOG STAGE 2 (Deferred +{quiet_i + 1} | {lock_context}): "
+                            f"Deferred sweep clear — confirmed 0 open equity shares"
+                            + (" and 0 open option contracts." if opt_armed else ".")
+                        )
+                        if not _is_wd_superseded() and (is_one_shot or cooldown_active):
+                            speak_async("15 second sweep clear, account confirmed flat.")
+                        return True
+                    if (q_pos is not None and len(q_pos) > 0) or (
+                        opt_armed and q_opt is not None and len(q_opt) > 0
+                    ):
+                        post_pos, post_opt = q_pos, q_opt
+                        api_unverified = False
+                        break
+                if api_unverified:
+                    log_event(
+                        "WARN",
+                        f"POST-LOCK WATCHDOG STAGE 2 (Deferred | {lock_context}): "
+                        f"Broker API still rate-limited/unreachable; pre-lock flat state preserved."
+                    )
+                    return "UNVERIFIED"
+            else:
+                log_event(
+                    "CRITICAL",
+                    f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
+                    f"Broker API unreachable (None) after retries and pre-lock flat state was unverified! "
+                    f"Attempting protective flatten verification..."
+                )
+                swept_flat = flatten_equities(
+                    adapter, force_flatten=True, include_options=opt_armed
+                )
+                if swept_flat:
+                    _mark_wd_flat_confirmed()
+                    log_event(
+                        "GUARDRAIL",
+                        f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
+                        f"Protective post-lock verification confirmed 100% flat."
+                    )
+                    if not _is_wd_superseded() and (is_one_shot or cooldown_active):
+                        speak_async("Account confirmed flat.")
+                    return True
+                log_event(
+                    "CRITICAL",
+                    f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
+                    f"Post-lock position verification UNVERIFIED! Aborting OS lock and sounding emergency siren!"
+                )
+                cooldown_active = False
+                trigger_alarm(
+                    "POST-LOCK POSITION CHECK UNVERIFIED — CHECK BROKER!", ui_button
+                )
+                return False
 
         straggler_desc = (
             f"Equities={post_pos}, Options={[(x[0], x[1]) for x in (post_opt or [])]}"
@@ -9263,6 +9701,7 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
             adapter, force_flatten=True, include_options=opt_armed
         )
         if swept_flat:
+            _mark_wd_flat_confirmed()
             log_event(
                 "GUARDRAIL",
                 f"POST-LOCK WATCHDOG STAGE {stage_num} ({elapsed_tag} | {lock_context}): "
@@ -9287,7 +9726,7 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
         try:
             # Stage 1: T + 2.0s initial post-lock verification
             time.sleep(2.0)
-            if not is_one_shot and not cooldown_active:
+            if _is_wd_superseded() or (not is_one_shot and not cooldown_active):
                 return
             if not _check_or_sweep_stage(1, "2.0s"):
                 return
@@ -9295,7 +9734,7 @@ def _run_post_lock_watchdog(adapter, ui_button, lock_context="OS LOCK"):
             # Stage 2: T + 15.0s delayed sweep to catch late ECN/unhalt prints
             rem_wait = max(1.0, 15.0 - (time.time() - lock_start_ts))
             time.sleep(rem_wait)
-            if not is_one_shot and not cooldown_active:
+            if _is_wd_superseded() or (not is_one_shot and not cooldown_active):
                 return
             _check_or_sweep_stage(2, "15.0s")
         except Exception as e:
@@ -10100,6 +10539,7 @@ def start_cooldown_lock(
     overlay=None,
     reason_text="",
     context_str="",
+    was_flat_at_lock_start=True,
 ):
     global cooldown_active, cooldown_end_time, cooldown_label
     global cooldown_30s_announced, cooldown_announced_mins, alarm_active
@@ -10130,7 +10570,12 @@ def start_cooldown_lock(
                 _format_lock_voice_msg(duration_mins, label_prefix, upgraded=True),
                 interrupt=True,
             )
-            _run_post_lock_watchdog(adapter, ui_button, label_prefix)
+            _run_post_lock_watchdog(
+                adapter,
+                ui_button,
+                label_prefix,
+                was_flat_at_lock_start=was_flat_at_lock_start,
+            )
         return
 
     cooldown_active = True
@@ -10193,7 +10638,12 @@ def start_cooldown_lock(
             _format_lock_voice_msg(duration_mins, cooldown_label, upgraded=False)
         )
         watchdog_launched = True
-        _run_post_lock_watchdog(adapter, ui_button, cooldown_label)
+        _run_post_lock_watchdog(
+            adapter,
+            ui_button,
+            cooldown_label,
+            was_flat_at_lock_start=was_flat_at_lock_start,
+        )
 
         overlay.wait_out_briefing_or_bypass(
             briefing_sec=brief_s,
@@ -10282,7 +10732,12 @@ def start_cooldown_lock(
             )
             if not watchdog_launched:
                 watchdog_launched = True
-                _run_post_lock_watchdog(adapter, ui_button, cooldown_label)
+                _run_post_lock_watchdog(
+                    adapter,
+                    ui_button,
+                    cooldown_label,
+                    was_flat_at_lock_start=was_flat_at_lock_start,
+                )
             time.sleep(0.20)
 
         if not cooldown_active:
@@ -10353,6 +10808,16 @@ def flatten_equities(
             return "[]"
         return str([(x[0], x[1]) for x in opt_list])
 
+    def _mark_flatten_flat():
+        if adapter is not None:
+            adapter._last_flatten_outcome = "FLAT"
+            if hasattr(adapter, "invalidate_cached_snapshots"):
+                adapter.invalidate_cached_snapshots()
+        return True
+
+    if adapter is not None:
+        adapter._last_flatten_outcome = "OPEN"
+
     try:
         if include_options and not is_market_hours():
             # US equity options only trade during RTH (9:30 AM - 4:00 PM ET).
@@ -10374,6 +10839,10 @@ def flatten_equities(
                     include_options=False,
                     status_cb=status_cb,
                 )
+                if adapter is not None:
+                    adapter._last_flatten_outcome = (
+                        "UNVERIFIED" if eh_opt is None else "OPEN"
+                    )
                 log_event(
                     "GUARDRAIL",
                     f"Options Auto-Flatten (BETA) is enabled, but US options "
@@ -10426,9 +10895,13 @@ def flatten_equities(
                 return pos_list
             time.sleep(0.35)
             re_list = (
-                adapter.get_open_option_positions()
+                adapter.get_open_option_positions(
+                    allow_stale_cache=False, pace_for_verify=True
+                )
                 if is_opt_flag and hasattr(adapter, "get_open_option_positions")
-                else adapter.get_open_equity_positions()
+                else adapter.get_open_equity_positions(
+                    allow_stale_cache=False, pace_for_verify=True
+                )
             )
             if re_list is not None:
                 re_syms = {x[0] for x in re_list}
@@ -10462,7 +10935,7 @@ def flatten_equities(
             )
             peek_pos = adapter.get_open_equity_positions()
             peek_opt = (
-                adapter.get_open_option_positions()
+                adapter.get_open_option_positions(reuse_paired_eq_read=True)
                 if include_options and hasattr(adapter, "get_open_option_positions")
                 else []
             )
@@ -10482,11 +10955,11 @@ def flatten_equities(
                 False,
             )
 
-            open_pos = adapter.get_open_equity_positions()
+            open_pos = adapter.get_open_equity_positions(cache_empty_ok=True)
             if open_pos is None and peek_pos is not None:
                 open_pos = peek_pos
             open_opt = (
-                adapter.get_open_option_positions()
+                adapter.get_open_option_positions(reuse_paired_eq_read=True)
                 if include_options and hasattr(adapter, "get_open_option_positions")
                 else []
             )
@@ -10518,9 +10991,15 @@ def flatten_equities(
                     False,
                 )
                 time.sleep(0.8)
-                open_pos = adapter.get_open_equity_positions()
+                open_pos = adapter.get_open_equity_positions(
+                    allow_stale_cache=False, pace_for_verify=True
+                )
                 open_opt = (
-                    adapter.get_open_option_positions()
+                    adapter.get_open_option_positions(
+                        allow_stale_cache=False,
+                        pace_for_verify=True,
+                        reuse_paired_eq_read=True,
+                    )
                     if include_options and hasattr(adapter, "get_open_option_positions")
                     else []
                 )
@@ -10535,7 +11014,7 @@ def flatten_equities(
                         if include_options
                         else "Double-confirmed 0 open equity shares (no flatten order needed)."
                     )
-                    return True
+                    return _mark_flatten_flat()
 
             if open_pos:
                 to_sub_eq = _filter_uncovered_positions(
@@ -10584,9 +11063,15 @@ def flatten_equities(
                 "⏳  2. Daytrade Positions: Verifying 0 open daytrade positions with broker API...",
                 False,
             )
-            open_pos = adapter.get_open_equity_positions()
+            open_pos = adapter.get_open_equity_positions(
+                allow_stale_cache=False, pace_for_verify=True
+            )
             open_opt = (
-                adapter.get_open_option_positions()
+                adapter.get_open_option_positions(
+                    allow_stale_cache=False,
+                    pace_for_verify=True,
+                    reuse_paired_eq_read=True,
+                )
                 if include_options and hasattr(adapter, "get_open_option_positions")
                 else []
             )
@@ -10596,9 +11081,15 @@ def flatten_equities(
                 and (not include_options or (open_opt is not None and len(open_opt) == 0))
             ):
                 time.sleep(0.8)
-                open_pos = adapter.get_open_equity_positions()
+                open_pos = adapter.get_open_equity_positions(
+                    allow_stale_cache=False, pace_for_verify=True
+                )
                 open_opt = (
-                    adapter.get_open_option_positions()
+                    adapter.get_open_option_positions(
+                        allow_stale_cache=False,
+                        pace_for_verify=True,
+                        reuse_paired_eq_read=True,
+                    )
                     if include_options and hasattr(adapter, "get_open_option_positions")
                     else []
                 )
@@ -10607,7 +11098,13 @@ def flatten_equities(
                     and len(open_pos) == 0
                     and (not include_options or (open_opt is not None and len(open_opt) == 0))
                 ):
-                    return True
+                    return _mark_flatten_flat()
+            if adapter is not None:
+                adapter._last_flatten_outcome = (
+                    "UNVERIFIED"
+                    if (open_pos is None or (include_options and open_opt is None))
+                    else "OPEN"
+                )
             log_event(
                 "WARNING",
                 f"Auto-Flatten is OFF, and positions remain open (or unverified): "
@@ -10622,17 +11119,31 @@ def flatten_equities(
             if include_options
             else "Polling broker API to verify 0 open equity shares..."
         )
+        max_wait_s = (
+            25.0 if getattr(adapter, "name", "") == "WEBULL" else 15.0
+        )
         start_wait = time.time()
         polls = 0
-        while time.time() - start_wait < 15:
+        last_live_verify_open_count = None
+        last_raw_eq = None
+        last_raw_opt = None
+        while time.time() - start_wait < max_wait_s:
             time.sleep(0.5 if polls == 0 else 1.5)
             polls += 1
-            rem_pos = adapter.get_open_equity_positions()
+            rem_pos = adapter.get_open_equity_positions(
+                allow_stale_cache=False, pace_for_verify=True
+            )
             rem_opt = (
-                adapter.get_open_option_positions()
+                adapter.get_open_option_positions(
+                    allow_stale_cache=False,
+                    pace_for_verify=True,
+                    reuse_paired_eq_read=True,
+                )
                 if include_options and hasattr(adapter, "get_open_option_positions")
                 else []
             )
+            last_raw_eq = rem_pos
+            last_raw_opt = rem_opt
             elapsed = time.time() - start_wait
             _notify_status(
                 "✓  1. Working Orders: Open working orders canceled & cleared",
@@ -10654,6 +11165,9 @@ def flatten_equities(
                 rem_opt = _filter_stale_replica_resurrections(
                     rem_opt, confirmed_closed_opt, is_opt_flag=True
                 )
+            last_live_verify_open_count = len(rem_pos) + (
+                len(rem_opt) if (include_options and rem_opt) else 0
+            )
 
             curr_eq_syms = {x[0] for x in rem_pos}
             for s in list(ever_seen_eq):
@@ -10684,12 +11198,20 @@ def flatten_equities(
                     False,
                 )
                 time.sleep(0.8)
-                rem_confirm = adapter.get_open_equity_positions()
+                rem_confirm = adapter.get_open_equity_positions(
+                    allow_stale_cache=False, pace_for_verify=True
+                )
                 opt_confirm = (
-                    adapter.get_open_option_positions()
+                    adapter.get_open_option_positions(
+                        allow_stale_cache=False,
+                        pace_for_verify=True,
+                        reuse_paired_eq_read=True,
+                    )
                     if include_options and hasattr(adapter, "get_open_option_positions")
                     else []
                 )
+                last_raw_eq = rem_confirm
+                last_raw_opt = opt_confirm
                 elapsed_confirm = time.time() - start_wait
                 if (
                     rem_confirm is not None
@@ -10702,13 +11224,16 @@ def flatten_equities(
                         if include_options
                         else f"SUCCESS: Double-confirmed 0 equity shares in {elapsed_confirm:.1f}s."
                     )
-                    return True
+                    return _mark_flatten_flat()
                 if rem_confirm is None or (include_options and opt_confirm is None):
                     log_event(
                         "WARNING",
                         "0.8s double-confirm query returned None; continuing verification loop..."
                     )
                     continue
+                last_live_verify_open_count = len(rem_confirm) + (
+                    len(opt_confirm) if (include_options and opt_confirm) else 0
+                )
                 log_event(
                     "FLATTEN",
                     f"Straggler positions detected on 0.8s double-confirm: "
@@ -10762,12 +11287,20 @@ def flatten_equities(
                 adapter.cancel_all_working_orders(
                     preserve_market_close_map=curr_preserve_map
                 )
-                rem_pos = adapter.get_open_equity_positions()
+                rem_pos = adapter.get_open_equity_positions(
+                    allow_stale_cache=False, pace_for_verify=True
+                )
                 rem_opt = (
-                    adapter.get_open_option_positions()
+                    adapter.get_open_option_positions(
+                        allow_stale_cache=False,
+                        pace_for_verify=True,
+                        reuse_paired_eq_read=True,
+                    )
                     if include_options and hasattr(adapter, "get_open_option_positions")
                     else []
                 )
+                last_raw_eq = rem_pos
+                last_raw_opt = rem_opt
                 if rem_pos is not None:
                     rem_pos = _filter_stale_replica_resurrections(
                         rem_pos, confirmed_closed_eq, is_opt_flag=False
@@ -10782,6 +11315,12 @@ def flatten_equities(
                     for s in list(ever_seen_opt):
                         if s not in {x[0] for x in rem_opt}:
                             confirmed_closed_opt.add(s)
+                if rem_pos is not None and (
+                    not include_options or rem_opt is not None
+                ):
+                    last_live_verify_open_count = len(rem_pos) + (
+                        len(rem_opt) if (include_options and rem_opt) else 0
+                    )
 
                 if (
                     rem_pos is not None
@@ -10789,12 +11328,20 @@ def flatten_equities(
                     and (not include_options or (rem_opt is not None and len(rem_opt) == 0))
                 ):
                     time.sleep(0.8)
-                    rem_confirm = adapter.get_open_equity_positions()
+                    rem_confirm = adapter.get_open_equity_positions(
+                        allow_stale_cache=False, pace_for_verify=True
+                    )
                     opt_confirm = (
-                        adapter.get_open_option_positions()
+                        adapter.get_open_option_positions(
+                            allow_stale_cache=False,
+                            pace_for_verify=True,
+                            reuse_paired_eq_read=True,
+                        )
                         if include_options and hasattr(adapter, "get_open_option_positions")
                         else []
                     )
+                    last_raw_eq = rem_confirm
+                    last_raw_opt = opt_confirm
                     if (
                         rem_confirm is not None
                         and len(rem_confirm) == 0
@@ -10808,9 +11355,15 @@ def flatten_equities(
                             else f"SUCCESS: Double-confirmed 0 equity shares after sweep "
                             f"({time.time() - start_wait:.1f}s)."
                         )
-                        return True
+                        return _mark_flatten_flat()
                     rem_pos = rem_confirm
                     rem_opt = opt_confirm
+                    if rem_pos is not None and (
+                        not include_options or rem_opt is not None
+                    ):
+                        last_live_verify_open_count = len(rem_pos) + (
+                            len(rem_opt) if (include_options and rem_opt) else 0
+                        )
 
                 uncovered_eq = (
                     _filter_uncovered_positions(rem_pos, submitted_close_eq)
@@ -10846,15 +11399,35 @@ def flatten_equities(
                     )
                     break
 
-        log_event(
-            "CRITICAL",
-            "Flatten 15s timeout reached! Positions (Equities/Options) still open!"
-            if include_options
-            else "Equity flatten 15s timeout reached! Shares still open!"
+        unverified_at_timeout = (
+            (last_raw_eq is None or (include_options and last_raw_opt is None))
+            and (
+                last_live_verify_open_count is None
+                or last_live_verify_open_count == 0
+            )
         )
+        if adapter is not None:
+            adapter._last_flatten_outcome = (
+                "UNVERIFIED" if unverified_at_timeout else "OPEN"
+            )
+        if unverified_at_timeout:
+            log_event(
+                "CRITICAL",
+                f"Flatten {int(max_wait_s)}s verification timeout reached "
+                f"(broker API rate-limited/unreachable — position state unverified)!"
+            )
+        else:
+            log_event(
+                "CRITICAL",
+                f"Flatten {int(max_wait_s)}s timeout reached! Positions (Equities/Options) still open!"
+                if include_options
+                else f"Equity flatten {int(max_wait_s)}s timeout reached! Shares still open!"
+            )
         return False
 
     except Exception as e:
+        if adapter is not None:
+            adapter._last_flatten_outcome = "UNVERIFIED"
         log_event("ERROR", f"Flatten execution exception: {e}")
         return False
 
@@ -10889,11 +11462,17 @@ def _enter_halt_breach_watch(
     watched = {}
     try:
         if adapter is not None:
-            rem_eq = adapter.get_open_equity_positions()
+            rem_eq = adapter.get_open_equity_positions(
+                allow_stale_cache=False, pace_for_verify=True
+            )
             for item in (rem_eq or []):
                 watched[str(item[0])] = float(item[1])
             if has_options and hasattr(adapter, "get_open_option_positions"):
-                rem_opt = adapter.get_open_option_positions()
+                rem_opt = adapter.get_open_option_positions(
+                    allow_stale_cache=False,
+                    pace_for_verify=True,
+                    reuse_paired_eq_read=True,
+                )
                 for item in (rem_opt or []):
                     watched[f"{item[0]} (OPT)"] = float(item[1])
     except Exception:
@@ -11800,9 +12379,15 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
             current_eq, is_flat, live_open_pnl, pos_details, has_options = (
                 active_adapter.fetch_account_data()
             )
+            snap_was_cached = bool(
+                getattr(active_adapter, "last_snapshot_was_cached", False)
+            )
+            reverify_deferred_cached = False
 
             if current_eq is not None and current_eq > 0:
-                if consecutive_api_failures > 0 or api_disconnect_alerted:
+                if not snap_was_cached and (
+                    consecutive_api_failures > 0 or api_disconnect_alerted
+                ):
                     recovered_attempts = max(1, consecutive_api_failures)
                     was_alerted = api_disconnect_alerted
                     consecutive_api_failures = 0
@@ -11863,7 +12448,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 if (
                     start_equity is None
                     or start_equity <= 0.0
-                    or force_reanchor
+                    or (force_reanchor and not snap_was_cached)
                 ):
                     anchor_eq = round(current_eq - live_open_pnl, 2)
                     start_equity = anchor_eq
@@ -11993,7 +12578,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 current_eq, realized_pnl, open_pnl = (
                     _stabilize_mid_fill_realized_and_equity(
-                        current_eq, is_flat, live_open_pnl, pos_details
+                        current_eq,
+                        is_flat,
+                        live_open_pnl,
+                        pos_details,
+                        is_reverify=snap_was_cached,
                     )
                 )
 
@@ -12076,6 +12665,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         else start_equity - t1_max
                     )
                 )
+                floor_equity = active_floor_now
                 warn_floors = []
                 if not rth_now:
                     if (
@@ -12138,7 +12728,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     and current_eq <= active_warn_floor_now
                 )
                 if (
-                    not first_poll_of_launch
+                    not snap_was_cached
+                    and not first_poll_of_launch
                     and (
                         floor_breach_cand
                         or open_breach_cand
@@ -12203,7 +12794,20 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         v_eq, v_flat, v_open, v_pos, v_opt = (
                             active_adapter.fetch_account_data()
                         )
-                        if v_eq is not None and v_eq > 0:
+                        v_was_cached = bool(
+                            getattr(
+                                active_adapter, "last_snapshot_was_cached", False
+                            )
+                        )
+                        if v_was_cached:
+                            reverify_deferred_cached = True
+                            log_event(
+                                "GUARDRAIL",
+                                f"Deferred breach confirmation (re-verify returned "
+                                f"cached rate-limit snapshot; awaiting next live poll | "
+                                f"Initial: {spike_ctx})."
+                            )
+                        elif v_eq is not None and v_eq > 0:
                             current_eq = v_eq
                             is_flat = v_flat
                             current_is_flat = v_flat
@@ -12262,12 +12866,19 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                     f"(Initial: {spike_ctx} -> Verified: {v_ctx})."
                                 )
 
-                consec_reason = log_position_transitions(
-                    pos_details,
-                    realized_pnl,
-                    open_pnl,
-                    net_pnl,
-                    session_high_pnl
+                consec_reason = (
+                    None
+                    if snap_was_cached
+                    else log_position_transitions(
+                        pos_details,
+                        realized_pnl,
+                        open_pnl,
+                        net_pnl,
+                        session_high_pnl
+                    )
+                )
+                skip_stop_actions = bool(
+                    snap_was_cached or reverify_deferred_cached
                 )
 
                 # Prevent immediate siren blast or flat re-lock on startup,
@@ -12344,7 +12955,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     f"Net={format_dollar(net_pnl)}"
                 )
 
-                if pending_halt_breach is not None:
+                if not snap_was_cached and pending_halt_breach is not None:
                     hb = pending_halt_breach
                     hb_type = hb.get("type", "DAILY")
                     hb_reason = hb.get("reason", "Daily Stop Breach")
@@ -12486,7 +13097,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
                             refreshed_w = {}
                             try:
-                                r_eq = active_adapter.get_open_equity_positions()
+                                r_eq = active_adapter.get_open_equity_positions(
+                                    allow_stale_cache=False,
+                                    pace_for_verify=True,
+                                )
                                 for item in (r_eq or []):
                                     refreshed_w[str(item[0])] = float(item[1])
                             except Exception:
@@ -12500,21 +13114,23 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     r_pm_w1 = f"Ext-Hours -${pm_w1:,.0f} Warn 1"
                     r_pm_tr = "Ext-Hours Trailing Floor Breach"
 
-                    check_alarm_rearm(r_pm_max, net_pnl, -pm_max)
-                    if pm_w2_on:
-                        check_alarm_rearm(r_pm_w2, net_pnl, -pm_w2)
-                    if pm_w1_on:
-                        check_alarm_rearm(r_pm_w1, net_pnl, -pm_w1)
+                    if not snap_was_cached:
+                        check_alarm_rearm(r_pm_max, net_pnl, -pm_max)
+                        if pm_w2_on:
+                            check_alarm_rearm(r_pm_w2, net_pnl, -pm_w2)
+                        if pm_w1_on:
+                            check_alarm_rearm(r_pm_w1, net_pnl, -pm_w1)
 
                     if pm_lock_on and max_realized_profit >= pm_trig:
                         floor_equity = max(start_equity - pm_max, max_equity - pm_trail)
-                        check_alarm_rearm(
-                            r_pm_tr, current_eq, floor_equity
-                        )
+                        if not snap_was_cached:
+                            check_alarm_rearm(
+                                r_pm_tr, current_eq, floor_equity
+                            )
                     else:
                         floor_equity = start_equity - pm_max
 
-                    if pending_halt_breach is not None:
+                    if pending_halt_breach is not None or skip_stop_actions:
                         pass
                     elif (
                         not is_locked_down
@@ -12556,7 +13172,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             start_equity + prior_rth_stop,
                             max_equity - t4_trail,
                         )
-                        if pending_halt_breach is not None:
+                        if pending_halt_breach is not None or skip_stop_actions:
                             pass
                         elif not is_locked_down and current_eq <= floor_equity:
                             msg = (
@@ -12584,9 +13200,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     elif t3_on and max_realized_profit >= t3_trig:
                         floor_equity = start_equity + eff_t3_max
                         r_t3 = "Hit $0 (Tier 3)"
-                        if eff_t3_max < 0:
+                        if eff_t3_max < 0 and not snap_was_cached:
                             check_alarm_rearm(r_t3, current_eq, start_equity)
-                        if pending_halt_breach is not None:
+                        if pending_halt_breach is not None or skip_stop_actions:
                             pass
                         elif not is_locked_down and current_eq <= floor_equity:
                             msg = f"Breached Tier 3 Stop ({format_dollar(eff_t3_max)})"
@@ -12618,9 +13234,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     elif t2_on and max_realized_profit >= t2_trig:
                         floor_equity = start_equity + eff_t2_max
                         r_t2 = "Hit $0 (Tier 2)"
-                        if eff_t2_max < 0:
+                        if eff_t2_max < 0 and not snap_was_cached:
                             check_alarm_rearm(r_t2, current_eq, start_equity)
-                        if pending_halt_breach is not None:
+                        if pending_halt_breach is not None or skip_stop_actions:
                             pass
                         elif not is_locked_down and current_eq <= floor_equity:
                             msg = f"Breached Tier 2 Stop ({format_dollar(eff_t2_max)})"
@@ -12654,16 +13270,17 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         r_t1_w2 = f"Hit -${t1_w2:,.0f} (Tier 1)"
                         r_t1_w1 = f"Hit -${t1_w1:,.0f} (Tier 1)"
 
-                        if t1_w2_on:
-                            check_alarm_rearm(
-                                r_t1_w2, current_eq, start_equity - t1_w2
-                            )
-                        if t1_w1_on:
-                            check_alarm_rearm(
-                                r_t1_w1, current_eq, start_equity - t1_w1
-                            )
+                        if not snap_was_cached:
+                            if t1_w2_on:
+                                check_alarm_rearm(
+                                    r_t1_w2, current_eq, start_equity - t1_w2
+                                )
+                            if t1_w1_on:
+                                check_alarm_rearm(
+                                    r_t1_w1, current_eq, start_equity - t1_w1
+                                )
 
-                        if pending_halt_breach is not None:
+                        if pending_halt_breach is not None or skip_stop_actions:
                             pass
                         elif not is_locked_down and current_eq <= floor_equity:
                             msg = f"Breached Tier 1 Floor (-${t1_max:,.0f})"
@@ -12708,7 +13325,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             trigger_alarm(r_t1_w1, mute_btn, ctx)
 
                 if (
-                    consec_reason
+                    not skip_stop_actions
+                    and consec_reason
                     and not cooldown_active
                     and pending_halt_breach is None
                 ):
@@ -12717,7 +13335,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     )
 
                 if (
-                    is_locked_down
+                    not snap_was_cached
+                    and is_locked_down
                     and is_flat
                     and current_eq >= (floor_equity + RECOVERY_BUFFER_DOLLARS)
                 ):
@@ -12771,7 +13390,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 new_upside_tier = compute_upside_tier(
                     rth_now, max_realized_profit, config
                 )
-                if is_flat and new_upside_tier > current_upside_tier:
+                if (
+                    not snap_was_cached
+                    and is_flat
+                    and new_upside_tier > current_upside_tier
+                ):
                     current_upside_tier = new_upside_tier
                     fl_str = format_dollar(terminate_pnl_level)
                     if not rth_now:

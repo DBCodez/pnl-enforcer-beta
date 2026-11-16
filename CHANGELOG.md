@@ -4,6 +4,20 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.59.2] — 2026-11-16
+### ⚡ Quick Summary
+- **Webull `HTTP 429` Rate-Limit Pacing & False Post-Lock Straggler Alarm Fix (Shoutout to `T$MAC`!):** Fixed a burst rate-limit edge case where Webull returning `HTTP 429` right after a successful auto-flatten could replay a cached pre-flatten snapshot and cause the 15-second Post-Lock Watchdog to mistake a `None` rate-limit response for open shares (*"Warning, straggler shares detected"* / `POST-LOCK FLATTEN FAILED`) even though the account was already 100% flat—special shoutout to beta tester **`T$MAC`** for stumbling into this one live and sending over the log that nailed it!
+
+### 🔍 Detailed Breakdown
+- **Zero-Delay Pre-Submit Reads, Paced Verification & Hold-Only Rate-Limit Snapshots (`WebullAdapter`, `SchwabAdapter`, `flatten_equities`, `data_loop`):**
+  - Pre-submit emergency flatten reads retain `0ms` pacing so order cancellation and exit submission are never delayed, while post-submit verification, `0.8s` settlement double-confirms, and Post-Lock Watchdog checks pace `get_account_position` calls cleanly (`WEBULL_POS_MIN_INTERVAL_SEC = 1.15s`, paired option cache reuse, `25s` Webull verification window) and stamp `_last_pos_call_ts` inside `finally:`.
+  - Added generation-guarded `invalidate_cached_snapshots()` across order submission and flat confirmation so stale pre-flatten snapshots cannot survive or repopulate after an exit order, and marked `HTTP 429` fallback snapshots as HUD **hold-only** (`last_snapshot_was_cached`) so stale cached ticks never re-confirm anti-wick spikes or re-fire stop/lockout actions.
+- **3-State Flatten Outcome & Single-Instance Post-Lock Watchdog (`_run_post_lock_watchdog`, `_post_lock_wd_state`):**
+  - Deduplicated Post-Lock Watchdog threads per `(broker, account_id)` across lock upgrades (`Upgraded active lock`) so concurrent watchdogs never collide on broker position endpoints.
+  - Separated API rate-limit `None` responses from real straggler positions (`len > 0`): `_run_post_lock_watchdog()` now retries `None` up to `3x` (`2.6s` backoff, clearing the `2.5s` `429` window) and preserves the active lock quietly without false *"straggler shares detected"* voice callouts or sirens whenever `0` shares were already confirmed prior to lock.
+
+---
+
 ## [v0.9.59.1] — 2026-11-16
 ### ⚡ Quick Summary
 - **Optional `SESSION LOW` HUD Column (`📊 HUD Columns`):** Added an opt-in **`SESSION LOW`** metric column (right below `SESSION HIGH`) that tracks your lowest closed (flat) realized PnL trough of the day in a calm muted slate-rose tone (`#6e2c2c` when below `$0.00`, `#2c3e50` at `$0.00`)—including automatic mid-day log backfill from today's closed round-trip trades if you update mid-session.
