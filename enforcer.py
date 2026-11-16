@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.59"
+APP_VERSION = "0.9.59.1"
 
 import os
 import sys
@@ -2171,6 +2171,7 @@ HUD_COLUMN_CATALOG = [
     ("terminate_lvl", "DAILY STOP", "Active Rulebook stop (Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock)"),
     ("dist_to_term", "$ TO STOP", "Remaining dollar cushion before hitting your active Daily Stop"),
     ("session_high", "SESSION HIGH", "Highest flat realized PnL of the day"),
+    ("session_low", "SESSION LOW", "Lowest flat realized PnL of the day"),
     ("from_high", "FROM HIGH", "Current drawdown/giveback from Session High"),
     ("trades_wl", "TRADES (W/L)", "Completed round-trip Wins & Losses (%)"),
     ("loss_streak", "LOSS STREAK", "Consecutive qualifying losses (e.g. 3/5) & live reset timer"),
@@ -2216,6 +2217,7 @@ config = json.loads(json.dumps(DEFAULT_CONFIG))
 start_equity = None
 max_equity = None
 daily_max_equity = None
+daily_min_equity = None
 last_flat_equity = None
 anchor_cash_flow = 0.0
 _last_logged_unanchored_cash_flow = 0.0
@@ -2620,6 +2622,113 @@ def backfill_trades_from_today_log(target_broker=None):
     except Exception:
         pass
     return w_cnt, l_cnt, prev_real
+
+
+def backfill_min_pnl_from_today_log(target_broker=None, target_start_eq=None):
+    """If upgrading mid-day when daily_min_equity was not yet persisted in
+    account_sessions, scans today's local log for flat realized PnL troughs on
+    the matching broker + starting baseline segment (never cross-contaminating
+    accounts or parsing rejected anti-wick lines)."""
+    if not os.path.exists(LOG_PATH):
+        return 0.0
+    today_str = get_today_str()
+    min_pnl = 0.0
+    curr_log_broker = target_broker or "SCHWAB"
+    seg_matches = target_start_eq is None
+    tgt_eq = (
+        round(float(target_start_eq), 2)
+        if target_start_eq is not None
+        else None
+    )
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            first = f.readline()
+            if today_str not in first:
+                return 0.0
+            for line in f:
+                if "SCHWAB API authenticated" in line or "Broker=SCHWAB" in line:
+                    curr_log_broker = "SCHWAB"
+                elif "WEBULL API authenticated" in line or "Broker=WEBULL" in line:
+                    curr_log_broker = "WEBULL"
+
+                if "Baseline anchored to:" in line:
+                    b_ok = target_broker is None or f"({target_broker})" in line
+                    if tgt_eq is not None:
+                        m_b = re.search(
+                            r"Baseline anchored to:\s*\$([0-9,]+(?:\.[0-9]{2})?)",
+                            line,
+                        )
+                        if m_b and b_ok:
+                            val_b = round(float(m_b.group(1).replace(",", "")), 2)
+                            seg_matches = abs(val_b - tgt_eq) <= 0.02
+                            if seg_matches:
+                                min_pnl = 0.0
+                        else:
+                            seg_matches = False
+                    elif b_ok:
+                        seg_matches = True
+                        min_pnl = 0.0
+                elif "baseline from memory:" in line and "Start=$" in line:
+                    b_ok = (
+                        target_broker is None
+                        or f"Restored {target_broker} baseline" in line
+                    )
+                    if tgt_eq is not None:
+                        m_s = re.search(
+                            r"Start=\$([0-9,]+(?:\.[0-9]{2})?)", line
+                        )
+                        seg_matches = bool(
+                            b_ok
+                            and m_s
+                            and abs(
+                                round(float(m_s.group(1).replace(",", "")), 2)
+                                - tgt_eq
+                            )
+                            <= 0.02
+                        )
+                elif (
+                    "Auto-aligned " in line
+                    and " starting baseline from $" in line
+                ):
+                    b_ok = (
+                        target_broker is None
+                        or f"Auto-aligned {target_broker} " in line
+                    )
+                    if tgt_eq is not None:
+                        m_a = re.search(
+                            r"\s+to\s+\$([0-9,]+(?:\.[0-9]{2})?)", line
+                        )
+                        seg_matches = bool(
+                            b_ok
+                            and m_a
+                            and abs(
+                                round(float(m_a.group(1).replace(",", "")), 2)
+                                - tgt_eq
+                            )
+                            <= 0.02
+                        )
+                        if seg_matches:
+                            min_pnl = 0.0
+                elif (
+                    seg_matches
+                    and (target_broker is None or curr_log_broker == target_broker)
+                    and "[POS_CHANGE]" in line
+                    and "(CLOSED FLAT)" in line
+                    and "Open: $0.00" in line
+                ):
+                    m = re.search(
+                        r"Realized:\s*([+-]?)\$(\d[\d,]*\.\d{2})", line
+                    )
+                    if m:
+                        sign = -1.0 if m.group(1) == "-" else 1.0
+                        val = round(
+                            sign * float(m.group(2).replace(",", "")), 2
+                        )
+                        if val < min_pnl:
+                            min_pnl = val
+    except Exception:
+        pass
+    return round(min_pnl, 2)
 
 
 # --- ACTION-ONLY DAILY EVENT LOGGER ---
@@ -3679,7 +3788,7 @@ def format_config_summary(cfg):
 def restore_account_session(broker_name, account_id, log_restore=False):
     """Restores today's saved baseline for a specific broker + account_id.
     Returns True if a valid baseline for today was found, False otherwise."""
-    global start_equity, max_equity, daily_max_equity
+    global start_equity, max_equity, daily_max_equity, daily_min_equity
     global last_flat_equity, anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close
     global win_trades, loss_trades, prev_flat_realized_pnl
@@ -3715,6 +3824,20 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             last_flat_equity = float(
                 s_data.get("last_flat_equity") or start_equity
             )
+            s_min = s_data.get("daily_min_equity")
+            if s_min is not None and float(s_min) > 0.0:
+                daily_min_equity = min(
+                    float(s_min), start_equity, last_flat_equity
+                )
+            else:
+                bf_min = backfill_min_pnl_from_today_log(
+                    broker_name, start_equity
+                )
+                daily_min_equity = min(
+                    start_equity,
+                    last_flat_equity,
+                    round(start_equity + bf_min, 2),
+                )
             anchor_cash_flow = float(
                 s_data.get("anchor_cash_flow", 0.0) or 0.0
             )
@@ -3769,6 +3892,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
                     f"LastFlat=${last_flat_equity:,.2f} | "
                     f"RulebookHWM={format_dollar(max_equity - start_equity)} | "
                     f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
+                    f"SessionLowPnL={format_dollar(daily_min_equity - start_equity)} | "
                     f"ActiveStop={format_dollar(st_pnl)} ({tier_short}) | "
                     f"{format_trades_wl_inline(win_trades, loss_trades)}{ig_note}"
                 )
@@ -3790,6 +3914,12 @@ def restore_account_session(broker_name, account_id, log_restore=False):
         )
         last_flat_equity = float(
             config.get("saved_last_flat_equity") or start_equity
+        )
+        bf_min = backfill_min_pnl_from_today_log(broker_name, start_equity)
+        daily_min_equity = min(
+            start_equity,
+            last_flat_equity,
+            round(start_equity + bf_min, 2),
         )
         has_reset_at_open = bool(config.get("saved_has_reset_at_open", False))
         has_reset_at_close = bool(config.get("saved_has_reset_at_close", False))
@@ -3814,6 +3944,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
                 f"LastFlat=${last_flat_equity:,.2f} | "
                 f"RulebookHWM={format_dollar(max_equity - start_equity)} | "
                 f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
+                f"SessionLowPnL={format_dollar(daily_min_equity - start_equity)} | "
                 f"ActiveStop={format_dollar(st_pnl)} ({tier_short}) | "
                 f"{format_trades_wl_inline(win_trades, loss_trades)}"
             )
@@ -3822,6 +3953,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     start_equity = None
     max_equity = None
     daily_max_equity = None
+    daily_min_equity = None
     last_flat_equity = None
     anchor_cash_flow = 0.0
     has_reset_at_open = False
@@ -3928,6 +4060,7 @@ def save_session_state():
         "start_equity": start_equity,
         "max_equity": max_equity,
         "daily_max_equity": daily_max_equity,
+        "daily_min_equity": daily_min_equity,
         "last_flat_equity": last_flat_equity,
         "anchor_cash_flow": round(float(anchor_cash_flow or 0.0), 2),
         "has_reset_at_open": has_reset_at_open,
@@ -4137,6 +4270,7 @@ def _apply_ignored_positions_to_snapshot(
     sum_ignored_impact = 0.0
     state_mutated = False
     mutated_igs = []
+    mutated_notional = 0.0
     transition_notes = []
 
     for tag, ig in list(ignored_positions.items()):
@@ -4185,6 +4319,7 @@ def _apply_ignored_positions_to_snapshot(
                 ig["locked_impact"] = locked_impact
                 state_mutated = True
                 mutated_igs.append(ig)
+                mutated_notional += abs(ref_qty) * max(exit_lp, ref_price, 1.0) * mult
             sum_ignored_impact += locked_impact
             continue
 
@@ -4243,6 +4378,9 @@ def _apply_ignored_positions_to_snapshot(
             ig["locked_impact"] = locked_impact
             state_mutated = True
             mutated_igs.append(ig)
+            mutated_notional += (
+                abs(curr_qty - ref_qty) * max(curr_lp, ref_price, 1.0) * mult
+            )
             sum_ignored_impact += locked_impact
         else:
             ig["last_seen_price"] = round(curr_lp, 4)
@@ -4266,7 +4404,8 @@ def _apply_ignored_positions_to_snapshot(
                 last_flat_equity if last_flat_equity is not None else start_equity
             )
             if (
-                not tracked_qty_changed
+                not first_poll_of_launch
+                and not tracked_qty_changed
                 and ref_flat_eq is not None
                 and float(ref_flat_eq) > 0.0
             ):
@@ -4274,12 +4413,20 @@ def _apply_ignored_positions_to_snapshot(
                     (float(raw_adj_eq) - tot_open_pnl) - float(ref_flat_eq), 2
                 )
                 drift = round(target_sum_ignored - sum_ignored_impact, 2)
-                if abs(drift) >= 0.01 and abs(drift) <= 50000.0:
-                    last_ig = mutated_igs[-1]
-                    last_ig["locked_impact"] = round(
-                        float(last_ig.get("locked_impact", 0.0)) + drift, 2
-                    )
-                    sum_ignored_impact = round(sum_ignored_impact + drift, 2)
+                max_drift_cap = min(5000.0, max(250.0, mutated_notional * 0.05))
+                if abs(drift) >= 0.01:
+                    if abs(drift) <= max_drift_cap:
+                        last_ig = mutated_igs[-1]
+                        last_ig["locked_impact"] = round(
+                            float(last_ig.get("locked_impact", 0.0)) + drift, 2
+                        )
+                        sum_ignored_impact = round(sum_ignored_impact + drift, 2)
+                    else:
+                        log_event(
+                            "WARN",
+                            f"Ignored position fill drift ({format_dollar(drift)}) exceeded "
+                            f"proportional cap (${max_drift_cap:,.2f}); not absorbing excess drift.",
+                        )
         save_session_state()
         if transition_notes:
             log_event(
@@ -11324,7 +11471,7 @@ def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
     differs from start_equity while 0 trades have been filled today on the
     brokerage account, automatically re-aligns start_equity to eq_now so the
     trader does not start their day with a phantom fee PnL."""
-    global start_equity, max_equity, daily_max_equity, last_flat_equity
+    global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global prev_flat_realized_pnl, settled_realized_pnl
     if (
         not is_fl_now
@@ -11348,6 +11495,7 @@ def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
     start_equity = new_start
     max_equity = new_start
     daily_max_equity = new_start
+    daily_min_equity = new_start
     last_flat_equity = new_start
     prev_flat_realized_pnl = 0.0
     settled_realized_pnl = 0.0
@@ -11371,7 +11519,7 @@ def _stabilize_mid_fill_realized_and_equity(
         desynchronization (e.g. Webull/Schwab deducting cash for a buy fill
         150-350ms before /positions reports the shares, or crediting sale
         proceeds during a multi-lot scale-out before /positions reduces qty). """
-    global last_flat_equity, max_equity, daily_max_equity
+    global last_flat_equity, max_equity, daily_max_equity, daily_min_equity
     global settled_realized_pnl, prev_flat_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol, _launch_fee_drift_checked
 
@@ -11385,6 +11533,8 @@ def _stabilize_mid_fill_realized_and_equity(
                 max_equity = current_eq
             if current_eq > daily_max_equity:
                 daily_max_equity = current_eq
+            if daily_min_equity is None or current_eq < daily_min_equity:
+                daily_min_equity = current_eq
             save_session_state()
             realized_pnl = round(last_flat_equity - start_equity, 2)
             open_pnl = 0.0
@@ -11433,6 +11583,8 @@ def _stabilize_mid_fill_realized_and_equity(
                     max_equity = current_eq
                 if current_eq > daily_max_equity:
                     daily_max_equity = current_eq
+                if daily_min_equity is None or current_eq < daily_min_equity:
+                    daily_min_equity = current_eq
                 save_session_state()
                 realized_pnl = round(last_flat_equity - start_equity, 2)
                 settled_realized_pnl = realized_pnl
@@ -11477,6 +11629,8 @@ def _stabilize_mid_fill_realized_and_equity(
                     max_equity = current_eq
                 if current_eq > daily_max_equity:
                     daily_max_equity = current_eq
+                if daily_min_equity is None or current_eq < daily_min_equity:
+                    daily_min_equity = current_eq
                 save_session_state()
                 realized_pnl = round(last_flat_equity - start_equity, 2)
                 settled_realized_pnl = realized_pnl
@@ -11620,7 +11774,7 @@ def _stabilize_mid_fill_realized_and_equity(
 
 
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
-    global start_equity, max_equity, daily_max_equity, last_flat_equity
+    global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close, is_locked_down, force_reanchor
     global triggered_alarms, prev_pos_snapshot, current_is_flat
@@ -11715,6 +11869,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     start_equity = anchor_eq
                     max_equity = anchor_eq
                     daily_max_equity = max(anchor_eq, current_eq)
+                    daily_min_equity = anchor_eq
                     last_flat_equity = anchor_eq
                     anchor_cash_flow = (
                         active_adapter.get_last_intraday_cash_flow()
@@ -11752,6 +11907,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 if daily_max_equity is None:
                     daily_max_equity = max(start_equity, max_equity)
+                if daily_min_equity is None:
+                    daily_min_equity = min(
+                        start_equity,
+                        last_flat_equity
+                        if last_flat_equity is not None
+                        else start_equity,
+                    )
 
                 reset_925 = config.get("reset_at_925", True)
                 if is_rth() and not has_reset_at_open:
@@ -12702,6 +12864,18 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     else ("#d35400" if distance_to_terminate <= 500 else "#2c3e50")
                 )
                 c5_bg = "#1e8449" if session_high_pnl > 0 else "#2c3e50"
+                eff_min_eq = (
+                    daily_min_equity
+                    if daily_min_equity is not None
+                    else min(
+                        start_equity,
+                        last_flat_equity
+                        if last_flat_equity is not None
+                        else start_equity,
+                    )
+                )
+                session_low_pnl = round(eff_min_eq - start_equity, 2)
+                sl_bg = "#6e2c2c" if session_low_pnl < 0 else "#2c3e50"
 
                 giveback_val = (
                     round(net_pnl - session_high_pnl, 2)
@@ -12728,6 +12902,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         c4_bg,
                     ),
                     "session_high": (format_dollar(session_high_pnl), c5_bg),
+                    "session_low": (format_dollar(session_low_pnl), sl_bg),
                     "from_high": (format_dollar(giveback_val), fh_bg),
                     "trades_wl": (
                         format_trades_wl_multiline(win_trades, loss_trades),
@@ -13823,7 +13998,7 @@ def show_preflight_window(
             )
 
     def _apply_preexisting_selection(chosen_ignored_tags, mark_reviewed=True):
-        global start_equity, last_flat_equity, max_equity, daily_max_equity
+        global start_equity, last_flat_equity, max_equity, daily_max_equity, daily_min_equity
         global force_reanchor
         raw_pos = (
             active_adapter.get_last_raw_pos_details()
@@ -13913,6 +14088,15 @@ def show_preflight_window(
                                 + delta_base,
                                 2,
                             )
+                            daily_min_equity = round(
+                                (
+                                    daily_min_equity
+                                    if daily_min_equity is not None
+                                    else min(start_equity - delta_base, last_flat_equity - delta_base)
+                                )
+                                + delta_base,
+                                2,
+                            )
                             _card3_base_cache["eq_str"] = (
                                 f"${start_equity:,.2f} (Saved)"
                             )
@@ -13975,12 +14159,54 @@ def show_preflight_window(
                     (float(raw_eq_now) - tracked_opnl) - float(ref_flat_eq), 2
                 )
                 ig_drift = round(target_ig_sum - cur_ig_sum, 2)
-                if abs(ig_drift) >= 0.01 and abs(ig_drift) <= 50000.0:
-                    newly_ignored_igs[-1]["locked_impact"] = round(
-                        float(newly_ignored_igs[-1].get("locked_impact", 0.0))
-                        + ig_drift,
-                        2,
-                    )
+                new_ig_opt_contracts = 0.0
+                new_ig_notional = 0.0
+                for t_ni in chosen_ignored_tags:
+                    r_ni = raw_pos.get(t_ni)
+                    ig_ni = ignored_positions.get(t_ni)
+                    if ig_ni in newly_ignored_igs and isinstance(r_ni, dict):
+                        is_opt_ni = (
+                            str(ig_ni.get("asset_type", "EQUITY")).upper()
+                            == "OPTION"
+                        )
+                        q_ni = abs(float(r_ni.get("qty", 0.0)))
+                        lp_ni = abs(
+                            float(r_ni.get("last", 0.0) or r_ni.get("avg", 0.0))
+                        )
+                        if is_opt_ni:
+                            new_ig_opt_contracts += q_ni
+                            new_ig_notional += q_ni * lp_ni * 100.0
+                        else:
+                            new_ig_notional += q_ni * lp_ni
+                max_ig_drift = round(
+                    min(
+                        25.0,
+                        max(
+                            2.0,
+                            new_ig_opt_contracts * 1.0
+                            + new_ig_notional * 0.0005,
+                        ),
+                    ),
+                    2,
+                )
+                if abs(ig_drift) >= 0.01:
+                    if abs(ig_drift) <= max_ig_drift:
+                        newly_ignored_igs[-1]["locked_impact"] = round(
+                            float(newly_ignored_igs[-1].get("locked_impact", 0.0))
+                            + ig_drift,
+                            2,
+                        )
+                        log_event(
+                            "SESSION",
+                            f"Absorbed newly-ignored fee/mark drift ({format_dollar(ig_drift)} <= "
+                            f"${max_ig_drift:,.2f} cap) into {newly_ignored_igs[-1].get('symbol', 'ignored position')}.",
+                        )
+                    else:
+                        log_event(
+                            "SESSION",
+                            f"Skipped newly-ignored drift ({format_dollar(ig_drift)} exceeds "
+                            f"${max_ig_drift:,.2f} fee/mark cap) to preserve off-session realized PnL.",
+                        )
             save_session_state()
 
         if chosen_ignored_tags and not var_ignore_preexisting.get():
@@ -14033,6 +14259,11 @@ def show_preflight_window(
             )
             _preexisting_state["reviewed"] = True
             _preexisting_state["reanchor_reviewed"] = False
+            _preexisting_state["raw_eq"] = (
+                active_adapter.get_last_raw_adj_eq()
+                if hasattr(active_adapter, "get_last_raw_adj_eq")
+                else None
+            )
             eq_str = f"${start_equity:,.2f} (Saved)"
         else:
             had_saved = restore_account_session(
@@ -14046,6 +14277,7 @@ def show_preflight_window(
             )
             _preexisting_state["reviewed"] = False
             _preexisting_state["reanchor_reviewed"] = False
+            _preexisting_state["raw_eq"] = None
 
             is_live_broker = isinstance(
                 active_adapter, (SchwabAdapter, WebullAdapter)
@@ -17873,6 +18105,7 @@ def show_preflight_window(
                     s_entry["start_equity"] = start_equity
                     s_entry["max_equity"] = max_equity
                     s_entry["daily_max_equity"] = daily_max_equity
+                    s_entry["daily_min_equity"] = daily_min_equity
                     s_entry["last_flat_equity"] = last_flat_equity
                     s_entry["anchor_cash_flow"] = round(
                         float(anchor_cash_flow or 0.0), 2
@@ -25062,7 +25295,7 @@ def _insert_formatted_changelog(txt_box, markdown_text):
             txt_box.insert("end", main_part, ("ver_hdr", hdr_tag))
             txt_box.insert("end", hint_part, ("ver_hdr", "ver_hdr_hint", hdr_tag))
             short_m = re.match(
-                r"^(v?\d+\.\d+(?:\.\d+)?(?:\s*(?:[&,–-]\s*v?\d+\.\d+(?:\.\d+)?)+)?)",
+                r"^(v?\d+\.\d+(?:\.\d+)*(?:\s*(?:[&,–-]\s*v?\d+\.\d+(?:\.\d+)*)+)?)",
                 ver_txt,
             )
             short_ver = short_m.group(1) if short_m else ver_txt[:12]

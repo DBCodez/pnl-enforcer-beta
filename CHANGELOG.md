@@ -4,6 +4,20 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.59.1] — 2026-11-16
+### ⚡ Quick Summary
+- **Optional `SESSION LOW` HUD Column (`📊 HUD Columns`):** Added an opt-in **`SESSION LOW`** metric column (right below `SESSION HIGH`) that tracks your lowest closed (flat) realized PnL trough of the day in a calm muted slate-rose tone (`#6e2c2c` when below `$0.00`, `#2c3e50` at `$0.00`)—including automatic mid-day log backfill from today's closed round-trip trades if you update mid-session.
+- **Mid-Session Newly-Ignored Position Drift Cap (`Ignored` Positions):** Fixed an edge case where marking a newly opened position (e.g., an ETF share lot bought while Enforcer was closed) as **Ignored** mid-day could absorb off-session realized daytrade PnL into that ignored ticker's offset.
+
+### 🔍 Detailed Breakdown
+- **`SESSION LOW` Tracking, Per-Account Persistence & Mid-Day Backfill (`HUD_COLUMN_CATALOG`, `daily_min_equity`, `restore_account_session`, `backfill_min_pnl_from_today_log`):**
+  - Tracks per-account `daily_min_equity` across all confirmed flat transitions in `_stabilize_mid_fill_realized_and_equity()` (mirroring `SESSION HIGH` on the closed-realized curve while filtering transient cross-endpoint cash desyncs), preserves `daily_min_equity` across 9:30 AM and 4:00 PM rulebook switches, shifts cleanly on un-ignore `delta_base` adjustments, and resets on `↺ Re-Zero Baseline` or new trading days.
+  - When upgrading mid-day with an active session that predates `daily_min_equity`, `backfill_min_pnl_from_today_log()` reconstructs today's flat realized trough from `[POS_CHANGE] ... (CLOSED FLAT)` log entries scoped strictly to the active broker and starting baseline segment.
+- **Tightened Newly-Ignored Fee/Mark Drift Cap (`_apply_preexisting_selection` & `_apply_ignored_positions_to_snapshot`):**
+  - Capped newly-ignored mid-session drift absorption strictly to entry fees and penny rounding (`min($25.00, max($2.00, contracts * $1.00 + 0.05% notional))`), cleared stale preview equity across account restores, and gated live-trim drift absorption off `first_poll_of_launch` so off-session realized PnL is never masked inside `locked_impact`.
+
+---
+
 ## [v0.9.59] — 2026-11-16
 ### ⚡ Quick Summary
 - **1-Click Update Rollback & Crash-Safe Startup Recovery (`enforcer.py.prev`, `📜 Logs ▾`, `View Release Notes`, `Launch_Enforcer.bat`):** Before installing any future update, PnL Enforcer now validates and saves a verified local backup (`enforcer.py.prev` and `CHANGELOG.md.prev`) in your app folder—giving you **1-click version rollback** from **`📜 Logs ▾ -> ↺ Restore Previous Version`**, **`View Release Notes`**, or the Pre-Flight footer **`↺ Rollback`** link while keeping 100% of your saved settings, API tokens, and today's session baseline intact, pausing repeat startup prompts for the reverted version (`skipped_update_version`), enforcing full anti-tamper guardrails against lock/trade bypass, and offering automatic native Windows crash-recovery rollback if a future update ever fails to launch.
