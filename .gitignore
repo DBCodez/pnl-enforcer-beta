@@ -18,6 +18,10 @@ dist/
 
 # Local AI Instructions, Permanent Verification Suite & Beta Tester Log Sync (Kept private on local machine)
 AGENTS.md
+GEMINI.md
+ask_claude.py
+.claude_debate_prompt.txt
+.claude_last_session.json
 test_enforcer.py
 beta_logs/
 PnL_Enforcer_Beta_Logs/
