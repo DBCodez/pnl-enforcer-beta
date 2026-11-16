@@ -4,6 +4,19 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.59] — 2026-11-16
+### ⚡ Quick Summary
+- **1-Click Update Rollback & Crash-Safe Startup Recovery (`enforcer.py.prev`, `📜 Logs ▾`, `View Release Notes`, `Launch_Enforcer.bat`):** Before installing any future update, PnL Enforcer now validates and saves a verified local backup (`enforcer.py.prev` and `CHANGELOG.md.prev`) in your app folder—giving you **1-click version rollback** from **`📜 Logs ▾ -> ↺ Restore Previous Version`**, **`View Release Notes`**, or the Pre-Flight footer **`↺ Rollback`** link while keeping 100% of your saved settings, API tokens, and today's session baseline intact, pausing repeat startup prompts for the reverted version (`skipped_update_version`), enforcing full anti-tamper guardrails against lock/trade bypass, and offering automatic native Windows crash-recovery rollback if a future update ever fails to launch.
+
+### 🔍 Detailed Breakdown
+- **Verified `.prev` Backup Rotation, Two-Phase Boot Confirmation & Crash-Safe Recovery (`_install_update_payload`, `get_rollback_backup_info`, `check_rollback_allowed`, `execute_version_rollback`, `prompt_version_rollback_dialog`, `_offer_crash_boot_rollback`, `check_for_updates_manual`):**
+  - `_install_update_payload()` validates UTF-8 integrity, entrypoint markers (`def data_loop`, `if __name__ == "__main__":`), `APP_VERSION`, and `compile()` syntax on incoming updates before touching disk; atomically backs up your working `enforcer.py -> enforcer.py.prev` and `CHANGELOG.md -> CHANGELOG.md.prev` (preserving any existing known-good `.prev` whenever `.enforcer_boot_pending.json` is still present); and clears `.enforcer_boot_pending.json` only after Pre-Flight opens (`_clear_boot_pending_marker()`).
+  - Added rollback controls in **`📜 Logs ▾`** (`↺ Restore Previous Version (vX.Y.Z)...` when `.prev` exists, or `↺ Version Rollback: Armed` before your first update, plus background-threaded **`🔄 Check for Updates Now...`**), **`View Release Notes`** (`↺ Restore vX.Y.Z` / `↺ Rollback: Armed ✓` with modal grab restoration), and the Pre-Flight footer (`↺ Rollback (vX.Y.Z)`), with `(st_mtime_ns, st_size)` memoization on `get_rollback_backup_info()`.
+  - Enforced `_check_version_switch_guardrails()` to block rollback while the live HUD is open, during active Penalty Box / OS cooldown timers, while Daily Stop Breach Lockout or a rolling Consecutive Loss Streak is active today, or while any non-ignored live position is open—while allowing rollback when flat and unlocked even if the broker adapter is offline.
+  - Added 2-layer crash-safe startup recovery via in-process `_offer_crash_boot_rollback()` (native Win32 `MessageBoxW`, preserving `enforcer_config.json` on disk even before `load_config()` runs) and a pure-stdlib pre-launch guard in `Launch_Enforcer.bat`.
+
+---
+
 ## [v0.9.58] — 2026-11-14
 ### ⚡ Quick Summary
 - **Prior-Day Safe Log Attachment Fix & Preview Sync (Bug Report Modal):** Fixed an issue where checking *"Include yesterday's sanitized log"* updated the cloud upload without including the prior-day file in the live preview, attached badge, fallback exports, or upload filename.
