@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.69"
+APP_VERSION = "0.9.70"
 
 import os
 import sys
@@ -12135,6 +12135,12 @@ def _is_halt_breach_auto_flatten_armed(hb_dict=None):
     return bool(config.get("enable_open_flatten", False))
 
 
+def _with_mute_idle_prefix(txt, compact=False):
+    if not config.get("mute_all_audio", False):
+        return txt
+    return f"🔇 {txt}" if compact else f"🔇 MUTED · {txt}"
+
+
 def get_full_idle_button_text():
     b_name = (
         "🧪 DEMO SIM"
@@ -12158,11 +12164,11 @@ def get_full_idle_button_text():
             pending_halt_breach
         )
         if lock_en_hb and lock_m_hb > 0:
-            return (
+            return _with_mute_idle_prefix(
                 f"⏸ HALT ({h_lbl}): EXIT QUEUED · OS LOCK ({lock_m_hb:g}m) "
                 f"PAUSED ONLY FOR HALT · NEW POSITIONS AUTO-FLATTENED"
             )
-        return (
+        return _with_mute_idle_prefix(
             f"⏸ HALT ({h_lbl}): EXIT ORDER QUEUED AT BROKER · "
             f"NEW POSITIONS WILL BE AUTO-FLATTENED"
         )
@@ -12178,22 +12184,24 @@ def get_full_idle_button_text():
             if rem_nh > 0.2
             else h_syms
         )
-        return (
+        return _with_mute_idle_prefix(
             f"⏸ HALT DETECTED ({nh_lbl}): MONITORING POSITION — "
             f"NO RISK RULES BREACHED"
         )
     if done_for_today and not is_locked_down:
-        return (
+        return _with_mute_idle_prefix(
             f"🔒 DONE FOR TODAY ({b_name}): SESSION LOCKED IN — "
             f"NEW TRADES AUTO-FLATTENED"
         )
     if is_post_breach_force_flatten_active():
-        return (
+        return _with_mute_idle_prefix(
             f"🚨 BREACH LOCKOUT ({b_name}): NEW TRADES AUTO-FLATTENED — "
             f"RAISE LIMITS OR RE-ZERO IN SETTINGS"
         )
     if config.get("alarms_only_mode", False):
-        return f"{b_name} : ALARMS ONLY MODE (OBSERVATION / SIREN ONLY)"
+        return _with_mute_idle_prefix(
+            f"{b_name} : ALARMS ONLY MODE (OBSERVATION / SIREN ONLY)"
+        )
     opt_armed = is_options_flatten_armed(config)
     pills = [b_name]
     if is_committed_for_today():
@@ -12237,8 +12245,10 @@ def get_full_idle_button_text():
             pills.append(" + ".join(daily_parts))
 
     if len(pills) == 1:
-        return f"{b_name} : ALARM ONLY (OBSERVATION MODE)"
-    return "ARMED: " + " + ".join(pills)
+        return _with_mute_idle_prefix(
+            f"{b_name} : ALARM ONLY (OBSERVATION MODE)"
+        )
+    return _with_mute_idle_prefix("ARMED: " + " + ".join(pills))
 
 
 def get_medium_idle_button_text():
@@ -12266,11 +12276,13 @@ def get_medium_idle_button_text():
             pending_halt_breach
         )
         if lock_en_hb and lock_m_hb > 0:
-            return (
+            return _with_mute_idle_prefix(
                 f"⏸ HALT ({h_lbl}): LOCK ({lock_m_hb:g}m) PAUSED UNTIL FLAT · "
                 f"NEW TRADES FLATTENED"
             )
-        return f"⏸ HALT ({h_lbl}): EXIT QUEUED · NEW TRADES AUTO-FLATTENED"
+        return _with_mute_idle_prefix(
+            f"⏸ HALT ({h_lbl}): EXIT QUEUED · NEW TRADES AUTO-FLATTENED"
+        )
     if active_non_breach_halted_syms:
         h_syms = ", ".join(active_non_breach_halted_syms)
         rem_nh = (
@@ -12283,13 +12295,21 @@ def get_medium_idle_button_text():
             if rem_nh > 0.2
             else h_syms
         )
-        return f"⏸ HALT ({nh_lbl}) — MONITORING (NO STOP BREACHED)"
+        return _with_mute_idle_prefix(
+            f"⏸ HALT ({nh_lbl}) — MONITORING (NO STOP BREACHED)"
+        )
     if done_for_today and not is_locked_down:
-        return "🔒 DONE FOR TODAY: NEW TRADES AUTO-FLATTENED"
+        return _with_mute_idle_prefix(
+            "🔒 DONE FOR TODAY: NEW TRADES AUTO-FLATTENED"
+        )
     if is_post_breach_force_flatten_active():
-        return "🚨 BREACH LOCKOUT: NEW TRADES AUTO-FLATTENED"
+        return _with_mute_idle_prefix(
+            "🚨 BREACH LOCKOUT: NEW TRADES AUTO-FLATTENED"
+        )
     if config.get("alarms_only_mode", False):
-        return f"{b_name} : ALARMS ONLY MODE (SIREN ONLY)"
+        return _with_mute_idle_prefix(
+            f"{b_name} : ALARMS ONLY MODE (SIREN ONLY)"
+        )
     opt_armed = is_options_flatten_armed(config)
     pills = [b_name]
     if is_committed_for_today():
@@ -12329,13 +12349,18 @@ def get_medium_idle_button_text():
             pills.extend(daily_parts)
 
     if len(pills) == 1:
-        return f"{b_name} : ALARM ONLY (OBSERVATION)"
-    return "ARMED: " + " · ".join(pills)
+        return _with_mute_idle_prefix(f"{b_name} : ALARM ONLY (OBSERVATION)")
+    return _with_mute_idle_prefix("ARMED: " + " · ".join(pills))
 
 
 def get_idle_button_text():
     n_cols = len(get_active_hud_columns(config))
     full_txt = get_full_idle_button_text()
+    base_full = (
+        full_txt[len("🔇 MUTED · "):]
+        if full_txt.startswith("🔇 MUTED · ")
+        else full_txt
+    )
     if n_cols <= 3:
         if pending_halt_breach is not None:
             w_syms = (
@@ -12350,7 +12375,7 @@ def get_idle_button_text():
                 else 0.0
             )
             h_lbl = f"{w_syms} · {max(1, int(round(rem_h)))}s" if rem_h > 0.2 else w_syms
-            return f"⏸ HALT ({h_lbl})"
+            return _with_mute_idle_prefix(f"⏸ HALT ({h_lbl})", compact=True)
         if active_non_breach_halted_syms:
             h_syms = ", ".join(active_non_breach_halted_syms)
             rem_nh = (
@@ -12359,18 +12384,20 @@ def get_idle_button_text():
                 else 0.0
             )
             nh_lbl = f"{h_syms} · {max(1, int(round(rem_nh)))}s" if rem_nh > 0.2 else h_syms
-            return f"⏸ HALT ({nh_lbl})"
+            return _with_mute_idle_prefix(f"⏸ HALT ({nh_lbl})", compact=True)
         if done_for_today and not is_locked_down:
-            return "🔒 DONE TODAY"
+            return _with_mute_idle_prefix("🔒 DONE TODAY", compact=True)
         if is_post_breach_force_flatten_active():
-            return "🚨 BREACH (AUTO-FLATTEN)"
+            return _with_mute_idle_prefix("🚨 BREACH (AUTO-FLATTEN)", compact=True)
         if is_demo_mode_active():
-            return "🧪 DEMO SIM"
-        if "ALARM" in full_txt and not full_txt.startswith("ARMED:"):
-            return "● ALARMS ONLY"
+            return _with_mute_idle_prefix("🧪 DEMO SIM", compact=True)
+        if "ALARM" in base_full and not base_full.startswith("ARMED:"):
+            return _with_mute_idle_prefix("● ALARMS ONLY", compact=True)
         if is_locked_down:
-            return "⚠️ DAY BREACHED"
-        return "🔒 ARMED" if is_committed_for_today() else "● ARMED"
+            return _with_mute_idle_prefix("⚠️ DAY BREACHED", compact=True)
+        return _with_mute_idle_prefix(
+            "🔒 ARMED" if is_committed_for_today() else "● ARMED", compact=True
+        )
     if n_cols == 4:
         return get_medium_idle_button_text()
     return full_txt
@@ -12395,6 +12422,8 @@ def get_idle_button_style():
         return ("#7f1d1d", "#ffffff", "#ef4444", "#991b1b")
     if is_demo_mode_active():
         return ("#2e1065", "#f5f3ff", "#8b5cf6", "#4c1d95")
+    if config.get("mute_all_audio", False):
+        return ("#262018", "#fde68a", "#b45309", "#451a03")
     return ("#282c31", "#ffca58", "#6c757d", "#343a40")
 
 
@@ -20657,6 +20686,17 @@ def show_preflight_window(
             _sync_prefs_modal_state()
         except Exception:
             pass
+        try:
+            _sync_hud_settings_btn_state(is_flat_now=current_is_flat)
+            if (
+                hud_mute_btn is not None
+                and hud_mute_btn.winfo_exists()
+                and not alarm_active
+                and not cooldown_active
+            ):
+                apply_idle_button_config(hud_mute_btn)
+        except Exception:
+            pass
 
     var_mute_all_audio.trace_add("write", _on_toggle_mute_all_audio)
     var_voice_cues = tk.BooleanVar(
@@ -25492,6 +25532,7 @@ def show_preflight_window(
             consecutive_loop_exceptions = 0
             rebuild_hud_columns()
             _sync_hud_demo_pad_button_visibility()
+            _sync_hud_settings_btn_state(is_flat_now=current_is_flat)
             if mute_btn is not None:
                 if alarm_active and not cooldown_active:
                     mute_btn.config(
@@ -25887,6 +25928,7 @@ def show_preflight_window(
             consecutive_loop_exceptions = 0
             rebuild_hud_columns()
             _sync_hud_demo_pad_button_visibility()
+            _sync_hud_settings_btn_state(is_flat_now=current_is_flat)
 
             if mute_btn is not None:
                 if alarm_active and not cooldown_active:
@@ -30166,7 +30208,7 @@ def show_preflight_window(
         sw_txt = "Reset" if var_reset925.get() else "Carry"
         pos_txt = "Ignored" if var_ignore_preexisting.get() else "Tracked"
         if var_mute_all_audio.get():
-            audio_txt = "Audio: MUTED"
+            audio_txt = "🔇 Audio: MUTED"
         else:
             audio_txt = f"Voice: {'ON' if var_voice_cues.get() else 'OFF'}"
         raw_p = str(var_poll.get()).strip()
@@ -30781,6 +30823,42 @@ def show_preflight_window(
         command=open_preferences_audio_dialog,
     )
     btn_prefs_card3.pack(side="right")
+
+    def _refresh_prefs_card3_btn_style(*_):
+        if pf_timer_state.get("closing"):
+            return
+        try:
+            if not pf.winfo_exists() or not btn_prefs_card3.winfo_exists():
+                return
+            if var_mute_all_audio.get():
+                btn_prefs_card3.config(
+                    text="🔇 Audio Muted · Prefs...",
+                    fill_color="#291d0e",
+                    fill_top_color="#382813",
+                    border_color="#b45309",
+                    hover_fill="#362612",
+                    hover_fill_top="#473218",
+                    hover_border="#f59e0b",
+                    fg="#fde68a",
+                    width=158,
+                )
+            else:
+                btn_prefs_card3.config(
+                    text="⚙ Preferences & Audio...",
+                    fill_color="#141820",
+                    fill_top_color="#1c212b",
+                    border_color="#2e3746",
+                    hover_fill="#181e28",
+                    hover_fill_top="#232a36",
+                    hover_border="#38bdf8",
+                    fg="#cbd5e1",
+                    width=150,
+                )
+        except Exception:
+            pass
+
+    var_mute_all_audio.trace_add("write", _refresh_prefs_card3_btn_style)
+    _refresh_prefs_card3_btn_style()
     _refresh_done_today_pill()
     attach_tooltip(
         btn_prefs_card3,
@@ -32543,7 +32621,7 @@ def show_preflight_window(
             c3_keys = ("edit_api_keys", "recheck_trade_perm", "open_demo_pad")
 
         static_btn_snapshots = {}
-        for sb_w in (btn_report_bug, btn_prefs_card3):
+        for sb_w in (btn_report_bug,):
             if sb_w is not None and sb_w.winfo_exists():
                 static_btn_snapshots[sb_w] = {
                     "fill_color": getattr(sb_w, "_fill", "#141820"),
@@ -32584,6 +32662,7 @@ def show_preflight_window(
                 _refresh_privacy_mode_ui()
                 _refresh_tilt_filter_btn_style()
                 _refresh_alarms_only_btn_style()
+                _refresh_prefs_card3_btn_style()
             _refresh_logs_menu_btn_style()
             _refresh_commit_today_pill()
             _refresh_done_today_pill()
@@ -34315,14 +34394,83 @@ def _sync_hud_breach_banner(is_flat_now=None):
 
     if (
         hud_settings_btn is not None
-        and hud_settings_btn.winfo_exists()
         and (not cooldown_active or is_demo_mode_active())
         and is_flat_now
     ):
-        if done_for_today and not is_locked_down and not breach_visual_sim_active:
-            s_txt = "⚙ DONE" if n_cols <= 2 else "⚙ DONE TODAY"
+        _sync_hud_settings_btn_state(hud_settings_btn, is_flat_now=is_flat_now)
+
+
+def _get_hud_settings_idle_style(cfg=None):
+    c = cfg if isinstance(cfg, dict) else config
+    if c.get("mute_all_audio", False):
+        return {
+            "text": "🔇 SETTINGS",
+            "fill_color": "#241b10",
+            "fill_top_color": "#312414",
+            "border_color": "#b45309",
+            "hover_fill": "#312414",
+            "hover_fill_top": "#423019",
+            "hover_border": "#f59e0b",
+            "fg": "#fde68a",
+        }
+    return {
+        "text": "⚙ SETTINGS",
+        "fill_color": "#141922",
+        "fill_top_color": "#1c2430",
+        "border_color": "#2e3d4f",
+        "hover_fill": "#1e293b",
+        "hover_fill_top": "#293548",
+        "hover_border": "#38bdf8",
+        "fg": "#e2e8f0",
+    }
+
+
+def _sync_hud_settings_btn_state(btn_widget=None, is_flat_now=None):
+    """Applies the active HUD Settings button label & palette across all states
+    (Cooldown Lock, Demo/Live In-Trade, Done Today, Breach Raise Limits, or Idle),
+    surfacing a subtle warm-amber '🔇' indicator whenever Silent/Mute Mode is ON."""
+    target = btn_widget if btn_widget is not None else hud_settings_btn
+    if target is None:
+        return
+    if hasattr(target, "winfo_exists"):
+        try:
+            if not target.winfo_exists():
+                return
+        except Exception:
+            return
+    fl_now = current_is_flat if is_flat_now is None else bool(is_flat_now)
+    n_cols = len(get_active_hud_columns(config))
+    s_ico = "🔇" if config.get("mute_all_audio", False) else "⚙"
+
+    if cooldown_active and not is_demo_mode_active():
+        _apply_stadium_btn_memo(
+            target,
+            text="🔒 LOCKED",
+            fill_color="#1e2228",
+            fill_top_color="#262a30",
+            border_color="#4b5563",
+            fg="#9ca3af",
+            disabledforeground="#9ca3af",
+            state="disabled",
+        )
+    elif fl_now or is_demo_mode_active():
+        if not fl_now and is_demo_mode_active():
             _apply_stadium_btn_memo(
-                hud_settings_btn,
+                target,
+                text=f"📊 IN TRADE {s_ico}",
+                fill_color="#291d0e",
+                fill_top_color="#382813",
+                border_color="#b45309",
+                hover_fill="#362612",
+                hover_fill_top="#473218",
+                hover_border="#f59e0b",
+                fg="#fde68a",
+                state="normal",
+            )
+        elif done_for_today and not is_locked_down and not breach_visual_sim_active:
+            s_txt = f"{s_ico} DONE" if n_cols <= 2 else f"{s_ico} DONE TODAY"
+            _apply_stadium_btn_memo(
+                target,
                 text=s_txt,
                 fill_color="#064e3b",
                 fill_top_color="#065f46",
@@ -34335,12 +34483,12 @@ def _sync_hud_breach_banner(is_flat_now=None):
             )
         elif is_post_breach_force_flatten_active():
             s_txt = (
-                "⚙ SETTINGS"
+                f"{s_ico} SETTINGS"
                 if is_committed_for_today()
-                else ("⚙ LIMITS" if n_cols <= 2 else "⚙ RAISE LIMITS")
+                else (f"{s_ico} LIMITS" if n_cols <= 2 else f"{s_ico} RAISE LIMITS")
             )
             _apply_stadium_btn_memo(
-                hud_settings_btn,
+                target,
                 text=s_txt,
                 fill_color="#7f1d1d",
                 fill_top_color="#991b1b",
@@ -34352,18 +34500,21 @@ def _sync_hud_breach_banner(is_flat_now=None):
                 state="normal",
             )
         else:
-            _apply_stadium_btn_memo(
-                hud_settings_btn,
-                text="⚙ SETTINGS",
-                fill_color="#141922",
-                fill_top_color="#1c2430",
-                border_color="#2e3d4f",
-                hover_fill="#1e293b",
-                hover_fill_top="#293548",
-                hover_border="#38bdf8",
-                fg="#e2e8f0",
-                state="normal",
-            )
+            st_kw = _get_hud_settings_idle_style(config)
+            _apply_stadium_btn_memo(target, state="normal", **st_kw)
+    else:
+        _apply_stadium_btn_memo(
+            target,
+            text=f"🔒 IN TRADE {s_ico}",
+            fill_color="#291d0e",
+            fill_top_color="#382813",
+            border_color="#b45309",
+            hover_fill="#362612",
+            hover_fill_top="#473218",
+            hover_border="#f59e0b",
+            fg="#fde68a",
+            state="normal",
+        )
 
 
 def get_saved_hud_position(w_px, h_px=88, fallback_widget=None):
@@ -34929,17 +35080,8 @@ def update_gui(
     _sync_hud_demo_chrome()
     _sync_hud_breach_banner(is_flat)
 
+    _sync_hud_settings_btn_state(settings_btn, is_flat_now=is_flat)
     if cooldown_active and not is_demo_mode_active():
-        _apply_stadium_btn_memo(
-            settings_btn,
-            text="🔒 LOCKED",
-            fill_color="#1e2228",
-            fill_top_color="#262a30",
-            border_color="#4b5563",
-            fg="#9ca3af",
-            disabledforeground="#9ca3af",
-            state="disabled",
-        )
         _apply_stadium_btn_memo(
             close_btn,
             text="🔒",
@@ -34951,64 +35093,6 @@ def update_gui(
             state="disabled",
         )
     elif is_flat or is_demo_mode_active():
-        if not is_flat and is_demo_mode_active():
-            _apply_stadium_btn_memo(
-                settings_btn,
-                text="📊 IN TRADE ⚙",
-                fill_color="#291d0e",
-                fill_top_color="#382813",
-                border_color="#b45309",
-                hover_fill="#362612",
-                hover_fill_top="#473218",
-                hover_border="#f59e0b",
-                fg="#fde68a",
-                state="normal",
-            )
-        elif done_for_today and not is_locked_down and not breach_visual_sim_active:
-            s_txt = "⚙ DONE" if len(active_cols) <= 2 else "⚙ DONE TODAY"
-            _apply_stadium_btn_memo(
-                settings_btn,
-                text=s_txt,
-                fill_color="#064e3b",
-                fill_top_color="#065f46",
-                border_color="#10b981",
-                hover_fill="#065f46",
-                hover_fill_top="#047857",
-                hover_border="#34d399",
-                fg="#ecfdf5",
-                state="normal",
-            )
-        elif is_post_breach_force_flatten_active():
-            s_txt = (
-                "⚙ SETTINGS"
-                if is_committed_for_today()
-                else ("⚙ LIMITS" if len(active_cols) <= 2 else "⚙ RAISE LIMITS")
-            )
-            _apply_stadium_btn_memo(
-                settings_btn,
-                text=s_txt,
-                fill_color="#7f1d1d",
-                fill_top_color="#991b1b",
-                border_color="#ef4444",
-                hover_fill="#991b1b",
-                hover_fill_top="#b91c1c",
-                hover_border="#f87171",
-                fg="#ffffff",
-                state="normal",
-            )
-        else:
-            _apply_stadium_btn_memo(
-                settings_btn,
-                text="⚙ SETTINGS",
-                fill_color="#141922",
-                fill_top_color="#1c2430",
-                border_color="#2e3d4f",
-                hover_fill="#1e293b",
-                hover_fill_top="#293548",
-                hover_border="#38bdf8",
-                fg="#e2e8f0",
-                state="normal",
-            )
         _apply_stadium_btn_memo(
             close_btn,
             text="✕",
@@ -35019,18 +35103,6 @@ def update_gui(
             state="normal",
         )
     else:
-        _apply_stadium_btn_memo(
-            settings_btn,
-            text="🔒 IN TRADE ⚙",
-            fill_color="#291d0e",
-            fill_top_color="#382813",
-            border_color="#b45309",
-            hover_fill="#362612",
-            hover_fill_top="#473218",
-            hover_border="#f59e0b",
-            fg="#fde68a",
-            state="normal",
-        )
         if consecutive_api_failures >= 2 or api_disconnect_alerted:
             _apply_stadium_btn_memo(
                 close_btn,
@@ -35244,6 +35316,20 @@ def attach_hud_mute_tooltip(widget, hud_win):
                     text=ld_txt,
                     font=("Arial", 9, "bold"),
                     fg="#fca5a5",
+                    bg="#141820",
+                    justify="left",
+                    anchor="w",
+                ).pack(fill="x", pady=(0, 4))
+
+            if config.get("mute_all_audio", False):
+                tk.Label(
+                    inner,
+                    text=(
+                        "🔇 SILENT MODE ACTIVE: Sirens, chimes & voice callouts are muted "
+                        "(visual HUD alerts & auto-flatten stay 100% active)."
+                    ),
+                    font=("Arial", 9, "bold"),
+                    fg="#fde68a",
                     bg="#141820",
                     justify="left",
                     anchor="w",
@@ -36814,17 +36900,18 @@ def start_gui():
         command=lambda: mute_alarm(mute_btn)
     )
 
+    init_set_st = _get_hud_settings_idle_style(config)
     settings_btn = make_stadium_button(
         bottom_bar,
-        text="⚙ SETTINGS",
+        text=init_set_st["text"],
         font=("Arial", 8, "bold"),
-        fill_color="#141922",
-        fill_top_color="#1c2430",
-        border_color="#2e3d4f",
-        hover_fill="#1b2432",
-        hover_fill_top="#253142",
-        hover_border="#38bdf8",
-        fg="#e2e8f0",
+        fill_color=init_set_st["fill_color"],
+        fill_top_color=init_set_st["fill_top_color"],
+        border_color=init_set_st["border_color"],
+        hover_fill=init_set_st["hover_fill"],
+        hover_fill_top=init_set_st["hover_fill_top"],
+        hover_border=init_set_st["hover_border"],
+        fg=init_set_st["fg"],
         hover_fg="#ffffff",
         canvas_bg="#1a1a1a",
         width=96,
@@ -36835,6 +36922,13 @@ def start_gui():
     )
     settings_btn.pack(side="right", padx=(0, 2))
     hud_settings_btn = settings_btn
+    attach_hud_widget_tooltip(
+        settings_btn,
+        root,
+        "Open Pre-Flight & Risk Rulebook Settings:\n"
+        "• Review or adjust risk stops, HUD columns, and audio preferences.\n"
+        "• Shows '🔇 SETTINGS' in warm amber whenever Silent Mode (Mute All Audio) is active.",
+    )
 
     panic_idle_lbl = (
         "🚨 FLATTEN (2s)" if is_compact_hud() else "🚨 HOLD 2s: FLATTEN"
@@ -36953,6 +37047,7 @@ def start_gui():
                     if (
                         getattr(mute_btn, "_text", "") != new_idle
                         or getattr(mute_btn, "_bg", "") != new_bg
+                        or getattr(mute_btn, "_rim", "") != new_rim
                     ):
                         mute_btn.config(
                             text=new_idle,

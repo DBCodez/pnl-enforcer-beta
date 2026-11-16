@@ -4,6 +4,19 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.70] — 2026-11-16
+### ⚡ Quick Summary
+- **Clearer Subtle Silent / Mute Mode Indicators Across Pre-Flight & Live HUD (`🔇 Audio Muted · Prefs...`, `🔇 MUTED · ARMED...`, `🔇 SETTINGS`):** Made active Silent Mode (`Mute All Sounds & Voice Callouts`) subtly unmistakable on both screens without adding clutter—highlighting Card 3's **`🔇 Audio Muted · Prefs...`** pill in warm amber on the Pre-Flight screen, front-anchoring **`🔇 MUTED ·`** on the HUD status bar so it is never clipped on 3- or 4-column layouts, and tinting the HUD **`🔇 SETTINGS`** button in matching warm amber across idle, in-trade, and lockout states.
+
+### 🔍 Detailed Breakdown
+- **Front-Anchored HUD Status Pill & Warm-Amber `🔇 SETTINGS` Cue (`_with_mute_idle_prefix`, `get_idle_button_style`, `_get_hud_settings_idle_style`, `_sync_hud_settings_btn_state`, `attach_hud_mute_tooltip`, `Suite 22`):**
+  - Prefixes HUD idle status text with `🔇 MUTED · ` in 4+ column modes (`🔇 ` in `<= 3`-column compact mode) so the mute indicator sits at the leading edge of `mute_btn` where right-side ellipsis clipping cannot hide it, paired with a subtle warm charcoal-amber rim (`#b45309` on `#262018`).
+  - Updates `hud_settings_btn` (`⚙ SETTINGS` -> `🔇 SETTINGS` in warm amber `#241b10` / `#b45309` / `#fde68a`, plus `🔒 IN TRADE 🔇`, `🔇 DONE TODAY`, and `🔇 RAISE LIMITS`) and surfaces a `🔇 SILENT MODE ACTIVE` callout inside the HUD status hover tooltip.
+- **Pre-Flight Card 3 Pill & Live HUD Sync (`_refresh_prefs_card3_btn_style`, `_on_toggle_mute_all_audio`):**
+  - Switches Card 3's `⚙ Preferences & Audio...` button to a warm-amber **`🔇 Audio Muted · Prefs...`** pill (`🔇 Audio: MUTED` in the telemetry summary) whenever Silent Mode is enabled, preserves Quick Tour spotlight restoration, and syncs the live HUD immediately when toggled inside `Preferences & Audio`.
+
+---
+
 ## [v0.9.69] — 2026-11-16
 ### ⚡ Quick Summary
 - **Ignored-Position Penny-Flicker Elimination & Clean Re-Anchor Fix (Shoutout to `InvWithRed`!):** Fixed a floating-point double-rounding and Schwab multi-bucket mark-rounding edge case where accounts holding open **Ignored Pre-Existing Positions** (e.g., long-term shares + LEAPS) could see flat `REALIZED PnL` / `NET PnL` alternate between `$0.00` and `-$0.01` (and latch `SESSION LOW` at `-$0.01`) with zero daytrades taken—special shoutout to beta tester **`InvWithRed`** for spotting this after re-zeroing and sending over the screenshot + clean log!
