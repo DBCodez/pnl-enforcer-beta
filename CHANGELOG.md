@@ -4,6 +4,24 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.71] — 2026-11-16
+### ⚡ Quick Summary
+- **3-State Open-Options Verification on `🚨 HOLD 2s: FLATTEN` & `🔒 Done Today` (`_verify_post_flatten_unarmed_options`, `PanicFlattenHoldController`, `activate_done_for_today`):** Prevents Emergency Flatten or Voluntary `Done Today` from flashing **`✓ FLATTENED`** or announcing *"Account confirmed flat"* when non-ignored option contracts remain open while Options Auto-Flatten is OFF (or outside `9:30 AM – 4:00 PM ET` RTH)—surfacing **`⚠️ OPTIONS OPEN`** (or **`⚠️ VERIFY OPTIONS`** if rate-limited) and sounding a manual-close alert without ever auto-flattening options when unarmed.
+- **Webull Startup Permission Probe Pacing & Rollback Tilt-Streak Anti-Bypass (`WebullAdapter.check_trading_permission_preview`, `_check_version_switch_guardrails`, `_offer_crash_boot_rollback`):** Routes Webull's `preview_order` startup check through `_pace_position_verify_call()` (`1.15s` pacer + `HTTP 429` backoff), enforces cross-account rollback blocking against persisted `"loss_timestamps"` even when viewing `DEMO`, and logs a `[GUARDRAIL]` audit entry on boot crash-recovery.
+
+### 🔍 Detailed Breakdown
+- **3-State Post-Flatten Options Guard (`_verify_post_flatten_unarmed_options`, `trigger_manual_panic_flatten`, `PanicFlattenHoldController`, `activate_done_for_today`, `Suite 23`):**
+  - Added thread-safe `_manual_flatten_state_lock` around `_manual_flatten_in_flight` and a paced uncached `_verify_post_flatten_unarmed_options()` check whenever `flatten_equities(..., include_options=False)` completes with `opt_armed=False`:
+    - `FLAT` (`0` open options): Preserves `"✓ FLATTENED"` and *"Account confirmed flat."*
+    - `OPTIONS_OPEN` (`>= 1` non-ignored option contract): Leaves option contracts untouched per Invariant #2, sets `ok = False`, flashes **`⚠️ OPTIONS OPEN`** on the HUD panic button, logs `[WARN]`, fires `EQUITIES FLAT — CLOSE OPTIONS MANUALLY!`, and announces that open option contracts remain.
+    - `OPTIONS_UNVERIFIED` (`None` on broker API rate-limit/error): Sets `ok = False`, flashes **`⚠️ VERIFY OPTIONS`** (`⚠️ VERIFY OPT` in compact mode), and warns to verify option status manually at the broker.
+  - Clarified in the `🔒 Done Today` confirmation dialog that activating `Done Today` cancels working orders and flattens open tracked equities even when `Alarms Only` is ON.
+- **Webull Preview Pacing & Rollback Anti-Tamper Tightening (`WebullAdapter`, `_check_version_switch_guardrails`, `_offer_crash_boot_rollback`):**
+  - Added `_pace_position_verify_call()`, `_last_pos_call_ts` stamping, and `2.5s` `_rate_limit_until` backoff on `HTTP 429` inside `WebullAdapter.check_trading_permission_preview()` (mapping `HTTP 429` cleanly to `"UNCONFIRMED"` on both brokers).
+  - Updated `_check_version_switch_guardrails()` to inspect `sess_v.get("loss_timestamps")` (matching `save_session_state()`) in addition to `"recent_loss_timestamps"`, and added an explicit `[GUARDRAIL]` log entry when `_offer_crash_boot_rollback()` restores `enforcer.py.prev` prior to Pre-Flight.
+
+---
+
 ## [v0.9.70] — 2026-11-16
 ### ⚡ Quick Summary
 - **Clearer Subtle Silent / Mute Mode Indicators Across Pre-Flight & Live HUD (`🔇 Audio Muted · Prefs...`, `🔇 MUTED · ARMED...`, `🔇 SETTINGS`):** Made active Silent Mode (`Mute All Sounds & Voice Callouts`) subtly unmistakable on both screens without adding clutter—highlighting Card 3's **`🔇 Audio Muted · Prefs...`** pill in warm amber on the Pre-Flight screen, front-anchoring **`🔇 MUTED ·`** on the HUD status bar so it is never clipped on 3- or 4-column layouts, and tinting the HUD **`🔇 SETTINGS`** button in matching warm amber across idle, in-trade, and lockout states.

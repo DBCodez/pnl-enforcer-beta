@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.70"
+APP_VERSION = "0.9.71"
 
 import os
 import sys
@@ -2323,6 +2323,7 @@ cooldown_active = False
 dry_run_lock_active = False
 breach_visual_sim_active = False
 _manual_flatten_in_flight = False
+_manual_flatten_state_lock = threading.Lock()
 PANIC_FLATTEN_HOLD_SEC = 2.0
 _last_real_broker = "SCHWAB"
 _demo_memory_session = {}
@@ -4088,6 +4089,10 @@ def _offer_crash_boot_rollback(err_summary, allow_in_test=False):
             log_event(
                 "SESSION",
                 f"Crash-recovery rollback restored v{restored_v} after failed v{APP_VERSION} boot.",
+            )
+            log_event(
+                "GUARDRAIL",
+                f"Startup crash-recovery restored enforcer.py.prev (v{restored_v}) before Pre-Flight opened (in-app session lock checks bypassed due to failed v{APP_VERSION} boot).",
             )
             if allow_in_test:
                 return True
@@ -7972,44 +7977,49 @@ class WebullAdapter:
         }
 
         def _invoke_webull_preview():
-            r = None
-            if (
-                self.api_client is not None
-                and hasattr(self.api_client, "get_response")
-                and "webull" in type(self.api_client).__module__.lower()
-            ):
-                try:
-                    from webull.trade.request.v3.preview_order_request import (
-                        PreviewOrderRequest,
-                    )
+            self._pace_position_verify_call()
+            try:
+                r = None
+                if (
+                    self.api_client is not None
+                    and hasattr(self.api_client, "get_response")
+                    and "webull" in type(self.api_client).__module__.lower()
+                ):
+                    try:
+                        from webull.trade.request.v3.preview_order_request import (
+                            PreviewOrderRequest,
+                        )
 
-                    req = PreviewOrderRequest()
-                    req.set_account_id(account_id=self.account_id)
-                    req.set_new_orders(new_orders=[preview_item])
-                    req.add_header("category", "US_EQUITY")
-                    r = self.api_client.get_response(req)
-                except Exception as inner_v3_req_e:
-                    if hasattr(inner_v3_req_e, "http_status") or hasattr(
-                        inner_v3_req_e, "error_code"
+                        req = PreviewOrderRequest()
+                        req.set_account_id(account_id=self.account_id)
+                        req.set_new_orders(new_orders=[preview_item])
+                        req.add_header("category", "US_EQUITY")
+                        r = self.api_client.get_response(req)
+                    except Exception as inner_v3_req_e:
+                        if hasattr(inner_v3_req_e, "http_status") or hasattr(
+                            inner_v3_req_e, "error_code"
+                        ):
+                            raise
+                        r = None
+                if r is None:
+                    if hasattr(self.trade_client, "order_v3") and hasattr(
+                        self.trade_client.order_v3, "preview_order"
                     ):
-                        raise
-                    r = None
-            if r is None:
-                if hasattr(self.trade_client, "order_v3") and hasattr(
-                    self.trade_client.order_v3, "preview_order"
-                ):
-                    r = self.trade_client.order_v3.preview_order(
-                        self.account_id, [preview_item]
-                    )
-                elif hasattr(self.trade_client, "order_v2") and hasattr(
-                    self.trade_client.order_v2, "preview_order"
-                ):
-                    r = self.trade_client.order_v2.preview_order(
-                        self.account_id, [preview_item]
-                    )
-                else:
-                    return ("_NO_METHOD_", None)
-            return ("_OK_", r)
+                        r = self.trade_client.order_v3.preview_order(
+                            self.account_id, [preview_item]
+                        )
+                    elif hasattr(self.trade_client, "order_v2") and hasattr(
+                        self.trade_client.order_v2, "preview_order"
+                    ):
+                        r = self.trade_client.order_v2.preview_order(
+                            self.account_id, [preview_item]
+                        )
+                    else:
+                        return ("_NO_METHOD_", None)
+                return ("_OK_", r)
+            finally:
+                with self._pos_pace_lock:
+                    self._last_pos_call_ts = time.time()
 
         try:
             try:
@@ -8044,6 +8054,11 @@ class WebullAdapter:
                         "Webull preview_order method unavailable on trade_client.",
                     )
             code = c_resp_code(resp)
+            if code == 429:
+                with self._pos_pace_lock:
+                    self._rate_limit_until = max(
+                        self._rate_limit_until, time.time() + 2.5
+                    )
             txt = ""
             try:
                 txt = str(getattr(resp, "text", "") or "")
@@ -8057,6 +8072,17 @@ class WebullAdapter:
             err_cd = getattr(e, "error_code", "") or ""
             err_ms = getattr(e, "error_msg", "") or ""
             full_txt = f"{err_ms} {str(e)}".strip()
+            low_e = f"{err_cd} {full_txt}".lower()
+            if (
+                http_st == 429
+                or "429" in low_e
+                or "too_many_requests" in low_e
+                or "too many requests" in low_e
+            ):
+                with self._pos_pace_lock:
+                    self._rate_limit_until = max(
+                        self._rate_limit_until, time.time() + 2.5
+                    )
             state, detail = _classify_preview_order_result(
                 http_status=http_st, body_text=full_txt, error_code=err_cd
             )
@@ -15697,6 +15723,37 @@ def flatten_equities(
             return False
 
 
+def _verify_post_flatten_unarmed_options(adapter):
+    """Checks for non-ignored open option contracts when an equity-only flatten
+    completed while Options Auto-Flatten was disabled or outside RTH.
+    Never auto-flattens options (AGENTS.md Invariant #2). Returns a 2-tuple:
+      ('FLAT' | 'OPTIONS_OPEN' | 'OPTIONS_UNVERIFIED', formatted_list_or_empty)."""
+    if adapter is None or not hasattr(adapter, "get_open_option_positions"):
+        return "FLAT", []
+    retry_sleep = 0.02 if isinstance(adapter, DemoBrokerAdapter) else 0.30
+    raw_opt = None
+    for att in range(2):
+        try:
+            raw_opt = _call_adapter_open_opt(
+                adapter, allow_stale_cache=False, pace_for_verify=True
+            )
+        except Exception:
+            raw_opt = None
+        if raw_opt is not None:
+            break
+        if att == 0:
+            time.sleep(retry_sleep)
+    if raw_opt is None:
+        return "OPTIONS_UNVERIFIED", []
+    open_opts = [
+        item for item in raw_opt if abs(float(item[1])) > 1e-9
+    ]
+    if open_opts:
+        fmt_opts = [f"{item[0]} ({float(item[1]):g})" for item in open_opts]
+        return "OPTIONS_OPEN", fmt_opts
+    return "FLAT", []
+
+
 def trigger_manual_panic_flatten(
     adapter=None, ui_button=None, run_async=True, on_done_cb=None
 ):
@@ -15711,23 +15768,24 @@ def trigger_manual_panic_flatten(
         if callable(on_done_cb):
             on_done_cb(False)
         return False
-    if _manual_flatten_in_flight:
-        log_event(
-            "FLATTEN",
-            "Manual Emergency Flatten already in flight — ignoring duplicate trigger.",
-        )
-        if callable(on_done_cb):
-            try:
-                on_done_cb(False)
-            except Exception:
-                pass
-        return False
-
-    _manual_flatten_in_flight = True
+    with _manual_flatten_state_lock:
+        if _manual_flatten_in_flight:
+            log_event(
+                "FLATTEN",
+                "Manual Emergency Flatten already in flight — ignoring duplicate trigger.",
+            )
+            if callable(on_done_cb):
+                try:
+                    on_done_cb(False)
+                except Exception:
+                    pass
+            return False
+        _manual_flatten_in_flight = True
 
     def _worker():
         global _manual_flatten_in_flight
         ok = False
+        panic_status = "INCOMPLETE"
         try:
             opt_armed = is_options_flatten_armed(config) and is_market_hours()
             log_event(
@@ -15747,12 +15805,66 @@ def trigger_manual_panic_flatten(
                 )
             )
             if ok:
-                log_event(
-                    "FLATTEN",
-                    "Manual Emergency Flatten confirmed 100% flat.",
-                )
-                speak_async("Emergency flatten complete. Account confirmed flat.")
+                if opt_armed:
+                    panic_status = "FLAT"
+                    log_event(
+                        "FLATTEN",
+                        "Manual Emergency Flatten confirmed 100% flat.",
+                    )
+                    speak_async("Emergency flatten complete. Account confirmed flat.")
+                else:
+                    opt_st, opt_list = _verify_post_flatten_unarmed_options(
+                        target_adapter
+                    )
+                    panic_status = opt_st
+                    if opt_st == "FLAT":
+                        log_event(
+                            "FLATTEN",
+                            "Manual Emergency Flatten confirmed 100% flat.",
+                        )
+                        speak_async(
+                            "Emergency flatten complete. Account confirmed flat."
+                        )
+                    elif opt_st == "OPTIONS_OPEN":
+                        ok = False
+                        why_off = (
+                            "outside 9:30 AM – 4:00 PM ET RTH"
+                            if is_options_flatten_armed(config)
+                            else "Options Auto-Flatten is OFF"
+                        )
+                        log_event(
+                            "WARN",
+                            f"Manual Emergency Flatten closed equities, but open option contract(s) remain "
+                            f"{opt_list} ({why_off}) — close options manually!",
+                        )
+                        if ui_button is not None:
+                            trigger_alarm(
+                                "EQUITIES FLAT — CLOSE OPTIONS MANUALLY!",
+                                ui_button,
+                                "Emergency Flatten Now (Options Open)",
+                                force_repeat=True,
+                            )
+                        speak_async(
+                            "Equities flat. Warning: open option contracts remain and must be closed manually."
+                        )
+                    else:
+                        ok = False
+                        log_event(
+                            "WARN",
+                            "Manual Emergency Flatten closed equities, but option position status could not be verified — check broker manually!",
+                        )
+                        if ui_button is not None:
+                            trigger_alarm(
+                                "EQUITIES FLAT — VERIFY OPTIONS AT BROKER!",
+                                ui_button,
+                                "Emergency Flatten Now (Options Unverified)",
+                                force_repeat=True,
+                            )
+                        speak_async(
+                            "Equities flat. Option status unverified, please check broker manually."
+                        )
             else:
+                panic_status = "INCOMPLETE"
                 log_event(
                     "CRITICAL",
                     "Manual Emergency Flatten did not confirm 100% flat within 15s!",
@@ -15767,8 +15879,14 @@ def trigger_manual_panic_flatten(
         except Exception as e:
             log_event("ERROR", f"Manual Emergency Flatten exception: {e}")
             ok = False
+            panic_status = "INCOMPLETE"
         finally:
-            _manual_flatten_in_flight = False
+            try:
+                setattr(target_adapter, "_last_manual_panic_status", panic_status)
+            except Exception:
+                pass
+            with _manual_flatten_state_lock:
+                _manual_flatten_in_flight = False
             if callable(on_done_cb):
                 try:
                     on_done_cb(ok)
@@ -15996,22 +16114,45 @@ class PanicFlattenHoldController:
                 return
 
             sched = self.root if self.root is not None else self.button
+            ad_for_panic = self.adapter_getter()
 
             def _on_done(ok):
                 def _restore():
                     if self.button is not None:
                         try:
-                            done_txt = "✓ FLATTENED" if ok else "⚠️ CHECK POS"
+                            p_st = getattr(
+                                ad_for_panic, "_last_manual_panic_status", None
+                            )
+                            if ok or p_st == "FLAT":
+                                done_txt = "✓ FLATTENED"
+                            elif p_st == "OPTIONS_OPEN":
+                                done_txt = "⚠️ OPTIONS OPEN"
+                            elif p_st == "OPTIONS_UNVERIFIED":
+                                done_txt = (
+                                    "⚠️ VERIFY OPT"
+                                    if is_compact_hud()
+                                    else "⚠️ VERIFY OPTIONS"
+                                )
+                            else:
+                                done_txt = "⚠️ CHECK POS"
                             self.button.config(
                                 text=done_txt,
                                 progress_pct=0.0,
                             )
                             if sched is not None:
+                                def _restore_idle_lbl():
+                                    try:
+                                        if self.button is not None and self.button.winfo_exists():
+                                            self.button.config(
+                                                text=self.idle_text,
+                                                progress_pct=0.0,
+                                            )
+                                    except Exception:
+                                        pass
+
                                 sched.after(
-                                    1800,
-                                    lambda: self.button.config(
-                                        text=self.idle_text, progress_pct=0.0
-                                    ),
+                                    1800 if ok else 2600,
+                                    _restore_idle_lbl,
                                 )
                         except Exception:
                             pass
@@ -16025,7 +16166,7 @@ class PanicFlattenHoldController:
                 _restore()
 
             trigger_manual_panic_flatten(
-                adapter=self.adapter_getter(),
+                adapter=ad_for_panic,
                 ui_button=self.status_btn_getter(),
                 run_async=self.run_async,
                 on_done_cb=_on_done,
@@ -16101,6 +16242,7 @@ def activate_done_for_today(
 
     def _worker():
         ok = True
+        done_status = "FLAT"
         if target_adapter is not None:
             opt_armed = is_options_flatten_armed(config) and is_market_hours()
             ok = bool(
@@ -16111,6 +16253,55 @@ def activate_done_for_today(
                     manual_panic=True,
                 )
             )
+            if ok and not opt_armed:
+                opt_st, opt_list = _verify_post_flatten_unarmed_options(
+                    target_adapter
+                )
+                done_status = opt_st
+                if opt_st == "OPTIONS_OPEN":
+                    ok = False
+                    why_off = (
+                        "outside 9:30 AM – 4:00 PM ET RTH"
+                        if is_options_flatten_armed(config)
+                        else "Options Auto-Flatten is OFF"
+                    )
+                    log_event(
+                        "WARN",
+                        f"Voluntary 'Done for Today' flattened equities, but open option contract(s) remain "
+                        f"{opt_list} ({why_off}) — close options manually!",
+                    )
+                    if ui_button is not None:
+                        trigger_alarm(
+                            "DONE FOR TODAY — CLOSE OPTIONS MANUALLY!",
+                            ui_button,
+                            "Voluntary Done for Today (Options Open)",
+                            force_repeat=True,
+                        )
+                    speak_async(
+                        "Done for today active. Equities flat. Warning: open option contracts remain and must be closed manually."
+                    )
+                elif opt_st == "OPTIONS_UNVERIFIED":
+                    ok = False
+                    log_event(
+                        "WARN",
+                        "Voluntary 'Done for Today' flattened equities, but option position status could not be verified — check broker manually!",
+                    )
+                    if ui_button is not None:
+                        trigger_alarm(
+                            "DONE FOR TODAY — VERIFY OPTIONS AT BROKER!",
+                            ui_button,
+                            "Voluntary Done for Today (Options Unverified)",
+                            force_repeat=True,
+                        )
+                    speak_async(
+                        "Done for today active. Equities flat. Option status unverified, please check broker manually."
+                    )
+            elif not ok:
+                done_status = "INCOMPLETE"
+            try:
+                setattr(target_adapter, "_last_done_today_status", done_status)
+            except Exception:
+                pass
         if callable(on_done_cb):
             try:
                 on_done_cb(ok)
@@ -30514,8 +30705,8 @@ def show_preflight_window(
                 (" 🔒 Done Today ", ("body", "pill_green")),
                 (" lets you walk away with a green session (or call a choppy day early)\n", ("body",)),
                 ("      before giving back profits.\n", ("body",)),
-                ("    • Immediately cancels working daytrade orders and flattens any open tracked positions\n", ("body",)),
-                ("      (pre-existing ", ("body",)),
+                ("    • Immediately cancels working daytrade orders and flattens open tracked equities\n", ("body",)),
+                ("      even if Alarms Only is ON (pre-existing ", ("body",)),
                 (" Ignored ", ("body", "pill_blue")),
                 (" swing positions are never touched).\n", ("body",)),
             ]
@@ -38421,7 +38612,12 @@ def _check_version_switch_guardrails(
             not sess_v.get("session_date")
             or sess_v.get("session_date") == today_str
         ):
-            for loss_ts in sess_v.get("recent_loss_timestamps") or []:
+            saved_streak_ts = (
+                sess_v.get("loss_timestamps")
+                if "loss_timestamps" in sess_v
+                else sess_v.get("recent_loss_timestamps")
+            ) or []
+            for loss_ts in saved_streak_ts:
                 try:
                     if (now_ep - float(loss_ts)) < tilt_win_s:
                         return _deny(
