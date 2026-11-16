@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.66"
+APP_VERSION = "0.9.67"
 
 import os
 import sys
@@ -2249,6 +2249,7 @@ HUD_COLUMN_CATALOG = [
     ("terminate_lvl", "DAILY STOP", "Active Rulebook stop (Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock)"),
     ("dist_to_term", "$ TO STOP", "Remaining dollar cushion before hitting your active Daily Stop"),
     ("session_high", "SESSION HIGH", "Highest flat realized PnL of the day"),
+    ("session_low", "SESSION LOW", "Lowest flat realized PnL of the day"),
     ("from_high", "FROM HIGH", "Current drawdown/giveback from Session High"),
     ("trades_wl", "TRADES (W/L)", "Completed round-trip Wins & Losses (%)"),
     ("loss_streak", "LOSS STREAK", "Consecutive qualifying losses (e.g. 3/5) & live reset timer"),
@@ -2299,6 +2300,7 @@ config = json.loads(json.dumps(DEFAULT_CONFIG))
 start_equity = None
 max_equity = None
 daily_max_equity = None
+daily_min_equity = None
 last_flat_equity = None
 anchor_cash_flow = 0.0
 _last_logged_unanchored_cash_flow = 0.0
@@ -2311,6 +2313,10 @@ force_reanchor = False
 current_is_flat = True
 first_poll_of_launch = True
 _launch_fee_drift_checked = False
+_restored_session_saved_epoch = 0.0
+_restored_session_was_flat = True
+_off_session_reconciled = False
+_cold_launch_ignored_qty_mutated = False
 
 alarm_active = False
 cooldown_active = False
@@ -3037,6 +3043,113 @@ def backfill_trades_from_today_log(target_broker=None):
     except Exception:
         pass
     return w_cnt, l_cnt, prev_real
+
+
+def backfill_min_pnl_from_today_log(target_broker=None, target_start_eq=None):
+    """If upgrading mid-day when daily_min_equity was not yet persisted in
+    account_sessions, scans today's local log for flat realized PnL troughs on
+    the matching broker + starting baseline segment (never cross-contaminating
+    accounts or parsing rejected anti-wick lines)."""
+    if not os.path.exists(LOG_PATH):
+        return 0.0
+    today_str = get_today_str()
+    min_pnl = 0.0
+    curr_log_broker = target_broker or "SCHWAB"
+    seg_matches = target_start_eq is None
+    tgt_eq = (
+        round(float(target_start_eq), 2)
+        if target_start_eq is not None
+        else None
+    )
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            first = f.readline()
+            if today_str not in first:
+                return 0.0
+            for line in f:
+                if "SCHWAB API authenticated" in line or "Broker=SCHWAB" in line:
+                    curr_log_broker = "SCHWAB"
+                elif "WEBULL API authenticated" in line or "Broker=WEBULL" in line:
+                    curr_log_broker = "WEBULL"
+
+                if "Baseline anchored to:" in line:
+                    b_ok = target_broker is None or f"({target_broker})" in line
+                    if tgt_eq is not None:
+                        m_b = re.search(
+                            r"Baseline anchored to:\s*\$([0-9,]+(?:\.[0-9]{2})?)",
+                            line,
+                        )
+                        if m_b and b_ok:
+                            val_b = round(float(m_b.group(1).replace(",", "")), 2)
+                            seg_matches = abs(val_b - tgt_eq) <= 0.02
+                            if seg_matches:
+                                min_pnl = 0.0
+                        else:
+                            seg_matches = False
+                    elif b_ok:
+                        seg_matches = True
+                        min_pnl = 0.0
+                elif "baseline from memory:" in line and "Start=$" in line:
+                    b_ok = (
+                        target_broker is None
+                        or f"Restored {target_broker} baseline" in line
+                    )
+                    if tgt_eq is not None:
+                        m_s = re.search(
+                            r"Start=\$([0-9,]+(?:\.[0-9]{2})?)", line
+                        )
+                        seg_matches = bool(
+                            b_ok
+                            and m_s
+                            and abs(
+                                round(float(m_s.group(1).replace(",", "")), 2)
+                                - tgt_eq
+                            )
+                            <= 0.02
+                        )
+                elif (
+                    "Auto-aligned " in line
+                    and " starting baseline from $" in line
+                ):
+                    b_ok = (
+                        target_broker is None
+                        or f"Auto-aligned {target_broker} " in line
+                    )
+                    if tgt_eq is not None:
+                        m_a = re.search(
+                            r"\s+to\s+\$([0-9,]+(?:\.[0-9]{2})?)", line
+                        )
+                        seg_matches = bool(
+                            b_ok
+                            and m_a
+                            and abs(
+                                round(float(m_a.group(1).replace(",", "")), 2)
+                                - tgt_eq
+                            )
+                            <= 0.02
+                        )
+                        if seg_matches:
+                            min_pnl = 0.0
+                elif (
+                    seg_matches
+                    and (target_broker is None or curr_log_broker == target_broker)
+                    and "[POS_CHANGE]" in line
+                    and "(CLOSED FLAT)" in line
+                    and "Open: $0.00" in line
+                ):
+                    m = re.search(
+                        r"Realized:\s*([+-]?)\$(\d[\d,]*\.\d{2})", line
+                    )
+                    if m:
+                        sign = -1.0 if m.group(1) == "-" else 1.0
+                        val = round(
+                            sign * float(m.group(2).replace(",", "")), 2
+                        )
+                        if val < min_pnl:
+                            min_pnl = val
+    except Exception:
+        pass
+    return round(min_pnl, 2)
 
 
 # --- ACTION-ONLY DAILY EVENT LOGGER ---
@@ -4120,7 +4233,7 @@ def format_config_summary(cfg):
 def restore_account_session(broker_name, account_id, log_restore=False):
     """Restores today's saved baseline for a specific broker + account_id.
     Returns True if a valid baseline for today was found, False otherwise."""
-    global start_equity, max_equity, daily_max_equity
+    global start_equity, max_equity, daily_max_equity, daily_min_equity
     global last_flat_equity, anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close, is_locked_down
     global done_for_today, committed_for_today
@@ -4128,11 +4241,17 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
     global current_upside_tier, first_poll_of_launch, _launch_fee_drift_checked
+    global _restored_session_saved_epoch, _restored_session_was_flat
+    global _off_session_reconciled, _cold_launch_ignored_qty_mutated
     global recent_loss_timestamps, ignored_positions, pending_halt_breach
     global active_non_breach_halted_syms, _notified_non_breach_halt_syms
     global active_session_date
 
     _launch_fee_drift_checked = False
+    _restored_session_saved_epoch = 0.0
+    _restored_session_was_flat = True
+    _off_session_reconciled = False
+    _cold_launch_ignored_qty_mutated = False
     recent_loss_timestamps.clear()
     ignored_positions.clear()
     pending_halt_breach = None
@@ -4165,6 +4284,28 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             )
             last_flat_equity = float(
                 s_data.get("last_flat_equity") or start_equity
+            )
+            s_min = s_data.get("daily_min_equity")
+            if s_min is not None and float(s_min) > 0.0:
+                daily_min_equity = min(
+                    float(s_min), start_equity, last_flat_equity
+                )
+            elif str(broker_name).upper() == "DEMO":
+                daily_min_equity = min(start_equity, last_flat_equity)
+            else:
+                bf_min = backfill_min_pnl_from_today_log(
+                    broker_name, start_equity
+                )
+                daily_min_equity = min(
+                    start_equity,
+                    last_flat_equity,
+                    round(start_equity + bf_min, 2),
+                )
+            _restored_session_saved_epoch = float(
+                s_data.get("last_saved_epoch") or 0.0
+            )
+            _restored_session_was_flat = bool(
+                s_data.get("was_flat_at_save", True)
             )
             anchor_cash_flow = float(
                 s_data.get("anchor_cash_flow", 0.0) or 0.0
@@ -4241,6 +4382,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
                     f"LastFlat=${last_flat_equity:,.2f} | "
                     f"RulebookHWM={format_dollar(max_equity - start_equity)} | "
                     f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
+                    f"SessionLowPnL={format_dollar(daily_min_equity - start_equity)} | "
                     f"ActiveStop={format_dollar(st_pnl)} ({tier_short}) | "
                     f"{format_trades_wl_inline(win_trades, loss_trades)}{ig_note}"
                 )
@@ -4263,6 +4405,12 @@ def restore_account_session(broker_name, account_id, log_restore=False):
         )
         last_flat_equity = float(
             config.get("saved_last_flat_equity") or start_equity
+        )
+        bf_min = backfill_min_pnl_from_today_log(broker_name, start_equity)
+        daily_min_equity = min(
+            start_equity,
+            last_flat_equity,
+            round(start_equity + bf_min, 2),
         )
         has_reset_at_open = bool(config.get("saved_has_reset_at_open", False))
         has_reset_at_close = bool(config.get("saved_has_reset_at_close", False))
@@ -4294,6 +4442,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
                 f"LastFlat=${last_flat_equity:,.2f} | "
                 f"RulebookHWM={format_dollar(max_equity - start_equity)} | "
                 f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
+                f"SessionLowPnL={format_dollar(daily_min_equity - start_equity)} | "
                 f"ActiveStop={format_dollar(st_pnl)} ({tier_short}) | "
                 f"{format_trades_wl_inline(win_trades, loss_trades)}"
             )
@@ -4302,6 +4451,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     start_equity = None
     max_equity = None
     daily_max_equity = None
+    daily_min_equity = None
     last_flat_equity = None
     anchor_cash_flow = 0.0
     has_reset_at_open = False
@@ -4525,7 +4675,9 @@ def save_config(new_cfg=None):
             print(f"Error saving config file: {e}")
 
 
-def save_session_state(expected_epoch=None, adapter_override=None):
+def save_session_state(
+    expected_epoch=None, adapter_override=None, force_epoch_stamp=False
+):
     global active_session_date
     with _config_io_lock:
         if expected_epoch is not None and expected_epoch != _adapter_epoch:
@@ -4548,11 +4700,13 @@ def save_session_state(expected_epoch=None, adapter_override=None):
         )
         s_key = get_session_key(active_b, sel_acct)
 
+        now_ep = round(time.time(), 2)
         new_entry = {
             "session_date": today_str,
             "start_equity": start_equity,
             "max_equity": max_equity,
             "daily_max_equity": daily_max_equity,
+            "daily_min_equity": daily_min_equity,
             "last_flat_equity": last_flat_equity,
             "anchor_cash_flow": round(float(anchor_cash_flow or 0.0), 2),
             "has_reset_at_open": has_reset_at_open,
@@ -4567,6 +4721,8 @@ def save_session_state(expected_epoch=None, adapter_override=None):
             "loss_trades": loss_trades,
             "loss_timestamps": [round(float(t), 2) for t in recent_loss_timestamps],
             "ignored_positions": json.loads(json.dumps(ignored_positions)),
+            "was_flat_at_save": bool(current_is_flat),
+            "last_saved_epoch": now_ep,
         }
 
         if str(active_b).upper() == "DEMO":
@@ -4580,8 +4736,15 @@ def save_session_state(expected_epoch=None, adapter_override=None):
             config["account_sessions"] = {}
 
         old_entry = config["account_sessions"].get(s_key)
+        old_cmp = (
+            {k: v for k, v in old_entry.items() if k != "last_saved_epoch"}
+            if isinstance(old_entry, dict)
+            else None
+        )
+        new_cmp = {k: v for k, v in new_entry.items() if k != "last_saved_epoch"}
         changed = (
-            old_entry != new_entry
+            force_epoch_stamp
+            or old_cmp != new_cmp
             or config.get("session_date") != today_str
             or config.get("saved_start_equity") != start_equity
             or config.get("saved_max_equity") != max_equity
@@ -4761,6 +4924,7 @@ def _apply_ignored_positions_to_snapshot(
     pos_details, open_pnl, has_options, and flatten caches, and neutralizes
     their intraday PnL impact (across price moves, adds, partial sells, and
     full closes) from raw_adj_eq."""
+    global _cold_launch_ignored_qty_mutated
     if not isinstance(raw_pos_details, dict):
         raw_pos_details = {}
     if (
@@ -4932,6 +5096,8 @@ def _apply_ignored_positions_to_snapshot(
             sum_ignored_impact += locked_impact + open_impact
 
     if state_mutated:
+        if first_poll_of_launch:
+            _cold_launch_ignored_qty_mutated = True
         if mutated_igs and raw_adj_eq is not None:
             tracked_qty_changed = (
                 set(filt_pos_details.keys()) != set(prev_pos_snapshot.keys())
@@ -4948,7 +5114,8 @@ def _apply_ignored_positions_to_snapshot(
                 last_flat_equity if last_flat_equity is not None else start_equity
             )
             if (
-                not tracked_qty_changed
+                not first_poll_of_launch
+                and not tracked_qty_changed
                 and ref_flat_eq is not None
                 and float(ref_flat_eq) > 0.0
             ):
@@ -6293,7 +6460,7 @@ class SchwabAdapter:
                 return bool(c_val)
         try:
             now_utc = datetime.now(timezone.utc)
-            from_dt = now_utc - timedelta(days=2)
+            from_dt = now_utc - timedelta(days=58)
             to_dt = now_utc + timedelta(hours=1)
             resp = self.client.get_orders_for_account(
                 self.account_id,
@@ -6336,6 +6503,98 @@ class SchwabAdapter:
             return False
         except Exception:
             return True
+
+    def has_non_ignored_closing_fills_since(
+        self, since_epoch, was_flat_at_save=True
+    ):
+        """Returns True ONLY when the Schwab API confirms at least one non-ignored
+        closing order (or any non-ignored fill if the session saved while in a
+        trade) executed on today's ET date at or after `since_epoch`."""
+        if (
+            not self.client
+            or not self.account_id
+            or since_epoch is None
+            or float(since_epoch) <= 0.0
+        ):
+            return False
+        today_str = get_today_str()
+        cutoff = float(since_epoch) - 2.0
+        closing_instrs = {
+            "SELL",
+            "SELL_TO_CLOSE",
+            "BUY_TO_COVER",
+            "BUY_TO_CLOSE",
+        }
+        try:
+            now_utc = datetime.now(timezone.utc)
+            from_dt = now_utc - timedelta(days=58)
+            to_dt = now_utc + timedelta(hours=1)
+            try:
+                resp = self.client.get_orders_for_account(
+                    self.account_id,
+                    from_entered_datetime=from_dt,
+                    to_entered_datetime=to_dt,
+                )
+            except TypeError:
+                resp = self.client.get_orders_for_account(self.account_id)
+            if resp.status_code != 200:
+                return False
+            orders = resp.json()
+            if not isinstance(orders, list):
+                return False
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                st = str(o.get("status") or "").upper()
+                try:
+                    filled_q = float(o.get("filledQuantity") or 0.0)
+                except Exception:
+                    filled_q = 0.0
+                if filled_q <= 0.0 and st not in ("FILLED", "PARTIAL_FILLED"):
+                    continue
+                fill_epochs = []
+                fill_dates = set()
+                for act in o.get("orderActivityCollection") or []:
+                    if isinstance(act, dict):
+                        for ex_leg in act.get("executionLegs") or []:
+                            if isinstance(ex_leg, dict):
+                                raw_t = ex_leg.get("time")
+                                ep = self._order_ts_to_epoch(raw_t)
+                                if ep > 0.0:
+                                    fill_epochs.append(ep)
+                                d_s = self._order_ts_to_eastern_date(raw_t)
+                                if d_s:
+                                    fill_dates.add(d_s)
+                for ts_key in ("closeTime", "enteredTime"):
+                    raw_t = o.get(ts_key)
+                    ep = self._order_ts_to_epoch(raw_t)
+                    if ep > 0.0 and not fill_epochs:
+                        fill_epochs.append(ep)
+                    d_s = self._order_ts_to_eastern_date(raw_t)
+                    if d_s:
+                        fill_dates.add(d_s)
+                if today_str not in fill_dates:
+                    continue
+                if not fill_epochs or max(fill_epochs) < cutoff:
+                    continue
+                for lg in o.get("orderLegCollection") or []:
+                    if not isinstance(lg, dict):
+                        continue
+                    inst = lg.get("instrument") or {}
+                    leg_sym = str(inst.get("symbol") or "").strip()
+                    if not leg_sym:
+                        continue
+                    leg_opt = (
+                        str(inst.get("assetType") or "").upper() == "OPTION"
+                    )
+                    if is_position_ignored(leg_sym, is_opt=leg_opt):
+                        continue
+                    instr = str(lg.get("instruction") or "").upper()
+                    if (not was_flat_at_save) or (instr in closing_instrs):
+                        return True
+            return False
+        except Exception:
+            return False
 
     def get_open_equity_positions(self, allow_stale_cache=True):
         """Returns ONLY Equity positions for Auto-Flatten, or None on API error."""
@@ -8364,6 +8623,153 @@ class WebullAdapter:
             return True
 
     @staticmethod
+    def _webull_ts_to_epoch(raw_ts):
+        if raw_ts is None:
+            return 0.0
+        if isinstance(raw_ts, (int, float)):
+            v = float(raw_ts)
+            return v / 1000.0 if v > 1e12 else v
+        s = str(raw_ts).strip()
+        if not s:
+            return 0.0
+        if re.fullmatch(r"\d+(?:\.\d+)?", s):
+            v = float(s)
+            return v / 1000.0 if v > 1e12 else v
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            elif re.search(r"[+-]\d{4}$", s):
+                s = s[:-2] + ":" + s[-2:]
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return float(dt.timestamp())
+        except Exception:
+            return 0.0
+
+    def has_non_ignored_closing_fills_since(
+        self, since_epoch, was_flat_at_save=True
+    ):
+        """Returns True ONLY when the Webull API confirms at least one non-ignored
+        closing order (or any non-ignored fill if the session saved while in a
+        trade) executed on today's ET date at or after `since_epoch`."""
+        if (
+            not self.trade_client
+            or not self.account_id
+            or since_epoch is None
+            or float(since_epoch) <= 0.0
+        ):
+            return False
+        today_str = get_today_str()
+        cutoff = float(since_epoch) - 2.0
+        try:
+            res = None
+            if hasattr(self.trade_client, "order_v3") and hasattr(
+                self.trade_client.order_v3, "get_order_history"
+            ):
+                try:
+                    res = self.trade_client.order_v3.get_order_history(
+                        account_id=self.account_id,
+                        page_size=50,
+                        start_date=today_str,
+                        end_date=today_str,
+                    )
+                except TypeError:
+                    res = self.trade_client.order_v3.get_order_history(
+                        account_id=self.account_id, page_size=50
+                    )
+            elif hasattr(self.trade_client, "order_v2") and hasattr(
+                self.trade_client.order_v2, "get_order_history"
+            ):
+                try:
+                    res = self.trade_client.order_v2.get_order_history(
+                        account_id=self.account_id,
+                        page_size=50,
+                        start_date=today_str,
+                        end_date=today_str,
+                    )
+                except TypeError:
+                    res = self.trade_client.order_v2.get_order_history(
+                        account_id=self.account_id, page_size=50
+                    )
+            if res is None or res.status_code != 200:
+                return False
+            payload = res.json()
+            orders = (
+                payload
+                if isinstance(payload, list)
+                else payload.get("data", payload.get("orders", []))
+            )
+            if not isinstance(orders, list):
+                return False
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                st = str(
+                    o.get("status") or o.get("order_status") or ""
+                ).upper()
+                try:
+                    fq = float(
+                        o.get("filled_quantity")
+                        or o.get("filled_qty")
+                        or o.get("total_filled_quantity")
+                        or o.get("filledQuantity")
+                        or 0.0
+                    )
+                except Exception:
+                    fq = 0.0
+                if fq <= 0.0 and st not in (
+                    "FILLED",
+                    "PARTIAL_FILLED",
+                    "PARTIALLY_FILLED",
+                ):
+                    continue
+                raw_t = (
+                    o.get("filled_time")
+                    or o.get("update_time")
+                    or o.get("create_time")
+                    or o.get("placed_time")
+                )
+                ep = self._webull_ts_to_epoch(raw_t)
+                if ep <= 0.0 or ep < cutoff:
+                    continue
+                o_itype = str(
+                    o.get("instrument_type")
+                    or o.get("asset_type")
+                    or "EQUITY"
+                ).upper()
+                o_is_opt = ("OPT" in o_itype) or bool(o.get("legs"))
+                if o_is_opt:
+                    o_meta = self._parse_option_contract_meta(o)
+                    o_sym = (
+                        o_meta.get("display_sym")
+                        or o_meta.get("raw_symbol", "")
+                    )
+                else:
+                    o_sym = (
+                        o.get("symbol")
+                        or (o.get("ticker") or {}).get("symbol")
+                        or ""
+                    )
+                o_sym = str(o_sym or "").strip()
+                if not o_sym or is_position_ignored(o_sym, is_opt=o_is_opt):
+                    continue
+                o_side = str(o.get("side") or o.get("action") or "").upper()
+                o_intent = str(
+                    o.get("position_intent") or o.get("intent") or ""
+                ).upper()
+                is_closing = (
+                    o_side == "SELL"
+                    or "CLOSE" in o_intent
+                    or "COVER" in o_intent
+                )
+                if (not was_flat_at_save) or is_closing:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
     def _parse_option_contract_meta(p):
         """Extracts normalized option contract metadata from a Webull position
         record (supporting both v2 'legs' arrays, top-level fields, and OCC symbols)."""
@@ -9823,6 +10229,15 @@ class DemoBrokerAdapter:
             if not self._halt_until_ts:
                 return 0.0
             return max(0.0, max(float(v - now_t) for v in self._halt_until_ts.values()))
+
+    def has_any_filled_orders_today(self):
+        with self._lock:
+            return len(self._filled_orders) > 0
+
+    def has_non_ignored_closing_fills_since(
+        self, since_epoch, was_flat_at_save=True
+    ):
+        return False
 
     def sim_reset_account(self, start_cash=25000.0):
         with self._lock:
@@ -16181,7 +16596,7 @@ def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
     differs from start_equity while 0 trades have been filled today on the
     brokerage account, automatically re-aligns start_equity to eq_now so the
     trader does not start their day with a phantom fee PnL."""
-    global start_equity, max_equity, daily_max_equity, last_flat_equity
+    global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global prev_flat_realized_pnl, settled_realized_pnl
     if (
         not is_fl_now
@@ -16205,6 +16620,7 @@ def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
     start_equity = new_start
     max_equity = new_start
     daily_max_equity = new_start
+    daily_min_equity = new_start
     last_flat_equity = new_start
     prev_flat_realized_pnl = 0.0
     settled_realized_pnl = 0.0
@@ -16221,6 +16637,88 @@ def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
     return True
 
 
+def _reconcile_off_session_flat_delta(eq_now, is_fl_now):
+    """When resuming a saved same-day session while flat, reconciles any net
+    flat balance delta since `last_saved_epoch` against broker closing-order
+    history before `last_flat_equity` is overwritten:
+      - Books +1 Win or +1 Loss ONLY when `abs(off_delta) >= 1.00`, no
+        pre-existing ignored position mutated quantity during cold launch, and
+        the broker confirms >= 1 non-ignored closing fill since `last_saved_epoch`.
+      - Never auto-clears `is_locked_down` or `recent_loss_timestamps` on
+        inferred off-session gains (preserving tilt/breach guardrails).
+      - Always aligns `last_flat_equity`, `max_equity`, `daily_max_equity`,
+        `daily_min_equity`, `prev_flat_realized_pnl`, and `settled_realized_pnl`."""
+    global last_flat_equity, max_equity, daily_max_equity, daily_min_equity
+    global prev_flat_realized_pnl, settled_realized_pnl
+    global win_trades, loss_trades, recent_loss_timestamps
+    global _off_session_reconciled
+    if (
+        not is_fl_now
+        or eq_now is None
+        or float(eq_now) <= 0.0
+        or start_equity is None
+        or float(start_equity) <= 0.0
+    ):
+        return False
+    eq_f = round(float(eq_now), 2)
+    ref_flat = (
+        round(float(last_flat_equity), 2)
+        if last_flat_equity is not None and float(last_flat_equity) > 0.0
+        else round(float(start_equity), 2)
+    )
+    off_delta = round(eq_f - ref_flat, 2)
+    if (
+        not _off_session_reconciled
+        and _restored_session_saved_epoch > 0.0
+        and not _cold_launch_ignored_qty_mutated
+        and active_adapter is not None
+        and not is_demo_mode_active(active_adapter)
+        and abs(off_delta) >= 1.00
+        and hasattr(active_adapter, "has_non_ignored_closing_fills_since")
+    ):
+        _off_session_reconciled = True
+        if active_adapter.has_non_ignored_closing_fills_since(
+            _restored_session_saved_epoch,
+            was_flat_at_save=_restored_session_was_flat,
+        ):
+            if off_delta > 0.0:
+                win_trades += 1
+            else:
+                loss_trades += 1
+                if config.get("enable_consec_loss_cooldown", False):
+                    min_loss_mag = abs(
+                        float(config.get("consec_loss_min_dollars", 25.0))
+                    )
+                    if off_delta <= -min_loss_mag:
+                        recent_loss_timestamps.append(time.time())
+            log_event(
+                "SESSION",
+                f"Reconciled off-session closed trade activity "
+                f"({format_dollar(off_delta)} -> "
+                f"{format_trades_wl_inline(win_trades, loss_trades)}).",
+            )
+        else:
+            log_event(
+                "SESSION",
+                f"Synced flat balance delta ({format_dollar(off_delta)}) on session resume "
+                f"(no non-ignored closing fills since last save; W/L unchanged).",
+            )
+    elif not _off_session_reconciled:
+        _off_session_reconciled = True
+
+    last_flat_equity = eq_f
+    if max_equity is None or eq_f > max_equity:
+        max_equity = eq_f
+    if daily_max_equity is None or eq_f > daily_max_equity:
+        daily_max_equity = eq_f
+    if daily_min_equity is None or eq_f < daily_min_equity:
+        daily_min_equity = eq_f
+    prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
+    settled_realized_pnl = prev_flat_realized_pnl
+    save_session_state()
+    return True
+
+
 def _stabilize_mid_fill_realized_and_equity(
     current_eq, is_flat, live_open_pnl, pos_details, is_reverify=False
 ):
@@ -16228,7 +16726,7 @@ def _stabilize_mid_fill_realized_and_equity(
         desynchronization (e.g. Webull/Schwab deducting cash for a buy fill
         150-350ms before /positions reports the shares, or crediting sale
         proceeds during a multi-lot scale-out before /positions reduces qty). """
-    global last_flat_equity, max_equity, daily_max_equity
+    global last_flat_equity, max_equity, daily_max_equity, daily_min_equity
     global settled_realized_pnl, prev_flat_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol, _launch_fee_drift_checked
 
@@ -16236,12 +16734,15 @@ def _stabilize_mid_fill_realized_and_equity(
         if is_flat:
             if not _launch_fee_drift_checked:
                 _launch_fee_drift_checked = True
-                _maybe_absorb_untouched_flat_fee_drift(current_eq, is_flat)
+                if not _maybe_absorb_untouched_flat_fee_drift(current_eq, is_flat):
+                    _reconcile_off_session_flat_delta(current_eq, is_flat)
             last_flat_equity = current_eq
             if current_eq > max_equity:
                 max_equity = current_eq
             if current_eq > daily_max_equity:
                 daily_max_equity = current_eq
+            if daily_min_equity is None or current_eq < daily_min_equity:
+                daily_min_equity = current_eq
             save_session_state()
             realized_pnl = round(last_flat_equity - start_equity, 2)
             open_pnl = 0.0
@@ -16270,6 +16771,8 @@ def _stabilize_mid_fill_realized_and_equity(
                 max_equity = current_eq
             if current_eq > daily_max_equity:
                 daily_max_equity = current_eq
+            if daily_min_equity is None or current_eq < daily_min_equity:
+                daily_min_equity = current_eq
             save_session_state()
             realized_pnl = round(last_flat_equity - start_equity, 2)
             settled_realized_pnl = realized_pnl
@@ -16314,6 +16817,8 @@ def _stabilize_mid_fill_realized_and_equity(
                     max_equity = current_eq
                 if current_eq > daily_max_equity:
                     daily_max_equity = current_eq
+                if daily_min_equity is None or current_eq < daily_min_equity:
+                    daily_min_equity = current_eq
                 save_session_state()
                 realized_pnl = round(last_flat_equity - start_equity, 2)
                 settled_realized_pnl = realized_pnl
@@ -16358,6 +16863,8 @@ def _stabilize_mid_fill_realized_and_equity(
                     max_equity = current_eq
                 if current_eq > daily_max_equity:
                     daily_max_equity = current_eq
+                if daily_min_equity is None or current_eq < daily_min_equity:
+                    daily_min_equity = current_eq
                 save_session_state()
                 realized_pnl = round(last_flat_equity - start_equity, 2)
                 settled_realized_pnl = realized_pnl
@@ -16608,7 +17115,7 @@ def evaluate_stop_decisions(
     a dictionary containing `actions` (ordered list of action dicts),
     `action_types` (list of action type strings), and computed PnL/floor metrics.
     """
-    global start_equity, max_equity, daily_max_equity, last_flat_equity
+    global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global prev_pos_snapshot, prev_flat_realized_pnl, settled_realized_pnl
     global is_locked_down, daily_breach_settings_prompted, done_for_today
     global cooldown_active, pending_halt_breach
@@ -16626,6 +17133,8 @@ def evaluate_stop_decisions(
             max_equity = state["max_equity"]
         if "daily_max_equity" in state:
             daily_max_equity = state["daily_max_equity"]
+        if "daily_min_equity" in state:
+            daily_min_equity = state["daily_min_equity"]
         if "last_flat_equity" in state:
             last_flat_equity = state["last_flat_equity"]
         if "prev_pos_snapshot" in state:
@@ -17386,7 +17895,7 @@ def _wake_data_loop():
 
 
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
-    global start_equity, max_equity, daily_max_equity, last_flat_equity
+    global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close, is_locked_down, force_reanchor
     global done_for_today, committed_for_today, breach_visual_sim_active
@@ -17405,6 +17914,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     consecutive_loop_exceptions = 0
     api_disconnect_alerted = False
     last_data_loop_heartbeat = time.time()
+    _prev_poll_diag = {"open": None, "net": None, "ts": 0.0, "epoch": None}
 
     while True:
         last_data_loop_heartbeat = time.time()
@@ -17532,6 +18042,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     start_equity = anchor_eq
                     max_equity = anchor_eq
                     daily_max_equity = max(anchor_eq, current_eq)
+                    daily_min_equity = anchor_eq
                     last_flat_equity = anchor_eq
                     anchor_cash_flow = (
                         poll_ad.get_last_intraday_cash_flow()
@@ -17588,6 +18099,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     start_equity = anchor_eq
                     max_equity = anchor_eq
                     daily_max_equity = max(anchor_eq, current_eq)
+                    daily_min_equity = anchor_eq
                     last_flat_equity = anchor_eq
                     anchor_cash_flow = (
                         poll_ad.get_last_intraday_cash_flow()
@@ -17628,6 +18140,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 if daily_max_equity is None:
                     daily_max_equity = max(start_equity, max_equity)
+                if daily_min_equity is None:
+                    daily_min_equity = min(
+                        start_equity,
+                        last_flat_equity
+                        if last_flat_equity is not None
+                        else start_equity,
+                    )
 
                 reset_925 = config.get("reset_at_925", True)
                 if is_rth() and not has_reset_at_open:
@@ -17901,10 +18420,21 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         {k: v.get("qty") for k, v in pos_details.items()}
                         != {k: v.get("qty") for k, v in prev_pos_snapshot.items()}
                     )
+                    prev_poll_sfx = ""
+                    if (
+                        _prev_poll_diag["epoch"] == poll_epoch
+                        and _prev_poll_diag["ts"] > 0.0
+                        and _prev_poll_diag["open"] is not None
+                    ):
+                        prev_poll_sfx = (
+                            f", PrevPoll(Open={format_dollar(_prev_poll_diag['open'])}, "
+                            f"Net={format_dollar(_prev_poll_diag['net'])}, "
+                            f"dt={max(0.0, time.time() - _prev_poll_diag['ts']):.1f}s)"
+                        )
                     spike_ctx = (
                         f"Realized={format_dollar(realized_pnl)}, "
                         f"Open={format_dollar(open_pnl)}, "
-                        f"Net={format_dollar(net_pnl)}"
+                        f"Net={format_dollar(net_pnl)}{prev_poll_sfx}"
                     )
                     if is_demo_mode_active(poll_ad) or (
                         (
@@ -18107,21 +18637,43 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
                     elif act_type == "LOCKDOWN":
                         if pending_halt_breach is None and not is_locked_down:
+                            pp_sfx = (
+                                f", PrevPoll(Open={format_dollar(_prev_poll_diag['open'])}, "
+                                f"Net={format_dollar(_prev_poll_diag['net'])}, "
+                                f"dt={max(0.0, time.time() - _prev_poll_diag['ts']):.1f}s)"
+                                if (
+                                    _prev_poll_diag["epoch"] == poll_epoch
+                                    and _prev_poll_diag["ts"] > 0.0
+                                    and _prev_poll_diag["open"] is not None
+                                )
+                                else ""
+                            )
                             trigger_lockdown(
                                 poll_ad,
                                 act["reason"],
                                 mute_btn,
                                 act["has_options"],
-                                act["ctx"],
+                                f"{act['ctx']}{pp_sfx}",
                             )
                     elif act_type == "OPEN_PNL_FLATTEN":
                         if pending_halt_breach is None:
+                            pp_sfx = (
+                                f", PrevPoll(Open={format_dollar(_prev_poll_diag['open'])}, "
+                                f"Net={format_dollar(_prev_poll_diag['net'])}, "
+                                f"dt={max(0.0, time.time() - _prev_poll_diag['ts']):.1f}s)"
+                                if (
+                                    _prev_poll_diag["epoch"] == poll_epoch
+                                    and _prev_poll_diag["ts"] > 0.0
+                                    and _prev_poll_diag["open"] is not None
+                                )
+                                else ""
+                            )
                             trigger_open_pnl_flatten(
                                 poll_ad,
                                 act["reason"],
                                 mute_btn,
                                 act["has_options"],
-                                act["ctx"],
+                                f"{act['ctx']}{pp_sfx}",
                             )
                     elif act_type == "ALARM":
                         trigger_alarm(act["reason"], mute_btn, act["ctx"])
@@ -18205,6 +18757,18 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 )
                 c3_bg = "#1e8449" if terminate_pnl_level > 0 else "#1f538d"
                 c5_bg = "#1e8449" if session_high_pnl > 0 else "#2c3e50"
+                eff_min_eq = (
+                    daily_min_equity
+                    if daily_min_equity is not None
+                    else min(
+                        start_equity,
+                        last_flat_equity
+                        if last_flat_equity is not None
+                        else start_equity,
+                    )
+                )
+                session_low_pnl = round(eff_min_eq - start_equity, 2)
+                sl_bg = "#6e2c2c" if session_low_pnl < 0 else "#2c3e50"
 
                 giveback_val = (
                     round(net_pnl - session_high_pnl, 2)
@@ -18235,6 +18799,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         c4_bg,
                     ),
                     "session_high": (format_dollar(session_high_pnl), c5_bg),
+                    "session_low": (format_dollar(session_low_pnl), sl_bg),
                     "from_high": (format_dollar(giveback_val), fh_bg),
                     "trades_wl": (
                         format_trades_wl_multiline(win_trades, loss_trades),
@@ -18248,6 +18813,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     for cid in active_cols
                 ]
 
+                _prev_poll_diag["open"] = open_pnl
+                _prev_poll_diag["net"] = net_pnl
+                _prev_poll_diag["ts"] = time.time()
+                _prev_poll_diag["epoch"] = poll_epoch
                 if not _poll_still_valid():
                     continue
                 root.after(
@@ -19851,8 +20420,8 @@ def show_preflight_window(
             )
 
     def _apply_preexisting_selection(chosen_ignored_tags, mark_reviewed=True):
-        global start_equity, last_flat_equity, max_equity, daily_max_equity
-        global force_reanchor
+        global start_equity, last_flat_equity, max_equity, daily_max_equity, daily_min_equity
+        global force_reanchor, current_is_flat
         raw_pos = (
             active_adapter.get_last_raw_pos_details()
             if active_adapter is not None
@@ -19941,6 +20510,15 @@ def show_preflight_window(
                                 + delta_base,
                                 2,
                             )
+                            daily_min_equity = round(
+                                (
+                                    daily_min_equity
+                                    if daily_min_equity is not None
+                                    else min(start_equity - delta_base, last_flat_equity - delta_base)
+                                )
+                                + delta_base,
+                                2,
+                            )
                             _card3_base_cache["eq_str"] = (
                                 f"${start_equity:,.2f} (Saved)"
                             )
@@ -20003,25 +20581,59 @@ def show_preflight_window(
                     (float(raw_eq_now) - tracked_opnl) - float(ref_flat_eq), 2
                 )
                 ig_drift = round(target_ig_sum - cur_ig_sum, 2)
+                new_ig_opt_contracts = 0.0
                 new_ig_notional = 0.0
                 for ig_e in newly_ignored_igs:
-                    m_e = (
-                        100.0
-                        if str(ig_e.get("asset_type", "EQUITY")).upper() == "OPTION"
-                        else 1.0
+                    is_opt_e = (
+                        str(ig_e.get("asset_type", "EQUITY")).upper() == "OPTION"
                     )
-                    new_ig_notional += (
-                        abs(float(ig_e.get("ref_qty", 0.0)))
-                        * max(0.01, float(ig_e.get("ref_price", 0.0)))
-                        * m_e
-                    )
-                max_ig_drift = max(250.0, new_ig_notional * 0.10)
-                if abs(ig_drift) >= 0.01 and abs(ig_drift) <= max_ig_drift:
-                    newly_ignored_igs[-1]["locked_impact"] = round(
-                        float(newly_ignored_igs[-1].get("locked_impact", 0.0))
-                        + ig_drift,
-                        2,
-                    )
+                    q_e = abs(float(ig_e.get("ref_qty", 0.0)))
+                    p_e = max(0.01, float(ig_e.get("ref_price", 0.0)))
+                    if is_opt_e:
+                        new_ig_opt_contracts += q_e
+                        new_ig_notional += q_e * p_e * 100.0
+                    else:
+                        new_ig_notional += q_e * p_e
+                max_ig_drift = round(
+                    min(
+                        25.0,
+                        max(
+                            2.0,
+                            new_ig_opt_contracts * 1.0
+                            + new_ig_notional * 0.0005,
+                        ),
+                    ),
+                    2,
+                )
+                if abs(ig_drift) >= 0.01:
+                    if abs(ig_drift) <= max_ig_drift:
+                        newly_ignored_igs[-1]["locked_impact"] = round(
+                            float(newly_ignored_igs[-1].get("locked_impact", 0.0))
+                            + ig_drift,
+                            2,
+                        )
+                        cur_ig_sum = round(cur_ig_sum + ig_drift, 2)
+                        log_event(
+                            "SESSION",
+                            f"Absorbed newly-ignored fee/mark drift ({format_dollar(ig_drift)} <= "
+                            f"${max_ig_drift:,.2f} cap) into {newly_ignored_igs[-1].get('symbol', 'ignored position')}.",
+                        )
+                    else:
+                        log_event(
+                            "SESSION",
+                            f"Skipped newly-ignored drift ({format_dollar(ig_drift)} exceeds "
+                            f"${max_ig_drift:,.2f} fee/mark cap) to preserve off-session realized PnL.",
+                        )
+                all_tracked_flat = all(
+                    t_r in ignored_positions for t_r in raw_pos
+                )
+                if all_tracked_flat and parent is None:
+                    current_is_flat = True
+                    adj_flat_now = round(float(raw_eq_now) - cur_ig_sum, 2)
+                    if not _maybe_absorb_untouched_flat_fee_drift(
+                        adj_flat_now, True
+                    ):
+                        _reconcile_off_session_flat_delta(adj_flat_now, True)
             save_session_state()
 
         if chosen_ignored_tags and not var_ignore_preexisting.get():
@@ -20076,6 +20688,11 @@ def show_preflight_window(
             )
             _preexisting_state["reviewed"] = True
             _preexisting_state["reanchor_reviewed"] = False
+            _preexisting_state["raw_eq"] = (
+                active_adapter.get_last_raw_adj_eq()
+                if hasattr(active_adapter, "get_last_raw_adj_eq")
+                else None
+            )
             eq_str = f"${start_equity:,.2f} (Saved)"
         else:
             had_saved = restore_account_session(
@@ -20089,6 +20706,7 @@ def show_preflight_window(
             )
             _preexisting_state["reviewed"] = False
             _preexisting_state["reanchor_reviewed"] = False
+            _preexisting_state["raw_eq"] = None
 
             is_live_broker = isinstance(
                 active_adapter, (SchwabAdapter, WebullAdapter)
@@ -20112,6 +20730,11 @@ def show_preflight_window(
                         active_adapter.fetch_account_data()
                     )
                     if eq_now is not None and eq_now > 0:
+                        _preexisting_state["raw_eq"] = (
+                            active_adapter.get_last_raw_adj_eq()
+                            if hasattr(active_adapter, "get_last_raw_adj_eq")
+                            else eq_now
+                        )
                         if getattr(active_adapter, "last_positions_fetch_ok", True):
                             _initial_positions_verified = True
                         current_is_flat = bool(is_fl_now)
@@ -20124,12 +20747,7 @@ def show_preflight_window(
                         if not _maybe_absorb_untouched_flat_fee_drift(
                             eq_now, is_fl_now
                         ):
-                            last_flat_equity = round(float(eq_now), 2)
-                            prev_flat_realized_pnl = round(
-                                last_flat_equity - start_equity, 2
-                            )
-                            settled_realized_pnl = prev_flat_realized_pnl
-                            save_session_state()
+                            _reconcile_off_session_flat_delta(eq_now, is_fl_now)
                 eq_str = f"${start_equity:,.2f} (Saved)"
             elif defer_to_bg:
                 _pf_initial_shown["needs_bg_sync"] = True
@@ -24194,6 +24812,7 @@ def show_preflight_window(
                     s_entry["start_equity"] = start_equity
                     s_entry["max_equity"] = max_equity
                     s_entry["daily_max_equity"] = daily_max_equity
+                    s_entry["daily_min_equity"] = daily_min_equity
                     s_entry["last_flat_equity"] = last_flat_equity
                     s_entry["anchor_cash_flow"] = round(
                         float(anchor_cash_flow or 0.0), 2
@@ -32360,16 +32979,18 @@ def show_preflight_window(
                         and start_equity is not None
                         and start_equity > 0
                     ):
+                        _preexisting_state["raw_eq"] = (
+                            ad.get_last_raw_adj_eq()
+                            if hasattr(ad, "get_last_raw_adj_eq")
+                            else eq_now
+                        )
                         if eq_now is not None and eq_now > 0 and is_fl_now:
                             if not _maybe_absorb_untouched_flat_fee_drift(
                                 eq_now, is_fl_now
                             ):
-                                last_flat_equity = round(float(eq_now), 2)
-                                prev_flat_realized_pnl = round(
-                                    last_flat_equity - start_equity, 2
+                                _reconcile_off_session_flat_delta(
+                                    eq_now, is_fl_now
                                 )
-                                settled_realized_pnl = prev_flat_realized_pnl
-                                save_session_state()
                         _card3_base_cache["eq_str"] = (
                             f"${start_equity:,.2f} (Saved)"
                         )
@@ -33859,7 +34480,7 @@ def open_demo_simulator_pad(parent_win=None):
     live PnL up or down, and rehearse Single-Trade Stop, Daily Stop, Tilt
     Streak, or LULD Halt breaches."""
     global _demo_sim_pad_win, start_equity, last_flat_equity
-    global prev_flat_realized_pnl, settled_realized_pnl, max_equity, daily_max_equity
+    global prev_flat_realized_pnl, settled_realized_pnl, max_equity, daily_max_equity, daily_min_equity
     global recent_loss_timestamps, win_trades, loss_trades, is_locked_down, done_for_today
 
     if _demo_sim_pad_win is not None:
@@ -34331,7 +34952,7 @@ def open_demo_simulator_pad(parent_win=None):
         Demo equity back to $25,000 when needed so every scenario button in the
         Demo Simulator Pad can be clicked repeatedly in any order."""
         global start_equity, last_flat_equity, prev_flat_realized_pnl
-        global settled_realized_pnl, max_equity, daily_max_equity
+        global settled_realized_pnl, max_equity, daily_max_equity, daily_min_equity
         global is_locked_down, done_for_today, daily_breach_settings_prompted
         global cooldown_active, cooldown_end_time, dry_run_lock_active, penalty_box_until
         global pending_halt_breach, active_non_breach_halted_syms, _notified_non_breach_halt_syms
@@ -34393,6 +35014,7 @@ def open_demo_simulator_pad(parent_win=None):
             settled_realized_pnl = 0.0
             max_equity = 25000.0
             daily_max_equity = 25000.0
+            daily_min_equity = 25000.0
             current_upside_tier = compute_upside_tier(is_rth(), 0.0, config)
             current_is_flat = True
             prev_pos_snapshot = {}
@@ -34539,7 +35161,7 @@ def open_demo_simulator_pad(parent_win=None):
 
     def _reset_demo_acct():
         global start_equity, last_flat_equity, prev_flat_realized_pnl
-        global settled_realized_pnl, max_equity, daily_max_equity
+        global settled_realized_pnl, max_equity, daily_max_equity, daily_min_equity
         global win_trades, loss_trades, is_locked_down, done_for_today
         global committed_for_today, cooldown_active, cooldown_end_time
         global dry_run_lock_active, penalty_box_until, pending_halt_breach
@@ -34566,6 +35188,7 @@ def open_demo_simulator_pad(parent_win=None):
         settled_realized_pnl = 0.0
         max_equity = 25000.0
         daily_max_equity = 25000.0
+        daily_min_equity = 25000.0
         win_trades = 0
         loss_trades = 0
         recent_loss_timestamps.clear()
@@ -34820,6 +35443,213 @@ def open_demo_simulator_pad(parent_win=None):
     return win
 
 
+def _get_win32_primary_mouse_vk():
+    if sys.platform != "win32":
+        return 0x01
+    try:
+        swapped = bool(ctypes.windll.user32.GetSystemMetrics(23))
+        return 0x02 if swapped else 0x01
+    except Exception:
+        return 0x01
+
+
+def _is_win32_primary_mouse_physically_down():
+    if sys.platform != "win32":
+        return True
+    try:
+        vk = _get_win32_primary_mouse_vk()
+        return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+    except Exception:
+        return True
+
+
+def _heal_win32_stuck_mouse_button_state(is_phys_down_fn=None):
+    """Clears a stuck Win32/Tk 8.6 thread-queued mouse button bit (`GetKeyState`
+    down while hardware `GetAsyncKeyState` is already up, e.g. when an external
+    window steals focus before `WM_LBUTTONUP` reaches this thread) via
+    `GetKeyboardState` -> `SetKeyboardState`, falling back to `ReleaseCapture()`
+    only if the thread state remains stuck."""
+    if sys.platform != "win32":
+        return False
+    try:
+        u32 = ctypes.windll.user32
+        vk = _get_win32_primary_mouse_vk()
+        phys_down = (
+            bool(is_phys_down_fn())
+            if callable(is_phys_down_fn)
+            else bool(u32.GetAsyncKeyState(vk) & 0x8000)
+        )
+        if phys_down:
+            return False
+        if not (u32.GetKeyState(vk) & 0x8000):
+            return False
+        buf = (ctypes.c_ubyte * 256)()
+        if u32.GetKeyboardState(buf):
+            buf[0x01] &= 0x7F
+            buf[0x02] &= 0x7F
+            u32.SetKeyboardState(buf)
+        if u32.GetKeyState(vk) & 0x8000:
+            u32.ReleaseCapture()
+        return True
+    except Exception:
+        return False
+
+
+class HudDragController:
+    """State-guarded HUD drag controller that prevents Win32/Tk 8.6 'phantom
+    drag' (HUD following cursor and swallowing button clicks if another window
+    steals focus mid-click before ButtonRelease-1 arrives)."""
+
+    DEADZONE_PX = 3
+    WATCHDOG_MS = 100
+
+    def __init__(self, root, flush_pos_cb, is_phys_down_fn=None):
+        self.root = root
+        self._flush_pos_cb = flush_pos_cb
+        self._is_phys_down_fn = (
+            is_phys_down_fn or _is_win32_primary_mouse_physically_down
+        )
+        self._dragging = False
+        self._moved_past_deadzone = False
+        self._press_root_x = 0
+        self._press_root_y = 0
+        self._offset_x = 0
+        self._offset_y = 0
+        self._save_after_id = None
+        self._watchdog_after_id = None
+
+    def _cancel_watchdog(self):
+        aid = self._watchdog_after_id
+        if aid is not None:
+            self._watchdog_after_id = None
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+
+    def _schedule_watchdog(self):
+        self._cancel_watchdog()
+        try:
+            if self.root.winfo_exists():
+                self._watchdog_after_id = self.root.after(
+                    self.WATCHDOG_MS, self._watchdog_tick
+                )
+        except Exception:
+            self._watchdog_after_id = None
+
+    def _watchdog_tick(self):
+        self._watchdog_after_id = None
+        if not self._dragging:
+            return
+        try:
+            if not self.root.winfo_exists():
+                self._dragging = False
+                return
+        except Exception:
+            self._dragging = False
+            return
+        if not self._is_phys_down_fn():
+            self.cancel_drag(heal_os=True)
+            return
+        self._schedule_watchdog()
+
+    def start_move(self, event):
+        if not self._is_phys_down_fn():
+            self.cancel_drag(heal_os=True)
+            return
+        try:
+            rx = int(getattr(event, "x_root", 0))
+            ry = int(getattr(event, "y_root", 0))
+            self._press_root_x = rx
+            self._press_root_y = ry
+            self._offset_x = rx - int(self.root.winfo_x())
+            self._offset_y = ry - int(self.root.winfo_y())
+            self.root.x = self._offset_x
+            self.root.y = self._offset_y
+            self._dragging = True
+            self._moved_past_deadzone = False
+            self._schedule_watchdog()
+        except Exception:
+            self._dragging = False
+
+    def do_move(self, event):
+        if not self._dragging:
+            _heal_win32_stuck_mouse_button_state(self._is_phys_down_fn)
+            return "break"
+        if not self._is_phys_down_fn():
+            self.cancel_drag(heal_os=True)
+            return "break"
+        rx = int(getattr(event, "x_root", 0))
+        ry = int(getattr(event, "y_root", 0))
+        if not self._moved_past_deadzone:
+            if (
+                abs(rx - self._press_root_x) < self.DEADZONE_PX
+                and abs(ry - self._press_root_y) < self.DEADZONE_PX
+            ):
+                return
+            self._moved_past_deadzone = True
+        x = int(rx - self._offset_x)
+        y = int(ry - self._offset_y)
+        self.root.geometry(f"+{x}+{y}")
+        config["hud_x"] = x
+        config["hud_y"] = y
+        if self._save_after_id is not None:
+            try:
+                self.root.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+            self._save_after_id = None
+        try:
+            self._save_after_id = self.root.after(250, self._debounced_save)
+        except Exception:
+            self._flush_pos_cb()
+
+    def _debounced_save(self):
+        self._save_after_id = None
+        self._flush_pos_cb()
+
+    def cancel_drag(self, heal_os=False):
+        was_moved = self._moved_past_deadzone
+        self._dragging = False
+        self._moved_past_deadzone = False
+        self._cancel_watchdog()
+        if heal_os:
+            _heal_win32_stuck_mouse_button_state(self._is_phys_down_fn)
+        if was_moved:
+            self._flush_existing_geometry()
+
+    def _flush_existing_geometry(self):
+        if self._save_after_id is not None:
+            try:
+                self.root.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+            self._save_after_id = None
+        try:
+            if self.root.winfo_exists():
+                config["hud_x"] = int(self.root.winfo_x())
+                config["hud_y"] = int(self.root.winfo_y())
+                self._flush_pos_cb()
+        except Exception:
+            pass
+
+    def end_move(self, _event=None):
+        was_moved = self._moved_past_deadzone
+        self._dragging = False
+        self._moved_past_deadzone = False
+        self._cancel_watchdog()
+        if was_moved:
+            self._flush_existing_geometry()
+
+    def on_focus_out(self, _event=None):
+        if self._dragging and not self._is_phys_down_fn():
+            self.cancel_drag(heal_os=True)
+
+    def on_idle_motion_guard(self, _event=None):
+        if not self._dragging:
+            _heal_win32_stuck_mouse_button_state(self._is_phys_down_fn)
+
+
 def start_gui():
     global acct_badge_lbl, hud_root, hud_grid_frame
     global hud_ui_labels, hud_start_move_fn, hud_do_move_fn, hud_end_move_fn
@@ -34855,38 +35685,14 @@ def start_gui():
         except Exception:
             pass
 
-    def start_move(event):
-        root.x = event.x_root - root.winfo_x()
-        root.y = event.y_root - root.winfo_y()
+    drag_ctrl = HudDragController(root, _flush_hud_pos_to_disk)
+    root._drag_ctrl = drag_ctrl
+    root.bind("<FocusOut>", drag_ctrl.on_focus_out, add="+")
+    root.bind("<Motion>", drag_ctrl.on_idle_motion_guard, add="+")
 
-    def do_move(event):
-        x = int(event.x_root - getattr(root, "x", 0))
-        y = int(event.y_root - getattr(root, "y", 0))
-        root.geometry(f"+{x}+{y}")
-        config["hud_x"] = x
-        config["hud_y"] = y
-        prev_aid = hud_move_save_state.get("after_id")
-        if prev_aid is not None:
-            try:
-                root.after_cancel(prev_aid)
-            except Exception:
-                pass
-        try:
-            hud_move_save_state["after_id"] = root.after(
-                250, _flush_hud_pos_to_disk
-            )
-        except Exception:
-            _flush_hud_pos_to_disk()
-
-    def end_move(_event=None):
-        try:
-            if root.winfo_exists():
-                config["hud_x"] = int(root.winfo_x())
-                config["hud_y"] = int(root.winfo_y())
-                _flush_hud_pos_to_disk()
-        except Exception:
-            pass
-
+    start_move = drag_ctrl.start_move
+    do_move = drag_ctrl.do_move
+    end_move = drag_ctrl.end_move
     hud_start_move_fn = start_move
     hud_do_move_fn = do_move
     hud_end_move_fn = end_move
@@ -34912,10 +35718,15 @@ def start_gui():
             )
             return "break"
         try:
+            drag_ctrl.cancel_drag(heal_os=False)
             if root.winfo_exists():
                 config["hud_x"] = int(root.winfo_x())
                 config["hud_y"] = int(root.winfo_y())
                 _flush_hud_pos_to_disk()
+        except Exception:
+            pass
+        try:
+            save_session_state(force_epoch_stamp=True)
         except Exception:
             pass
         alarm_active = False
@@ -35666,7 +36477,7 @@ def _insert_formatted_changelog(txt_box, markdown_text):
             txt_box.insert("end", main_part, ("ver_hdr", hdr_tag))
             txt_box.insert("end", hint_part, ("ver_hdr", "ver_hdr_hint", hdr_tag))
             short_m = re.match(
-                r"^(v?\d+\.\d+(?:\.\d+)?(?:\s*(?:[&,–-]\s*v?\d+\.\d+(?:\.\d+)?)+)?)",
+                r"^(v?\d+\.\d+(?:\.\d+)*(?:\s*(?:[&,–-]\s*v?\d+\.\d+(?:\.\d+)*)+)?)",
                 ver_txt,
             )
             short_ver = short_m.group(1) if short_m else ver_txt[:12]

@@ -4,6 +4,25 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.67] — 2026-11-16
+### ⚡ Quick Summary
+- **Optional `SESSION LOW` HUD Column & Mid-Day Log Backfill (`📊 HUD Columns`):** Added an opt-in **`SESSION LOW`** metric column (right below `SESSION HIGH`) that tracks your lowest closed (flat) realized PnL trough of the day in a calm muted slate-rose tone (`#6e2c2c` when below `$0.00`, `#2c3e50` at `$0.00`)—including automatic per-account mid-day log backfill when upgrading mid-session and full Demo Simulator parity.
+- **Order-Verified Off-Session `W/L` Reconciliation & Newly-Ignored Drift Cap (`_reconcile_off_session_flat_delta`, `_apply_preexisting_selection`):** Fixed a mid-session restart bug where closing Enforcer, completing a daytrade while closed, and newly marking an ETF/share position as **Ignored** upon reopening could absorb off-session realized PnL into `locked_impact` and leave off-session round-trips uncounted in `W/L`.
+- **HUD Phantom-Drag Immunity & Win32 Stuck-Button Self-Heal (`HudDragController`, `_heal_win32_stuck_mouse_button_state`):** Eliminated a Win32/Tk 8.6 edge case where another process stealing window focus mid-click could leave Tk's thread-queued mouse button bit stuck down (causing the HUD to follow the cursor and swallow button clicks).
+
+### 🔍 Detailed Breakdown
+- **`SESSION LOW` Tracking, Per-Account Persistence & Mid-Day Backfill (`HUD_COLUMN_CATALOG`, `daily_min_equity`, `restore_account_session`, `backfill_min_pnl_from_today_log`):**
+  - Tracks per-account `daily_min_equity` across all 4 confirmed-flat paths in `_stabilize_mid_fill_realized_and_equity()` (including Demo Simulator mode and transient cash-desync filtering), preserves `daily_min_equity` across 9:30 AM and 4:00 PM rulebook switches, shifts in lockstep on un-ignore `delta_base` updates, resets to `$25,000.00` on Demo resets, and enforces function-level `global daily_min_equity` parity via static AST verification (`Suite 17`).
+  - When restoring an active session that predates `daily_min_equity`, `backfill_min_pnl_from_today_log()` reconstructs today's flat realized trough strictly from `[POS_CHANGE] ... (CLOSED FLAT)` log entries matching the active broker and starting baseline segment.
+- **Off-Session Trade Reconciliation, `58-Day` GTC Fill Lookback & Newly-Ignored Cap (`SchwabAdapter`, `WebullAdapter`, `_reconcile_off_session_flat_delta`, `Suite 18`):**
+  - Capped newly-ignored mid-session drift strictly to entry fees and penny rounding (`min($25.00, max($2.00, contracts * $1.00 + 0.05% notional))`), cleared stale preview `raw_eq` across account restores, and gated live-trim drift absorption off `first_poll_of_launch`.
+  - Extended `SchwabAdapter.has_any_filled_orders_today()` entered-time lookback from `2` days to `58` days so GTC orders entered >2 days ago that fill today are recognized, added two-way `has_non_ignored_closing_fills_since()` on `SchwabAdapter` and `WebullAdapter`, and reconciled net off-session flat balance deltas into `win_trades` / `loss_trades` (without ever auto-clearing `is_locked_down` or `recent_loss_timestamps` on inferred off-session gains).
+  - Added prior-poll telemetry (`PrevPoll(Open=..., Net=..., dt=...s)`) to `[GUARDRAIL]` and `[LOCKDOWN]` breach logs.
+- **State-Guarded `HudDragController` & Non-Activating Test Roots (`_heal_win32_stuck_mouse_button_state`, `Suite 19`):**
+  - Added `HudDragController` with explicit `_dragging` state, physical `GetAsyncKeyState` validation on press/motion, a `3px` click deadzone, a `100ms` active-drag focus-steal watchdog, and `GetKeyboardState` -> `SetKeyboardState` thread-queue healing (falling back to `ReleaseCapture()` only if still stuck), plus off-screen `overrideredirect` test roots in `test_enforcer.py` so running tests never steals desktop focus.
+
+---
+
 ## [v0.9.66] — 2026-11-16
 ### ⚡ Quick Summary
 - **1-Click Update Rollback & Crash-Safe Startup Recovery (`enforcer.py.prev`, `📜 Logs ▾`, `View Release Notes`, `Launch_Enforcer.bat`):** Before installing any future update, PnL Enforcer now validates and saves a verified local backup (`enforcer.py.prev` and `CHANGELOG.md.prev`) in your app folder—allowing **1-click version rollback** from **`📜 Logs ▾ -> ↺ Restore Previous Version`**, **`View Release Notes`**, or the Pre-Flight footer **`↺ Rollback`** link while keeping 100% of your saved settings, API tokens, and today's session baseline intact, pausing repeat startup prompts for the reverted version (`skipped_update_version`), enforcing full anti-tamper guardrails against lock/trade bypass, and offering automatic native Windows crash-recovery rollback if a future update ever fails to launch.
