@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.59.2"
+APP_VERSION = "0.9.59.3"
 
 import os
 import sys
@@ -2252,6 +2252,9 @@ triggered_alarms = {}
 pending_halt_breach = None
 ALARM_COOLDOWN_SEC = 180
 RECOVERY_BUFFER_DOLLARS = 150.0
+LEASH_CELL_WARN_PCT = 1.0 / 3.0
+GIVEBACK_WARN_RATIO = 1.0 / 6.0
+GIVEBACK_ALERT_RATIO = 1.0 / 3.0
 
 settings_win_open = False
 broker_reconfig_in_progress = False
@@ -4133,30 +4136,59 @@ def get_unanchored_cash_flow(intraday_cf):
     return unanchored
 
 
+_ignored_positions_lock = threading.RLock()
+
+
+def _round_cents(val):
+    """Two-step IEEE-754 clean cent rounding: rounds to 6 decimals first to
+    eliminate ~1e-12 floating-point addition/subtraction order noise before
+    rounding to cents."""
+    return round(round(float(val), 6), 2)
+
+
+def _has_active_open_ignored_positions(adp=None):
+    """Returns True when Ticker-Level Ignore is active and at least one
+    ignored position currently holds non-zero open shares/contracts."""
+    with _ignored_positions_lock:
+        if (
+            not config.get("ignore_preexisting_positions", True)
+            or not isinstance(ignored_positions, dict)
+            or not ignored_positions
+        ):
+            return False
+        for ig in ignored_positions.values():
+            if isinstance(ig, dict) and abs(float(ig.get("ref_qty", 0.0))) > 1e-6:
+                return True
+        return False
+
+
 def is_position_ignored(sym_or_tag, is_opt=False):
     """Returns True if sym_or_tag is currently registered in ignored_positions
     and 'ignore_preexisting_positions' is enabled in config."""
-    if not config.get("ignore_preexisting_positions", True) or not ignored_positions:
-        return False
-    s = str(sym_or_tag or "").strip()
-    if not s:
-        return False
-    tag = f"{s} (OPT)" if (is_opt and not s.endswith(" (OPT)")) else s
-    if tag in ignored_positions:
-        return True
-    base_s = s[:-6].strip() if s.endswith(" (OPT)") else s
-    for ig_tag, ig in ignored_positions.items():
-        if not isinstance(ig, dict):
-            continue
-        ig_is_opt = (ig.get("asset_type") == "OPTION") or ig_tag.endswith(" (OPT)")
-        if bool(is_opt) != bool(ig_is_opt):
-            continue
-        if (
-            str(ig.get("symbol", "")).strip() == base_s
-            or str(ig.get("raw_symbol", "")).strip() == base_s
-        ):
+    with _ignored_positions_lock:
+        if not config.get("ignore_preexisting_positions", True) or not ignored_positions:
+            return False
+        s = str(sym_or_tag or "").strip()
+        if not s:
+            return False
+        tag = f"{s} (OPT)" if (is_opt and not s.endswith(" (OPT)")) else s
+        if tag in ignored_positions:
             return True
-    return False
+        if not isinstance(ignored_positions, dict):
+            return False
+        base_s = s[:-6].strip() if s.endswith(" (OPT)") else s
+        for ig_tag, ig in ignored_positions.items():
+            if not isinstance(ig, dict):
+                continue
+            ig_is_opt = (ig.get("asset_type") == "OPTION") or ig_tag.endswith(" (OPT)")
+            if bool(is_opt) != bool(ig_is_opt):
+                continue
+            if (
+                str(ig.get("symbol", "")).strip() == base_s
+                or str(ig.get("raw_symbol", "")).strip() == base_s
+            ):
+                return True
+        return False
 
 
 def build_ignored_position_entry(tag, d, lock_existing_open_pnl=False):
@@ -4187,33 +4219,53 @@ def build_ignored_position_entry(tag, d, lock_existing_open_pnl=False):
     }
 
 
-def reanchor_ignored_positions_to_live(raw_pos_details):
+def reanchor_ignored_positions_to_live(raw_pos_details=None):
     """Re-anchors all currently tracked ignored_positions entries to their
     current live price with locked_impact = 0.0 when start_equity is freshly
     anchored or re-zeroed."""
-    if not ignored_positions or not isinstance(raw_pos_details, dict):
+    with _ignored_positions_lock:
+        if not ignored_positions or not isinstance(ignored_positions, dict):
+            return
+    if not isinstance(raw_pos_details, dict):
+        adp = (
+            raw_pos_details
+            if hasattr(raw_pos_details, "get_last_raw_pos_details")
+            else active_adapter
+        )
+        if adp is not None and hasattr(adp, "get_last_raw_pos_details"):
+            raw_pos_details = adp.get_last_raw_pos_details()
+        elif adp is not None and hasattr(adp, "_last_raw_pos_details"):
+            raw_pos_details = (
+                getattr(adp, "_last_raw_pos_details", {}).get(
+                    getattr(adp, "account_id", ""), {}
+                )
+            )
+    if not isinstance(raw_pos_details, dict):
         return
-    for tag, ig in list(ignored_positions.items()):
-        if not isinstance(ig, dict):
-            continue
-        d = raw_pos_details.get(tag)
-        if d is not None:
-            qty = float(d.get("qty", 0.0))
-            lp = float(d.get("last", 0.0))
-            avg = float(d.get("avg", 0.0))
-            opnl = round(float(d.get("open_pnl", 0.0)), 2)
-            ig["init_qty"] = qty
-            ig["init_price"] = round(lp, 4)
-            ig["ref_qty"] = qty
-            ig["ref_price"] = round(lp, 4)
-            ig["ref_avg"] = round(avg, 4)
-            ig["ref_open_pnl"] = opnl
-            ig["last_seen_price"] = round(lp, 4)
-            ig["locked_impact"] = 0.0
-        else:
-            ig["ref_qty"] = 0.0
-            ig["ref_open_pnl"] = 0.0
-            ig["locked_impact"] = 0.0
+    with _ignored_positions_lock:
+        if not isinstance(ignored_positions, dict):
+            return
+        for tag, ig in list(ignored_positions.items()):
+            if not isinstance(ig, dict):
+                continue
+            d = raw_pos_details.get(tag)
+            if d is not None:
+                qty = float(d.get("qty", 0.0))
+                lp = float(d.get("last", 0.0))
+                avg = float(d.get("avg", 0.0))
+                opnl = round(float(d.get("open_pnl", 0.0)), 2)
+                ig["init_qty"] = qty
+                ig["init_price"] = round(lp, 4)
+                ig["ref_qty"] = qty
+                ig["ref_price"] = round(lp, 4)
+                ig["ref_avg"] = round(avg, 4)
+                ig["ref_open_pnl"] = opnl
+                ig["last_seen_price"] = round(lp, 4)
+                ig["locked_impact"] = 0.0
+            else:
+                ig["ref_qty"] = 0.0
+                ig["ref_open_pnl"] = 0.0
+                ig["locked_impact"] = 0.0
 
 
 def _apply_ignored_positions_to_snapshot(
@@ -4225,230 +4277,234 @@ def _apply_ignored_positions_to_snapshot(
     full closes) from raw_adj_eq."""
     if not isinstance(raw_pos_details, dict):
         raw_pos_details = {}
-    if not config.get("ignore_preexisting_positions", True) or not ignored_positions:
-        tot_open = round(
-            sum(float(d.get("open_pnl", 0.0)) for d in raw_pos_details.values()),
+    with _ignored_positions_lock:
+        if (
+            not config.get("ignore_preexisting_positions", True)
+            or not ignored_positions
+            or not isinstance(ignored_positions, dict)
+        ):
+            tot_open = round(
+                sum(float(d.get("open_pnl", 0.0)) for d in raw_pos_details.values()),
+                2,
+            )
+            has_opt = any(
+                d.get("asset_type") == "OPTION" for d in raw_pos_details.values()
+            )
+            return (
+                _round_cents(raw_adj_eq) if raw_adj_eq is not None else None,
+                (len(raw_pos_details) == 0),
+                tot_open,
+                dict(raw_pos_details),
+                has_opt,
+                list(open_eq_cache or []),
+                list(open_opt_cache or []),
+            )
+
+        filt_pos_details = {
+            k: v
+            for k, v in raw_pos_details.items()
+            if not is_position_ignored(k, v.get("asset_type") == "OPTION")
+        }
+        filt_eq_cache = [
+            item
+            for item in (open_eq_cache or [])
+            if not is_position_ignored(item[0], is_opt=False)
+        ]
+        filt_opt_cache = [
+            item
+            for item in (open_opt_cache or [])
+            if not is_position_ignored(item[0], is_opt=True)
+        ]
+        tot_open_pnl = round(
+            sum(float(d.get("open_pnl", 0.0)) for d in filt_pos_details.values()),
             2,
         )
-        has_opt = any(
-            d.get("asset_type") == "OPTION" for d in raw_pos_details.values()
+        has_options = any(
+            d.get("asset_type") == "OPTION" for d in filt_pos_details.values()
         )
-        return (
-            raw_adj_eq,
-            (len(raw_pos_details) == 0),
-            tot_open,
-            dict(raw_pos_details),
-            has_opt,
-            list(open_eq_cache or []),
-            list(open_opt_cache or []),
-        )
+        is_flat = (len(filt_pos_details) == 0)
 
-    filt_pos_details = {
-        k: v
-        for k, v in raw_pos_details.items()
-        if not is_position_ignored(k, v.get("asset_type") == "OPTION")
-    }
-    filt_eq_cache = [
-        item
-        for item in (open_eq_cache or [])
-        if not is_position_ignored(item[0], is_opt=False)
-    ]
-    filt_opt_cache = [
-        item
-        for item in (open_opt_cache or [])
-        if not is_position_ignored(item[0], is_opt=True)
-    ]
-    tot_open_pnl = round(
-        sum(float(d.get("open_pnl", 0.0)) for d in filt_pos_details.values()),
-        2,
-    )
-    has_options = any(
-        d.get("asset_type") == "OPTION" for d in filt_pos_details.values()
-    )
-    is_flat = (len(filt_pos_details) == 0)
+        sum_ignored_impact = 0.0
+        state_mutated = False
+        mutated_igs = []
+        mutated_notional = 0.0
+        transition_notes = []
 
-    sum_ignored_impact = 0.0
-    state_mutated = False
-    mutated_igs = []
-    mutated_notional = 0.0
-    transition_notes = []
+        for tag, ig in list(ignored_positions.items()):
+            if not isinstance(ig, dict):
+                continue
+            d = raw_pos_details.get(tag)
+            if d is None:
+                base_s = str(ig.get("symbol", "")).strip()
+                for cand_tag, cand_d in raw_pos_details.items():
+                    cand_base = (
+                        cand_tag[:-6].strip()
+                        if str(cand_tag).endswith(" (OPT)")
+                        else str(cand_tag)
+                    )
+                    if cand_base == base_s and (
+                        cand_d.get("asset_type") == ig.get("asset_type")
+                    ):
+                        d = cand_d
+                        break
 
-    for tag, ig in list(ignored_positions.items()):
-        if not isinstance(ig, dict):
-            continue
-        d = raw_pos_details.get(tag)
-        if d is None:
-            base_s = str(ig.get("symbol", "")).strip()
-            for cand_tag, cand_d in raw_pos_details.items():
-                cand_base = (
-                    cand_tag[:-6].strip()
-                    if str(cand_tag).endswith(" (OPT)")
-                    else str(cand_tag)
-                )
-                if cand_base == base_s and (
-                    cand_d.get("asset_type") == ig.get("asset_type")
-                ):
-                    d = cand_d
-                    break
+            a_type = str(
+                (d or {}).get("asset_type") or ig.get("asset_type") or "EQUITY"
+            ).upper()
+            mult = 100.0 if a_type == "OPTION" else 1.0
+            ref_qty = float(ig.get("ref_qty", 0.0))
+            ref_price = float(ig.get("ref_price", 0.0))
+            ref_avg = float(ig.get("ref_avg", 0.0))
+            ref_open_pnl = ig.get("ref_open_pnl")
+            last_seen_lp = float(ig.get("last_seen_price") or ref_price)
+            locked_impact = float(ig.get("locked_impact", 0.0))
 
-        a_type = str(
-            (d or {}).get("asset_type") or ig.get("asset_type") or "EQUITY"
-        ).upper()
-        mult = 100.0 if a_type == "OPTION" else 1.0
-        ref_qty = float(ig.get("ref_qty", 0.0))
-        ref_price = float(ig.get("ref_price", 0.0))
-        ref_avg = float(ig.get("ref_avg", 0.0))
-        ref_open_pnl = ig.get("ref_open_pnl")
-        last_seen_lp = float(ig.get("last_seen_price") or ref_price)
-        locked_impact = float(ig.get("locked_impact", 0.0))
+            if d is None or float(d.get("qty", 0.0)) == 0.0:
+                # Position is currently closed (0 shares/contracts)
+                if abs(ref_qty) > 1e-6:
+                    exit_lp = last_seen_lp if last_seen_lp > 0 else ref_price
+                    locked_impact = _round_cents(
+                        locked_impact + ref_qty * (exit_lp - ref_price) * mult
+                    )
+                    transition_notes.append(
+                        f"{tag}: {int(ref_qty):+d} -> 0 (Ignored position closed @ ~${exit_lp:.4f})"
+                    )
+                    ig["ref_qty"] = 0.0
+                    ig["ref_price"] = round(exit_lp, 4)
+                    ig["ref_avg"] = 0.0
+                    ig["ref_open_pnl"] = 0.0
+                    ig["locked_impact"] = locked_impact
+                    state_mutated = True
+                    mutated_igs.append(ig)
+                    mutated_notional += abs(ref_qty) * max(exit_lp, ref_price, 1.0) * mult
+                sum_ignored_impact += locked_impact
+                continue
 
-        if d is None or float(d.get("qty", 0.0)) == 0.0:
-            # Position is currently closed (0 shares/contracts)
-            if abs(ref_qty) > 1e-6:
-                exit_lp = last_seen_lp if last_seen_lp > 0 else ref_price
-                locked_impact = round(
-                    locked_impact + ref_qty * (exit_lp - ref_price) * mult, 2
-                )
+            curr_qty = float(d.get("qty", 0.0))
+            curr_lp = float(d.get("last", 0.0))
+            curr_avg = float(d.get("avg", 0.0))
+            curr_open_pnl = float(d.get("open_pnl", 0.0))
+
+            if abs(curr_qty - ref_qty) > 1e-6:
+                # Ignored position quantity changed (added, trimmed, re-opened, or flipped)
+                if abs(ref_qty) < 1e-6:
+                    # Re-opened from 0 on an ignored ticker
+                    locked_impact = _round_cents(locked_impact + curr_open_pnl)
+                elif (curr_qty * ref_qty) > 0 and abs(curr_qty) > abs(ref_qty):
+                    # Added to ignored position in same direction (0 shares closed,
+                    # so exact equity delta since ref is curr_open_pnl - ref_open_pnl)
+                    if ref_open_pnl is not None:
+                        locked_impact = _round_cents(
+                            locked_impact + (curr_open_pnl - float(ref_open_pnl))
+                        )
+                    else:
+                        added_q = curr_qty - ref_qty
+                        old_delta = ref_qty * (curr_lp - ref_price) * mult
+                        new_delta = 0.0
+                        if curr_avg > 0 and ref_avg > 0 and abs(added_q) > 1e-6:
+                            inferred_fill = (
+                                (abs(curr_qty) * curr_avg) - (abs(ref_qty) * ref_avg)
+                            ) / abs(added_q)
+                            if (
+                                curr_lp > 0
+                                and (0.5 * curr_lp) <= inferred_fill <= (1.5 * curr_lp)
+                            ):
+                                new_delta = added_q * (curr_lp - inferred_fill) * mult
+                        locked_impact = _round_cents(locked_impact + old_delta + new_delta)
+                elif (curr_qty * ref_qty) > 0 and abs(curr_qty) < abs(ref_qty):
+                    # Trimmed / partially sold ignored position
+                    locked_impact = _round_cents(
+                        locked_impact + ref_qty * (curr_lp - ref_price) * mult
+                    )
+                else:
+                    # Flipped sign on ignored ticker
+                    locked_impact = _round_cents(
+                        locked_impact
+                        + ref_qty * (curr_lp - ref_price) * mult
+                        + curr_open_pnl
+                    )
                 transition_notes.append(
-                    f"{tag}: {int(ref_qty):+d} -> 0 (Ignored position closed @ ~${exit_lp:.4f})"
+                    f"{tag}: {int(ref_qty):+d} -> {int(curr_qty):+d} (Ignored ticker)"
                 )
-                ig["ref_qty"] = 0.0
-                ig["ref_price"] = round(exit_lp, 4)
-                ig["ref_avg"] = 0.0
-                ig["ref_open_pnl"] = 0.0
+                ig["ref_qty"] = curr_qty
+                ig["ref_price"] = round(curr_lp, 4)
+                ig["ref_avg"] = round(curr_avg, 4)
+                ig["ref_open_pnl"] = round(curr_open_pnl, 2)
+                ig["last_seen_price"] = round(curr_lp, 4)
                 ig["locked_impact"] = locked_impact
                 state_mutated = True
                 mutated_igs.append(ig)
-                mutated_notional += abs(ref_qty) * max(exit_lp, ref_price, 1.0) * mult
-            sum_ignored_impact += locked_impact
-            continue
-
-        curr_qty = float(d.get("qty", 0.0))
-        curr_lp = float(d.get("last", 0.0))
-        curr_avg = float(d.get("avg", 0.0))
-        curr_open_pnl = float(d.get("open_pnl", 0.0))
-
-        if abs(curr_qty - ref_qty) > 1e-6:
-            # Ignored position quantity changed (added, trimmed, re-opened, or flipped)
-            if abs(ref_qty) < 1e-6:
-                # Re-opened from 0 on an ignored ticker
-                locked_impact = round(locked_impact + curr_open_pnl, 2)
-            elif (curr_qty * ref_qty) > 0 and abs(curr_qty) > abs(ref_qty):
-                # Added to ignored position in same direction (0 shares closed,
-                # so exact equity delta since ref is curr_open_pnl - ref_open_pnl)
-                if ref_open_pnl is not None:
-                    locked_impact = round(
-                        locked_impact + (curr_open_pnl - float(ref_open_pnl)), 2
-                    )
-                else:
-                    added_q = curr_qty - ref_qty
-                    old_delta = ref_qty * (curr_lp - ref_price) * mult
-                    new_delta = 0.0
-                    if curr_avg > 0 and ref_avg > 0 and abs(added_q) > 1e-6:
-                        inferred_fill = (
-                            (abs(curr_qty) * curr_avg) - (abs(ref_qty) * ref_avg)
-                        ) / abs(added_q)
-                        if (
-                            curr_lp > 0
-                            and (0.5 * curr_lp) <= inferred_fill <= (1.5 * curr_lp)
-                        ):
-                            new_delta = added_q * (curr_lp - inferred_fill) * mult
-                    locked_impact = round(locked_impact + old_delta + new_delta, 2)
-            elif (curr_qty * ref_qty) > 0 and abs(curr_qty) < abs(ref_qty):
-                # Trimmed / partially sold ignored position
-                locked_impact = round(
-                    locked_impact + ref_qty * (curr_lp - ref_price) * mult, 2
+                mutated_notional += (
+                    abs(curr_qty - ref_qty) * max(curr_lp, ref_price, 1.0) * mult
                 )
+                sum_ignored_impact += locked_impact
             else:
-                # Flipped sign on ignored ticker
-                locked_impact = round(
-                    locked_impact
-                    + ref_qty * (curr_lp - ref_price) * mult
-                    + curr_open_pnl,
-                    2,
-                )
-            transition_notes.append(
-                f"{tag}: {int(ref_qty):+d} -> {int(curr_qty):+d} (Ignored ticker)"
-            )
-            ig["ref_qty"] = curr_qty
-            ig["ref_price"] = round(curr_lp, 4)
-            ig["ref_avg"] = round(curr_avg, 4)
-            ig["ref_open_pnl"] = round(curr_open_pnl, 2)
-            ig["last_seen_price"] = round(curr_lp, 4)
-            ig["locked_impact"] = locked_impact
-            state_mutated = True
-            mutated_igs.append(ig)
-            mutated_notional += (
-                abs(curr_qty - ref_qty) * max(curr_lp, ref_price, 1.0) * mult
-            )
-            sum_ignored_impact += locked_impact
-        else:
-            ig["last_seen_price"] = round(curr_lp, 4)
-            open_impact = curr_qty * (curr_lp - ref_price) * mult
-            sum_ignored_impact += locked_impact + open_impact
+                ig["last_seen_price"] = round(curr_lp, 4)
+                open_impact = curr_qty * (curr_lp - ref_price) * mult
+                sum_ignored_impact += locked_impact + open_impact
 
-    if state_mutated:
-        if mutated_igs and raw_adj_eq is not None:
-            tracked_qty_changed = (
-                set(filt_pos_details.keys()) != set(prev_pos_snapshot.keys())
-                or any(
-                    abs(
-                        float(filt_pos_details[k].get("qty", 0.0))
-                        - float(prev_pos_snapshot[k].get("qty", 0.0))
+        if state_mutated:
+            if mutated_igs and raw_adj_eq is not None:
+                tracked_qty_changed = (
+                    set(filt_pos_details.keys()) != set(prev_pos_snapshot.keys())
+                    or any(
+                        abs(
+                            float(filt_pos_details[k].get("qty", 0.0))
+                            - float(prev_pos_snapshot[k].get("qty", 0.0))
+                        )
+                        > 1e-6
+                        for k in filt_pos_details
                     )
-                    > 1e-6
-                    for k in filt_pos_details
                 )
-            )
-            ref_flat_eq = (
-                last_flat_equity if last_flat_equity is not None else start_equity
-            )
-            if (
-                not first_poll_of_launch
-                and not tracked_qty_changed
-                and ref_flat_eq is not None
-                and float(ref_flat_eq) > 0.0
-            ):
-                target_sum_ignored = round(
-                    (float(raw_adj_eq) - tot_open_pnl) - float(ref_flat_eq), 2
+                ref_flat_eq = (
+                    last_flat_equity if last_flat_equity is not None else start_equity
                 )
-                drift = round(target_sum_ignored - sum_ignored_impact, 2)
-                max_drift_cap = min(5000.0, max(250.0, mutated_notional * 0.05))
-                if abs(drift) >= 0.01:
-                    if abs(drift) <= max_drift_cap:
-                        last_ig = mutated_igs[-1]
-                        last_ig["locked_impact"] = round(
-                            float(last_ig.get("locked_impact", 0.0)) + drift, 2
-                        )
-                        sum_ignored_impact = round(sum_ignored_impact + drift, 2)
-                    else:
-                        log_event(
-                            "WARN",
-                            f"Ignored position fill drift ({format_dollar(drift)}) exceeded "
-                            f"proportional cap (${max_drift_cap:,.2f}); not absorbing excess drift.",
-                        )
-        save_session_state()
-        if transition_notes:
-            log_event(
-                "SESSION",
-                f"Ignored pre-existing position activity neutralized: "
-                f"{', '.join(transition_notes)}",
-            )
+                if (
+                    not first_poll_of_launch
+                    and not tracked_qty_changed
+                    and ref_flat_eq is not None
+                    and float(ref_flat_eq) > 0.0
+                ):
+                    target_sum_ignored = _round_cents(
+                        (float(raw_adj_eq) - tot_open_pnl) - float(ref_flat_eq)
+                    )
+                    drift = _round_cents(target_sum_ignored - sum_ignored_impact)
+                    max_drift_cap = min(5000.0, max(250.0, mutated_notional * 0.05))
+                    if abs(drift) >= 0.01:
+                        if abs(drift) <= max_drift_cap:
+                            last_ig = mutated_igs[-1]
+                            last_ig["locked_impact"] = _round_cents(
+                                float(last_ig.get("locked_impact", 0.0)) + drift
+                            )
+                            sum_ignored_impact = _round_cents(sum_ignored_impact + drift)
+                        else:
+                            log_event(
+                                "WARN",
+                                f"Ignored position fill drift ({format_dollar(drift)}) exceeded "
+                                f"proportional cap (${max_drift_cap:,.2f}); not absorbing excess drift.",
+                            )
+            save_session_state()
+            if transition_notes:
+                log_event(
+                    "SESSION",
+                    f"Ignored pre-existing position activity neutralized: "
+                    f"{', '.join(transition_notes)}",
+                )
 
-    adj_eq = (
-        round(float(raw_adj_eq) - sum_ignored_impact, 2)
-        if raw_adj_eq is not None
-        else None
-    )
-    return (
-        adj_eq,
-        is_flat,
-        tot_open_pnl,
-        filt_pos_details,
-        has_options,
-        filt_eq_cache,
-        filt_opt_cache,
-    )
+        adj_eq = (
+            _round_cents(float(raw_adj_eq) - sum_ignored_impact)
+            if raw_adj_eq is not None
+            else None
+        )
+        return (
+            adj_eq,
+            is_flat,
+            tot_open_pnl,
+            filt_pos_details,
+            has_options,
+            filt_eq_cache,
+            filt_opt_cache,
+        )
 
 
 def is_rth():
@@ -4923,6 +4979,10 @@ class SchwabAdapter:
         self._last_good_snapshot = {}
         self._last_raw_pos_details = {}
         self._last_raw_adj_eq = {}
+        self._last_unrounded_true_live_eq = {}
+        self._last_flat_rounding_tol = {}
+        self._last_bucket_residual = {}
+        self._last_bucket_residual_log_ts = 0.0
         self._last_open_eq = {}
         self._last_open_opt = {}
         self._last_intraday_cash_flow = {}
@@ -4948,6 +5008,15 @@ class SchwabAdapter:
     def get_last_raw_adj_eq(self):
         val = self._last_raw_adj_eq.get(self.account_id)
         return float(val) if val is not None else None
+
+    def get_last_true_live_eq(self):
+        val = self._last_unrounded_true_live_eq.get(self.account_id)
+        if val is not None:
+            return float(val)
+        return self.get_last_raw_adj_eq()
+
+    def get_flat_rounding_tolerance(self):
+        return float(self._last_flat_rounding_tol.get(self.account_id, 0.0))
 
     def get_last_intraday_cash_flow(self):
         return float(self._last_intraday_cash_flow.get(self.account_id, 0.0))
@@ -5882,7 +5951,7 @@ class SchwabAdapter:
                 data = resp.json().get("securitiesAccount", {})
                 init_balances = data.get("initialBalances", {}) or {}
                 balances = data.get("currentBalances", {}) or {}
-                raw_eq = float(balances.get("liquidationValue", 0))
+                raw_eq_true = float(balances.get("liquidationValue", 0))
                 init_cr = float(init_balances.get("cashReceipts") or 0.0)
                 init_pend = float(init_balances.get("pendingDeposits") or 0.0)
                 curr_cr = float(balances.get("cashReceipts") or 0.0)
@@ -5896,9 +5965,7 @@ class SchwabAdapter:
                     2,
                 )
                 self._last_intraday_cash_flow[self.account_id] = intraday_cf
-                raw_eq = round(
-                    raw_eq - get_unanchored_cash_flow(intraday_cf), 2
-                )
+                raw_eq = raw_eq_true - get_unanchored_cash_flow(intraday_cf)
 
                 positions = data.get("positions", [])
                 open_assets = []
@@ -5931,7 +5998,10 @@ class SchwabAdapter:
 
                 if not open_assets:
                     self._last_raw_pos_details[self.account_id] = {}
-                    self._last_raw_adj_eq[self.account_id] = raw_eq
+                    self._last_unrounded_true_live_eq[self.account_id] = raw_eq_true
+                    self._last_flat_rounding_tol[self.account_id] = 0.0
+                    self._last_bucket_residual.pop(self.account_id, None)
+                    self._last_raw_adj_eq[self.account_id] = _round_cents(raw_eq)
                     (
                         adj_eq,
                         is_flat,
@@ -6085,25 +6155,44 @@ class SchwabAdapter:
                 ):
                     cb_eq_opt_mkt_val += mf_val
 
+                used_cb_mkt_fields = bool(
+                    has_cb_mkt_fields
+                    and (
+                        abs(cb_eq_opt_mkt_val) >= 0.01
+                        or abs(total_acct_mkt_val) < 0.01
+                    )
+                )
                 ref_bal_mkt_val = (
                     cb_eq_opt_mkt_val
-                    if (
-                        has_cb_mkt_fields
-                        and (
-                            abs(cb_eq_opt_mkt_val) >= 0.01
-                            or abs(total_acct_mkt_val) < 0.01
-                        )
-                    )
+                    if used_cb_mkt_fields
                     else total_acct_mkt_val
                 )
-                adj_eq = round(
-                    raw_eq + (total_live_mkt_val - ref_bal_mkt_val), 2
+                true_live_eq = raw_eq_true + (
+                    total_live_mkt_val - ref_bal_mkt_val
+                )
+                unrounded_adj_eq = raw_eq + (
+                    total_live_mkt_val - ref_bal_mkt_val
+                )
+                flat_tol = (
+                    0.02
+                    if used_cb_mkt_fields
+                    else max(
+                        0.01,
+                        min(
+                            0.05,
+                            math.floor((len(pos_details) + 1) * 0.5) / 100.0,
+                        ),
+                    )
                 )
 
                 self._last_raw_pos_details[self.account_id] = json.loads(
                     json.dumps(pos_details)
                 )
-                self._last_raw_adj_eq[self.account_id] = adj_eq
+                self._last_unrounded_true_live_eq[self.account_id] = true_live_eq
+                self._last_flat_rounding_tol[self.account_id] = flat_tol
+                self._last_raw_adj_eq[self.account_id] = _round_cents(
+                    unrounded_adj_eq
+                )
                 (
                     adj_eq,
                     is_flat,
@@ -6113,8 +6202,30 @@ class SchwabAdapter:
                     filt_eq,
                     filt_opt,
                 ) = _apply_ignored_positions_to_snapshot(
-                    adj_eq, pos_details, open_eq_cache, open_opt_cache
+                    unrounded_adj_eq, pos_details, open_eq_cache, open_opt_cache
                 )
+                if is_flat and len(pos_details) > 0:
+                    bucket_res = _round_cents(raw_eq_true - ref_bal_mkt_val)
+                    prev_res = self._last_bucket_residual.get(self.account_id)
+                    self._last_bucket_residual[self.account_id] = bucket_res
+                    if prev_res is not None:
+                        res_delta = _round_cents(bucket_res - prev_res)
+                        if (
+                            0.005 <= abs(res_delta) <= (flat_tol + 1e-9)
+                            and (
+                                time.time() - self._last_bucket_residual_log_ts
+                            )
+                            >= 300.0
+                        ):
+                            self._last_bucket_residual_log_ts = time.time()
+                            log_event(
+                                "SESSION",
+                                f"Broker multi-field balance rounding residual shifted by "
+                                f"{format_dollar(res_delta)} across ignored holdings "
+                                f"(held steady within ±${flat_tol:.2f} flat deadband).",
+                            )
+                else:
+                    self._last_bucket_residual.pop(self.account_id, None)
 
                 open_res = (
                     adj_eq,
@@ -6208,6 +6319,10 @@ class WebullAdapter:
         self._last_good_snapshot = {}
         self._last_raw_pos_details = {}
         self._last_raw_adj_eq = {}
+        self._last_unrounded_true_live_eq = {}
+        self._last_flat_rounding_tol = {}
+        self._last_bucket_residual = {}
+        self._last_bucket_residual_log_ts = 0.0
         self._last_open_eq = {}
         self._last_open_opt = {}
         self._last_intraday_cash_flow = {}
@@ -6247,6 +6362,15 @@ class WebullAdapter:
     def get_last_raw_adj_eq(self):
         val = self._last_raw_adj_eq.get(self.account_id)
         return float(val) if val is not None else None
+
+    def get_last_true_live_eq(self):
+        val = self._last_unrounded_true_live_eq.get(self.account_id)
+        if val is not None:
+            return float(val)
+        return self.get_last_raw_adj_eq()
+
+    def get_flat_rounding_tolerance(self):
+        return float(self._last_flat_rounding_tol.get(self.account_id, 0.0))
 
     def get_last_intraday_cash_flow(self):
         return float(self._last_intraday_cash_flow.get(self.account_id, 0.0))
@@ -7474,12 +7598,17 @@ class WebullAdapter:
                 pass
             wb_dep = round(wb_pos_dep + wb_neg_cf, 2)
             self._last_intraday_cash_flow[self.account_id] = wb_dep
-            raw_eq = round(raw_eq - get_unanchored_cash_flow(wb_dep), 2)
+            raw_eq_true = raw_eq
+            raw_eq = (
+                (raw_eq_true - get_unanchored_cash_flow(wb_dep))
+                if raw_eq_true is not None
+                else None
+            )
             if self.account_id not in self._logged_accounts:
                 self._logged_accounts.add(self.account_id)
                 log_event(
                     "SESSION",
-                    f"Webull Balance Parsed -> TotalAccountValue=${raw_eq:,.2f} "
+                    f"Webull Balance Parsed -> TotalAccountValue=${_round_cents(raw_eq or 0.0):,.2f} "
                     f"(Cash=${cash_bal if cash_bal is not None else 0.0:,.2f})"
                 )
 
@@ -7628,28 +7757,52 @@ class WebullAdapter:
                 if (bal_mkt_val is not None and len(pos_details) > 0)
                 else total_raw_pos_mkt_val
             )
-            raw_adj_eq = (
-                round(raw_eq + (total_pos_mkt_val - ref_bal_mkt_val), 2)
+            unrounded_raw_adj_eq = (
+                (raw_eq + (total_pos_mkt_val - ref_bal_mkt_val))
                 if (raw_eq is not None and raw_eq > 0)
                 else None
             )
+            unrounded_true_raw_adj_eq = (
+                (raw_eq_true + (total_pos_mkt_val - ref_bal_mkt_val))
+                if (raw_eq_true is not None and raw_eq_true > 0)
+                else None
+            )
+            used_webull_raw_adj = False
             if cash_bal is not None and cash_bal > 0:
-                cash_plus_pos = round(cash_bal + total_pos_mkt_val, 2)
+                unrounded_cash_plus_pos = cash_bal + total_pos_mkt_val
                 if (
-                    raw_adj_eq is not None
-                    and abs(cash_plus_pos - raw_adj_eq) > 15.0
+                    unrounded_raw_adj_eq is not None
+                    and abs(unrounded_cash_plus_pos - unrounded_raw_adj_eq) > 15.0
                 ):
-                    adj_eq = raw_adj_eq
+                    unrounded_adj_eq = unrounded_raw_adj_eq
+                    used_webull_raw_adj = True
                 else:
-                    adj_eq = cash_plus_pos
+                    unrounded_adj_eq = unrounded_cash_plus_pos
+                if (
+                    unrounded_true_raw_adj_eq is not None
+                    and abs(unrounded_cash_plus_pos - unrounded_true_raw_adj_eq)
+                    > 15.0
+                ):
+                    true_live_eq = unrounded_true_raw_adj_eq
+                else:
+                    true_live_eq = unrounded_cash_plus_pos
             else:
-                adj_eq = (
-                    raw_adj_eq
-                    if raw_adj_eq is not None
-                    else round(raw_eq or 0.0, 2)
-                )
+                if unrounded_raw_adj_eq is not None:
+                    unrounded_adj_eq = unrounded_raw_adj_eq
+                    used_webull_raw_adj = True
+                else:
+                    unrounded_adj_eq = float(raw_eq or 0.0)
+                if unrounded_true_raw_adj_eq is not None:
+                    true_live_eq = unrounded_true_raw_adj_eq
+                else:
+                    true_live_eq = float(raw_eq_true or 0.0)
 
-            self._last_raw_adj_eq[self.account_id] = adj_eq
+            flat_tol = (
+                0.01 if (used_webull_raw_adj and len(pos_details) > 0) else 0.0
+            )
+            self._last_unrounded_true_live_eq[self.account_id] = true_live_eq
+            self._last_flat_rounding_tol[self.account_id] = flat_tol
+            self._last_raw_adj_eq[self.account_id] = _round_cents(unrounded_adj_eq)
             (
                 adj_eq,
                 is_flat,
@@ -7659,7 +7812,7 @@ class WebullAdapter:
                 filt_eq,
                 filt_opt,
             ) = _apply_ignored_positions_to_snapshot(
-                adj_eq, pos_details, open_eq_cache, open_opt_cache
+                unrounded_adj_eq, pos_details, open_eq_cache, open_opt_cache
             )
 
             self.last_error = ""
@@ -11954,7 +12107,16 @@ def log_position_transitions(
     consec_trigger_reason = None
     streak_note = ""
     if completed_round_trip and (len(pos_details) == 0 or any("Re-entry Avg:" in c for c in changes)):
-        delta = round(realized_pnl - prev_flat_realized_pnl, 2)
+        delta = _round_cents(realized_pnl - prev_flat_realized_pnl)
+        ig_scratch_tol = (
+            float(active_adapter.get_flat_rounding_tolerance())
+            if (
+                _has_active_open_ignored_positions(active_adapter)
+                and active_adapter is not None
+                and hasattr(active_adapter, "get_flat_rounding_tolerance")
+            )
+            else 0.0
+        )
         req_losses = max(
             2, int(round(float(config.get("consec_loss_count", 3))))
         )
@@ -11970,7 +12132,7 @@ def log_position_transitions(
             for ts in recent_loss_timestamps
             if (now_ts - ts) <= (win_mins * 60.0)
         ]
-        if delta > 0.0:
+        if delta > (ig_scratch_tol + 1e-9):
             win_trades += 1
             if recent_loss_timestamps:
                 min_win_to_reset = abs(
@@ -11988,7 +12150,7 @@ def log_position_transitions(
                         f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
                         f"(Scratch win {format_dollar(delta)} < +${min_win_to_reset:,.0f} did not reset streak)"
                     )
-        elif delta < 0.0:
+        elif delta < -(ig_scratch_tol + 1e-9):
             loss_trades += 1
             if not first_poll_of_launch:
                 if cooldown_active and "DAILY" in str(cooldown_label).upper():
@@ -12104,6 +12266,25 @@ def _stabilize_mid_fill_realized_and_equity(
 
     if first_poll_of_launch or settled_realized_pnl is None:
         if is_flat:
+            ig_launch_tol = (
+                float(active_adapter.get_flat_rounding_tolerance())
+                if (
+                    len(prev_pos_snapshot) == 0
+                    and last_flat_equity is not None
+                    and float(last_flat_equity) > 0.0
+                    and _has_active_open_ignored_positions(active_adapter)
+                    and active_adapter is not None
+                    and hasattr(active_adapter, "get_flat_rounding_tolerance")
+                )
+                else 0.0
+            )
+            if (
+                ig_launch_tol > 0.0
+                and 0.0
+                < abs(current_eq - last_flat_equity)
+                <= (ig_launch_tol + 1e-9)
+            ):
+                current_eq = last_flat_equity
             if not _launch_fee_drift_checked:
                 _launch_fee_drift_checked = True
                 _maybe_absorb_untouched_flat_fee_drift(current_eq, is_flat)
@@ -12115,15 +12296,15 @@ def _stabilize_mid_fill_realized_and_equity(
             if daily_min_equity is None or current_eq < daily_min_equity:
                 daily_min_equity = current_eq
             save_session_state()
-            realized_pnl = round(last_flat_equity - start_equity, 2)
+            realized_pnl = _round_cents(last_flat_equity - start_equity)
             open_pnl = 0.0
             for k in list(triggered_alarms.keys()):
                 if k.startswith("Open PnL -"):
                     del triggered_alarms[k]
         else:
             open_pnl = live_open_pnl
-            realized_pnl = round((current_eq - start_equity) - open_pnl, 2)
-            last_flat_equity = round(start_equity + realized_pnl, 2)
+            realized_pnl = _round_cents((current_eq - start_equity) - open_pnl)
+            last_flat_equity = _round_cents(start_equity + realized_pnl)
             prev_flat_realized_pnl = realized_pnl
         settled_realized_pnl = realized_pnl
         flat_desync_streak = 0
@@ -12133,11 +12314,33 @@ def _stabilize_mid_fill_realized_and_equity(
 
     if is_flat:
         open_pnl = 0.0
-        raw_flat_realized = round(current_eq - start_equity, 2)
+        raw_flat_realized = _round_cents(current_eq - start_equity)
         was_flat_before = (len(prev_pos_snapshot) == 0)
 
         if was_flat_before:
+            ig_flat_tol = (
+                float(active_adapter.get_flat_rounding_tolerance())
+                if (
+                    last_flat_equity is not None
+                    and _has_active_open_ignored_positions(active_adapter)
+                    and active_adapter is not None
+                    and hasattr(active_adapter, "get_flat_rounding_tolerance")
+                )
+                else 0.0
+            )
             if (
+                ig_flat_tol > 0.0
+                and 0.0
+                < abs(current_eq - last_flat_equity)
+                <= (ig_flat_tol + 1e-9)
+            ):
+                flat_desync_streak = 0
+                in_trade_desync_streak = 0
+                pending_scale_out_tol = 0.0
+                current_eq = last_flat_equity
+                realized_pnl = _round_cents(last_flat_equity - start_equity)
+                settled_realized_pnl = realized_pnl
+            elif (
                 last_flat_equity is not None
                 and abs(raw_flat_realized - settled_realized_pnl) > 25.0
                 and flat_desync_streak < 2
@@ -12165,7 +12368,7 @@ def _stabilize_mid_fill_realized_and_equity(
                 if daily_min_equity is None or current_eq < daily_min_equity:
                     daily_min_equity = current_eq
                 save_session_state()
-                realized_pnl = round(last_flat_equity - start_equity, 2)
+                realized_pnl = _round_cents(last_flat_equity - start_equity)
                 settled_realized_pnl = realized_pnl
         else:
             est_open_sum = sum(
@@ -12352,12 +12555,95 @@ def _stabilize_mid_fill_realized_and_equity(
     return current_eq, realized_pnl, open_pnl
 
 
+def _compute_leash_metrics(
+    distance_to_terminate,
+    floor_equity,
+    max_eq_val,
+    rth_now,
+    pm_max,
+    pm_lock_on,
+    pm_trig,
+    t1_max,
+    t2_on,
+    t2_trig,
+    t3_on,
+    t3_trig,
+    t4_on,
+    t4_trig,
+    max_realized_profit,
+    locked_down,
+):
+    """Computes (full_leash, base_leash, leash_pct) for the HUD '$ TO STOP'
+    column and neon leash bar."""
+    base_leash = max(1.0, abs(float(pm_max if not rth_now else t1_max)))
+    if not rth_now:
+        ratchet_unlocked = bool(pm_lock_on and max_realized_profit >= pm_trig)
+    else:
+        ratchet_unlocked = bool(
+            (t4_on and max_realized_profit >= t4_trig)
+            or (t3_on and max_realized_profit >= t3_trig)
+            or (t2_on and max_realized_profit >= t2_trig)
+        )
+    if ratchet_unlocked and max_eq_val is not None and floor_equity is not None:
+        ratchet_cushion = float(max_eq_val) - float(floor_equity)
+        full_leash = (
+            max(1.0, ratchet_cushion) if ratchet_cushion > 0.0 else base_leash
+        )
+    else:
+        full_leash = base_leash
+    leash_pct = (
+        0.0
+        if locked_down
+        else max(0.0, min(1.0, float(distance_to_terminate) / full_leash))
+    )
+    return full_leash, base_leash, leash_pct
+
+
+def _compute_dist_and_giveback_bgs(
+    distance_to_terminate,
+    leash_pct,
+    hud_breach_active,
+    session_high_pnl,
+    giveback_val,
+    base_leash,
+):
+    """Computes proportional HUD cell background colors (c4_bg, fh_bg) for
+    '$ TO STOP' and 'FROM HIGH' so smaller/custom Daily Stops stay calm slate
+    at 100% cushion and warn proportionally (at <= 1/3 leash remaining)."""
+    c4_bg = (
+        "#b03a2e"
+        if (hud_breach_active or distance_to_terminate <= 0)
+        else (
+            "#d35400"
+            if leash_pct <= (LEASH_CELL_WARN_PCT + 1e-6)
+            else "#2c3e50"
+        )
+    )
+    eff_base = max(1.0, abs(float(base_leash or 1.0)))
+    fh_red_thresh = -(eff_base * GIVEBACK_ALERT_RATIO)
+    fh_warn_thresh = -(eff_base * GIVEBACK_WARN_RATIO)
+    fh_bg = (
+        "#1e8449"
+        if (session_high_pnl > 0 and giveback_val >= 0)
+        else (
+            "#b03a2e"
+            if giveback_val <= (fh_red_thresh + 1e-6)
+            else (
+                "#d35400"
+                if giveback_val <= (fh_warn_thresh + 1e-6)
+                else "#2c3e50"
+            )
+        )
+    )
+    return c4_bg, fh_bg
+
+
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close, is_locked_down, force_reanchor
     global triggered_alarms, prev_pos_snapshot, current_is_flat
-    global active_adapter, first_poll_of_launch
+    global active_adapter, first_poll_of_launch, _launch_fee_drift_checked
     global current_upside_tier, last_rth_mode
     global win_trades, loss_trades, prev_flat_realized_pnl
     global settled_realized_pnl, flat_desync_streak
@@ -12450,18 +12736,52 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     or start_equity <= 0.0
                     or (force_reanchor and not snap_was_cached)
                 ):
-                    anchor_eq = round(current_eq - live_open_pnl, 2)
-                    start_equity = anchor_eq
-                    max_equity = anchor_eq
-                    daily_max_equity = max(anchor_eq, current_eq)
-                    daily_min_equity = anchor_eq
-                    last_flat_equity = anchor_eq
                     anchor_cash_flow = (
                         active_adapter.get_last_intraday_cash_flow()
                         if active_adapter is not None
                         else 0.0
                     )
                     _last_logged_unanchored_cash_flow = 0.0
+                    reanchor_ignored_positions_to_live(active_adapter)
+                    if active_adapter is not None:
+                        active_adapter.invalidate_cached_snapshots()
+                    true_live_eq_r = (
+                        active_adapter.get_last_true_live_eq()
+                        if (
+                            active_adapter is not None
+                            and hasattr(active_adapter, "get_last_true_live_eq")
+                        )
+                        else None
+                    )
+                    if true_live_eq_r is not None and true_live_eq_r > 0:
+                        raw_pos_r = (
+                            active_adapter.get_last_raw_pos_details()
+                            if (
+                                active_adapter is not None
+                                and hasattr(
+                                    active_adapter, "get_last_raw_pos_details"
+                                )
+                            )
+                            else {}
+                        )
+                        (
+                            current_eq,
+                            is_flat,
+                            live_open_pnl,
+                            pos_details,
+                            has_options,
+                            _,
+                            _,
+                        ) = _apply_ignored_positions_to_snapshot(
+                            true_live_eq_r, raw_pos_r, [], []
+                        )
+                        current_is_flat = is_flat
+                    anchor_eq = _round_cents(current_eq - live_open_pnl)
+                    start_equity = anchor_eq
+                    max_equity = anchor_eq
+                    daily_max_equity = max(anchor_eq, current_eq)
+                    daily_min_equity = anchor_eq
+                    last_flat_equity = anchor_eq
                     has_reset_at_open = is_rth() or is_after_hours()
                     has_reset_at_close = is_after_hours()
                     force_reanchor = False
@@ -12478,6 +12798,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     recent_loss_timestamps.clear()
                     triggered_alarms.clear()
                     prev_pos_snapshot = {}
+                    first_poll_of_launch = True
+                    _launch_fee_drift_checked = True
                     save_session_state()
                     ig_log_sfx = (
                         f" | IgnoredPreExisting={list(ignored_positions.keys())}"
@@ -13358,33 +13680,23 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 terminate_pnl_level = round(floor_equity - start_equity, 2)
                 distance_to_terminate = round(current_eq - floor_equity, 2)
 
-                if not rth_now:
-                    full_leash = (
-                        max(1.0, float(pm_trail), float(pm_max))
-                        if (pm_lock_on and max_realized_profit >= pm_trig)
-                        else max(1.0, float(pm_max))
-                    )
-                else:
-                    if t4_on and max_realized_profit >= t4_trig:
-                        full_leash = max(1.0, float(t4_trail))
-                    elif t3_on and max_realized_profit >= t3_trig:
-                        full_leash = max(
-                            1.0,
-                            float(max_realized_profit - eff_t3_max),
-                            float(t1_max)
-                        )
-                    elif t2_on and max_realized_profit >= t2_trig:
-                        full_leash = max(
-                            1.0,
-                            float(max_realized_profit - eff_t2_max),
-                            float(t1_max)
-                        )
-                    else:
-                        full_leash = max(1.0, float(t1_max))
-                leash_pct = (
-                    0.0
-                    if is_locked_down
-                    else max(0.0, min(1.0, distance_to_terminate / full_leash))
+                full_leash, base_leash, leash_pct = _compute_leash_metrics(
+                    distance_to_terminate=distance_to_terminate,
+                    floor_equity=floor_equity,
+                    max_eq_val=max_equity,
+                    rth_now=rth_now,
+                    pm_max=pm_max,
+                    pm_lock_on=pm_lock_on,
+                    pm_trig=pm_trig,
+                    t1_max=t1_max,
+                    t2_on=t2_on,
+                    t2_trig=t2_trig,
+                    t3_on=t3_on,
+                    t3_trig=t3_trig,
+                    t4_on=t4_on,
+                    t4_trig=t4_trig,
+                    max_realized_profit=max_realized_profit,
+                    locked_down=is_locked_down,
                 )
 
                 new_upside_tier = compute_upside_tier(
@@ -13482,10 +13794,6 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     else ("#b03a2e" if net_pnl < 0 else "#2c3e50")
                 )
                 c3_bg = "#1e8449" if terminate_pnl_level > 0 else "#1f538d"
-                c4_bg = (
-                    "#b03a2e" if (is_locked_down or distance_to_terminate <= 0)
-                    else ("#d35400" if distance_to_terminate <= 500 else "#2c3e50")
-                )
                 c5_bg = "#1e8449" if session_high_pnl > 0 else "#2c3e50"
                 eff_min_eq = (
                     daily_min_equity
@@ -13504,12 +13812,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     round(net_pnl - session_high_pnl, 2)
                     if session_high_pnl > 0 else 0.0
                 )
-                fh_bg = (
-                    "#1e8449" if (session_high_pnl > 0 and giveback_val >= 0)
-                    else (
-                        "#b03a2e" if giveback_val <= -500
-                        else ("#d35400" if giveback_val <= -250 else "#2c3e50")
-                    )
+                c4_bg, fh_bg = _compute_dist_and_giveback_bgs(
+                    distance_to_terminate=distance_to_terminate,
+                    leash_pct=leash_pct,
+                    hud_breach_active=is_locked_down,
+                    session_high_pnl=session_high_pnl,
+                    giveback_val=giveback_val,
+                    base_leash=base_leash,
                 )
                 wl_bg = "#2c3e50"
 
@@ -13858,7 +14167,7 @@ def show_preflight_window(
 
     def on_close(event=None, force=False):
         global settings_win_open, first_poll_of_launch
-        global active_preflight_close_fn, active_preflight_win
+        global active_preflight_close_fn, active_preflight_win, daily_breach_settings_prompted, active_preflight_win
         if (dry_run_lock_active or cooldown_active) and not force:
             log_event(
                 "GUARDRAIL",
@@ -14636,20 +14945,25 @@ def show_preflight_window(
             and start_equity > 0
         )
         if not is_mid_session:
-            ignored_positions.clear()
-            for tag in chosen_ignored_tags:
-                if tag in raw_pos:
-                    ignored_positions[tag] = build_ignored_position_entry(
-                        tag, raw_pos[tag], lock_existing_open_pnl=False
-                    )
             raw_eq_now = (
-                active_adapter.get_last_raw_adj_eq()
+                (
+                    active_adapter.get_last_true_live_eq()
+                    if hasattr(active_adapter, "get_last_true_live_eq")
+                    else active_adapter.get_last_raw_adj_eq()
+                )
                 if (
                     active_adapter is not None
                     and hasattr(active_adapter, "get_last_raw_adj_eq")
                 )
                 else None
             ) or _preexisting_state.get("raw_eq")
+            with _ignored_positions_lock:
+                ignored_positions.clear()
+                for tag in chosen_ignored_tags:
+                    if tag in raw_pos:
+                        ignored_positions[tag] = build_ignored_position_entry(
+                            tag, raw_pos[tag], lock_existing_open_pnl=False
+                        )
             if raw_eq_now is not None and raw_eq_now > 0:
                 tracked_opnl = round(
                     sum(
@@ -14659,78 +14973,9 @@ def show_preflight_window(
                     ),
                     2,
                 )
-                start_equity = round(raw_eq_now - tracked_opnl, 2)
+                start_equity = _round_cents(raw_eq_now - tracked_opnl)
                 _card3_base_cache["eq_str"] = f"${start_equity:,.2f} (Live)"
         else:
-            for tag in list(ignored_positions.keys()):
-                if tag not in chosen_ignored_tags:
-                    old_ig = ignored_positions.pop(tag, None)
-                    if tag in raw_pos and isinstance(old_ig, dict):
-                        d = raw_pos[tag]
-                        mult = (
-                            100.0
-                            if str(old_ig.get("asset_type", "EQUITY")).upper()
-                            == "OPTION"
-                            else 1.0
-                        )
-                        lp = float(d.get("last", 0.0))
-                        qty = float(d.get("qty", 0.0))
-                        ref_p = float(old_ig.get("ref_price", lp))
-                        locked_imp = float(old_ig.get("locked_impact", 0.0))
-                        old_impact = locked_imp + (
-                            (lp - ref_p) * qty * mult if lp > 0 else 0.0
-                        )
-                        d_open = float(d.get("open_pnl", 0.0))
-                        delta_base = round(old_impact - d_open, 2)
-                        if abs(delta_base) >= 0.01:
-                            start_equity = round(start_equity + delta_base, 2)
-                            last_flat_equity = round(
-                                (
-                                    last_flat_equity
-                                    if last_flat_equity is not None
-                                    else start_equity
-                                )
-                                + delta_base,
-                                2,
-                            )
-                            max_equity = round(
-                                (
-                                    max_equity
-                                    if max_equity is not None
-                                    else start_equity
-                                )
-                                + delta_base,
-                                2,
-                            )
-                            daily_max_equity = round(
-                                (
-                                    daily_max_equity
-                                    if daily_max_equity is not None
-                                    else max_equity
-                                )
-                                + delta_base,
-                                2,
-                            )
-                            daily_min_equity = round(
-                                (
-                                    daily_min_equity
-                                    if daily_min_equity is not None
-                                    else min(start_equity - delta_base, last_flat_equity - delta_base)
-                                )
-                                + delta_base,
-                                2,
-                            )
-                            _card3_base_cache["eq_str"] = (
-                                f"${start_equity:,.2f} (Saved)"
-                            )
-            newly_ignored_igs = []
-            for tag in chosen_ignored_tags:
-                if tag not in ignored_positions and tag in raw_pos:
-                    ig_entry = build_ignored_position_entry(
-                        tag, raw_pos[tag], lock_existing_open_pnl=True
-                    )
-                    ignored_positions[tag] = ig_entry
-                    newly_ignored_igs.append(ig_entry)
             raw_eq_now = (
                 active_adapter.get_last_raw_adj_eq()
                 if (
@@ -14739,97 +14984,174 @@ def show_preflight_window(
                 )
                 else None
             ) or _preexisting_state.get("raw_eq")
-            ref_flat_eq = (
-                last_flat_equity
-                if last_flat_equity is not None
-                else start_equity
-            )
-            if (
-                newly_ignored_igs
-                and raw_eq_now is not None
-                and float(raw_eq_now) > 0.0
-                and ref_flat_eq is not None
-                and float(ref_flat_eq) > 0.0
-            ):
-                tracked_opnl = round(
-                    sum(
-                        float(d.get("open_pnl", 0.0))
-                        for t, d in raw_pos.items()
-                        if t not in chosen_ignored_tags
-                    ),
-                    2,
+            with _ignored_positions_lock:
+                for tag in list(ignored_positions.keys()):
+                    if tag not in chosen_ignored_tags:
+                        old_ig = ignored_positions.pop(tag, None)
+                        if tag in raw_pos and isinstance(old_ig, dict):
+                            d = raw_pos[tag]
+                            mult = (
+                                100.0
+                                if str(old_ig.get("asset_type", "EQUITY")).upper()
+                                == "OPTION"
+                                else 1.0
+                            )
+                            lp = float(d.get("last", 0.0))
+                            qty = float(d.get("qty", 0.0))
+                            ref_p = float(old_ig.get("ref_price", lp))
+                            locked_imp = float(old_ig.get("locked_impact", 0.0))
+                            old_impact = locked_imp + (
+                                (lp - ref_p) * qty * mult if lp > 0 else 0.0
+                            )
+                            d_open = float(d.get("open_pnl", 0.0))
+                            delta_base = _round_cents(old_impact - d_open)
+                            if abs(delta_base) >= 0.01:
+                                start_equity = _round_cents(
+                                    start_equity + delta_base
+                                )
+                                last_flat_equity = _round_cents(
+                                    (
+                                        last_flat_equity
+                                        if last_flat_equity is not None
+                                        else start_equity
+                                    )
+                                    + delta_base
+                                )
+                                max_equity = _round_cents(
+                                    (
+                                        max_equity
+                                        if max_equity is not None
+                                        else start_equity
+                                    )
+                                    + delta_base
+                                )
+                                daily_max_equity = _round_cents(
+                                    (
+                                        daily_max_equity
+                                        if daily_max_equity is not None
+                                        else max_equity
+                                    )
+                                    + delta_base
+                                )
+                                daily_min_equity = _round_cents(
+                                    (
+                                        daily_min_equity
+                                        if daily_min_equity is not None
+                                        else min(
+                                            start_equity - delta_base,
+                                            last_flat_equity - delta_base,
+                                        )
+                                    )
+                                    + delta_base
+                                )
+                                _card3_base_cache["eq_str"] = (
+                                    f"${start_equity:,.2f} (Saved)"
+                                )
+                newly_ignored_igs = []
+                for tag in chosen_ignored_tags:
+                    if tag not in ignored_positions and tag in raw_pos:
+                        ig_entry = build_ignored_position_entry(
+                            tag, raw_pos[tag], lock_existing_open_pnl=True
+                        )
+                        ignored_positions[tag] = ig_entry
+                        newly_ignored_igs.append(ig_entry)
+                ref_flat_eq = (
+                    last_flat_equity
+                    if last_flat_equity is not None
+                    else start_equity
                 )
-                cur_ig_sum = 0.0
-                for t_ig, ig_d in ignored_positions.items():
-                    if not isinstance(ig_d, dict):
-                        continue
-                    r_d = raw_pos.get(t_ig)
-                    l_imp = float(ig_d.get("locked_impact", 0.0))
-                    if r_d is not None:
-                        m_ig = (
-                            100.0
-                            if str(ig_d.get("asset_type", "EQUITY")).upper()
-                            == "OPTION"
-                            else 1.0
-                        )
-                        q_ig = float(r_d.get("qty", 0.0))
-                        lp_ig = float(r_d.get("last", 0.0))
-                        rp_ig = float(ig_d.get("ref_price", lp_ig))
-                        cur_ig_sum += l_imp + q_ig * (lp_ig - rp_ig) * m_ig
-                    else:
-                        cur_ig_sum += l_imp
-                target_ig_sum = round(
-                    (float(raw_eq_now) - tracked_opnl) - float(ref_flat_eq), 2
-                )
-                ig_drift = round(target_ig_sum - cur_ig_sum, 2)
-                new_ig_opt_contracts = 0.0
-                new_ig_notional = 0.0
-                for t_ni in chosen_ignored_tags:
-                    r_ni = raw_pos.get(t_ni)
-                    ig_ni = ignored_positions.get(t_ni)
-                    if ig_ni in newly_ignored_igs and isinstance(r_ni, dict):
-                        is_opt_ni = (
-                            str(ig_ni.get("asset_type", "EQUITY")).upper()
-                            == "OPTION"
-                        )
-                        q_ni = abs(float(r_ni.get("qty", 0.0)))
-                        lp_ni = abs(
-                            float(r_ni.get("last", 0.0) or r_ni.get("avg", 0.0))
-                        )
-                        if is_opt_ni:
-                            new_ig_opt_contracts += q_ni
-                            new_ig_notional += q_ni * lp_ni * 100.0
-                        else:
-                            new_ig_notional += q_ni * lp_ni
-                max_ig_drift = round(
-                    min(
-                        25.0,
-                        max(
-                            2.0,
-                            new_ig_opt_contracts * 1.0
-                            + new_ig_notional * 0.0005,
+                if (
+                    newly_ignored_igs
+                    and raw_eq_now is not None
+                    and float(raw_eq_now) > 0.0
+                    and ref_flat_eq is not None
+                    and float(ref_flat_eq) > 0.0
+                ):
+                    tracked_opnl = round(
+                        sum(
+                            float(d.get("open_pnl", 0.0))
+                            for t, d in raw_pos.items()
+                            if t not in chosen_ignored_tags
                         ),
-                    ),
-                    2,
-                )
-                if abs(ig_drift) >= 0.01:
-                    if abs(ig_drift) <= max_ig_drift:
-                        newly_ignored_igs[-1]["locked_impact"] = round(
-                            float(newly_ignored_igs[-1].get("locked_impact", 0.0))
-                            + ig_drift,
-                            2,
-                        )
-                        log_event(
-                            "SESSION",
-                            f"Absorbed newly-ignored fee/mark drift ({format_dollar(ig_drift)} <= "
-                            f"${max_ig_drift:,.2f} cap) into {newly_ignored_igs[-1].get('symbol', 'ignored position')}.",
-                        )
-                    else:
-                        log_event(
-                            "SESSION",
-                            f"Skipped newly-ignored drift ({format_dollar(ig_drift)} exceeds "
-                            f"${max_ig_drift:,.2f} fee/mark cap) to preserve off-session realized PnL.",
-                        )
+                        2,
+                    )
+                    cur_ig_sum = 0.0
+                    for t_ig, ig_d in ignored_positions.items():
+                        if not isinstance(ig_d, dict):
+                            continue
+                        r_d = raw_pos.get(t_ig)
+                        l_imp = float(ig_d.get("locked_impact", 0.0))
+                        if r_d is not None:
+                            m_ig = (
+                                100.0
+                                if str(ig_d.get("asset_type", "EQUITY")).upper()
+                                == "OPTION"
+                                else 1.0
+                            )
+                            q_ig = float(r_d.get("qty", 0.0))
+                            lp_ig = float(r_d.get("last", 0.0))
+                            rp_ig = float(ig_d.get("ref_price", lp_ig))
+                            cur_ig_sum += l_imp + q_ig * (lp_ig - rp_ig) * m_ig
+                        else:
+                            cur_ig_sum += l_imp
+                    target_ig_sum = _round_cents(
+                        (float(raw_eq_now) - tracked_opnl) - float(ref_flat_eq)
+                    )
+                    ig_drift = _round_cents(target_ig_sum - cur_ig_sum)
+                    new_ig_opt_contracts = 0.0
+                    new_ig_notional = 0.0
+                    for t_ni in chosen_ignored_tags:
+                        r_ni = raw_pos.get(t_ni)
+                        ig_ni = ignored_positions.get(t_ni)
+                        if ig_ni in newly_ignored_igs and isinstance(r_ni, dict):
+                            is_opt_ni = (
+                                str(ig_ni.get("asset_type", "EQUITY")).upper()
+                                == "OPTION"
+                            )
+                            q_ni = abs(float(r_ni.get("qty", 0.0)))
+                            lp_ni = abs(
+                                float(
+                                    r_ni.get("last", 0.0)
+                                    or r_ni.get("avg", 0.0)
+                                )
+                            )
+                            if is_opt_ni:
+                                new_ig_opt_contracts += q_ni
+                                new_ig_notional += q_ni * lp_ni * 100.0
+                            else:
+                                new_ig_notional += q_ni * lp_ni
+                    max_ig_drift = round(
+                        min(
+                            25.0,
+                            max(
+                                2.0,
+                                new_ig_opt_contracts * 1.0
+                                + new_ig_notional * 0.0005,
+                            ),
+                        ),
+                        2,
+                    )
+                    if abs(ig_drift) >= 0.01:
+                        if abs(ig_drift) <= max_ig_drift:
+                            newly_ignored_igs[-1]["locked_impact"] = _round_cents(
+                                float(
+                                    newly_ignored_igs[-1].get(
+                                        "locked_impact", 0.0
+                                    )
+                                )
+                                + ig_drift
+                            )
+                            log_event(
+                                "SESSION",
+                                f"Absorbed newly-ignored fee/mark drift ({format_dollar(ig_drift)} <= "
+                                f"${max_ig_drift:,.2f} cap) into {newly_ignored_igs[-1].get('symbol', 'ignored position')}.",
+                            )
+                        else:
+                            log_event(
+                                "SESSION",
+                                f"Skipped newly-ignored drift ({format_dollar(ig_drift)} exceeds "
+                                f"${max_ig_drift:,.2f} fee/mark cap) to preserve off-session realized PnL.",
+                            )
             save_session_state()
 
         if chosen_ignored_tags and not var_ignore_preexisting.get():
@@ -18414,7 +18736,7 @@ def show_preflight_window(
     def save_and_launch():
         global settings_win_open, triggered_alarms, first_poll_of_launch
         global force_reanchor, is_locked_down, current_is_flat, active_adapter
-        global active_preflight_close_fn
+        global active_preflight_close_fn, active_preflight_win, daily_breach_settings_prompted
 
         if dry_run_lock_active or cooldown_active:
             log_event(
@@ -18708,9 +19030,7 @@ def show_preflight_window(
                 recent_loss_timestamps.clear()
                 triggered_alarms.clear()
                 if active_adapter is not None:
-                    reanchor_ignored_positions_to_live(
-                        active_adapter.get_last_raw_pos_details()
-                    )
+                    active_adapter.invalidate_cached_snapshots()
                 s_key = get_session_key(chosen_b, active_adapter.account_id)
                 if s_key and s_key in new_cfg.get("account_sessions", {}):
                     del new_cfg["account_sessions"][s_key]

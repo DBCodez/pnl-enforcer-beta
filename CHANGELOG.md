@@ -4,6 +4,22 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.59.3] — 2026-11-16
+### ⚡ Quick Summary
+- **Ignored-Position Penny-Flicker Elimination & Proportional `$ TO STOP` Color Fix (Shoutout to `InvWithRed`!):** Fixed an edge case where accounts holding open **Ignored Pre-Existing Positions** (e.g., long-term shares + LEAPS) could see flat `REALIZED PnL` / `NET PnL` alternate between `$0.00` and `-$0.01` with zero daytrades taken, AND replaced the hardcoded `<= $500` orange warning threshold on **`$ TO STOP`** with proportional `1/3` leash coloring so Daily Stops `<= $500` (such as `-$450.00`) stay calm slate (`#2c3e50`) at `$0.00` PnL until `<= 33.3%` (`$150.00`) of cushion remains—special shoutout to beta tester **`InvWithRed`** for catching both and sending over the screenshot + clean log! *(Tip: if your `SESSION LOW` saved `-$0.01` earlier, clicking `↺ Re-Zero Baseline` once when flat clears it cleanly.)*
+
+### 🔍 Detailed Breakdown
+- **Single-Round Algebraic Cancellation & Two-Step IEEE-754 Cent Cleanup (`_round_cents`, `SchwabAdapter`, `WebullAdapter`, `_apply_ignored_positions_to_snapshot`):**
+  - Removed premature cent rounding on `raw_adj_eq` inside `SchwabAdapter.fetch_account_data()` and `WebullAdapter.fetch_account_data()` before `_apply_ignored_positions_to_snapshot()` so `(qty * lp * mult) - qty * (lp - ref_price) * mult` cancels live quote ticks algebraically prior to rounding, and added `_round_cents(val)` (`round(round(float(val), 6), 2)`) across ignored-impact neutralization and un-ignore `delta_base` updates so exact half-cent (`x.xx5`) baselines never flip by `±$0.01`.
+- **Adapter-Reported Flat Rounding Deadband & Scratch-Trade W/L Protection (`get_flat_rounding_tolerance`, `_stabilize_mid_fill_realized_and_equity`, `log_position_transitions`):**
+  - Added two-way `get_flat_rounding_tolerance()` (`SchwabAdapter`: `$0.02` on `currentBalances` equity/option buckets or `min($0.05, floor((N+1)*0.5)/100)` fallback; `WebullAdapter`: `$0.00` on `cash + pos` / `$0.01` on `raw_adj_eq` fallback) plus throttled balance-free `[SESSION]` residual-shift telemetry.
+  - When continuously flat with active open ignored positions, `_stabilize_mid_fill_realized_and_equity()` holds `current_eq` steady at `last_flat_equity` within `±tol` without mutating `last_flat_equity` or `daily_min_equity` (preventing random walk while allowing any `> tol` fee or tracked trade exit to snap through immediately), and `log_position_transitions()` treats closed round-trips with `abs(delta) <= tol` as flat scratches.
+- **Thread-Safe Clean-Frame `Re-Zero Baseline` & Proportional HUD Colors (`_ignored_positions_lock`, `get_last_true_live_eq`, `_compute_leash_metrics`, `_compute_dist_and_giveback_bgs`):**
+  - Protected `ignored_positions` reads/mutations with `_ignored_positions_lock` and anchored `force_reanchor` on the `data_loop()` thread against unrounded `get_last_true_live_eq()` after resetting `anchor_cash_flow` and `reanchor_ignored_positions_to_live()`.
+  - Replaced hardcoded `$500` / `-$250` / `-$500` HUD warning thresholds on `$ TO STOP` and `FROM HIGH` with proportional thresholds (`<= 1/3` of active leash on `$ TO STOP`; `-1/6` orange / `-1/3` red of base Daily Stop on `FROM HIGH`).
+
+---
+
 ## [v0.9.59.2] — 2026-11-16
 ### ⚡ Quick Summary
 - **Webull `HTTP 429` Rate-Limit Pacing & False Post-Lock Straggler Alarm Fix (Shoutout to `T$MAC`!):** Fixed a burst rate-limit edge case where Webull returning `HTTP 429` right after a successful auto-flatten could replay a cached pre-flatten snapshot and cause the 15-second Post-Lock Watchdog to mistake a `None` rate-limit response for open shares (*"Warning, straggler shares detected"* / `POST-LOCK FLATTEN FAILED`) even though the account was already 100% flat—special shoutout to beta tester **`T$MAC`** for stumbling into this one live and sending over the log that nailed it!
