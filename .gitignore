@@ -8,11 +8,14 @@ enforcer_log.txt
 .env
 scratch/
 
-# Python Cache & Build Artifacts
+# Python Cache, Update Backups & Build Artifacts
 __pycache__/
 *.py[cod]
 *$py.class
 *.spec
+*.prev
+*.tmp
+.enforcer_boot_pending.json
 build/
 dist/
 

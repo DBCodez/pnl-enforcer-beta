@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.65"
+APP_VERSION = "0.9.66"
 
 import os
 import sys
@@ -1438,6 +1438,11 @@ class DarkDropdownMenu:
         if (time.monotonic() - self._last_close_ts) < 0.16:
             return
         DarkDropdownMenu.close_active()
+        if callable(getattr(self, "_before_popup", None)):
+            try:
+                self._before_popup()
+            except Exception:
+                pass
         if not self._items:
             if callable(on_close):
                 on_close()
@@ -2044,8 +2049,30 @@ def is_options_flatten_armed(cfg=None):
     )
 
 
-LAYOUT_TOUR_VERSION = "0.9.48"
+LAYOUT_TOUR_VERSION = "0.9.65"
+TOUR_TABS = ("whats_new", "overview", "controls", "checklist")
+WHATS_NEW_CONTROL_PILLS = (
+    "🔒 Done Today",
+    "🔒 Commit Today",
+    "🧪 DEMO (SIMULATOR)",
+    "BROKER:",
+    "Trade API:",
+    "🐞 Report Bug",
+    "📜 Logs ▾",
+)
 _is_existing_user_install = False
+
+
+def build_tour_pulse_schedule():
+    """Returns [(is_on, duration_ms), ...] for the Quick Tour control spotlight:
+    starts immediately ON for 1,000ms so controls are lit as the modal closes,
+    followed by 7 calm breathing cycles (320ms rest / 860ms lit = 9,260ms total,
+    ~76% cumulative lit time, ending on a lit hold before clean restore)."""
+    sched = [(True, 1000)]
+    for _ in range(7):
+        sched.append((False, 320))
+        sched.append((True, 860))
+    return sched
 
 DEFAULT_CONFIG = {
     "waiver_accepted": False,
@@ -2060,6 +2087,7 @@ DEFAULT_CONFIG = {
     "auto_share_sanitized_logs": False,
     "show_debug_console": False,
     "check_updates_on_startup": True,
+    "skipped_update_version": "",
     "last_uploaded_sanitized_log": "",
     "anonymous_tester_id": "",
     "active_broker": "SCHWAB",
@@ -3622,6 +3650,351 @@ def _install_tcl_bgerror_hook(tk_obj):
         pass
 
 
+_crash_rollback_prompted = False
+
+
+def _get_prev_enforcer_path():
+    return os.path.join(SCRIPT_DIR, "enforcer.py.prev")
+
+
+def _get_prev_changelog_path():
+    return os.path.join(SCRIPT_DIR, "CHANGELOG.md.prev")
+
+
+def _get_boot_pending_path():
+    return os.path.join(SCRIPT_DIR, ".enforcer_boot_pending.json")
+
+
+def _validate_enforcer_source_bytes(raw_bytes):
+    """Validates candidate enforcer.py / enforcer.py.prev bytes for UTF-8
+    integrity, core entrypoint markers, APP_VERSION header, and Python syntax.
+    Returns (ok, parsed_version, error_reason)."""
+    if not isinstance(raw_bytes, (bytes, bytearray)) or len(raw_bytes) < 512:
+        return False, "", "Backup file is empty or truncated."
+    try:
+        src_txt = bytes(raw_bytes).decode("utf-8")
+    except UnicodeDecodeError:
+        return False, "", "Backup file failed UTF-8 decoding."
+    if "\x00" in src_txt:
+        return False, "", "Backup file contains null bytes."
+    if (
+        "def data_loop" not in src_txt
+        or 'if __name__ == "__main__":' not in src_txt
+    ):
+        return False, "", "Backup file is missing core PnL Enforcer entrypoints."
+    m_ver = re.search(
+        r'(?m)^APP_VERSION\s*=\s*["\']([^"\']+)["\']', src_txt
+    )
+    if not m_ver or not m_ver.group(1).strip():
+        return False, "", "Backup file is missing APP_VERSION."
+    parsed_ver = m_ver.group(1).strip()
+    try:
+        compile(src_txt, "enforcer.py.prev", "exec")
+    except Exception as exc:
+        return False, "", f"Backup failed Python syntax check ({exc})."
+    return True, parsed_ver, ""
+
+
+_ROLLBACK_INFO_CACHE = {"key": None, "val": None}
+_rollback_cfg_fallback_lock = threading.RLock()
+
+
+def get_rollback_backup_info():
+    """Inspects enforcer.py.prev in SCRIPT_DIR and returns metadata dict:
+    {available, reason, prev_version, mtime_str, same_version, prev_path}.
+    Memoized by (path, st_mtime_ns, st_size, APP_VERSION) so UI menus/dialogs
+    never recompile 37k+ lines repeatedly on the main thread."""
+    prev_py = _get_prev_enforcer_path()
+    if not os.path.isfile(prev_py):
+        _ROLLBACK_INFO_CACHE["key"] = None
+        _ROLLBACK_INFO_CACHE["val"] = None
+        return {
+            "available": False,
+            "reason": "NO_BACKUP",
+            "prev_version": "",
+            "mtime_str": "",
+            "same_version": False,
+            "prev_path": prev_py,
+        }
+    try:
+        st = os.stat(prev_py)
+        cache_key = (
+            prev_py,
+            getattr(st, "st_mtime_ns", st.st_mtime),
+            int(st.st_size),
+            str(APP_VERSION),
+        )
+        if (
+            _ROLLBACK_INFO_CACHE.get("key") == cache_key
+            and isinstance(_ROLLBACK_INFO_CACHE.get("val"), dict)
+        ):
+            return dict(_ROLLBACK_INFO_CACHE["val"])
+        mtime_str = datetime.fromtimestamp(st.st_mtime).strftime(
+            "%Y-%m-%d %I:%M %p"
+        )
+        with open(prev_py, "rb") as pf_in:
+            raw_b = pf_in.read()
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": "CORRUPT_BACKUP",
+            "prev_version": "",
+            "mtime_str": "",
+            "same_version": False,
+            "prev_path": prev_py,
+            "detail": str(exc),
+        }
+    ok_src, prev_ver, err_msg = _validate_enforcer_source_bytes(raw_b)
+    if not ok_src:
+        res_d = {
+            "available": False,
+            "reason": "CORRUPT_BACKUP",
+            "prev_version": "",
+            "mtime_str": mtime_str,
+            "same_version": False,
+            "prev_path": prev_py,
+            "detail": err_msg,
+        }
+    elif prev_ver == APP_VERSION:
+        res_d = {
+            "available": False,
+            "reason": "SAME_VERSION",
+            "prev_version": prev_ver,
+            "mtime_str": mtime_str,
+            "same_version": True,
+            "prev_path": prev_py,
+        }
+    else:
+        res_d = {
+            "available": True,
+            "reason": "OK",
+            "prev_version": prev_ver,
+            "mtime_str": mtime_str,
+            "same_version": False,
+            "prev_path": prev_py,
+        }
+    _ROLLBACK_INFO_CACHE["key"] = cache_key
+    _ROLLBACK_INFO_CACHE["val"] = dict(res_d)
+    return res_d
+
+
+def _peek_saved_skipped_update_version():
+    """Reads skipped_update_version from CONFIG_PATH / loaded config."""
+    io_lk = globals().get("_config_io_lock") or _rollback_cfg_fallback_lock
+    with io_lk:
+        try:
+            if os.path.isfile(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as cf:
+                    disk_cfg = json.load(cf)
+                if isinstance(disk_cfg, dict):
+                    return str(
+                        disk_cfg.get("skipped_update_version", "") or ""
+                    ).strip()
+        except Exception:
+            pass
+        try:
+            mem_cfg = globals().get("config")
+            if isinstance(mem_cfg, dict):
+                return str(
+                    mem_cfg.get("skipped_update_version", "") or ""
+                ).strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _record_skipped_update_version_on_disk(ver_str):
+    """Thread-safely updates ONLY skipped_update_version inside CONFIG_PATH on
+    disk under _config_io_lock (preserving 100% of existing settings, tokens,
+    locks, and baselines even if called before load_config() during early startup
+    crash recovery without racing concurrent save_config() calls)."""
+    clean_v = str(ver_str or "").strip()
+    io_lk = globals().get("_config_io_lock") or _rollback_cfg_fallback_lock
+    with io_lk:
+        mem_cfg = globals().get("config")
+        if isinstance(mem_cfg, dict):
+            mem_cfg["skipped_update_version"] = clean_v
+        if not os.path.isfile(CONFIG_PATH):
+            return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as cf:
+                disk_cfg = json.load(cf)
+            if not isinstance(disk_cfg, dict):
+                return
+            if (
+                str(disk_cfg.get("skipped_update_version", "") or "").strip()
+                == clean_v
+            ):
+                return
+            disk_cfg["skipped_update_version"] = clean_v
+            tmp_cfg_p = f"{CONFIG_PATH}.{os.getpid()}.rb.tmp"
+            with open(tmp_cfg_p, "w", encoding="utf-8") as wf:
+                json.dump(disk_cfg, wf, indent=4)
+                wf.flush()
+                os.fsync(wf.fileno())
+            os.replace(tmp_cfg_p, CONFIG_PATH)
+        except Exception:
+            pass
+
+
+def _mark_boot_pending_bat_prompt_suppressed():
+    """Marks .enforcer_boot_pending.json with suppress_bat_prompt=True (when the
+    user declines the crash prompt or declines the liability waiver) WITHOUT
+    deleting the marker, so an unconfirmed build can still never overwrite a
+    known-good enforcer.py.prev backup on a subsequent update."""
+    bp_path = _get_boot_pending_path()
+    if not os.path.isfile(bp_path):
+        return
+    try:
+        with open(bp_path, "r", encoding="utf-8") as rf:
+            bp_d = json.load(rf)
+        if not isinstance(bp_d, dict):
+            return
+        bp_d["suppress_bat_prompt"] = True
+        tmp_bp = f"{bp_path}.{os.getpid()}.sup.tmp"
+        with open(tmp_bp, "w", encoding="utf-8") as wf:
+            json.dump(bp_d, wf, indent=2)
+            wf.flush()
+            os.fsync(wf.fileno())
+        os.replace(tmp_bp, bp_path)
+    except Exception:
+        pass
+
+
+def _restore_prev_files_to_disk():
+    """Atomically copies verified enforcer.py.prev -> enforcer.py (and
+    CHANGELOG.md.prev -> CHANGELOG.md if present) while keeping .prev intact on
+    disk, and clears .enforcer_boot_pending.json. Returns (ok, prev_ver)."""
+    prev_py = _get_prev_enforcer_path()
+    if not os.path.isfile(prev_py):
+        return False, ""
+    try:
+        with open(prev_py, "rb") as pf_in:
+            prev_bytes = pf_in.read()
+        ok_src, prev_ver, _err = _validate_enforcer_source_bytes(prev_bytes)
+        if not ok_src:
+            return False, ""
+        target_py = os.path.join(SCRIPT_DIR, "enforcer.py")
+        tmp_py = f"{target_py}.{os.getpid()}.rb.tmp"
+        with open(tmp_py, "wb") as out_f:
+            out_f.write(prev_bytes)
+            out_f.flush()
+            os.fsync(out_f.fileno())
+        os.replace(tmp_py, target_py)
+
+        prev_cl = _get_prev_changelog_path()
+        if os.path.isfile(prev_cl):
+            try:
+                with open(prev_cl, "rb") as clf_in:
+                    cl_b = clf_in.read()
+                if cl_b:
+                    target_cl = os.path.join(SCRIPT_DIR, "CHANGELOG.md")
+                    tmp_cl = f"{target_cl}.{os.getpid()}.rb.tmp"
+                    with open(tmp_cl, "wb") as clf_out:
+                        clf_out.write(cl_b)
+                    os.replace(tmp_cl, target_cl)
+            except Exception:
+                pass
+
+        bp_path = _get_boot_pending_path()
+        if os.path.exists(bp_path):
+            try:
+                os.remove(bp_path)
+            except Exception:
+                pass
+        return True, prev_ver
+    except Exception:
+        return False, ""
+
+
+def _clear_boot_pending_marker():
+    """Clears .enforcer_boot_pending.json once Pre-Flight has successfully opened
+    (confirming the newly installed update booted cleanly)."""
+    bp_path = _get_boot_pending_path()
+    if not os.path.exists(bp_path):
+        return False
+    try:
+        os.remove(bp_path)
+        log_event(
+            "SESSION",
+            f"Confirmed clean startup on updated build v{APP_VERSION}.",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _offer_crash_boot_rollback(err_summary, allow_in_test=False):
+    """Win32 crash-safe fallback: if a newly installed update (.enforcer_boot_pending.json
+    still present) throws a fatal startup exception before Pre-Flight opens, pops a
+    native Win32 MessageBoxW offering 1-click restore to enforcer.py.prev without
+    needing Tkinter."""
+    global _crash_rollback_prompted
+    if _crash_rollback_prompted:
+        return False
+    if not allow_in_test and not (
+        globals().get("_IS_MAIN_PROCESS", False) or __name__ == "__main__"
+    ):
+        return False
+    bp_path = _get_boot_pending_path()
+    if not os.path.exists(bp_path):
+        return False
+    rb_info = get_rollback_backup_info()
+    if not rb_info.get("available"):
+        return False
+    _crash_rollback_prompted = True
+    prev_ver = rb_info["prev_version"]
+    short_err = str(err_summary or "Unknown startup error").strip()
+    if len(short_err) > 260:
+        short_err = short_err[:257] + "..."
+    prompt_txt = (
+        f"PnL Enforcer v{APP_VERSION} hit a startup error before opening Pre-Flight:\n\n"
+        f"{short_err}\n\n"
+        f"Restore your previous working version (v{prev_ver}) and relaunch now?\n\n"
+        "(Your saved settings, broker tokens, and session baseline stay untouched.)"
+    )
+    try:
+        t_ans = os.environ.get("ENFORCER_TEST_RECOVERY_ANS", "").strip()
+        if t_ans:
+            ans = int(t_ans)
+        else:
+            # MB_YESNO (0x04) | MB_ICONWARNING (0x30) | MB_TOPMOST (0x40000)
+            ans = ctypes.windll.user32.MessageBoxW(
+                0,
+                prompt_txt,
+                "PnL Enforcer — Startup Recovery",
+                0x00040034,
+            )
+    except Exception:
+        return False
+
+    if ans == 6:  # IDYES
+        ok_rb, restored_v = _restore_prev_files_to_disk()
+        if ok_rb:
+            _record_skipped_update_version_on_disk(APP_VERSION)
+            log_event(
+                "SESSION",
+                f"Crash-recovery rollback restored v{restored_v} after failed v{APP_VERSION} boot.",
+            )
+            if allow_in_test:
+                return True
+            rel_fn = globals().get("_release_single_instance_mutex")
+            if callable(rel_fn):
+                rel_fn()
+            spawn_fn = globals().get("_spawn_updated_enforcer")
+            target_py = os.path.join(SCRIPT_DIR, "enforcer.py")
+            if callable(spawn_fn):
+                spawn_fn(target_py)
+            try:
+                subprocess.Popen([sys.executable, target_py])
+            except Exception:
+                pass
+            sys.exit(0)
+    elif ans == 7:  # IDNO — keep boot_pending marker so .prev stays protected, suppress bat repeat prompt
+        _mark_boot_pending_bat_prompt_suppressed()
+    return False
+
+
 def _install_global_error_hooks():
     """Routes all uncaught main-thread, background-thread, Tkinter callback,
     Tcl background errors, and stderr messages into enforcer_log.txt."""
@@ -3640,6 +4013,7 @@ def _install_global_error_hooks():
             if ln.strip()
         )
         log_event("UNCAUGHT", tb_str)
+        _offer_crash_boot_rollback(f"{exc_type.__name__}: {exc_value}")
 
     def _handle_thread_uncaught(args):
         if issubclass(args.exc_type, (KeyboardInterrupt, SystemExit)):
@@ -18290,6 +18664,7 @@ def show_preflight_window(
         "streak_after_id": None,
         "pulse_after_id": None,
         "pulse_stop_fn": None,
+        "card3_pulse_keys": (),
         "closing": False,
     }
 
@@ -19129,14 +19504,18 @@ def show_preflight_window(
                     or act_key == "recheck_trade_perm"
                     or act_key == "open_demo_pad"
                 )
+                pulse_keys = pf_timer_state.get("card3_pulse_keys") or ()
+                is_pulsed = bool(act_key and act_key in pulse_keys)
+                eff_fg = "#e0f2fe" if is_pulsed else seg_col
+                eff_bg = "#13283d" if is_pulsed else "#131922"
                 lbl = tk.Label(
                     row_parent,
                     text=seg_txt,
                     font=("Arial", 9, "bold"),
-                    fg=seg_col,
-                    bg="#131922",
+                    fg=eff_fg,
+                    bg=eff_bg,
                     bd=0,
-                    padx=0,
+                    padx=2 if is_pulsed else 0,
                     pady=0,
                     anchor="w",
                     cursor="hand2" if is_clickable else "arrow",
@@ -19151,7 +19530,7 @@ def show_preflight_window(
                     )
                     lbl.bind(
                         "<Leave>",
-                        lambda _e, w=lbl, c=seg_col: w.config(
+                        lambda _e, w=lbl, c=eff_fg: w.config(
                             fg=c, font=("Arial", 9, "bold")
                         ),
                     )
@@ -19260,7 +19639,11 @@ def show_preflight_window(
                     "Switch to the built-in Demo Simulator in the top BROKER ▾ menu to test all guardrails and lockouts safely.",
                 )
             ]
-            combined_key = (row1_spans, row2_spans)
+            combined_key = (
+                row1_spans,
+                row2_spans,
+                tuple(pf_timer_state.get("card3_pulse_keys") or ()),
+            )
             if force or combined_key != _card3_base_cache["last_spans"]:
                 _card3_base_cache["last_spans"] = combined_key
                 _render_baseline_telemetry_spans(row1_spans, row2_spans)
@@ -19401,7 +19784,11 @@ def show_preflight_window(
         if is_committed_for_today():
             row2_spans.append((" | ", "#475569"))
             row2_spans.append(("🔒 COMMITTED", "#38bdf8"))
-        combined_key = (row1_spans, row2_spans)
+        combined_key = (
+            row1_spans,
+            row2_spans,
+            tuple(pf_timer_state.get("card3_pulse_keys") or ()),
+        )
         if force or combined_key != _card3_base_cache["last_spans"]:
             _card3_base_cache["last_spans"] = combined_key
             _render_baseline_telemetry_spans(row1_spans, row2_spans)
@@ -22679,6 +23066,43 @@ def show_preflight_window(
             label=f"📁 Open Raw Archived Logs ({LOG_RETENTION_DAYS}-Day Full)",
             command=open_log_archive_folder,
         )
+        logs_dropdown.add_separator()
+        rb_menu_info = get_rollback_backup_info()
+        if rb_menu_info.get("available"):
+            logs_dropdown.add_command(
+                label=f"↺ Restore Previous Version (v{rb_menu_info['prev_version']})...",
+                command=lambda: prompt_version_rollback_dialog(
+                    parent_win=pf,
+                    from_live_hud=(parent is not None),
+                    cancel_pf_fn=_cancel_pf_timers,
+                ),
+                fg="#fbbf24",
+                activeforeground="#fef3c7",
+                bg="#1f1a10",
+                activebg="#2d2414",
+                font=("Arial", 9, "bold"),
+            )
+        else:
+            logs_dropdown.add_command(
+                label="↺ Version Rollback: Armed (Backs up on next update)",
+                command=lambda: prompt_version_rollback_dialog(
+                    parent_win=pf,
+                    from_live_hud=(parent is not None),
+                    cancel_pf_fn=_cancel_pf_timers,
+                ),
+                fg="#94a3b8",
+                activeforeground="#e2e8f0",
+            )
+        logs_dropdown.add_command(
+            label="🔄 Check for Updates Now...",
+            command=lambda: check_for_updates_manual(
+                parent_pf=pf,
+                from_live_hud=(parent is not None),
+                cancel_pf_fn=_cancel_pf_timers,
+            ),
+        )
+
+    logs_dropdown._before_popup = rebuild_logs_dropdown
 
     btn_logs_menu = None
 
@@ -22772,7 +23196,8 @@ def show_preflight_window(
         f"• View Today's Log: Opens your local audit log in Notepad ({_mask_user_path(LOG_PATH)})\n"
         "• Export Today's Safe Log: Creates a privacy-scrubbed copy with total account balances redacted ($[REDACTED]) and copies it to clipboard\n"
         f"• Open Safe Archived Logs: Opens your {LOG_RETENTION_DAYS}-day redacted log archive ({_mask_user_path(SANITIZED_ARCHIVE_DIR)})\n"
-        f"• Open Raw Archived Logs: Opens your {LOG_RETENTION_DAYS}-day full local log archive ({_mask_user_path(LOG_ARCHIVE_DIR)})"
+        f"• Open Raw Archived Logs: Opens your {LOG_RETENTION_DAYS}-day full local log archive ({_mask_user_path(LOG_ARCHIVE_DIR)})\n"
+        "• Restore Previous Version / Check for Updates: 1-click rollback to your saved enforcer.py.prev backup or manual update check"
     )
 
     btn_report_bug = make_stadium_button(
@@ -30478,78 +30903,90 @@ def show_preflight_window(
         bg="#0d1117",
     ).pack(side="left", padx=(0, 6))
 
-    def pulse_relocated_controls():
-        """Pulses the border and surface glow of the relocated Pre-Flight controls
-        (BROKER/ACCOUNT capsule, Privacy Mode, Card 1 Filter, Card 3 Token &
-        Preferences & Audio, and Alarms Only) with a warm, cohesive sky-blue
-        spotlight for ~3.2 seconds. Stops automatically on any click."""
+    def pulse_relocated_controls(mode="all"):
+        """Pulses the border and surface glow of key or newly added Pre-Flight
+        controls using build_tour_pulse_schedule() (~9.3s calm sky-blue cadence,
+        starting immediately ON for 1.0s). Stops automatically on any click."""
         _stop_control_pulse()
         if not pf.winfo_exists() or pf_timer_state.get("closing"):
             return
 
-        # 4 calm, single-hue sky-blue glow cycles (8 steps @ 400ms = ~3.2s total)
         spotlight_theme = {
             "border": "#38bdf8",
             "fill": "#13283d",
             "fill_top": "#1a3652",
             "fg": "#e0f2fe",
         }
-        pulse_themes = []
-        for _ in range(4):
-            pulse_themes.append(spotlight_theme)
-            pulse_themes.append(None)
+        pulse_sched = build_tour_pulse_schedule()
+        is_new_only = str(mode or "all").lower() == "new"
 
-        target_btns = [
-            btn_privacy_mode,
-            btn_tilt_filter,
-            btn_prefs_card3,
-            btn_alarms_only,
-        ]
+        if is_new_only:
+            target_btns = [
+                btn_logs_menu,
+                btn_report_bug,
+                btn_commit_today_pill,
+                btn_done_today_pill,
+            ]
+            c3_keys = ("recheck_trade_perm", "open_demo_pad")
+        else:
+            target_btns = [
+                btn_logs_menu,
+                btn_report_bug,
+                btn_privacy_mode,
+                btn_tilt_filter,
+                btn_commit_today_pill,
+                btn_done_today_pill,
+                btn_prefs_card3,
+                btn_alarms_only,
+            ]
+            c3_keys = ("edit_api_keys", "recheck_trade_perm", "open_demo_pad")
 
-        def _iter_base_sub_labels():
-            if base_sub_lbl is None or not base_sub_lbl.winfo_exists():
-                return
-            for ch_w in base_sub_lbl.winfo_children():
-                if isinstance(ch_w, tk.Label):
-                    yield ch_w
-                elif isinstance(ch_w, tk.Frame):
-                    for sub_w in ch_w.winfo_children():
-                        if isinstance(sub_w, tk.Label):
-                            yield sub_w
+        static_btn_snapshots = {}
+        for sb_w in (btn_report_bug, btn_prefs_card3):
+            if sb_w is not None and sb_w.winfo_exists():
+                static_btn_snapshots[sb_w] = {
+                    "fill_color": getattr(sb_w, "_fill", "#141820"),
+                    "fill_top_color": getattr(sb_w, "_fill_top", "#1c212b"),
+                    "border_color": getattr(sb_w, "_border", "#2e3746"),
+                    "fg": getattr(sb_w, "_fg", "#cbd5e1"),
+                }
 
-        orig_tok_styles = {}
-        try:
-            for ch_w in _iter_base_sub_labels():
-                if "Token:" in str(ch_w.cget("text")):
-                    orig_tok_styles[str(ch_w)] = (ch_w.cget("fg"), ch_w.cget("bg"))
-        except Exception:
-            pass
+        prev_status_txt = None
+        prev_status_fg = None
+        if default_status_lbl is not None and default_status_lbl.winfo_exists():
+            prev_status_txt = str(default_status_lbl.cget("text"))
+            prev_status_fg = str(default_status_lbl.cget("fg"))
 
-        def _restore_normal_control_styles():
+        tamper_lk_start = is_in_trade_tamper_locked()
+        hint_txt = (
+            "✦ Spotlighting available controls (locked stops paused while In Trade / Committed) — click anywhere to finish"
+            if tamper_lk_start
+            else (
+                "✦ Spotlighting new controls — click anywhere to finish early"
+                if is_new_only
+                else "✦ Spotlighting controls — click anywhere to finish early"
+            )
+        )
+        if default_status_lbl is not None and default_status_lbl.winfo_exists():
+            default_status_lbl.config(text=hint_txt, fg="#7dd3fc")
+
+        def _apply_off_step():
             _capsule_state["pulse_border"] = None
             _capsule_state["pulse_fill"] = None
             _capsule_state["pulse_fill_top"] = None
-            for b_w in target_btns:
-                if b_w is not None and b_w.winfo_exists():
-                    b_w._hovered = False
+            pf_timer_state["card3_pulse_keys"] = ()
             _redraw_broker_acct_capsule()
-            _refresh_privacy_mode_ui()
-            _refresh_tilt_filter_btn_style()
-            if btn_prefs_card3 is not None and btn_prefs_card3.winfo_exists():
-                btn_prefs_card3.config(
-                    fill_color="#141820",
-                    fill_top_color="#1c212b",
-                    border_color="#2e3746",
-                    fg="#cbd5e1",
-                )
-            _refresh_alarms_only_btn_style()
-            try:
-                for ch_w in _iter_base_sub_labels():
-                    if "Token:" in str(ch_w.cget("text")):
-                        orig_fg, orig_bg = orig_tok_styles.get(str(ch_w), ("#4ade80", "#131922"))
-                        ch_w.config(fg=orig_fg, bg=orig_bg)
-            except Exception:
-                pass
+            for sb_w, snap_kw in static_btn_snapshots.items():
+                if sb_w in target_btns and sb_w.winfo_exists():
+                    sb_w.config(**snap_kw)
+            if not is_new_only:
+                _refresh_privacy_mode_ui()
+                _refresh_tilt_filter_btn_style()
+                _refresh_alarms_only_btn_style()
+            _refresh_logs_menu_btn_style()
+            _refresh_commit_today_pill()
+            _refresh_done_today_pill()
+            _render_card3_telemetry_live(force=True)
 
         def _stop_pulse():
             aid = pf_timer_state.get("pulse_after_id")
@@ -30560,8 +30997,21 @@ def show_preflight_window(
                 except Exception:
                     pass
             pf_timer_state["pulse_stop_fn"] = None
+            pf_timer_state["card3_pulse_keys"] = ()
             if pf.winfo_exists() and not pf_timer_state.get("closing"):
-                _restore_normal_control_styles()
+                for b_w in target_btns:
+                    if b_w is not None and b_w.winfo_exists():
+                        b_w._hovered = False
+                _apply_off_step()
+                if (
+                    default_status_lbl is not None
+                    and default_status_lbl.winfo_exists()
+                    and prev_status_txt is not None
+                    and str(default_status_lbl.cget("text")) == hint_txt
+                ):
+                    default_status_lbl.config(
+                        text=prev_status_txt, fg=prev_status_fg
+                    )
 
         pf_timer_state["pulse_stop_fn"] = _stop_pulse
 
@@ -30570,18 +31020,20 @@ def show_preflight_window(
             try:
                 if not pf.winfo_exists() or pf_timer_state.get("closing"):
                     pf_timer_state["pulse_stop_fn"] = None
+                    pf_timer_state["card3_pulse_keys"] = ()
                     return
-                if idx >= len(pulse_themes) or is_in_trade_tamper_locked():
+                if idx >= len(pulse_sched):
                     _stop_pulse()
                     return
-                theme = pulse_themes[idx]
-                if theme is None:
-                    _restore_normal_control_styles()
+                is_on, dur_ms = pulse_sched[idx]
+                if not is_on:
+                    _apply_off_step()
                 else:
-                    _capsule_state["pulse_border"] = theme["border"]
-                    _capsule_state["pulse_fill"] = theme["fill"]
-                    _capsule_state["pulse_fill_top"] = theme["fill_top"]
-                    _redraw_broker_acct_capsule()
+                    if not is_in_trade_tamper_locked():
+                        _capsule_state["pulse_border"] = spotlight_theme["border"]
+                        _capsule_state["pulse_fill"] = spotlight_theme["fill"]
+                        _capsule_state["pulse_fill_top"] = spotlight_theme["fill_top"]
+                        _redraw_broker_acct_capsule()
                     for b_w in target_btns:
                         if (
                             b_w is not None
@@ -30589,19 +31041,15 @@ def show_preflight_window(
                             and getattr(b_w, "_state", "normal") == "normal"
                         ):
                             b_w.config(
-                                fill_color=theme["fill"],
-                                fill_top_color=theme["fill_top"],
-                                border_color=theme["border"],
-                                fg=theme["fg"],
+                                fill_color=spotlight_theme["fill"],
+                                fill_top_color=spotlight_theme["fill_top"],
+                                border_color=spotlight_theme["border"],
+                                fg=spotlight_theme["fg"],
                             )
-                    for ch_w in _iter_base_sub_labels():
-                        if "Token:" in str(ch_w.cget("text")):
-                            ch_w.config(
-                                fg=theme["fg"],
-                                bg=theme["fill"],
-                            )
+                    pf_timer_state["card3_pulse_keys"] = c3_keys
+                    _render_card3_telemetry_live(force=True)
                 pf_timer_state["pulse_after_id"] = pf.after(
-                    400, lambda: _step_pulse(idx + 1)
+                    int(dur_ms), lambda: _step_pulse(idx + 1)
                 )
             except Exception:
                 _stop_pulse()
@@ -30609,29 +31057,26 @@ def show_preflight_window(
         _step_pulse(0)
 
     def show_layout_tour_dialog(initial_mode=None):
-        """Displays a cohesive 3-tab Quick Start & Layout Guide covering how PnL Enforcer's
-        rules work, where every control lives, and first-run/live-HUD tips, with an
-        explicit optional control spotlight pulse."""
+        """Displays a cohesive 4-tab Quick Start & What's New Guide covering recent
+        upgrades (default for existing users), how PnL Enforcer's rules work, where
+        every control lives, and first-run/HUD tips, with a ~9.3s spotlight pulse."""
         hide_all_tooltips()
         _stop_control_pulse()
         if not pf.winfo_exists():
             return
-        if initial_mode in ("overview", "controls", "checklist"):
+        is_existing_user = bool(
+            _is_existing_user_install
+            or config.get("account_sessions")
+            or config.get("user_defaults")
+        )
+        if initial_mode in TOUR_TABS:
             start_tab = initial_mode
-        elif initial_mode == "existing":
-            start_tab = "controls"
-        elif (
-            initial_mode is None
-            and (
-                _is_existing_user_install
-                or bool(config.get("account_sessions"))
-                or bool(config.get("user_defaults"))
-            )
-        ):
-            start_tab = "controls"
+        elif initial_mode is None and is_existing_user:
+            start_tab = "whats_new"
         else:
             start_tab = "overview"
         tour_state = {"tab": start_tab}
+        open_rel_notes = {"req": False}
 
         dlg = tk.Toplevel(pf)
         dlg.withdraw()
@@ -30641,7 +31086,7 @@ def show_preflight_window(
             except Exception:
                 pass
         apply_dark_title_bar(dlg)
-        dlg.title(f"PnL Enforcer v{APP_VERSION} — Quick Start & Layout Guide")
+        dlg.title(f"PnL Enforcer v{APP_VERSION} — Quick Tour & What's New")
         dlg.configure(bg="#0d1117", padx=24, pady=20)
         dlg.resizable(False, False)
         dlg.attributes("-topmost", True)
@@ -30657,9 +31102,15 @@ def show_preflight_window(
             _restore_pf_modal_focus(dlg)
 
         def on_got_it_pulse():
+            pulse_mode = "new" if tour_state.get("tab") == "whats_new" else "all"
             _mark_tour_seen()
             _restore_pf_modal_focus(dlg)
-            pf.after(80, pulse_relocated_controls)
+            pf.after(80, lambda m=pulse_mode: pulse_relocated_controls(mode=m))
+
+        def on_open_release_notes(_event=None):
+            open_rel_notes["req"] = True
+            _mark_tour_seen()
+            _restore_pf_modal_focus(dlg)
 
         dlg.protocol("WM_DELETE_WINDOW", on_close_plain)
         dlg.bind("<Escape>", lambda _e: on_close_plain())
@@ -30703,14 +31154,15 @@ def show_preflight_window(
         tab_btns = {}
 
         def _select_tab(tab_key):
-            if tab_key in ("overview", "controls", "checklist"):
+            if tab_key in TOUR_TABS:
                 tour_state["tab"] = tab_key
                 _render_tour_tab()
 
         for t_key, t_label, t_w in (
-            ("overview", "1. How Enforcer Works", 192),
-            ("controls", "2. Where Controls Live", 196),
-            ("checklist", "3. First-Run & HUD Tips", 200),
+            ("whats_new", "✦ What's New", 142),
+            ("overview", "1. How Enforcer Works", 184),
+            ("controls", "2. Where Controls Live", 188),
+            ("checklist", "3. First-Run & HUD Tips", 192),
         ):
             tb = make_stadium_button(
                 tab_bar,
@@ -30794,14 +31246,28 @@ def show_preflight_window(
 
         tour_geom = {"txt_w": 84, "txt_h": 15, "locked": False}
 
+        foot_left = tk.Frame(btn_row, bg="#0d1117")
+        foot_left.pack(side="left")
         tk.Label(
-            btn_row,
-            text="Tip: Re-open anytime via '✦ Quick Tour' in the footer.",
+            foot_left,
+            text="Tip: Re-open anytime via '✦ Quick Tour' in the footer  ·  ",
             font=("Arial", 8, "bold"),
             fg="#64748b",
             bg="#0d1117",
             anchor="w",
         ).pack(side="left")
+        tour_rel_lbl = tk.Label(
+            foot_left,
+            text="View Release Notes ↗",
+            font=("Arial", 8, "bold underline"),
+            fg="#5dade2",
+            bg="#0d1117",
+            cursor="hand2",
+        )
+        tour_rel_lbl.pack(side="left")
+        tour_rel_lbl.bind("<Enter>", lambda _e: tour_rel_lbl.config(fg="#7dd3fc"))
+        tour_rel_lbl.bind("<Leave>", lambda _e: tour_rel_lbl.config(fg="#5dade2"))
+        tour_rel_lbl.bind("<Button-1>", on_open_release_notes)
 
         make_stadium_button(
             btn_row,
@@ -30821,9 +31287,9 @@ def show_preflight_window(
             command=on_close_plain,
         ).pack(side="right")
 
-        make_stadium_button(
+        btn_tour_spotlight = make_stadium_button(
             btn_row,
-            text="✦ Highlight Controls",
+            text="✦ Spotlight New Controls",
             font=("Arial", 9, "bold"),
             fill_color="#13283d",
             fill_top_color="#1a3652",
@@ -30833,17 +31299,16 @@ def show_preflight_window(
             hover_border="#7dd3fc",
             fg="#e0f2fe",
             canvas_bg="#0d1117",
-            width=180,
+            width=198,
             height=34,
             auto_width=False,
             command=on_got_it_pulse,
-        ).pack(side="right", padx=(0, 8))
+        )
+        btn_tour_spotlight.pack(side="right", padx=(0, 8))
 
         def _render_tour_tab(tab_override=None):
             active_tab = (
-                tab_override
-                if tab_override in ("overview", "controls", "checklist")
-                else tour_state["tab"]
+                tab_override if tab_override in TOUR_TABS else tour_state["tab"]
             )
             for t_k, tb in tab_btns.items():
                 if t_k == active_tab:
@@ -30867,11 +31332,75 @@ def show_preflight_window(
                         fg="#94a3b8",
                     )
 
+            btn_tour_spotlight.config(
+                text=(
+                    "✦ Spotlight New Controls"
+                    if active_tab == "whats_new"
+                    else "✦ Highlight Controls"
+                )
+            )
+
             txt_box.config(state="normal")
             txt_box.delete("1.0", "end")
             neon_bar.set_neon("#38bdf8", glow_on=True)
 
-            if active_tab == "overview":
+            if active_tab == "whats_new":
+                hdr_title_lbl.config(
+                    text="▶  WHAT'S NEW — RECENT UPGRADES & WHERE TO FIND THEM",
+                    fg="#7dd3fc",
+                )
+                hdr_badge_lbl.config(
+                    text=f"THROUGH v{LAYOUT_TOUR_VERSION}",
+                    fg="#93c5fd",
+                    bg="#162231",
+                )
+                sub_lbl.config(
+                    text="Key additions for existing traders — click '✦ Spotlight New Controls' below to light them up (~9s):"
+                )
+
+                txt_box.insert(
+                    "end",
+                    "1. NEW IN PRE-FLIGHT — SESSION LOCKS, DEMO SANDBOX & TRADE API CHECK\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • ", ("body",)),
+                    (" 🔒 Done Today ", ("body", "pill")),
+                    (" in Card 3 flattens tracked daytrades now and blocks new ones until Midnight ET.\n", ("body",)),
+                    ("    • ", ("body",)),
+                    (" 🔒 Commit Today ", ("body", "pill")),
+                    (" in Card 3 freezes your risk rules and broker switching until Midnight ET.\n", ("body",)),
+                    ("    • Pick ", ("body",)),
+                    (" 🧪 DEMO (SIMULATOR) ", ("body", "pill")),
+                    (" under ", ("body",)),
+                    (" BROKER: ", ("body", "pill")),
+                    (" to rehearse breaches and lockouts on paper.\n", ("body",)),
+                    ("    • Click ", ("body",)),
+                    (" Trade API: ", ("body", "pill")),
+                    (" in Card 3 to confirm your broker accepts exit orders.\n", ("body",)),
+                    ("    • ", ("body",)),
+                    (" 🐞 Report Bug ", ("body", "pill")),
+                    (" sends feedback with a Safe Log; ", ("body",)),
+                    (" 📜 Logs ▾ ", ("body", "pill")),
+                    (" adds 1-Click Update Rollback.\n", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+                txt_box.insert("end", "─" * 76 + "\n", "div_line")
+
+                txt_box.insert(
+                    "end",
+                    "2. NEW ON THE LIVE HUD — EMERGENCY EXIT & CALMER SIGNALS\n",
+                    "hdr_sec",
+                )
+                for s_txt, s_tags in [
+                    ("    • Hold the 🚨 FLATTEN button on the HUD for 2 seconds to exit tracked positions, even in Alarms Only mode.\n", ("body",)),
+                    ("    • Trading halts show a calm notice; breach exits queue and OS Lock waits until you are confirmed flat.\n", ("body",)),
+                    ("    • $ TO STOP and FROM HIGH colors now scale proportionally with your stop size so smaller presets stay calm.", ("body",)),
+                ]:
+                    txt_box.insert("end", s_txt, s_tags)
+
+            elif active_tab == "overview":
                 hdr_title_lbl.config(
                     text="▶  HOW PNL ENFORCER WORKS — RISK SYSTEM OVERVIEW",
                     fg="#7dd3fc",
@@ -30923,11 +31452,15 @@ def show_preflight_window(
 
                 txt_box.insert(
                     "end",
-                    "3. CARD 3 — TODAY'S BASELINE, RE-ZERO & SWING FILTER\n",
+                    "3. CARD 3 — TODAY'S BASELINE, DISCIPLINE LOCKS & SWING FILTER\n",
                     "hdr_sec",
                 )
                 for s_txt, s_tags in [
-                    ("    • Card 3 anchors your flat cash equity as $0.00 Net PnL so live gains and losses stay clear.\n", ("body",)),
+                    ("    • Card 3 anchors your flat cash equity as $0.00 Net PnL and lets you arm ", ("body",)),
+                    (" 🔒 Commit Today ", ("body", "pill")),
+                    (" or ", ("body",)),
+                    (" 🔒 Done Today ", ("body", "pill")),
+                    (".\n", ("body",)),
                     ("    • Use ", ("body",)),
                     (" ↺ Re-Zero Baseline ", ("body", "pill")),
                     (" only for mid-day resets, or ", ("body",)),
@@ -30947,25 +31480,25 @@ def show_preflight_window(
                     bg="#162231",
                 )
                 sub_lbl.config(
-                    text="Every setting has a dedicated home. Click '✦ Highlight Controls' below to spotlight them:"
+                    text="Every setting has a dedicated home. Click '✦ Highlight Controls' below to spotlight them (~9s):"
                 )
 
                 txt_box.insert(
                     "end",
-                    "1. TOP BAR — BROKER, ACCOUNTS, COLUMNS, LOGS & PRIVACY\n",
+                    "1. TOP BAR — BROKER / DEMO SIM, ACCOUNTS, COLUMNS, LOGS & PRIVACY\n",
                     "hdr_sec",
                 )
                 for s_txt, s_tags in [
                     ("    • ", ("body",)),
                     (" BROKER: SCHWAB ▾ ", ("body", "pill")),
-                    (" manages API Keys; ", ("body",)),
+                    (" switches brokers or launches Demo Simulator; ", ("body",)),
                     (" ACCOUNT ▾ ", ("body", "pill")),
-                    (" switches between funded accounts.\n", ("body",)),
+                    (" selects accounts.\n", ("body",)),
                     ("    • Customize your bar via ", ("body",)),
                     (" HUD Columns ", ("body", "pill")),
                     (", mask balances with ", ("body",)),
                     (" 👁 Privacy: OFF ", ("body", "pill")),
-                    (", or inspect Logs.\n", ("body",)),
+                    (", or send Safe Logs.\n", ("body",)),
                 ]:
                     txt_box.insert("end", s_txt, s_tags)
 
@@ -30973,16 +31506,18 @@ def show_preflight_window(
 
                 txt_box.insert(
                     "end",
-                    "2. CARD 3 — TOKEN RENEWAL, PREFERENCES & SILENT MODE\n",
+                    "2. CARD 3 — TOKEN / TRADE API CHECK, SESSION LOCKS & PREFERENCES\n",
                     "hdr_sec",
                 )
                 for s_txt, s_tags in [
                     ("    • Click ", ("body",)),
                     (" Token: X.Xd ↻ ", ("body", "pill")),
-                    (" directly inside Card 3 to refresh expiring Schwab auth tokens.\n", ("body",)),
+                    (" to renew Schwab auth or ", ("body",)),
+                    (" Trade API: ", ("body", "pill")),
+                    (" to verify live order permissions.\n", ("body",)),
                     ("    • ", ("body",)),
                     (" ⚙ Preferences & Audio... ", ("body", "pill")),
-                    (" holds Silent Mode, Voice/Sirens, 10s Dry-Run, Poll Rate, & Ratchet Reset.\n", ("body",)),
+                    (" holds Silent Mode, Voice/Sirens, Dry-Run Previews, Poll Rate, & Ratchet Reset.\n", ("body",)),
                 ]:
                     txt_box.insert("end", s_txt, s_tags)
 
@@ -30990,7 +31525,7 @@ def show_preflight_window(
 
                 txt_box.insert(
                     "end",
-                    "3. CARD 1 & BOTTOM BAR — STREAK FILTER, PRESETS & DRY-RUNS\n",
+                    "3. CARD 1 & BOTTOM BAR — STREAK FILTER, PRESETS & ALARMS ONLY\n",
                     "hdr_sec",
                 )
                 for s_txt, s_tags in [
@@ -31005,7 +31540,7 @@ def show_preflight_window(
                 ]:
                     txt_box.insert("end", s_txt, s_tags)
 
-            else:
+            elif active_tab == "checklist":
                 hdr_title_lbl.config(
                     text="▶  FIRST-RUN CHECKLIST & LIVE HUD TIPS",
                     fg="#7dd3fc",
@@ -31038,16 +31573,18 @@ def show_preflight_window(
 
                 txt_box.insert(
                     "end",
-                    "2. TEST AUDIO OR ARM SILENT / ALARMS-ONLY MODE\n",
+                    "2. TEST IN DEMO SANDBOX OR ARM SILENT / ALARMS-ONLY MODE\n",
                     "hdr_sec",
                 )
                 for s_txt, s_tags in [
                     ("    • Open ", ("body",)),
                     (" ⚙ Preferences & Audio... ", ("body", "pill")),
-                    (" to test Voice/Sirens — or check Silent Mode for quiet calls.\n", ("body",)),
-                    ("    • New to Enforcer? Practice with ", ("body",)),
+                    (" to test Voice/Sirens — or switch ", ("body",)),
+                    (" BROKER: ", ("body", "pill")),
+                    (" to Demo Simulator first.\n", ("body",)),
+                    ("    • New to live trading? Practice with ", ("body",)),
                     (" 🔔 Alarms Only: ON ", ("body", "pill")),
-                    (" first (visual/audio warnings active, zero orders placed).\n", ("body",)),
+                    (" first (warnings active, zero orders placed).\n", ("body",)),
                 ]:
                     txt_box.insert("end", s_txt, s_tags)
 
@@ -31055,11 +31592,11 @@ def show_preflight_window(
 
                 txt_box.insert(
                     "end",
-                    "3. LIVE HUD SHORTCUTS & IN-TRADE TAMPER LOCK\n",
+                    "3. LIVE HUD SHORTCUTS, 2s PANIC FLATTEN & TAMPER LOCK\n",
                     "hdr_sec",
                 )
                 for s_txt, s_tags in [
-                    ("    • Click the HUD Account/Badge pill to cycle metrics; right-click the HUD to open Settings or Mute Siren.\n", ("body",)),
+                    ("    • Hold the HUD's 🚨 FLATTEN button for 2.0s to exit positions anytime; click the left badge to cycle metrics.\n", ("body",)),
                     ("    • Risk stops lock automatically while a position is open (anti-tamper guard) — wait until flat to loosen.", ("body",)),
                 ]:
                     txt_box.insert("end", s_txt, s_tags)
@@ -31076,10 +31613,10 @@ def show_preflight_window(
                 )
             txt_box.config(state="disabled")
 
-        # Measure all 3 tabs while withdrawn so switching tabs never resizes the window
+        # Measure all 4 tabs while withdrawn so switching tabs never resizes the window
         max_txt_w, max_txt_h = 84, 15
         max_dlg_w, max_dlg_h = 0, 0
-        for probe_tab in ("overview", "controls", "checklist"):
+        for probe_tab in TOUR_TABS:
             _render_tour_tab(tab_override=probe_tab)
             dlg.update_idletasks()
             max_txt_w = max(max_txt_w, int(txt_box.cget("width")))
@@ -31100,6 +31637,55 @@ def show_preflight_window(
         pf.wait_window(dlg)
         if pf.winfo_exists():
             _restore_pf_modal_focus(dlg)
+            if open_rel_notes["req"]:
+                pf.after(
+                    30,
+                    lambda: show_release_notes_dialog(
+                        parent=pf,
+                        from_live_hud=(parent is not None),
+                        cancel_pf_fn=_cancel_pf_timers,
+                    ),
+                )
+
+    _ver_rb_info = get_rollback_backup_info()
+    if _ver_rb_info.get("available"):
+        rollback_ver_lbl = tk.Label(
+            ver_frame,
+            text=f"↺ Rollback (v{_ver_rb_info['prev_version']})",
+            font=("Arial", 9, "bold underline"),
+            fg="#fbbf24",
+            bg="#0d1117",
+            cursor="hand2",
+        )
+        rollback_ver_lbl.pack(side="left")
+        rollback_ver_lbl.bind(
+            "<Enter>", lambda _e: rollback_ver_lbl.config(fg="#fde68a")
+        )
+        rollback_ver_lbl.bind(
+            "<Leave>", lambda _e: rollback_ver_lbl.config(fg="#fbbf24")
+        )
+        rollback_ver_lbl.bind(
+            "<Button-1>",
+            lambda _e: (
+                hide_all_tooltips(),
+                prompt_version_rollback_dialog(
+                    parent_win=pf,
+                    from_live_hud=(parent is not None),
+                    cancel_pf_fn=_cancel_pf_timers,
+                ),
+            ),
+        )
+        attach_tooltip(
+            rollback_ver_lbl,
+            f"Restore your saved local backup (v{_ver_rb_info['prev_version']}) in one click while keeping all settings, tokens, and session baselines intact.",
+        )
+        tk.Label(
+            ver_frame,
+            text="  ·  ",
+            font=("Arial", 9, "bold"),
+            fg="#64748b",
+            bg="#0d1117",
+        ).pack(side="left")
 
     quick_tour_lbl = tk.Label(
         ver_frame,
@@ -31117,11 +31703,11 @@ def show_preflight_window(
         "<Leave>", lambda e: quick_tour_lbl.config(fg="#38bdf8")
     )
     quick_tour_lbl.bind(
-        "<Button-1>", lambda e: (hide_all_tooltips(), show_layout_tour_dialog("overview"))
+        "<Button-1>", lambda e: (hide_all_tooltips(), show_layout_tour_dialog(None))
     )
     attach_tooltip(
         quick_tour_lbl,
-        "Open the Quick Start & Layout Guide (How Enforcer Works, Where Controls Live, & First-Run Tips)."
+        "Open the Quick Tour & What's New Guide (What's New, How Enforcer Works, Where Controls Live, & HUD Tips)."
     )
 
     tk.Label(
@@ -31149,7 +31735,14 @@ def show_preflight_window(
     )
     rel_notes_lbl.bind(
         "<Button-1>",
-        lambda e: (hide_all_tooltips(), show_release_notes_dialog(parent=pf)),
+        lambda e: (
+            hide_all_tooltips(),
+            show_release_notes_dialog(
+                parent=pf,
+                from_live_hud=(parent is not None),
+                cancel_pf_fn=_cancel_pf_timers,
+            ),
+        ),
     )
     attach_tooltip(
         rel_notes_lbl,
@@ -31656,6 +32249,7 @@ def show_preflight_window(
     _pf_initial_shown["done"] = True
 
     if parent is None:
+        _clear_boot_pending_marker()
         if _IS_MAIN_PROCESS:
             start_background_update_check(pf, cancel_pf_fn=_cancel_pf_timers)
 
@@ -35838,9 +36432,537 @@ def show_update_available_dialog(
         return False
 
 
-def show_release_notes_dialog(parent=None):
+def _check_version_switch_guardrails(
+    from_live_hud=False, action_label="Rollback", log_block=True
+):
+    """Shared anti-tamper gate for in-app version switching (Rollback or Manual
+    Update install): blocks switching while the live HUD is open, while any
+    today-dated session lock / cooldown / rolling tilt streak is active on any
+    real broker account, or while any tracked real-broker position is open."""
+    def _deny(code_s, log_s, user_s):
+        if log_block and log_s:
+            log_event("GUARDRAIL", log_s)
+        return False, code_s, user_s
+
+    if from_live_hud:
+        return _deny(
+            "HUD_OPEN",
+            "",
+            f"Close the live HUD first before running {action_label.lower()}.\n\n"
+            "Exit the HUD to standalone Pre-Flight (when flat and unlocked), then try again.",
+        )
+
+    now_ep = time.time()
+    today_str = get_today_str()
+    mem_cfg = config if isinstance(config, dict) else {}
+    ad_cur = globals().get("active_adapter")
+    in_demo_now = bool(
+        callable(globals().get("is_demo_mode_active"))
+        and globals()["is_demo_mode_active"](ad_cur)
+    )
+
+    if (
+        globals().get("dry_run_lock_active", False)
+        or (globals().get("cooldown_active", False) and not in_demo_now)
+        or float(mem_cfg.get("active_cooldown_end_epoch", 0.0) or 0.0) > now_ep
+    ):
+        return _deny(
+            "GUARDRAIL",
+            f"BLOCKED: Attempted {action_label.lower()} during an active Penalty Box / Lockout timer.",
+            f"{action_label} is blocked while a Penalty Box / OS Lockout cooldown timer is active.",
+        )
+
+    if mem_cfg.get("committed_session_date") == today_str or (
+        callable(globals().get("is_real_broker_committed_for_today"))
+        and globals()["is_real_broker_committed_for_today"]()
+    ):
+        return _deny(
+            "GUARDRAIL",
+            f"BLOCKED: Attempted {action_label.lower()} while 'Commit Rulebook for Today' is active.",
+            f"{action_label} is locked until 00:00 Midnight ET because 'Commit Rulebook for Today' is active.",
+        )
+
+    if not in_demo_now and globals().get("done_for_today", False):
+        return _deny(
+            "GUARDRAIL",
+            f"BLOCKED: Attempted {action_label.lower()} while 'Done for Today' is active.",
+            f"{action_label} is locked while 'Done for Today' is active.\n\n"
+            "Unlock 'Done Today' in Card 3 first if you need to switch versions.",
+        )
+
+    if not in_demo_now and globals().get("is_locked_down", False):
+        return _deny(
+            "GUARDRAIL",
+            f"BLOCKED: Attempted {action_label.lower()} while Daily Stop Breach Lockout is active.",
+            f"{action_label} is blocked while Daily Stop Breach Lockout is active today.",
+        )
+
+    tilt_en = bool(mem_cfg.get("enable_consec_loss_cooldown", False))
+    tilt_win_s = max(
+        0.5, float(mem_cfg.get("consec_loss_window_mins", 15.0) or 15.0)
+    ) * 60.0
+
+    for sess_k, sess_v in (mem_cfg.get("account_sessions") or {}).items():
+        if not isinstance(sess_v, dict) or str(sess_k).upper().startswith("DEMO"):
+            continue
+        if sess_v.get("committed_for_today") and (
+            sess_v.get("committed_date") == today_str
+            or sess_v.get("session_date") == today_str
+        ):
+            return _deny(
+                "GUARDRAIL",
+                f"BLOCKED: Attempted {action_label.lower()} while 'Commit Today' is active on {sess_k}.",
+                f"{action_label} is locked until 00:00 Midnight ET because 'Commit Rulebook for Today' is active.",
+            )
+        if (
+            sess_v.get("done_for_today")
+            and sess_v.get("done_for_today_date") == today_str
+        ):
+            return _deny(
+                "GUARDRAIL",
+                f"BLOCKED: Attempted {action_label.lower()} while 'Done for Today' is active on {sess_k}.",
+                f"{action_label} is locked while 'Done for Today' is active on your live account.",
+            )
+        if sess_v.get("is_locked_down") and sess_v.get("breach_date") == today_str:
+            return _deny(
+                "GUARDRAIL",
+                f"BLOCKED: Attempted {action_label.lower()} while Daily Stop Breach Lockout is active on {sess_k}.",
+                f"{action_label} is blocked while Daily Stop Breach Lockout is active today.",
+            )
+        if tilt_en and (
+            not sess_v.get("session_date")
+            or sess_v.get("session_date") == today_str
+        ):
+            for loss_ts in sess_v.get("recent_loss_timestamps") or []:
+                try:
+                    if (now_ep - float(loss_ts)) < tilt_win_s:
+                        return _deny(
+                            "GUARDRAIL",
+                            f"BLOCKED: Attempted {action_label.lower()} during active Consecutive Loss Streak on {sess_k}.",
+                            f"{action_label} is locked while an active Consecutive Loss Streak is on the rolling clock.",
+                        )
+                except Exception:
+                    return _deny(
+                        "GUARDRAIL",
+                        f"BLOCKED: Attempted {action_label.lower()} with unverified tilt streak state on {sess_k}.",
+                        f"{action_label} is locked because tilt streak state could not be verified.",
+                    )
+
+    if not in_demo_now and tilt_en:
+        try:
+            cur_s, _req_l, _nx_s, _fl_s, _en_b = get_loss_streak_status()
+            if cur_s > 0:
+                return _deny(
+                    "GUARDRAIL",
+                    f"BLOCKED: Attempted {action_label.lower()} during active Consecutive Loss Streak.",
+                    f"{action_label} is locked while an active Consecutive Loss Streak is on the rolling clock.",
+                )
+        except Exception:
+            return _deny(
+                "GUARDRAIL",
+                f"BLOCKED: Attempted {action_label.lower()} while tilt streak verification raised an error.",
+                f"{action_label} is locked because tilt streak state could not be verified.",
+            )
+
+    if ad_cur is not None and not in_demo_now:
+        ig_set = globals().get("ignored_positions") or set()
+        has_open_tracked = not bool(globals().get("current_is_flat", True))
+        if not has_open_tracked and hasattr(ad_cur, "get_last_raw_pos_details"):
+            try:
+                raw_p = ad_cur.get_last_raw_pos_details() or {}
+                for p_tag, p_info in raw_p.items():
+                    if p_tag in ig_set or not isinstance(p_info, dict):
+                        continue
+                    if abs(float(p_info.get("qty", 0) or 0)) > 1e-9:
+                        has_open_tracked = True
+                        break
+            except Exception:
+                return _deny(
+                    "GUARDRAIL",
+                    f"BLOCKED: Attempted {action_label.lower()} while open-position check failed.",
+                    f"{action_label} is blocked because live position status could not be verified.",
+                )
+        if has_open_tracked:
+            return _deny(
+                "GUARDRAIL",
+                f"BLOCKED: Attempted {action_label.lower()} while a tracked live position is open.",
+                f"{action_label} is blocked while a tracked position is open.\n\n"
+                "Flatten your active daytrade (or mark pre-existing swing positions Ignored) first.",
+            )
+
+    return True, "OK", ""
+
+
+def check_rollback_allowed(from_live_hud=False):
+    """Verifies whether in-app version rollback is permitted right now.
+    Returns (allowed_bool, status_code, rb_info_dict, message_str)."""
+    rb_info = get_rollback_backup_info()
+    if not rb_info.get("available"):
+        reason_code = rb_info.get("reason") or "NO_BACKUP"
+        return False, reason_code, rb_info, "No previous version backup is saved yet."
+    ok_sw, sw_code, sw_msg = _check_version_switch_guardrails(
+        from_live_hud=from_live_hud, action_label="Rollback"
+    )
+    if not ok_sw:
+        return False, sw_code, rb_info, sw_msg
+    return True, "OK", rb_info, ""
+
+
+def execute_version_rollback(
+    cancel_pf_fn=None, close_wins=(), spawn_relaunch=True
+):
+    """Restores enforcer.py.prev -> enforcer.py, records skipped_update_version
+    so the reverted release does not immediately re-prompt on startup, preserves
+    100% of config/baselines, and relaunches into the restored version."""
+    allowed, _code, _info, err_msg = check_rollback_allowed(from_live_hud=False)
+    if not allowed:
+        return False, err_msg
+    ok_disk, prev_ver = _restore_prev_files_to_disk()
+    if not ok_disk:
+        return False, "Could not restore enforcer.py.prev (file missing or invalid)."
+    _record_skipped_update_version_on_disk(APP_VERSION)
+    log_event(
+        "SESSION",
+        f"Rolled back PnL Enforcer from v{APP_VERSION} to v{prev_ver} "
+        f"(skipped_update_version={APP_VERSION}).",
+    )
+    if callable(cancel_pf_fn):
+        try:
+            cancel_pf_fn()
+        except Exception:
+            pass
+    for w_obj in close_wins or ():
+        if w_obj is not None:
+            try:
+                if w_obj.winfo_exists():
+                    w_obj.destroy()
+            except Exception:
+                pass
+    if spawn_relaunch:
+        _release_single_instance_mutex()
+        _spawn_updated_enforcer(os.path.join(SCRIPT_DIR, "enforcer.py"))
+    return True, prev_ver
+
+
+def prompt_version_rollback_dialog(
+    parent_win=None,
+    from_live_hud=False,
+    cancel_pf_fn=None,
+    extra_close_win=None,
+):
+    """Opens a dark-glass confirmation modal to restore enforcer.py.prev in one
+    click (or shows an informational 'Rollback Armed' status card if no .prev
+    backup exists yet, or a guardrail notice if rollback is currently locked)."""
+    hide_all_tooltips()
+    allowed, code, rb_info, block_msg = check_rollback_allowed(
+        from_live_hud=from_live_hud
+    )
+
+    if code in ("NO_BACKUP", "SAME_VERSION", "CORRUPT_BACKUP"):
+        dlg = (
+            tk.Tk()
+            if parent_win is None
+            else tk.Toplevel(parent_win)
+        )
+        dlg.withdraw()
+        if parent_win is not None:
+            dlg.transient(parent_win)
+        if os.path.exists(ICON_PATH):
+            try:
+                dlg.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+        dlg.title("PnL Enforcer — Automatic Update Rollback")
+        dlg.config(bg="#0d1117", padx=24, pady=18)
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+
+        tk.Label(
+            dlg,
+            text=f"▶ ↺ AUTOMATIC UPDATE ROLLBACK  (ARMED ON v{APP_VERSION})",
+            font=("Arial", 11, "bold"),
+            fg="#7dd3fc",
+            bg="#0d1117",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        card_o = tk.Frame(
+            dlg,
+            bg="#131922",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        card_o.pack(fill="x", pady=(0, 14))
+        NeonBarCanvas(
+            card_o, core_color="#38bdf8", card_bg="#131922", glow_on=True
+        ).pack(side="left", fill="y")
+        body_f = tk.Frame(card_o, bg="#131922", padx=16, pady=12)
+        body_f.pack(side="left", fill="both", expand=True)
+
+        skipped_v = _peek_saved_skipped_update_version()
+        if code == "SAME_VERSION":
+            info_txt = (
+                f"You are already running your restored backup version (v{APP_VERSION}).\n\n"
+                + (
+                    f"• Automatic startup prompts for v{skipped_v} are paused until a newer update ships.\n"
+                    if skipped_v
+                    else ""
+                )
+                + "• Use '📜 Logs ▾ -> 🔄 Check for Updates Now...' anytime to manually check or re-install updates."
+            )
+        elif code == "CORRUPT_BACKUP":
+            info_txt = (
+                "An older enforcer.py.prev file was found, but it did not pass integrity verification.\n\n"
+                f"• PnL Enforcer will automatically write a fresh verified backup of v{APP_VERSION} before your next update."
+            )
+        else:
+            info_txt = (
+                f"No previous backup file exists yet because v{APP_VERSION} is your active baseline install.\n\n"
+                "• Automatic Local Backup: Right before installing any future update, PnL Enforcer automatically "
+                "saves a verified copy of your current working script (enforcer.py.prev).\n"
+                "• One-Click Restore: Anytime after your next update, click here (or in View Release Notes / "
+                "the bottom-right Rollback link) to revert in one click while keeping 100% of your saved settings, "
+                "broker API tokens, and today's baseline.\n"
+                "• Crash-Safe Boot Recovery: If a future update ever fails to launch, PnL Enforcer and "
+                "Launch_Enforcer.bat will automatically offer to restore your previous working version."
+            )
+
+        tk.Label(
+            body_f,
+            text=info_txt,
+            font=("Arial", 9, "bold"),
+            fg="#cbd5e1",
+            bg="#131922",
+            justify="left",
+            wraplength=580,
+            anchor="w",
+        ).pack(fill="x")
+
+        b_row = tk.Frame(dlg, bg="#0d1117")
+        b_row.pack(fill="x")
+        make_stadium_button(
+            b_row,
+            text="Got It ✓",
+            font=("Arial", 10, "bold"),
+            fill_color="#13283d",
+            fill_top_color="#1a3652",
+            border_color="#38bdf8",
+            hover_fill="#163049",
+            hover_fill_top="#1e3e5d",
+            hover_border="#7dd3fc",
+            fg="#e0f2fe",
+            canvas_bg="#0d1117",
+            height=34,
+            pad_x=28,
+            command=dlg.destroy,
+        ).pack(side="right")
+
+        prev_grab_win = None
+        if parent_win is not None:
+            try:
+                prev_grab_win = parent_win.grab_current()
+            except Exception:
+                prev_grab_win = None
+
+        dlg.update_idletasks()
+        center_dialog_over_parent(dlg, parent=parent_win)
+        if parent_win is not None:
+            try:
+                dlg.grab_set()
+            except Exception:
+                pass
+            dlg.focus_set()
+            parent_win.wait_window(dlg)
+            if prev_grab_win is not None:
+                try:
+                    if prev_grab_win.winfo_exists():
+                        prev_grab_win.grab_set()
+                except Exception:
+                    pass
+            if parent_win.winfo_exists():
+                try:
+                    parent_win.lift()
+                    parent_win.focus_force()
+                except Exception:
+                    pass
+        else:
+            dlg.mainloop()
+        return False
+
+    if not allowed:
+        messagebox.showwarning(
+            "Version Rollback Locked",
+            block_msg,
+            parent=parent_win,
+        )
+        return False
+
+    prev_ver = rb_info["prev_version"]
+    mtime_str = rb_info.get("mtime_str") or "local backup"
+    confirmed = {"ok": False}
+
+    dlg = tk.Tk() if parent_win is None else tk.Toplevel(parent_win)
+    dlg.withdraw()
+    if parent_win is not None:
+        dlg.transient(parent_win)
+    if os.path.exists(ICON_PATH):
+        try:
+            dlg.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+    dlg.title(f"Restore Previous Version (v{prev_ver})")
+    dlg.config(bg="#0d1117", padx=24, pady=18)
+    dlg.resizable(False, False)
+    dlg.attributes("-topmost", True)
+
+    tk.Label(
+        dlg,
+        text=f"▶ ↺ RESTORE PREVIOUS VERSION:  v{APP_VERSION}  ➔  v{prev_ver}",
+        font=("Arial", 11, "bold"),
+        fg="#7dd3fc",
+        bg="#0d1117",
+        anchor="w",
+    ).pack(fill="x", pady=(0, 10))
+
+    card_o = tk.Frame(
+        dlg,
+        bg="#131922",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#243040",
+    )
+    card_o.pack(fill="x", pady=(0, 14))
+    NeonBarCanvas(
+        card_o, core_color="#f59e0b", card_bg="#131922", glow_on=True
+    ).pack(side="left", fill="y")
+    body_f = tk.Frame(card_o, bg="#131922", padx=16, pady=12)
+    body_f.pack(side="left", fill="both", expand=True)
+
+    summary_txt = (
+        f"• Restores your verified local backup (v{prev_ver}, saved {mtime_str}) and relaunches immediately.\n\n"
+        "• 100% of your saved Pre-Flight settings, broker API tokens, and today's session baseline remain untouched.\n\n"
+        f"• Pauses automatic startup prompts for v{APP_VERSION} so you won't be nagged on relaunch "
+        "(resumes automatically when a newer release ships, or anytime via Logs ▾ -> Check for Updates Now)."
+    )
+    tk.Label(
+        body_f,
+        text=summary_txt,
+        font=("Arial", 9, "bold"),
+        fg="#cbd5e1",
+        bg="#131922",
+        justify="left",
+        wraplength=580,
+        anchor="w",
+    ).pack(fill="x")
+
+    if globals().get("active_adapter") is None:
+        tk.Label(
+            body_f,
+            text="⚠️ No live broker is currently connected — verify any open positions directly in your broker platform.",
+            font=("Arial", 9, "bold"),
+            fg="#fbbf24",
+            bg="#131922",
+            justify="left",
+            wraplength=580,
+            anchor="w",
+        ).pack(fill="x", pady=(10, 0))
+
+    def _on_cancel():
+        confirmed["ok"] = False
+        dlg.destroy()
+
+    def _on_confirm():
+        confirmed["ok"] = True
+        dlg.destroy()
+
+    b_row = tk.Frame(dlg, bg="#0d1117")
+    b_row.pack(fill="x")
+    make_stadium_button(
+        b_row,
+        text=f"Cancel (Stay on v{APP_VERSION})",
+        font=("Arial", 10, "bold"),
+        fill_color="#181e26",
+        border_color="#4a5568",
+        hover_fill="#232c38",
+        hover_border="#718096",
+        fg="#cbd5e1",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=34,
+        pad_x=24,
+        command=_on_cancel,
+    ).pack(side="left")
+
+    make_stadium_button(
+        b_row,
+        text=f"↺ Restore v{prev_ver} & Relaunch >>",
+        font=("Arial", 10, "bold"),
+        fill_color="#33220c",
+        fill_top_color="#473010",
+        border_color="#f59e0b",
+        hover_fill="#3f2a0f",
+        hover_fill_top="#543813",
+        hover_border="#fbbf24",
+        fg="#fde68a",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=34,
+        pad_x=28,
+        command=_on_confirm,
+    ).pack(side="right")
+
+    prev_grab_win = None
+    if parent_win is not None:
+        try:
+            prev_grab_win = parent_win.grab_current()
+        except Exception:
+            prev_grab_win = None
+
+    dlg.protocol("WM_DELETE_WINDOW", _on_cancel)
+    dlg.update_idletasks()
+    center_dialog_over_parent(dlg, parent=parent_win)
+    if parent_win is not None:
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.focus_set()
+        parent_win.wait_window(dlg)
+    else:
+        dlg.mainloop()
+
+    if not confirmed["ok"]:
+        if prev_grab_win is not None:
+            try:
+                if prev_grab_win.winfo_exists():
+                    prev_grab_win.grab_set()
+            except Exception:
+                pass
+        if parent_win is not None and parent_win.winfo_exists():
+            try:
+                parent_win.lift()
+                parent_win.focus_force()
+            except Exception:
+                pass
+        return False
+
+    ok_exec, res_msg = execute_version_rollback(
+        cancel_pf_fn=cancel_pf_fn,
+        close_wins=[w for w in (parent_win, extra_close_win) if w is not None],
+        spawn_relaunch=True,
+    )
+    if not ok_exec and parent_win is not None and parent_win.winfo_exists():
+        messagebox.showerror("Rollback Failed", res_msg, parent=parent_win)
+    return ok_exec
+
+
+def show_release_notes_dialog(
+    parent=None, from_live_hud=False, cancel_pf_fn=None
+):
     """Opens a dark-themed modal viewer displaying the local or remote
     CHANGELOG.md release notes, with a button to open the full web Changelog."""
+    hide_all_tooltips()
     cl_text = ""
     cl_path = os.path.join(SCRIPT_DIR, "CHANGELOG.md")
     if os.path.exists(cl_path):
@@ -35859,11 +36981,41 @@ def show_release_notes_dialog(parent=None):
         return
 
     is_standalone = parent is None
+    prev_rn_grab = None
+    if not is_standalone:
+        try:
+            prev_rn_grab = parent.grab_current()
+        except Exception:
+            prev_rn_grab = None
     win = tk.Tk() if is_standalone else tk.Toplevel(parent)
     win.withdraw()
     if not is_standalone:
         win.transient(parent)
-        win.grab_set()
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+    def _close_rn_win():
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        if prev_rn_grab is not None:
+            try:
+                if prev_rn_grab.winfo_exists():
+                    prev_rn_grab.grab_set()
+            except Exception:
+                pass
+        if parent is not None:
+            try:
+                if parent.winfo_exists():
+                    parent.lift()
+                    parent.focus_force()
+            except Exception:
+                pass
+
+    win.protocol("WM_DELETE_WINDOW", _close_rn_win)
     if os.path.exists(ICON_PATH):
         try:
             win.iconbitmap(ICON_PATH)
@@ -35953,8 +37105,54 @@ def show_release_notes_dialog(parent=None):
         canvas_bg="#0d1117",
         height=34,
         pad_x=32,
-        command=win.destroy,
+        command=_close_rn_win,
     ).pack(side="right")
+
+    _rn_rb_info = get_rollback_backup_info()
+    if _rn_rb_info.get("available"):
+        make_stadium_button(
+            btn_bar,
+            text=f"↺ Restore v{_rn_rb_info['prev_version']}",
+            font=("Arial", 9, "bold"),
+            fill_color="#2a1d0d",
+            fill_top_color="#3b2812",
+            border_color="#d97706",
+            hover_fill="#362511",
+            hover_fill_top="#4a3317",
+            hover_border="#fbbf24",
+            fg="#fde68a",
+            hover_fg="#ffffff",
+            canvas_bg="#0d1117",
+            height=34,
+            pad_x=22,
+            command=lambda: prompt_version_rollback_dialog(
+                parent_win=win,
+                from_live_hud=from_live_hud,
+                cancel_pf_fn=cancel_pf_fn,
+                extra_close_win=parent,
+            ),
+        ).pack(side="right", padx=(0, 8))
+    else:
+        make_stadium_button(
+            btn_bar,
+            text="↺ Rollback: Armed ✓",
+            font=("Arial", 9, "bold"),
+            fill_color="#141b26",
+            border_color="#334155",
+            hover_fill="#1c2636",
+            hover_border="#64748b",
+            fg="#94a3b8",
+            hover_fg="#e2e8f0",
+            canvas_bg="#0d1117",
+            height=34,
+            pad_x=20,
+            command=lambda: prompt_version_rollback_dialog(
+                parent_win=win,
+                from_live_hud=from_live_hud,
+                cancel_pf_fn=cancel_pf_fn,
+                extra_close_win=parent,
+            ),
+        ).pack(side="right", padx=(0, 8))
 
     card_outer = tk.Frame(
         win,
@@ -36141,14 +37339,15 @@ def _fetch_available_update_payload(skip_if_recent=False):
                 )
             enf_meta = g_meta.get("files", {}).get("enforcer.py", {})
             if not enf_meta.get("truncated") and enf_meta.get("content"):
-                c_txt = enf_meta["content"]
-                if "def data_loop" in c_txt:
-                    m_c = re.search(
-                        r'(?m)^APP_VERSION\s*=\s*["\']([^"\']+)["\']', c_txt
-                    )
-                    if m_c:
-                        best_ver = m_c.group(1).strip()
-                        best_bytes = c_txt.encode("utf-8")
+                c_bytes = enf_meta["content"].encode("utf-8")
+                ok_g, g_ver, _g_err = _validate_enforcer_source_bytes(c_bytes)
+                if ok_g and _parse_version_tuple(g_ver) > _parse_version_tuple(
+                    APP_VERSION
+                ):
+                    best_ver = g_ver
+                    best_bytes = c_bytes
+                elif ok_g:
+                    best_ver = g_ver
             live_raw = enf_meta.get("raw_url")
             if live_raw:
                 candidate_urls.append(live_raw)
@@ -36244,36 +37443,138 @@ def _fetch_available_update_payload(skip_if_recent=False):
 
 
 def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
-    """Writes the downloaded update files to SCRIPT_DIR and returns target_py."""
+    """Validates best_bytes, backs up the current working enforcer.py / CHANGELOG.md
+    to .prev (unless an unconfirmed boot_pending stamp is still active), records
+    .enforcer_boot_pending.json for crash-safe startup recovery, writes the new
+    update files atomically to SCRIPT_DIR, and returns target_py."""
+    ok_new, parsed_new_v, new_err = _validate_enforcer_source_bytes(best_bytes)
+    if not ok_new:
+        raise ValueError(f"Refusing to install invalid update payload: {new_err}")
+
     script_dir = SCRIPT_DIR
     target_py = os.path.join(script_dir, "enforcer.py")
-    tmp_py = target_py + ".tmp"
+    target_cl = os.path.join(script_dir, "CHANGELOG.md")
+    prev_py = _get_prev_enforcer_path()
+    prev_cl = _get_prev_changelog_path()
+    bp_path = _get_boot_pending_path()
+
+    # Only overwrite .prev if the current script booted cleanly (no stale
+    # boot_pending marker) OR no .prev backup exists yet, so a broken update
+    # that never reached Pre-Flight can never overwrite a known-good backup.
+    can_rotate_prev = (not os.path.exists(bp_path)) or (not os.path.isfile(prev_py))
+    saved_prev_ver = ""
+    wrote_new_prev = False
+    if can_rotate_prev and os.path.isfile(target_py):
+        try:
+            with open(target_py, "rb") as cur_f:
+                cur_bytes = cur_f.read()
+            ok_cur, cur_ver, _cur_err = _validate_enforcer_source_bytes(cur_bytes)
+            if ok_cur and cur_ver != (parsed_new_v or str(best_ver)):
+                tmp_prev = f"{prev_py}.{os.getpid()}.tmp"
+                with open(tmp_prev, "wb") as pf_out:
+                    pf_out.write(cur_bytes)
+                    pf_out.flush()
+                    os.fsync(pf_out.fileno())
+                os.replace(tmp_prev, prev_py)
+                saved_prev_ver = cur_ver
+                wrote_new_prev = True
+                if os.path.isfile(target_cl):
+                    try:
+                        with open(target_cl, "rb") as cur_cl_f:
+                            cur_cl_b = cur_cl_f.read()
+                        if cur_cl_b:
+                            tmp_prev_cl = f"{prev_cl}.{os.getpid()}.tmp"
+                            with open(tmp_prev_cl, "wb") as pcl_out:
+                                pcl_out.write(cur_cl_b)
+                            os.replace(tmp_prev_cl, prev_cl)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    existing_prev_ver = ""
+    if not saved_prev_ver:
+        rb_existing = get_rollback_backup_info()
+        existing_prev_ver = rb_existing.get("prev_version") or ""
+        saved_prev_ver = existing_prev_ver or APP_VERSION
+
+    try:
+        bp_payload = {
+            "target_version": str(best_ver),
+            "prev_version": str(saved_prev_ver),
+            "installed_at": time.time(),
+        }
+        tmp_bp = f"{bp_path}.{os.getpid()}.tmp"
+        with open(tmp_bp, "w", encoding="utf-8") as bpf:
+            json.dump(bp_payload, bpf, indent=2)
+            bpf.flush()
+            os.fsync(bpf.fileno())
+        os.replace(tmp_bp, bp_path)
+    except Exception:
+        pass
+
+    tmp_py = f"{target_py}.{os.getpid()}.tmp"
     with open(tmp_py, "wb") as f:
         f.write(best_bytes)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp_py, target_py)
 
     if cl_bytes:
         try:
-            with open(os.path.join(script_dir, "CHANGELOG.md"), "wb") as cf:
+            tmp_cl = f"{target_cl}.{os.getpid()}.tmp"
+            with open(tmp_cl, "wb") as cf:
                 cf.write(cl_bytes)
+            os.replace(tmp_cl, target_cl)
         except Exception:
             pass
 
-    for doc_name in (
-        "Launch_Enforcer.bat",
-        "README.md",
-        "LICENSE.txt",
-        "enforcer.ico",
-    ):
+    # When invoked from Launch_Enforcer.bat --console (--check-update), cmd.exe
+    # is still executing Launch_Enforcer.bat and will resume at its prior byte
+    # offset on return; skip rewriting Launch_Enforcer.bat in that mode so cmd
+    # never lands mid-line (normal GUI updates rewrite Launch_Enforcer.bat safely).
+    doc_list = (
+        ("README.md", "LICENSE.txt", "enforcer.ico")
+        if "--check-update" in sys.argv
+        else ("Launch_Enforcer.bat", "README.md", "LICENSE.txt", "enforcer.ico")
+    )
+    for doc_name in doc_list:
         doc_bytes = _fetch_remote_doc_bytes(doc_name, ts=ts)
         if doc_bytes:
             try:
-                with open(os.path.join(script_dir, doc_name), "wb") as df:
+                doc_dst = os.path.join(script_dir, doc_name)
+                doc_tmp = f"{doc_dst}.{os.getpid()}.tmp"
+                with open(doc_tmp, "wb") as df:
                     df.write(doc_bytes)
+                os.replace(doc_tmp, doc_dst)
             except Exception:
                 pass
-    print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver}.\n")
+
+    skipped_prev = _peek_saved_skipped_update_version()
+    if skipped_prev and _parse_version_tuple(best_ver) >= _parse_version_tuple(
+        skipped_prev
+    ):
+        _record_skipped_update_version_on_disk("")
+
+    if wrote_new_prev:
+        bk_note = f"rollback backup v{saved_prev_ver} saved"
+    elif existing_prev_ver:
+        bk_note = f"existing rollback backup v{existing_prev_ver} preserved"
+    else:
+        bk_note = "fresh install — no prior script to back up"
+    log_event(
+        "SESSION",
+        f"Installed update v{APP_VERSION} -> v{best_ver} ({bk_note}).",
+    )
+    print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver} ({bk_note}).\n")
     return target_py
+
+
+def _is_update_version_skipped(cand_ver):
+    skipped_v = _peek_saved_skipped_update_version()
+    if not skipped_v or not cand_ver:
+        return False
+    return _parse_version_tuple(cand_ver) == _parse_version_tuple(skipped_v)
 
 
 def _peek_saved_check_updates_pref():
@@ -36302,6 +37603,12 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
         if payload is None:
             return
         best_ver, best_bytes, cl_bytes, cl_text, ts = payload
+        if _is_update_version_skipped(best_ver):
+            print(
+                f"Version check: v{best_ver} paused after rollback "
+                f"(staying on v{APP_VERSION})."
+            )
+            return
         if show_update_available_dialog(APP_VERSION, best_ver, cl_text):
             target_py = _install_update_payload(
                 best_ver, best_bytes, cl_bytes, ts
@@ -36311,8 +37618,108 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
                 _spawn_updated_enforcer(target_py)
         else:
             print(f"[SKIPPED] Continuing with local v{APP_VERSION}...\n")
+    except SystemExit:
+        raise
     except Exception:
         print(f"Version check: v{APP_VERSION} (Offline / skipped)")
+
+
+_manual_update_chk_busy = False
+
+
+def check_for_updates_manual(parent_pf=None, from_live_hud=False, cancel_pf_fn=None):
+    """Manual on-demand update check from Logs ▾ -> Check for Updates Now...
+    Runs the network fetch off the UI thread, ignores skipped_update_version so
+    users who rolled back can manually re-apply an update whenever ready, and
+    enforces the same flat/unlocked guardrails."""
+    global _manual_update_chk_busy
+    hide_all_tooltips()
+    if _manual_update_chk_busy:
+        return False
+    ok_sw, _sw_code, sw_msg = _check_version_switch_guardrails(
+        from_live_hud=from_live_hud, action_label="In-app update", log_block=True
+    )
+    if not ok_sw:
+        messagebox.showwarning("Update Check Locked", sw_msg, parent=parent_pf)
+        return False
+
+    _manual_update_chk_busy = True
+    if parent_pf is not None:
+        try:
+            parent_pf.config(cursor="watch")
+        except Exception:
+            pass
+
+    def _bg_fetch():
+        global _manual_update_chk_busy
+        payload = _fetch_available_update_payload(skip_if_recent=False)
+
+        def _finish_on_ui():
+            global _manual_update_chk_busy
+            _manual_update_chk_busy = False
+            if parent_pf is not None:
+                try:
+                    if not parent_pf.winfo_exists():
+                        return
+                    parent_pf.config(cursor="")
+                except Exception:
+                    return
+            if payload is None:
+                messagebox.showinfo(
+                    "PnL Enforcer — Up to Date",
+                    f"You are running the latest available version on this channel (v{APP_VERSION}), "
+                    "or GitHub is currently unreachable.",
+                    parent=parent_pf,
+                )
+                return
+            best_ver, best_bytes, cl_bytes, cl_text, ts = payload
+            ok_re, _re_c, re_msg = _check_version_switch_guardrails(
+                from_live_hud=from_live_hud,
+                action_label="In-app update",
+                log_block=True,
+            )
+            if not ok_re:
+                messagebox.showwarning(
+                    "Update Check Locked", re_msg, parent=parent_pf
+                )
+                return
+            if show_update_available_dialog(
+                APP_VERSION, best_ver, cl_text, parent=parent_pf
+            ):
+                try:
+                    target_py = _install_update_payload(
+                        best_ver, best_bytes, cl_bytes, ts
+                    )
+                except Exception as exc:
+                    messagebox.showerror(
+                        "Update Install Failed",
+                        f"Could not install v{best_ver}: {exc}",
+                        parent=parent_pf,
+                    )
+                    return
+                if callable(cancel_pf_fn):
+                    try:
+                        cancel_pf_fn()
+                    except Exception:
+                        pass
+                if parent_pf is not None:
+                    try:
+                        parent_pf.destroy()
+                    except Exception:
+                        pass
+                _release_single_instance_mutex()
+                _spawn_updated_enforcer(target_py)
+
+        if parent_pf is not None:
+            try:
+                parent_pf.after(10, _finish_on_ui)
+                return
+            except Exception:
+                pass
+        _manual_update_chk_busy = False
+
+    threading.Thread(target=_bg_fetch, daemon=True).start()
+    return True
 
 
 def start_background_update_check(parent_pf, cancel_pf_fn=None):
@@ -36327,6 +37734,12 @@ def start_background_update_check(parent_pf, cancel_pf_fn=None):
         if payload is None:
             return
         best_ver, best_bytes, cl_bytes, cl_text, ts = payload
+        if _is_update_version_skipped(best_ver):
+            print(
+                f"Version check: v{best_ver} paused after rollback "
+                f"(staying on v{APP_VERSION})."
+            )
+            return
 
         def _prompt_on_ui():
             try:
@@ -36334,6 +37747,11 @@ def start_background_update_check(parent_pf, cancel_pf_fn=None):
                     return
                 if parent_pf.grab_current() is not None:
                     parent_pf.after(300, _prompt_on_ui)
+                    return
+                ok_sw, _sw_c, _sw_m = _check_version_switch_guardrails(
+                    from_live_hud=False, action_label="Update", log_block=False
+                )
+                if not ok_sw:
                     return
                 if show_update_available_dialog(
                     APP_VERSION, best_ver, cl_text, parent=parent_pf
@@ -36511,6 +37929,7 @@ if __name__ == "__main__":
     print("=========================================\n")
     try:
         if not show_liability_waiver():
+            _mark_boot_pending_bat_prompt_suppressed()
             log_event("SESSION", "Liability waiver declined. Exiting.")
             sys.exit(0)
 
@@ -36551,4 +37970,8 @@ if __name__ == "__main__":
             log_event("SESSION", "Pre-Flight closed without launching. Exiting.")
             sys.exit(0)
     except Exception as e:
-        log_event("ERROR", f"Startup failed: {e}")
+        tb_boot = " | ".join(
+            ln.strip() for ln in traceback.format_exc().splitlines() if ln.strip()
+        )
+        log_event("ERROR", f"Startup failed: {e} ({tb_boot})")
+        _offer_crash_boot_rollback(f"{type(e).__name__}: {e}")
