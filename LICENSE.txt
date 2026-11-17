@@ -32,26 +32,45 @@ TRADING, FINANCIAL RISK & REGULATORY DISCLAIMER:
    spreads, market gaps, trading halts, and software bugs. The Software DOES NOT
    and CANNOT guarantee that trading losses will be capped at your configured
    thresholds. Actual account losses may significantly exceed configured limits.
-   If you continue trading after a Daily Stop breach in disarmed mode without
-   re-anchoring or adjusting your stop, the breached Daily Stop will not re-fire
-   until re-armed.
+   Post-Breach Force-Flatten, voluntary session locks (`Done for Today` and
+   `Commit Today`), and manual emergency liquidation (`HOLD 2s: FLATTEN`) rely
+   on client-side API polling and order routing rather than a broker-side account
+   restriction; new orders can still be submitted and filled at your broker
+   before the next polling cycle detects them, and all such controls carry the
+   same outage, latency, rate-limit, halt, spread, and slippage risks. When
+   `Auto-Flatten Equities` is OFF or `Alarms Only` is ON, breaches produce
+   alerts only and a breached Daily Stop remains disarmed until re-armed or
+   re-zeroed. Any `Trade API` permission check (`VERIFIED`, `BLOCKED`, or
+   `UNCONFIRMED`) is a point-in-time informational check and does not guarantee
+   that future live orders will be accepted. In-app version rollback (`Revert to
+   Previous Version`) restores only local program files (`enforcer.py.prev` /
+   `CHANGELOG.md.prev`) and does not roll back saved configuration, session
+   baselines, or active lockouts in your user directory.
 
-3. EQUITIES, OPTIONS & IGNORED POSITIONS:
+3. EQUITIES, OPTIONS, IGNORED POSITIONS & DEMO SIMULATOR:
    (a) Equities (Stocks): Tracked for HUD PnL display, warning sirens, and
        automated Market (9:30 AM – 4:00 PM ET) or Extended-Hours Limit liquidation.
    (b) Options Contracts: Tracked for HUD PnL display and audio warning sirens
-       ONLY by default (`Include Options in Auto-Flatten` is OFF by default). If
-       you explicitly enable the optional experimental BETA Options Auto-Flatten
-       feature and accept the separate BETA Options Auto-Flatten Risk Waiver, the
-       Software submits single-leg Regular Trading Hours (9:30 AM – 4:00 PM ET)
-       Market orders (`BUY_TO_CLOSE` / `SELL_TO_CLOSE`), which carry severe
-       bid-ask spread, illiquidity, multi-leg legging, and market-order slippage
-       risks. Options cannot be auto-flattened outside Regular Trading Hours.
+       ONLY by default (`Include Options in Auto-Flatten` is OFF by default).
+       Automated stops, `Done for Today`, Post-Breach Force-Flatten, and manual
+       `HOLD 2s: FLATTEN` liquidate tracked equities ONLY unless you explicitly
+       enable the optional experimental BETA Options Auto-Flatten feature,
+       accept the separate BETA Options Auto-Flatten Risk Waiver, and are within
+       Regular Trading Hours (9:30 AM – 4:00 PM ET), in which case the Software
+       submits single-leg Market orders (`BUY_TO_CLOSE` / `SELL_TO_CLOSE`) that
+       carry severe bid-ask spread, illiquidity, multi-leg legging, and market-
+       order slippage risks. Otherwise, option positions remain open and you are
+       100% solely responsible for closing them manually.
    (c) Ignored Pre-Existing Positions (`Swing / Hold`): Any position marked as
        Ignored is excluded from daytrade PnL calculations, warning sirens, daily
        stops, order cancellation, and automated liquidation. You are 100% solely
        responsible for monitoring and managing all ignored positions directly in
        your brokerage platform.
+   (d) Demo Simulator Mode (`DEMO`): Operates exclusively on local synthetic
+       paper state (`$25,000` sandbox) with zero brokerage orders submitted and
+       Windows OS lockouts disabled. Demo-mode session locks (including `Commit
+       Today` and `Done Today`) do not apply to live brokerage accounts; switching
+       back to a live broker immediately resumes your configured live rules.
 
 4. NO BROKER AFFILIATION: This Software is an independent third-party tool and is
    not affiliated with, endorsed by, or sponsored by Charles Schwab Corporation,
