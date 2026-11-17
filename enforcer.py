@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.73"
+APP_VERSION = "0.9.74"
 
 import os
 import sys
@@ -5133,12 +5133,23 @@ def is_position_ignored(sym_or_tag, is_opt=False):
         return False
 
 
+def _clear_launch_grace_state():
+    """Clears all active and pending startup breach grace state so explicit
+    manual overrides (`HOLD 2s: FLATTEN` / `Done Today`) or post-launch safety
+    backstops immediately arm normal order cancellation and liquidation."""
+    global _launch_grace_pending, _launch_grace_ref_net
+    _launch_grace_pending = False
+    _launch_grace_syms.clear()
+    _launch_grace_ref_opnl.clear()
+    _launch_grace_ref_net = None
+
+
 def is_launch_grace_position(sym_or_tag, is_opt=None):
     """Returns True when sym_or_tag is a pre-existing position held at startup
     under active startup breach grace (`_launch_grace_syms`) so automated stops
     (`POST_BREACH_FLATTEN` / `OPEN_PNL_FLATTEN`) do not liquidate it until it
     closes flat, scales in, flips direction, or exceeds its post-launch loss backstop."""
-    if not _launch_grace_syms:
+    if not _launch_grace_syms or done_for_today or _manual_flatten_in_flight:
         return False
     s = str(sym_or_tag or "").strip()
     if not s:
@@ -6536,7 +6547,7 @@ class SchwabAdapter:
         pend = self._pending_flatten_cids.get((self.account_id, target_sym))
         pend_oid = str(pend[0]).strip() if (pend and pend[0]) else ""
         working_qty = 0.0
-        oco_working_max = {}
+        oco_groups = {}
         filled_qty = 0.0
         cov_seen_oids = set()
 
@@ -6592,35 +6603,124 @@ class SchwabAdapter:
             except Exception:
                 f_q = 0.0
             try:
+                raw_leg_q = (
+                    lg["quantity"]
+                    if lg.get("quantity") is not None
+                    else o.get("quantity")
+                )
+                leg_orig_q = float(raw_leg_q) if raw_leg_q is not None else 0.0
+            except Exception:
+                leg_orig_q = 0.0
+            try:
                 rem_q = float(
                     o.get("remainingQuantity")
                     if o.get("remainingQuantity") is not None
-                    else max(
-                        0.0,
-                        float(lg.get("quantity") or o.get("quantity") or 0.0)
-                        - f_q,
-                    )
+                    else max(0.0, leg_orig_q - f_q)
                 )
             except Exception:
                 rem_q = 0.0
-            if st in active_statuses and rem_q > 0:
-                if sc_oco_gid:
-                    oco_working_max[sc_oco_gid] = max(
-                        oco_working_max.get(sc_oco_gid, 0.0), rem_q
-                    )
-                else:
-                    working_qty += rem_q
+
+            recent_f_q = 0.0
+            has_fill_ts = False
             if f_q > 0:
-                ent_ep = self._order_ts_to_epoch(
-                    o.get("closeTime") or o.get("enteredTime")
+                exec_leg_eps = []
+                exec_recent_sum = 0.0
+                exec_has_qty = False
+                for act in o.get("orderActivityCollection") or []:
+                    if not isinstance(act, dict):
+                        continue
+                    for ex_leg in act.get("executionLegs") or []:
+                        if not isinstance(ex_leg, dict):
+                            continue
+                        ex_ep = self._order_ts_to_epoch(ex_leg.get("time"))
+                        if ex_ep > 0.0:
+                            exec_leg_eps.append(ex_ep)
+                            raw_ex_q = ex_leg.get("quantity")
+                            if raw_ex_q is not None:
+                                try:
+                                    ex_qv = float(raw_ex_q)
+                                    exec_has_qty = True
+                                    if ex_ep >= cutoff_epoch:
+                                        exec_recent_sum += ex_qv
+                                except Exception:
+                                    pass
+                if exec_leg_eps:
+                    has_fill_ts = True
+                    if exec_has_qty:
+                        recent_f_q = min(f_q, exec_recent_sum)
+                    elif max(exec_leg_eps) >= cutoff_epoch:
+                        recent_f_q = f_q
+                elif pend_oid and oid_str == pend_oid:
+                    has_fill_ts = True
+                    recent_f_q = f_q
+                elif o.get("closeTime") is not None:
+                    ep_c = self._order_ts_to_epoch(o.get("closeTime"))
+                    if ep_c > 0.0:
+                        has_fill_ts = True
+                        if ep_c >= cutoff_epoch:
+                            recent_f_q = f_q
+                elif st == "FILLED" and o.get("enteredTime") is not None:
+                    ep_e = self._order_ts_to_epoch(o.get("enteredTime"))
+                    if ep_e > 0.0:
+                        has_fill_ts = True
+                        if ep_e >= cutoff_epoch:
+                            recent_f_q = f_q
+
+            if sc_oco_gid:
+                b = oco_groups.setdefault(
+                    sc_oco_gid,
+                    {
+                        "init_max": 0.0,
+                        "work_max": 0.0,
+                        "filled_all": 0.0,
+                        "filled_recent": 0.0,
+                        "all_fills_timed": True,
+                    },
                 )
-                if (
-                    (pend_oid and oid_str == pend_oid)
-                    or ent_ep <= 0.0
-                    or ent_ep >= cutoff_epoch
-                ):
-                    filled_qty += f_q
-        working_qty += sum(oco_working_max.values())
+                b["init_max"] = max(
+                    b["init_max"],
+                    leg_orig_q,
+                    f_q + (rem_q if st in active_statuses else 0.0),
+                )
+                if st in active_statuses and rem_q > 0:
+                    b["work_max"] = max(b["work_max"], rem_q)
+                if f_q > 0:
+                    if has_fill_ts:
+                        b["filled_all"] += f_q
+                        b["filled_recent"] += recent_f_q
+                    else:
+                        b["all_fills_timed"] = False
+            else:
+                if st in active_statuses and rem_q > 0:
+                    working_qty += rem_q
+                if f_q > 0:
+                    if has_fill_ts:
+                        filled_qty += recent_f_q
+                    else:
+                        ent_ep = self._order_ts_to_epoch(
+                            o.get("closeTime") or o.get("enteredTime")
+                        )
+                        if (
+                            (pend_oid and oid_str == pend_oid)
+                            or ent_ep <= 0.0
+                            or ent_ep >= cutoff_epoch
+                        ):
+                            filled_qty += f_q
+
+        for b in oco_groups.values():
+            i_max = b["init_max"]
+            if b["all_fills_timed"] and i_max > 0:
+                grp_working = min(
+                    b["work_max"], max(0.0, i_max - b["filled_all"])
+                )
+                grp_filled_rec = min(b["filled_recent"], i_max)
+            else:
+                grp_working = min(b["work_max"], i_max) if i_max > 0 else b["work_max"]
+                grp_filled_rec = (
+                    min(b["filled_recent"], i_max) if i_max > 0 else b["filled_recent"]
+                )
+            working_qty += grp_working
+            filled_qty += grp_filled_rec
         return working_qty, filled_qty
 
     def cancel_all_working_orders(
@@ -9269,11 +9369,16 @@ class WebullAdapter:
         target_sym = str(symbol).strip()
         closing_side = "BUY" if is_short else "SELL"
         working_qty = 0.0
-        oco_working_max = {}
+        oco_groups = {}
         filled_qty = 0.0
         seen_cids = set()
         open_lookup_ok = False
         detail_lookup_ok = False
+        cutoff = (
+            float(math.floor(float(since_epoch)))
+            if since_epoch is not None
+            else (time.time() - 180.0)
+        )
 
         try:
             open_orders_raw = self._fetch_all_open_orders_webull()
@@ -9313,33 +9418,92 @@ class WebullAdapter:
                 if cid:
                     seen_cids.add(cid)
                 try:
-                    rem_q = float(
-                        o.get("remain_quantity")
-                        or o.get("unfilled_quantity")
-                        or o.get("quantity")
-                        or o.get("total_quantity")
-                        or 0.0
+                    raw_fq = (
+                        o["filled_quantity"]
+                        if o.get("filled_quantity") is not None
+                        else o["filled_qty"]
+                        if o.get("filled_qty") is not None
+                        else o.get("total_filled_quantity")
+                    )
+                    f_q = float(raw_fq) if raw_fq is not None else 0.0
+                except Exception:
+                    f_q = 0.0
+                try:
+                    raw_orig = (
+                        o["total_quantity"]
+                        if o.get("total_quantity") is not None
+                        else o.get("quantity")
+                    )
+                    orig_q = float(raw_orig) if raw_orig is not None else 0.0
+                except Exception:
+                    orig_q = 0.0
+                try:
+                    raw_rem = (
+                        o["remain_quantity"]
+                        if o.get("remain_quantity") is not None
+                        else o.get("unfilled_quantity")
+                    )
+                    rem_q = (
+                        float(raw_rem)
+                        if raw_rem is not None
+                        else max(0.0, orig_q - f_q)
                     )
                 except Exception:
                     rem_q = 0.0
-                if rem_q > 0:
-                    wb_gid_cov = o.get("_wb_oco_gid")
-                    if wb_gid_cov:
-                        oco_working_max[wb_gid_cov] = max(
-                            oco_working_max.get(wb_gid_cov, 0.0), rem_q
-                        )
-                    else:
+
+                fill_ep = self._webull_ts_to_epoch(
+                    o.get("filled_time") or o.get("update_time")
+                )
+                has_fill_ts = fill_ep > 0.0
+                wb_gid_cov = o.get("_wb_oco_gid")
+                if wb_gid_cov:
+                    b = oco_groups.setdefault(
+                        wb_gid_cov,
+                        {
+                            "init_max": 0.0,
+                            "work_max": 0.0,
+                            "filled_all": 0.0,
+                            "filled_recent": 0.0,
+                            "all_fills_timed": True,
+                        },
+                    )
+                    b["init_max"] = max(b["init_max"], orig_q, rem_q + f_q)
+                    if rem_q > 0:
+                        b["work_max"] = max(b["work_max"], rem_q)
+                    if f_q > 0:
+                        if has_fill_ts:
+                            b["filled_all"] += f_q
+                            if fill_ep >= cutoff:
+                                b["filled_recent"] += f_q
+                        else:
+                            b["all_fills_timed"] = False
+                else:
+                    if rem_q > 0:
                         working_qty += rem_q
-            working_qty += sum(oco_working_max.values())
+                    if f_q > 0 and has_fill_ts and fill_ep >= cutoff:
+                        filled_qty += f_q
+            for b in oco_groups.values():
+                i_max = b["init_max"]
+                if b["all_fills_timed"] and i_max > 0:
+                    grp_working = min(
+                        b["work_max"], max(0.0, i_max - b["filled_all"])
+                    )
+                    grp_filled_rec = min(b["filled_recent"], i_max)
+                else:
+                    grp_working = (
+                        min(b["work_max"], i_max) if i_max > 0 else b["work_max"]
+                    )
+                    grp_filled_rec = (
+                        min(b["filled_recent"], i_max)
+                        if i_max > 0
+                        else b["filled_recent"]
+                    )
+                working_qty += grp_working
+                filled_qty += grp_filled_rec
         except Exception:
             pass
 
         pend = self._pending_flatten_cids.get((self.account_id, target_sym))
-        cutoff = (
-            float(math.floor(float(since_epoch)))
-            if since_epoch is not None
-            else (time.time() - 180.0)
-        )
         need_detail_lookup = bool(
             pend and pend[0] not in seen_cids and float(pend[1]) >= cutoff
         )
@@ -16415,6 +16579,8 @@ def flatten_equities(
 
     with _flatten_exec_lock:
         try:
+            if manual_panic or done_for_today:
+                _clear_launch_grace_state()
             try:
                 setattr(adapter, "_last_flatten_halted_with_working_exit", False)
                 setattr(adapter, "_last_flatten_outcome", "OPEN")
@@ -17396,6 +17562,7 @@ def trigger_manual_panic_flatten(
                     pass
             return False
         _manual_flatten_in_flight = True
+        _clear_launch_grace_state()
 
     def _worker():
         global _manual_flatten_in_flight
@@ -17856,6 +18023,7 @@ def activate_done_for_today(
     if ui_button is None and mute_btn is not None:
         ui_button = mute_btn
     done_for_today = True
+    _clear_launch_grace_state()
     save_session_state()
     target_adapter = adapter if adapter is not None else active_adapter
     log_event(
@@ -20636,7 +20804,10 @@ def evaluate_stop_decisions(
         session_high_pnl,
     )
 
-    if _launch_grace_syms:
+    if done_for_today or _manual_flatten_in_flight:
+        if _launch_grace_syms or _launch_grace_pending:
+            _clear_launch_grace_state()
+    elif _launch_grace_syms:
         grace_bleed_limit = max(
             25.0,
             float(open_max)
@@ -20650,9 +20821,7 @@ def evaluate_stop_decisions(
         ):
             drop_net = round(float(net_pnl) - float(_launch_grace_ref_net), 2)
             g_ended = sorted(_launch_grace_syms.keys())
-            _launch_grace_syms.clear()
-            _launch_grace_ref_opnl.clear()
-            _launch_grace_ref_net = None
+            _clear_launch_grace_state()
             log_event(
                 "GUARDRAIL",
                 f"Startup position grace ended on {g_ended} (post-launch Net drawdown "
@@ -20707,10 +20876,15 @@ def evaluate_stop_decisions(
                     f"stop enforcement armed).",
                 )
             elif abs(cur_gq) < (abs(float(g_qty)) - 1e-6):
-                _launch_grace_syms[g_tag] = cur_gq
-                # Scale-out reduces remaining unrealized PnL proportionally; raise reference if cur_gop improved
-                if ref_gop is not None and cur_gop > float(ref_gop):
-                    _launch_grace_ref_opnl[g_tag] = cur_gop
+                if (
+                    g_tag in _launch_grace_syms
+                    and not done_for_today
+                    and not _manual_flatten_in_flight
+                ):
+                    _launch_grace_syms[g_tag] = cur_gq
+                    # Scale-out reduces remaining unrealized PnL proportionally; raise reference if cur_gop improved
+                    if ref_gop is not None and cur_gop > float(ref_gop):
+                        _launch_grace_ref_opnl[g_tag] = cur_gop
         if not _launch_grace_syms:
             _launch_grace_ref_opnl.clear()
             _launch_grace_ref_net = None

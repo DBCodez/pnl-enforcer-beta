@@ -4,6 +4,21 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.74] — 2026-11-17
+### ⚡ Quick Summary
+- **Manual Overrides Always Clear Startup Grace (`🔒 Done Today` & `🚨 HOLD 2s: FLATTEN`):** Ensured explicit manual overrides immediately clear any startup breach grace before saving session state or canceling working orders — even if an initial position read momentarily returns empty or `data_loop` polls mid-scale-out at the same instant.
+- **Timestamp-Safe OCO Partial-Fill Exit Coverage (Schwab & Webull):** Tightened OCO bracket coverage math during partial fills so a partially filled leg can never stack onto a `~100ms`-lagging sibling leg's remaining quantity (nor over-sell on a stale position snapshot), and fixed a numeric `remain_quantity = 0` check on Webull open orders.
+
+### 🔍 Detailed Breakdown
+- **Immediate Startup Grace Clearance on Manual Overrides (`_clear_launch_grace_state`, `activate_done_for_today`, `trigger_manual_panic_flatten`, `flatten_equities`, `evaluate_stop_decisions`):**
+  - Added `_clear_launch_grace_state()` (clearing `_launch_grace_pending = False`, `_launch_grace_syms`, `_launch_grace_ref_opnl`, and `_launch_grace_ref_net`) invoked at entry of `activate_done_for_today()` (prior to `save_session_state()`), inside `trigger_manual_panic_flatten()`, and at the start of `flatten_equities()` whenever `manual_panic or done_for_today` so transient `None` `peek_pos` reads or follow-up `POST_BREACH_FLATTEN` sweeps never skip graced working orders or shares.
+  - Added early `done_for_today or _manual_flatten_in_flight` guards in `is_launch_grace_position()` and `evaluate_stop_decisions()`'s scale-out branch so concurrent background polls cannot re-insert cleared grace keys.
+- **Timestamp-Verified OCO Partial-Fill Coverage Cap & Webull `0`-Remaining Fix (`SchwabAdapter.get_recent_exit_order_coverage`, `WebullAdapter.get_recent_exit_order_coverage`):**
+  - Tracks per-OCO-group `init_max`, `work_max`, `filled_all`, and post-`cutoff_epoch` `filled_recent` (via `orderActivityCollection[].executionLegs[].time` on Schwab and `filled_time` / `update_time` on Webull): caps `grp_working = min(work_max, max(0.0, init_max - filled_all))` and `grp_filled_rec = min(filled_recent, init_max)` whenever fill timestamps are present, preventing both sibling-lag coverage overstatement on updated snapshots and accidental over-selling on stale snapshots. *(Note: on Webull, a fully filled OCO leg drops off the open-orders list, leaving at most the broker's ~100ms sibling-cancel propagation window before the next sweep.)*
+  - Replaced Webull's falsy `or` chain on `remain_quantity` with explicit `is not None` checks so numeric `0` remaining never falls through to original `quantity`, and added Suite `Test 29` in `test_enforcer.py`.
+
+---
+
 ## [v0.9.73] — 2026-11-17
 ### ⚡ Quick Summary
 - **Off-Session Trade Catch-Up & Zero-Penalty Startup (Schwab & Webull):** Closed Enforcer for part of the day and took trades while it was off? Re-opening now automatically scans your broker fills while closed to catch up your **`TRADES (W/L)`**, **`SESSION HIGH`**, and **`SESSION LOW`** — and **never** penalizes you on launch (no surprise Windows OS lock, no instant position dump, and a calm **`• GRACE`** hold on any already-open trade until you close it, add size, flip, or lose past your post-launch stop backstop).
