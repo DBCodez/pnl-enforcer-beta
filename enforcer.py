@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.75"
+APP_VERSION = "0.9.76"
 
 import os
 import sys
@@ -14689,6 +14689,10 @@ def _sound_lock_straggler_alert_burst():
 
 _active_penalty_box_overlay = None
 _cooldown_seq_id = 0
+_cooldown_worker_seq = -1
+_cooldown_lock_engaged_seq = -1
+_cooldown_flat_at_start = True
+_cooldown_target_mins = 0.0
 _hud_hidden_by_overlay = False
 
 
@@ -16032,6 +16036,8 @@ class PenaltyBoxBriefingOverlay:
         ui_button=None,
         label_prefix="",
         lock_end_time=None,
+        lock_end_fn=None,
+        label_prefix_fn=None,
     ):
         """Runs the Stage B briefing countdown on the calling background worker
         thread, updating all monitor cards every 0.15s and returning early if
@@ -16054,9 +16060,17 @@ class PenaltyBoxBriefingOverlay:
             rem_f = max(0.0, end_t - now_t)
             rem_i = max(1, int(math.ceil(rem_f)))
             frac = max(0.0, min(1.0, rem_f / max(0.1, total_sec)))
+            eff_lock_end = (
+                lock_end_fn() if callable(lock_end_fn) else lock_end_time
+            )
+            eff_lbl_pfx = (
+                label_prefix_fn()
+                if callable(label_prefix_fn)
+                else label_prefix
+            )
             tot_rem_i = (
-                max(1, int(math.ceil(lock_end_time - now_t)))
-                if lock_end_time is not None
+                max(1, int(math.ceil(eff_lock_end - now_t)))
+                if eff_lock_end is not None
                 else None
             )
 
@@ -16130,13 +16144,13 @@ class PenaltyBoxBriefingOverlay:
 
             self._run_on_ui(_tick_ui, wait=False)
 
-            if ui_button is not None and label_prefix:
+            if ui_button is not None and eff_lbl_pfx:
                 hud_rem = tot_rem_i if tot_rem_i is not None else rem_i
                 hud_txt = (
                     f"🔒 LOCKED: {hud_rem}s"
                     if is_compact_hud()
                     else (
-                        f"{label_prefix}: {hud_rem}s REMAINING "
+                        f"{eff_lbl_pfx}: {hud_rem}s REMAINING "
                         f"(OS LOCK IN {rem_i}s)"
                     )
                 )
@@ -16243,6 +16257,8 @@ def start_cooldown_lock(
     global cooldown_active, cooldown_end_time, cooldown_label
     global cooldown_30s_announced, cooldown_announced_mins, alarm_active
     global _active_penalty_box_overlay, _cooldown_seq_id
+    global _cooldown_worker_seq, _cooldown_lock_engaged_seq
+    global _cooldown_flat_at_start, _cooldown_target_mins
     if _is_breach_epoch_superseded(adapter, expected_epoch):
         if overlay is not None:
             try:
@@ -16264,17 +16280,23 @@ def start_cooldown_lock(
         if (m * 60) >= (duration_sec - 10)
     }
 
-    if cooldown_active:
+    if cooldown_active and _cooldown_worker_seq == _cooldown_seq_id:
         if overlay is not None:
             try:
                 overlay.close()
             except Exception:
                 pass
+        _cooldown_flat_at_start = bool(
+            _cooldown_flat_at_start and was_flat_at_lock_start
+        )
+        upgraded_any = False
         if new_end_time > cooldown_end_time:
             cooldown_end_time = new_end_time
             cooldown_label = label_prefix
+            _cooldown_target_mins = float(duration_mins)
             cooldown_30s_announced = (duration_sec <= 35)
             cooldown_announced_mins = set(init_announced_mins)
+            upgraded_any = True
             if not demo_mode:
                 config["active_cooldown_end_epoch"] = float(cooldown_end_time)
                 config["active_cooldown_label"] = str(cooldown_label)
@@ -16288,22 +16310,56 @@ def start_cooldown_lock(
                 _format_lock_voice_msg(duration_mins, label_prefix, upgraded=True),
                 interrupt=True,
             )
-            _run_post_lock_watchdog(
-                adapter,
-                ui_button,
-                label_prefix,
-                was_flat_at_lock_start=was_flat_at_lock_start,
+        elif (
+            "DAILY" in str(label_prefix).upper()
+            and "DAILY" not in str(cooldown_label).upper()
+        ):
+            cooldown_label = label_prefix
+            upgraded_any = True
+            if not demo_mode:
+                config["active_cooldown_label"] = str(cooldown_label)
+                save_config(config)
+            log_event(
+                "COOLDOWN",
+                f"Promoted active lock label to {label_prefix} "
+                f"(retaining longer active timer). Siren muted."
             )
+        if upgraded_any:
+            if _cooldown_lock_engaged_seq == _cooldown_seq_id:
+                _run_post_lock_watchdog(
+                    adapter,
+                    ui_button,
+                    cooldown_label,
+                    was_flat_at_lock_start=was_flat_at_lock_start,
+                )
+            else:
+                log_event(
+                    "GUARDRAIL",
+                    f"Post-lock watchdog ({cooldown_label}) deferred until Windows OS lock engages.",
+                )
         return
 
+    prev_ov = _active_penalty_box_overlay
     _cooldown_seq_id += 1
     my_seq_id = _cooldown_seq_id
+    _cooldown_worker_seq = my_seq_id
+    _cooldown_flat_at_start = bool(was_flat_at_lock_start)
+    _cooldown_target_mins = float(duration_mins)
     cooldown_active = True
     cooldown_end_time = new_end_time
     cooldown_label = label_prefix
     cooldown_30s_announced = (duration_sec <= 35)
     cooldown_announced_mins = set(init_announced_mins)
     alarm_active = False
+    if (
+        prev_ov is not None
+        and prev_ov is not overlay
+        and not getattr(prev_ov, "closed", True)
+    ):
+        try:
+            prev_ov.close()
+        except Exception:
+            pass
     if not demo_mode:
         config["active_cooldown_end_epoch"] = float(cooldown_end_time)
         config["active_cooldown_label"] = str(cooldown_label)
@@ -16371,22 +16427,26 @@ def start_cooldown_lock(
     def cooldown_worker():
         global cooldown_active, cooldown_end_time, cooldown_label
         global cooldown_30s_announced, cooldown_announced_mins, alarm_active
+        global _cooldown_lock_engaged_seq, _cooldown_flat_at_start
         try:
             if _is_aborted():
                 if _cooldown_seq_id == my_seq_id:
                     cooldown_active = False
                 return
-            cooldown_end_time = time.time() + duration_sec
+            now_w = time.time()
+            cooldown_end_time = max(cooldown_end_time, now_w + duration_sec)
             tracked_wall_end = cooldown_end_time
-            mono_end = time.monotonic() + duration_sec
+            eff_dur_sec = max(duration_sec, int(round(cooldown_end_time - now_w)))
+            eff_dur_mins = _cooldown_target_mins
+            mono_end = time.monotonic() + (cooldown_end_time - now_w)
             if not demo_mode:
                 config["active_cooldown_end_epoch"] = float(cooldown_end_time)
                 config["active_cooldown_label"] = str(cooldown_label)
                 save_config(config)
             log_event(
                 "COOLDOWN",
-                f"Persistent {cooldown_label} started for {duration_sec}s "
-                f"({duration_mins:g} min, starting with {brief_s:g}s Penalty Box "
+                f"Persistent {cooldown_label} started for {eff_dur_sec}s "
+                f"({eff_dur_mins:g} min, starting with {brief_s:g}s Penalty Box "
                 f"briefing screen). Siren muted."
             )
             b_name = getattr(
@@ -16395,7 +16455,7 @@ def start_cooldown_lock(
             overlay.mark_flat_confirmed(broker_name=b_name)
             speak_async(
                 _format_lock_voice_msg(
-                    duration_mins,
+                    eff_dur_mins,
                     cooldown_label,
                     upgraded=False,
                     deferred_from_halt=deferred_from_halt,
@@ -16408,6 +16468,8 @@ def start_cooldown_lock(
                 ui_button=ui_button,
                 label_prefix=cooldown_label,
                 lock_end_time=cooldown_end_time,
+                lock_end_fn=lambda: cooldown_end_time,
+                label_prefix_fn=lambda: cooldown_label,
             )
         finally:
             if overlay is not None and not getattr(overlay, "closed", True):
@@ -16444,6 +16506,8 @@ def start_cooldown_lock(
                 ctypes.windll.user32.LockWorkStation()
             except Exception:
                 pass
+        if _cooldown_seq_id == my_seq_id:
+            _cooldown_lock_engaged_seq = my_seq_id
         watchdog_launched = True
         if demo_mode and (was_bypassed or (mono_end - time.monotonic()) <= 0.5):
             log_event(
@@ -16456,7 +16520,7 @@ def start_cooldown_lock(
                 adapter,
                 ui_button,
                 cooldown_label,
-                was_flat_at_lock_start=was_flat_at_lock_start,
+                was_flat_at_lock_start=_cooldown_flat_at_start,
             )
         time.sleep(0.35)
         lock_started_ts = time.time()
@@ -16541,7 +16605,7 @@ def start_cooldown_lock(
                     adapter,
                     ui_button,
                     cooldown_label,
-                    was_flat_at_lock_start=was_flat_at_lock_start,
+                    was_flat_at_lock_start=_cooldown_flat_at_start,
                 )
             time.sleep(0.20)
 
@@ -19281,7 +19345,7 @@ def trigger_lockdown(
     global is_locked_down, active_breach_source, last_breach_trigger_net_pnl
     global alarm_active, pending_halt_breach
     global daily_breach_settings_prompted, recent_loss_timestamps
-    global _active_penalty_box_overlay, cooldown_active, _cooldown_seq_id
+    global _active_penalty_box_overlay, cooldown_active, cooldown_label, _cooldown_seq_id
     eff_epoch = (
         get_adapter_epoch() if breach_epoch is None else breach_epoch
     )
@@ -19465,14 +19529,43 @@ def trigger_lockdown(
         else:
             if _is_breach_epoch_superseded(adapter, eff_epoch):
                 return
+            if cooldown_active and _cooldown_worker_seq == _cooldown_seq_id:
+                cooldown_label = "DAILY BREACH OS LOCK"
+                if not is_demo_mode_active(adapter):
+                    config["active_cooldown_label"] = str(cooldown_label)
+                    save_config(config)
+                log_event(
+                    "LOCKDOWN",
+                    f"Daily breach folded into active persistent {cooldown_label} "
+                    f"(preserving active lockout timer).",
+                )
+                if _cooldown_lock_engaged_seq == _cooldown_seq_id:
+                    _run_post_lock_watchdog(
+                        adapter,
+                        ui_button,
+                        cooldown_label,
+                        was_flat_at_lock_start=True,
+                    )
+                else:
+                    log_event(
+                        "GUARDRAIL",
+                        f"Post-lock watchdog ({cooldown_label}) deferred until Windows OS lock engages.",
+                    )
+                return
             log_event(
                 "LOCKDOWN",
                 "Confirmed flat. Showing Penalty Box briefing before one-shot Windows OS lock..."
             )
             demo_mode_one_shot = is_demo_mode_active(adapter)
+            prev_one_shot_ov = _active_penalty_box_overlay
             _cooldown_seq_id += 1
             one_shot_seq = _cooldown_seq_id
             cooldown_active = True
+            if prev_one_shot_ov is not None and not getattr(prev_one_shot_ov, "closed", True):
+                try:
+                    prev_one_shot_ov.close()
+                except Exception:
+                    pass
             eff_one_reason = (
                 f"Halt Ended & Position Confirmed Flat — Deferred Lockout ({reason})"
                 if deferred_from_halt
@@ -20900,9 +20993,13 @@ def evaluate_stop_decisions(
             )
         )
 
+    eff_max_eq = max_equity if max_equity is not None else start_equity
+    eff_dmax_eq = (
+        daily_max_equity if daily_max_equity is not None else eff_max_eq
+    )
     net_pnl = round(current_eq - start_equity, 2)
-    max_realized_profit = round(max_equity - start_equity, 2)
-    session_high_pnl = round(daily_max_equity - start_equity, 2)
+    max_realized_profit = round(eff_max_eq - start_equity, 2)
+    session_high_pnl = round(eff_dmax_eq - start_equity, 2)
 
     alarms_only = cfg.get("alarms_only_mode", False)
     open_flat_on = (not alarms_only) and cfg.get("enable_open_flatten", False)
@@ -20952,13 +21049,13 @@ def evaluate_stop_decisions(
         )
         floor_equity = (
             (
-                max(start_equity - pm_max, max_equity - pm_trail)
+                max(start_equity - pm_max, eff_max_eq - pm_trail)
                 if (pm_lock_on and max_realized_profit >= pm_trig)
                 else start_equity - pm_max
             )
             if not rth_now
             else (
-                max(start_equity + prior_rth_stop, max_equity - t4_trail)
+                max(start_equity + prior_rth_stop, eff_max_eq - t4_trail)
                 if (t4_on and max_realized_profit >= t4_trig)
                 else start_equity + eff_t3_max
                 if (t3_on and max_realized_profit >= t3_trig)
@@ -20972,7 +21069,7 @@ def evaluate_stop_decisions(
         full_leash, base_leash, leash_pct = _compute_leash_metrics(
             distance_to_terminate=distance_to_terminate,
             floor_equity=floor_equity,
-            max_eq_val=max_equity,
+            max_eq_val=eff_max_eq,
             rth_now=rth_now,
             pm_max=pm_max,
             pm_lock_on=pm_lock_on,
@@ -21114,13 +21211,13 @@ def evaluate_stop_decisions(
 
     active_floor = (
         (
-            max(start_equity - pm_max, max_equity - pm_trail)
+            max(start_equity - pm_max, eff_max_eq - pm_trail)
             if (pm_lock_on and max_realized_profit >= pm_trig)
             else start_equity - pm_max
         )
         if not rth_now
         else (
-            max(start_equity + prior_rth_stop, max_equity - t4_trail)
+            max(start_equity + prior_rth_stop, eff_max_eq - t4_trail)
             if (t4_on and max_realized_profit >= t4_trig)
             else start_equity + eff_t3_max
             if (t3_on and max_realized_profit >= t3_trig)
@@ -21329,7 +21426,7 @@ def evaluate_stop_decisions(
             check_alarm_rearm(r_pm_w1, net_pnl, -pm_w1)
 
         if pm_lock_on and max_realized_profit >= pm_trig:
-            floor_equity = max(start_equity - pm_max, max_equity - pm_trail)
+            floor_equity = max(start_equity - pm_max, eff_max_eq - pm_trail)
             check_alarm_rearm(r_pm_tr, current_eq, floor_equity)
         else:
             floor_equity = start_equity - pm_max
@@ -21385,14 +21482,14 @@ def evaluate_stop_decisions(
         if t4_on and max_realized_profit >= t4_trig:
             floor_equity = max(
                 start_equity + prior_rth_stop,
-                max_equity - t4_trail,
+                eff_max_eq - t4_trail,
             )
             if pending_halt_breach is not None:
                 pass
             elif not is_locked_down and current_eq <= floor_equity:
                 msg = (
                     f"Breached ${t4_trail:,.0f} Trailing Floor"
-                    if (max_equity - t4_trail) >= (start_equity + prior_rth_stop)
+                    if (eff_max_eq - t4_trail) >= (start_equity + prior_rth_stop)
                     else f"Breached Tier 4 Clamped Floor ({format_dollar(round(floor_equity - start_equity, 2))})"
                 )
                 actions.append(
@@ -21799,12 +21896,16 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     consecutive_loop_exceptions = 0
     api_disconnect_alerted = False
     rate_limit_hold_since = 0.0
+    rate_limit_anchor_hold_logged = False
+    _data_loop_wake_event.clear()
     last_data_loop_heartbeat = time.time()
     _prev_poll_diag = {"open": None, "net": None, "ts": 0.0, "epoch": None}
 
     while True:
         last_data_loop_heartbeat = time.time()
         poll_sec = 2
+        poll_ad = None
+        snap_was_cached = False
         try:
             try:
                 poll_sec = min(
@@ -21870,6 +21971,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
             if current_eq is not None and current_eq > 0:
                 if not snap_was_cached:
                     rate_limit_hold_since = 0.0
+                    rate_limit_anchor_hold_logged = False
                 if (
                     not snap_was_cached
                     and getattr(poll_ad, "last_positions_fetch_ok", True)
@@ -22028,6 +22130,30 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         f"({poll_ad.name}).",
                     )
 
+                if snap_was_cached and (
+                    force_reanchor
+                    or start_equity is None
+                    or start_equity <= 0.0
+                    or max_equity is None
+                ):
+                    rl_until_anc = float(
+                        getattr(poll_ad, "_rate_limit_until", 0.0) or 0.0
+                    )
+                    hold_s = max(
+                        0.25, min(5.0, rl_until_anc - time.time() + 0.05)
+                    )
+                    if not rate_limit_anchor_hold_logged:
+                        rate_limit_anchor_hold_logged = True
+                        log_event(
+                            "SESSION",
+                            "Broker rate-limited at launch — holding baseline anchor until the first live snapshot.",
+                        )
+                    consecutive_loop_exceptions = 0
+                    if _data_loop_wake_event.wait(timeout=hold_s):
+                        _data_loop_wake_event.clear()
+                        last_data_loop_heartbeat = time.time()
+                    continue
+
                 if (
                     start_equity is None
                     or start_equity <= 0.0
@@ -22123,6 +22249,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         f"({poll_ad.name}){ig_log_sfx}"
                     )
 
+                if max_equity is None and start_equity is not None:
+                    max_equity = start_equity
                 if daily_max_equity is None:
                     daily_max_equity = max(start_equity, max_equity)
                 if daily_min_equity is None:
@@ -23051,6 +23179,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 )
 
         rem_sleep = float(poll_sec)
+        if snap_was_cached and poll_ad is not None:
+            rl_until_slp = float(
+                getattr(poll_ad, "_rate_limit_until", 0.0) or 0.0
+            )
+            rl_rem = rl_until_slp - time.time()
+            if rl_rem > 0.0:
+                rem_sleep = max(rem_sleep, min(5.0, rl_rem + 0.05))
         while rem_sleep > 0:
             sl_step = min(0.25, rem_sleep)
             if _data_loop_wake_event.wait(timeout=sl_step):

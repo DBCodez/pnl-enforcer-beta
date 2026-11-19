@@ -4,6 +4,22 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.76] — 2026-11-19
+### ⚡ Quick Summary
+- **Clean Launch Past Startup `HTTP 429` Rate Limits (Webull & Schwab):** Cached snapshots replayed during an `HTTP 429` backoff no longer bypass baseline initialization or evaluate guardrails while an anchor or Force Re-Anchor is pending — eliminating the startup `'NoneType' and 'float'` `TypeError` alarm loop and pacing cleanly until the first live snapshot arrives (shoutout to **`T$MAC`** for the Safe Log catch!).
+- **Single Post-Lock Watchdog on Briefing Upgrades & Safe One-Shot Handoffs (`v0.9.75` Hardening):** Upgrading a `Penalty Box` or `Tilt Streak` cooldown to a `Daily Breach OS Lock` during the 15-second briefing screen now defers the post-lock watchdog until Windows actually locks (no duplicate Stage 1 sweep/callout), closes pre-worker duration races, and prevents persistent locks and `0-min` one-shot locks from overwriting or canceling each other.
+
+### 🔍 Detailed Breakdown
+- **Unanchored-Cache Gate, `max_equity` Guard & Paced `429` Backoff Recovery (`data_loop`, `evaluate_stop_decisions`):**
+  - Clears any stale `_data_loop_wake_event` on entry to `data_loop()` and initializes `poll_ad = None` / `snap_was_cached = False` at the top of `while True:` before `try:` so early pre-fetch exceptions can never raise `UnboundLocalError` in the sleep block.
+  - Added an explicit gate right after the Midnight ET rollover check (`data_loop()`): whenever `snap_was_cached` is `True` and `force_reanchor`, `start_equity is None`, `start_equity <= 0.0`, or `max_equity is None` holds, cached replays never anchor or evaluate while a re-anchor is pending — pacing directly to `poll_ad._rate_limit_until` (logged once per episode) until a live snapshot arrives, and pacing mid-session cached `429` waits cleanly at the bottom of the loop.
+  - Added defensive `max_equity` / `daily_max_equity` fallback normalization (`eff_max_eq` / `eff_dmax_eq`) inside `evaluate_stop_decisions()` and a live-poll `if max_equity is None and start_equity is not None: max_equity = start_equity` guard across both `WebullAdapter` and `SchwabAdapter`.
+- **Sequence-Tied Lock Engagement & Persistent / One-Shot Isolation (`_cooldown_worker_seq`, `_cooldown_lock_engaged_seq`, `_cooldown_flat_at_start`, `start_cooldown_lock`, `trigger_lockdown`, `PenaltyBoxBriefingOverlay`):**
+  - Replaced single-flag assumptions with sequence-tied `_cooldown_worker_seq`, `_cooldown_lock_engaged_seq`, and `_cooldown_flat_at_start` (`&= bool(was_flat_at_lock_start)` on upgrade): upgrades during the 15s briefing update `cooldown_label`, `cooldown_end_time`, and live countdown callbacks (`lock_end_fn` / `label_prefix_fn`) while deferring `_run_post_lock_watchdog()` until `cooldown_worker()` engages `LockWorkStation()`.
+  - Protected `cooldown_worker()`'s startup `cooldown_end_time = max(cooldown_end_time, now_w + duration_sec)` against pre-worker upgrades, and hardened the persistent ↔ `dl_mins == 0` one-shot boundary so active persistent locks fold Daily Breaches into `"DAILY BREACH OS LOCK"` without downgrading to one-shot while persistent locks cleanly supersede an active one-shot briefing.
+
+---
+
 ## [v0.9.75] — 2026-11-19
 ### ⚡ Quick Summary
 - **Accurate Win/Loss & Tilt-Streak Math Across Broker Fee Settlements (Schwab & Webull):** Post-close fee or commission adjustments while flat no longer leak into the next trade's PnL delta (preventing winning resets from being misread as scratches or losses), while any rapid round-trip opened and closed completely between polls still counts accurately toward your Tilt Streak.
