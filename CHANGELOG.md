@@ -4,6 +4,42 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.75] — 2026-11-19
+### ⚡ Quick Summary
+- **Accurate Win/Loss & Tilt-Streak Math Across Broker Fee Settlements (Schwab & Webull):** Post-close fee or commission adjustments while flat no longer leak into the next trade's PnL delta (preventing winning resets from being misread as scratches or losses), while any rapid round-trip opened and closed completely between polls still counts accurately toward your Tilt Streak.
+- **Zero `HTTP 429` Collisions on `Done for Today` / Flatten & Quieter Rate-Limit Holds (Webull & Schwab):** Serialized Webull `/account/position` requests across live polling, flatten verification, and post-lock watchdogs, reused the final verified flat check's paired options read so `Done for Today` / `Panic` never fire an extra position burst, and held brief `HTTP 429` backoffs cleanly without flashing false `RETRYING API` reconnects.
+- **Armed Options Order Sweep on All Breach Triggers During RTH & Resilient Audio Sirens:** Single-Trade Stops, Consecutive Loss Cooldowns, and Daily Stop Lockdowns now cancel resting option orders and sweep any sub-second option fills whenever `Options Auto-Flatten (BETA)` is armed during Regular Trading Hours (`9:30 AM – 4:00 PM ET`), and live HUD sirens now pause and resume cleanly when `⚙ SETTINGS` comes to the foreground instead of silencing permanently after one beep.
+
+### 🔍 Detailed Breakdown
+- **Flat-State Realized Baseline Sync & Sub-Poll Round-Trip Guard (`_classify_round_trip_delta`, `log_position_transitions`, `_stabilize_mid_fill_realized_and_equity`, `restore_account_session`, `evaluate_stop_decisions`):**
+  - Extracted W/L and `TiltStreak` scoring into `_classify_round_trip_delta(delta, cfg=None)` and tracked `_last_round_trip_close_ts` / `_pending_subpoll_consec_reason`.
+  - Inside `_stabilize_mid_fill_realized_and_equity()` (`is_flat` and `was_flat_before`, non-demo), post-close equity drifts within `90s` of a round-trip close log `[POS_SETTLE]` and sync `prev_flat_realized_pnl` cleanly; larger non-recent flat drifts (`drift <= -consec_loss_min_dollars` or `>= max(consec_loss_min_dollars, consec_win_reset_dollars)`) are scored as `(Sub-poll flat round-trip)` via `_classify_round_trip_delta()` before syncing, while preserving Demo Sandbox `_trig_tilt_loss()` and ignored-position deadband handling.
+- **Unified Webull Position Slot Pacer, Paired Post-Flatten Options Verify & Two-Way `HTTP 429` Hold (`WebullAdapter._reserve_pos_slot`, `flatten_equities`, `_verify_post_flatten_unarmed_options`, `data_loop`):**
+  - Replaced `WebullAdapter.fetch_account_data()`'s unlocked `2.10s` check and `_pace_position_verify_call()`'s single-pass sleep with `_reserve_pos_slot(own_gap=..., owner=...)` under `_pos_pace_lock`, stamping `_last_pos_call_ts` at claim time and re-checking `_rate_limit_until` every `<= 0.25s`.
+  - Updated `flatten_equities()`'s `_mark_flatten_flat(save_paired_opts=True)` to snapshot fresh (`< 1.0s`) paired `_last_open_opt` readings onto `adapter._post_flatten_opt_verify` right before `invalidate_cached_snapshots()`, letting `_verify_post_flatten_unarmed_options()` consume verified `< 2.0s` readings for the active `account_id` without a redundant `/account/position` or `/accounts` call (falling back to live polling if stale, mismatched, or inferred post-timeout via order coverage).
+  - Updated `data_loop()` to hold active `< 20s` `HTTP 429` rate-limit windows (`_rate_limit_until`) without incrementing `consecutive_api_failures` or calling `reconnect_session()` on both `SchwabAdapter` and `WebullAdapter`, escalating normally if continuous `429`s reach `>= 20s`.
+- **RTH Armed-Options Breach Coverage (`trigger_open_pnl_flatten`, `trigger_consec_loss_cooldown`, `trigger_lockdown`):**
+  - Evaluated `rth_now = is_market_hours()` once per trigger and passed `include_options=bool(opt_armed and rth_now)` directly to `flatten_equities()` (matching `activate_done_for_today` and `trigger_manual_panic_flatten`), keeping all unarmed/off-RTH siren & halt-watch guards intact and logging `bool(has_options or opt_exec_now)` to `_enter_halt_breach_watch()`.
+- **Siren Loop Foreground-Focus Survival & Non-Blocking Startup Grace Tone (`sound_alarm_loop`, `sound_disconnect_alert_loop`, `trigger_alarm`, `play_startup_grace_chime`):**
+  - Updated `sound_alarm_loop()` and `sound_disconnect_alert_loop()` to pause cleanly (`time.sleep(0.20); continue`) instead of terminating the loop thread while `_settings_suppresses_alarms()` is `True`, added `_alarm_loop_gen` under `_alarm_loop_lock` so overlapping alarm triggers never double-cadence, and moved `play_startup_grace_chime()` to a daemon thread so `data_loop()` never blocks `140ms` on startup grace.
+
+---
+
+## [v0.9.74] — 2026-11-17
+### ⚡ Quick Summary
+- **Manual Overrides Always Clear Startup Grace (`🔒 Done Today` & `🚨 HOLD 2s: FLATTEN`):** Ensured explicit manual overrides immediately clear any startup breach grace before saving session state or canceling working orders — even if an initial position read momentarily returns empty or `data_loop` polls mid-scale-out at the same instant.
+- **Timestamp-Safe OCO Partial-Fill Exit Coverage (Schwab & Webull):** Tightened OCO bracket coverage math during partial fills so a partially filled leg can never stack onto a `~100ms`-lagging sibling leg's remaining quantity (nor over-sell on a stale position snapshot), and fixed a numeric `remain_quantity = 0` check on Webull open orders.
+
+### 🔍 Detailed Breakdown
+- **Immediate Startup Grace Clearance on Manual Overrides (`_clear_launch_grace_state`, `activate_done_for_today`, `trigger_manual_panic_flatten`, `flatten_equities`, `evaluate_stop_decisions`):**
+  - Added `_clear_launch_grace_state()` (clearing `_launch_grace_pending = False`, `_launch_grace_syms`, `_launch_grace_ref_opnl`, and `_launch_grace_ref_net`) invoked at entry of `activate_done_for_today()` (prior to `save_session_state()`), inside `trigger_manual_panic_flatten()`, and at the start of `flatten_equities()` whenever `manual_panic or done_for_today` so transient `None` `peek_pos` reads or follow-up `POST_BREACH_FLATTEN` sweeps never skip graced working orders or shares.
+  - Added early `done_for_today or _manual_flatten_in_flight` guards in `is_launch_grace_position()` and `evaluate_stop_decisions()`'s scale-out branch so concurrent background polls cannot re-insert cleared grace keys.
+- **Timestamp-Verified OCO Partial-Fill Coverage Cap & Webull `0`-Remaining Fix (`SchwabAdapter.get_recent_exit_order_coverage`, `WebullAdapter.get_recent_exit_order_coverage`):**
+  - Tracks per-OCO-group `init_max`, `work_max`, `filled_all`, and post-`cutoff_epoch` `filled_recent` (via `orderActivityCollection[].executionLegs[].time` on Schwab and `filled_time` / `update_time` on Webull): caps `grp_working = min(work_max, max(0.0, init_max - filled_all))` and `grp_filled_rec = min(filled_recent, init_max)` whenever fill timestamps are present, preventing both sibling-lag coverage overstatement on updated snapshots and accidental over-selling on stale snapshots. *(Note: on Webull, a fully filled OCO leg drops off the open-orders list, leaving at most the broker's ~100ms sibling-cancel propagation window before the next sweep.)*
+  - Replaced Webull's falsy `or` chain on `remain_quantity` with explicit `is not None` checks so numeric `0` remaining never falls through to original `quantity`, and added Suite `Test 29` in `test_enforcer.py`.
+
+---
+
 ## [v0.9.73] — 2026-11-17
 ### ⚡ Quick Summary
 - **Off-Session Trade Catch-Up & Zero-Penalty Startup (Schwab & Webull):** Closed Enforcer for part of the day and took trades while it was off? Re-opening now automatically scans your broker fills while closed to catch up your **`TRADES (W/L)`**, **`SESSION HIGH`**, and **`SESSION LOW`** — and **never** penalizes you on launch (no surprise Windows OS lock, no instant position dump, and a calm **`• GRACE`** hold on any already-open trade until you close it, add size, flip, or lose past your post-launch stop backstop).

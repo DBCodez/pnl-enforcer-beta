@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.73"
+APP_VERSION = "0.9.75"
 
 import os
 import sys
@@ -2434,6 +2434,8 @@ _off_session_reconciled = False
 _cold_launch_ignored_qty_mutated = False
 
 alarm_active = False
+_alarm_loop_gen = 0
+_alarm_loop_lock = threading.Lock()
 cooldown_active = False
 dry_run_lock_active = False
 breach_visual_sim_active = False
@@ -2453,6 +2455,8 @@ last_rth_mode = None
 win_trades = 0
 loss_trades = 0
 prev_flat_realized_pnl = 0.0
+_last_round_trip_close_ts = 0.0
+_pending_subpoll_consec_reason = None
 settled_realized_pnl = None
 flat_desync_streak = 0
 in_trade_desync_streak = 0
@@ -4381,6 +4385,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     global last_breach_trigger_net_pnl
     global done_for_today, committed_for_today
     global win_trades, loss_trades, prev_flat_realized_pnl
+    global _last_round_trip_close_ts, _pending_subpoll_consec_reason
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
     global current_upside_tier, first_poll_of_launch, _launch_fee_drift_checked
@@ -4418,6 +4423,8 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     flat_desync_streak = 0
     in_trade_desync_streak = 0
     pending_scale_out_tol = 0.0
+    _last_round_trip_close_ts = 0.0
+    _pending_subpoll_consec_reason = None
     today_str = get_today_str()
     active_session_date = today_str
     s_key = get_session_key(broker_name, account_id)
@@ -4550,6 +4557,8 @@ def restore_account_session(broker_name, account_id, log_restore=False):
                 ignored_positions.update(json.loads(json.dumps(saved_ig)))
             prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
             settled_realized_pnl = prev_flat_realized_pnl
+            _last_round_trip_close_ts = 0.0
+            _pending_subpoll_consec_reason = None
             if (
                 "win_trades" not in s_data
                 and win_trades == 0
@@ -4620,6 +4629,8 @@ def restore_account_session(broker_name, account_id, log_restore=False):
         loss_trades = int(config.get("saved_loss_trades", 0) or 0)
         prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
         settled_realized_pnl = prev_flat_realized_pnl
+        _last_round_trip_close_ts = 0.0
+        _pending_subpoll_consec_reason = None
         if win_trades == 0 and loss_trades == 0:
             bw, bl, _ = backfill_trades_from_today_log(broker_name)
             if bw > 0 or bl > 0:
@@ -4663,6 +4674,8 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     loss_trades = 0
     prev_flat_realized_pnl = 0.0
     settled_realized_pnl = None
+    _last_round_trip_close_ts = 0.0
+    _pending_subpoll_consec_reason = None
     current_upside_tier = 1
     first_poll_of_launch = True
     return False
@@ -5133,12 +5146,23 @@ def is_position_ignored(sym_or_tag, is_opt=False):
         return False
 
 
+def _clear_launch_grace_state():
+    """Clears all active and pending startup breach grace state so explicit
+    manual overrides (`HOLD 2s: FLATTEN` / `Done Today`) or post-launch safety
+    backstops immediately arm normal order cancellation and liquidation."""
+    global _launch_grace_pending, _launch_grace_ref_net
+    _launch_grace_pending = False
+    _launch_grace_syms.clear()
+    _launch_grace_ref_opnl.clear()
+    _launch_grace_ref_net = None
+
+
 def is_launch_grace_position(sym_or_tag, is_opt=None):
     """Returns True when sym_or_tag is a pre-existing position held at startup
     under active startup breach grace (`_launch_grace_syms`) so automated stops
     (`POST_BREACH_FLATTEN` / `OPEN_PNL_FLATTEN`) do not liquidate it until it
     closes flat, scales in, flips direction, or exceeds its post-launch loss backstop."""
-    if not _launch_grace_syms:
+    if not _launch_grace_syms or done_for_today or _manual_flatten_in_flight:
         return False
     s = str(sym_or_tag or "").strip()
     if not s:
@@ -6047,6 +6071,7 @@ class SchwabAdapter:
         self._snapshot_gen = 0
         self.last_snapshot_was_cached = False
         self._last_flatten_outcome = "FLAT"
+        self._post_flatten_opt_verify = None
         self._last_good_snapshot = {}
         self._last_raw_pos_details = {}
         self._last_raw_adj_eq = {}
@@ -6536,7 +6561,7 @@ class SchwabAdapter:
         pend = self._pending_flatten_cids.get((self.account_id, target_sym))
         pend_oid = str(pend[0]).strip() if (pend and pend[0]) else ""
         working_qty = 0.0
-        oco_working_max = {}
+        oco_groups = {}
         filled_qty = 0.0
         cov_seen_oids = set()
 
@@ -6592,35 +6617,124 @@ class SchwabAdapter:
             except Exception:
                 f_q = 0.0
             try:
+                raw_leg_q = (
+                    lg["quantity"]
+                    if lg.get("quantity") is not None
+                    else o.get("quantity")
+                )
+                leg_orig_q = float(raw_leg_q) if raw_leg_q is not None else 0.0
+            except Exception:
+                leg_orig_q = 0.0
+            try:
                 rem_q = float(
                     o.get("remainingQuantity")
                     if o.get("remainingQuantity") is not None
-                    else max(
-                        0.0,
-                        float(lg.get("quantity") or o.get("quantity") or 0.0)
-                        - f_q,
-                    )
+                    else max(0.0, leg_orig_q - f_q)
                 )
             except Exception:
                 rem_q = 0.0
-            if st in active_statuses and rem_q > 0:
-                if sc_oco_gid:
-                    oco_working_max[sc_oco_gid] = max(
-                        oco_working_max.get(sc_oco_gid, 0.0), rem_q
-                    )
-                else:
-                    working_qty += rem_q
+
+            recent_f_q = 0.0
+            has_fill_ts = False
             if f_q > 0:
-                ent_ep = self._order_ts_to_epoch(
-                    o.get("closeTime") or o.get("enteredTime")
+                exec_leg_eps = []
+                exec_recent_sum = 0.0
+                exec_has_qty = False
+                for act in o.get("orderActivityCollection") or []:
+                    if not isinstance(act, dict):
+                        continue
+                    for ex_leg in act.get("executionLegs") or []:
+                        if not isinstance(ex_leg, dict):
+                            continue
+                        ex_ep = self._order_ts_to_epoch(ex_leg.get("time"))
+                        if ex_ep > 0.0:
+                            exec_leg_eps.append(ex_ep)
+                            raw_ex_q = ex_leg.get("quantity")
+                            if raw_ex_q is not None:
+                                try:
+                                    ex_qv = float(raw_ex_q)
+                                    exec_has_qty = True
+                                    if ex_ep >= cutoff_epoch:
+                                        exec_recent_sum += ex_qv
+                                except Exception:
+                                    pass
+                if exec_leg_eps:
+                    has_fill_ts = True
+                    if exec_has_qty:
+                        recent_f_q = min(f_q, exec_recent_sum)
+                    elif max(exec_leg_eps) >= cutoff_epoch:
+                        recent_f_q = f_q
+                elif pend_oid and oid_str == pend_oid:
+                    has_fill_ts = True
+                    recent_f_q = f_q
+                elif o.get("closeTime") is not None:
+                    ep_c = self._order_ts_to_epoch(o.get("closeTime"))
+                    if ep_c > 0.0:
+                        has_fill_ts = True
+                        if ep_c >= cutoff_epoch:
+                            recent_f_q = f_q
+                elif st == "FILLED" and o.get("enteredTime") is not None:
+                    ep_e = self._order_ts_to_epoch(o.get("enteredTime"))
+                    if ep_e > 0.0:
+                        has_fill_ts = True
+                        if ep_e >= cutoff_epoch:
+                            recent_f_q = f_q
+
+            if sc_oco_gid:
+                b = oco_groups.setdefault(
+                    sc_oco_gid,
+                    {
+                        "init_max": 0.0,
+                        "work_max": 0.0,
+                        "filled_all": 0.0,
+                        "filled_recent": 0.0,
+                        "all_fills_timed": True,
+                    },
                 )
-                if (
-                    (pend_oid and oid_str == pend_oid)
-                    or ent_ep <= 0.0
-                    or ent_ep >= cutoff_epoch
-                ):
-                    filled_qty += f_q
-        working_qty += sum(oco_working_max.values())
+                b["init_max"] = max(
+                    b["init_max"],
+                    leg_orig_q,
+                    f_q + (rem_q if st in active_statuses else 0.0),
+                )
+                if st in active_statuses and rem_q > 0:
+                    b["work_max"] = max(b["work_max"], rem_q)
+                if f_q > 0:
+                    if has_fill_ts:
+                        b["filled_all"] += f_q
+                        b["filled_recent"] += recent_f_q
+                    else:
+                        b["all_fills_timed"] = False
+            else:
+                if st in active_statuses and rem_q > 0:
+                    working_qty += rem_q
+                if f_q > 0:
+                    if has_fill_ts:
+                        filled_qty += recent_f_q
+                    else:
+                        ent_ep = self._order_ts_to_epoch(
+                            o.get("closeTime") or o.get("enteredTime")
+                        )
+                        if (
+                            (pend_oid and oid_str == pend_oid)
+                            or ent_ep <= 0.0
+                            or ent_ep >= cutoff_epoch
+                        ):
+                            filled_qty += f_q
+
+        for b in oco_groups.values():
+            i_max = b["init_max"]
+            if b["all_fills_timed"] and i_max > 0:
+                grp_working = min(
+                    b["work_max"], max(0.0, i_max - b["filled_all"])
+                )
+                grp_filled_rec = min(b["filled_recent"], i_max)
+            else:
+                grp_working = min(b["work_max"], i_max) if i_max > 0 else b["work_max"]
+                grp_filled_rec = (
+                    min(b["filled_recent"], i_max) if i_max > 0 else b["filled_recent"]
+                )
+            working_qty += grp_working
+            filled_qty += grp_filled_rec
         return working_qty, filled_qty
 
     def cancel_all_working_orders(
@@ -8623,12 +8737,14 @@ class WebullAdapter:
         self._logged_accounts = set()
         self._prev_pos_qty_map = {}
         self._last_pos_call_ts = 0.0
+        self._last_dl_pos_call_ts = 0.0
         self._pos_pace_lock = threading.Lock()
         self._next_pos_slot_ts = 0.0
         self._cache_lock = threading.Lock()
         self._snapshot_gen = 0
         self.last_snapshot_was_cached = False
         self._last_flatten_outcome = "FLAT"
+        self._post_flatten_opt_verify = None
         self._last_good_snapshot = {}
         self._last_raw_pos_details = {}
         self._last_raw_adj_eq = {}
@@ -8665,22 +8781,62 @@ class WebullAdapter:
             ):
                 self._filled_since_cache.clear()
 
-    def _pace_position_verify_call(self):
+    def _reserve_pos_slot(self, own_gap=None, owner="verify"):
+        """Serializes Webull `/account/position` requests across `data_loop`
+        and flatten/watchdog threads under `_pos_pace_lock`, stamping
+        `_last_pos_call_ts` on claim and re-checking mid-sleep 429 backoffs."""
         global last_data_loop_heartbeat
-        with self._pos_pace_lock:
-            now_p = time.time()
-            earliest = max(
-                now_p,
-                self._next_pos_slot_ts,
-                self._rate_limit_until,
-                self._last_pos_call_ts + WEBULL_POS_MIN_INTERVAL_SEC,
-            )
-            self._next_pos_slot_ts = earliest + WEBULL_POS_MIN_INTERVAL_SEC
-            wait_s = max(0.0, earliest - now_p)
-        if wait_s > 0.0:
-            last_data_loop_heartbeat = time.time()
-            time.sleep(wait_s)
-            last_data_loop_heartbeat = time.time()
+        if own_gap is None:
+            own_gap = WEBULL_POS_MIN_INTERVAL_SEC
+        while True:
+            with self._pos_pace_lock:
+                now_p = time.time()
+                if self._last_pos_call_ts <= 0.0:
+                    self._next_pos_slot_ts = 0.0
+                    self._last_dl_pos_call_ts = 0.0
+                dl_due = (
+                    (self._last_dl_pos_call_ts + float(own_gap))
+                    if (owner == "dl" and self._last_dl_pos_call_ts > 0.0)
+                    else 0.0
+                )
+                last_due = (
+                    (self._last_pos_call_ts + WEBULL_POS_MIN_INTERVAL_SEC)
+                    if self._last_pos_call_ts > 0.0
+                    else 0.0
+                )
+                due = max(
+                    now_p,
+                    self._next_pos_slot_ts,
+                    self._rate_limit_until,
+                    last_due,
+                    dl_due,
+                )
+                wait_s = due - now_p
+                if wait_s <= 0.005:
+                    self._last_pos_call_ts = now_p
+                    self._next_pos_slot_ts = now_p + WEBULL_POS_MIN_INTERVAL_SEC
+                    if owner == "dl":
+                        self._last_dl_pos_call_ts = now_p
+                    return
+            chunk_s = min(wait_s, 0.25)
+            t_pre_sl = time.time()
+            last_data_loop_heartbeat = t_pre_sl
+            time.sleep(chunk_s)
+            t_post_sl = time.time()
+            last_data_loop_heartbeat = t_post_sl
+            if chunk_s >= 0.10 and (t_post_sl - t_pre_sl) < (chunk_s * 0.4):
+                with self._pos_pace_lock:
+                    now_f = time.time()
+                    self._last_pos_call_ts = now_f
+                    self._next_pos_slot_ts = now_f + WEBULL_POS_MIN_INTERVAL_SEC
+                    if owner == "dl":
+                        self._last_dl_pos_call_ts = now_f
+                    return
+
+    def _pace_position_verify_call(self):
+        self._reserve_pos_slot(
+            own_gap=WEBULL_POS_MIN_INTERVAL_SEC, owner="verify"
+        )
 
     def _prune_pending_flatten_cids(self, acct_id, live_qty_map):
         if not acct_id or not self._pending_flatten_cids:
@@ -9269,11 +9425,16 @@ class WebullAdapter:
         target_sym = str(symbol).strip()
         closing_side = "BUY" if is_short else "SELL"
         working_qty = 0.0
-        oco_working_max = {}
+        oco_groups = {}
         filled_qty = 0.0
         seen_cids = set()
         open_lookup_ok = False
         detail_lookup_ok = False
+        cutoff = (
+            float(math.floor(float(since_epoch)))
+            if since_epoch is not None
+            else (time.time() - 180.0)
+        )
 
         try:
             open_orders_raw = self._fetch_all_open_orders_webull()
@@ -9313,33 +9474,92 @@ class WebullAdapter:
                 if cid:
                     seen_cids.add(cid)
                 try:
-                    rem_q = float(
-                        o.get("remain_quantity")
-                        or o.get("unfilled_quantity")
-                        or o.get("quantity")
-                        or o.get("total_quantity")
-                        or 0.0
+                    raw_fq = (
+                        o["filled_quantity"]
+                        if o.get("filled_quantity") is not None
+                        else o["filled_qty"]
+                        if o.get("filled_qty") is not None
+                        else o.get("total_filled_quantity")
+                    )
+                    f_q = float(raw_fq) if raw_fq is not None else 0.0
+                except Exception:
+                    f_q = 0.0
+                try:
+                    raw_orig = (
+                        o["total_quantity"]
+                        if o.get("total_quantity") is not None
+                        else o.get("quantity")
+                    )
+                    orig_q = float(raw_orig) if raw_orig is not None else 0.0
+                except Exception:
+                    orig_q = 0.0
+                try:
+                    raw_rem = (
+                        o["remain_quantity"]
+                        if o.get("remain_quantity") is not None
+                        else o.get("unfilled_quantity")
+                    )
+                    rem_q = (
+                        float(raw_rem)
+                        if raw_rem is not None
+                        else max(0.0, orig_q - f_q)
                     )
                 except Exception:
                     rem_q = 0.0
-                if rem_q > 0:
-                    wb_gid_cov = o.get("_wb_oco_gid")
-                    if wb_gid_cov:
-                        oco_working_max[wb_gid_cov] = max(
-                            oco_working_max.get(wb_gid_cov, 0.0), rem_q
-                        )
-                    else:
+
+                fill_ep = self._webull_ts_to_epoch(
+                    o.get("filled_time") or o.get("update_time")
+                )
+                has_fill_ts = fill_ep > 0.0
+                wb_gid_cov = o.get("_wb_oco_gid")
+                if wb_gid_cov:
+                    b = oco_groups.setdefault(
+                        wb_gid_cov,
+                        {
+                            "init_max": 0.0,
+                            "work_max": 0.0,
+                            "filled_all": 0.0,
+                            "filled_recent": 0.0,
+                            "all_fills_timed": True,
+                        },
+                    )
+                    b["init_max"] = max(b["init_max"], orig_q, rem_q + f_q)
+                    if rem_q > 0:
+                        b["work_max"] = max(b["work_max"], rem_q)
+                    if f_q > 0:
+                        if has_fill_ts:
+                            b["filled_all"] += f_q
+                            if fill_ep >= cutoff:
+                                b["filled_recent"] += f_q
+                        else:
+                            b["all_fills_timed"] = False
+                else:
+                    if rem_q > 0:
                         working_qty += rem_q
-            working_qty += sum(oco_working_max.values())
+                    if f_q > 0 and has_fill_ts and fill_ep >= cutoff:
+                        filled_qty += f_q
+            for b in oco_groups.values():
+                i_max = b["init_max"]
+                if b["all_fills_timed"] and i_max > 0:
+                    grp_working = min(
+                        b["work_max"], max(0.0, i_max - b["filled_all"])
+                    )
+                    grp_filled_rec = min(b["filled_recent"], i_max)
+                else:
+                    grp_working = (
+                        min(b["work_max"], i_max) if i_max > 0 else b["work_max"]
+                    )
+                    grp_filled_rec = (
+                        min(b["filled_recent"], i_max)
+                        if i_max > 0
+                        else b["filled_recent"]
+                    )
+                working_qty += grp_working
+                filled_qty += grp_filled_rec
         except Exception:
             pass
 
         pend = self._pending_flatten_cids.get((self.account_id, target_sym))
-        cutoff = (
-            float(math.floor(float(since_epoch)))
-            if since_epoch is not None
-            else (time.time() - 180.0)
-        )
         need_detail_lookup = bool(
             pend and pend[0] not in seen_cids and float(pend[1]) >= cutoff
         )
@@ -11318,9 +11538,7 @@ class WebullAdapter:
             return None, True, 0.0, {}, False
 
         try:
-            elapsed_pos = time.time() - self._last_pos_call_ts
-            if 0.0 <= elapsed_pos < 2.10:
-                time.sleep(2.10 - elapsed_pos)
+            self._reserve_pos_slot(own_gap=2.10, owner="dl")
             p_res = self._call_get_positions(acct_id=start_acct_id)
             if self.account_id != start_acct_id or broker_reconfig_in_progress:
                 return None, True, 0.0, {}, False
@@ -11755,6 +11973,7 @@ class DemoBrokerAdapter:
         self.last_positions_fetch_ok = True
         self.last_snapshot_was_cached = False
         self._last_flatten_outcome = "FLAT"
+        self._post_flatten_opt_verify = None
         self._fast_auth_deferred = False
         self.last_error = ""
         self._lock = threading.RLock()
@@ -13852,16 +14071,20 @@ def play_disconnect_tone_once(force=False):
 
 
 def play_startup_grace_chime(force=False, cfg_override=None):
-    """Plays a single calm heads-up tone (660 Hz) when startup breach grace
-    engages on a pre-existing open trade (distinct from the 2-note API
-    disconnect tone and emergency sirens)."""
+    """Plays a single calm heads-up tone (660 Hz) asynchronously when startup
+    breach grace engages on a pre-existing open trade (distinct from the
+    2-note API disconnect tone and emergency sirens)."""
     eff_c = cfg_override if isinstance(cfg_override, dict) else config
     if not force and eff_c.get("mute_all_audio", False):
         return
-    try:
-        winsound.Beep(660, 140)
-    except Exception:
-        pass
+
+    def _grace_worker():
+        try:
+            winsound.Beep(660, 140)
+        except Exception:
+            pass
+
+    threading.Thread(target=_grace_worker, daemon=True).start()
 
 
 def _settings_suppresses_alarms():
@@ -13896,17 +14119,19 @@ def _settings_suppresses_alarms():
     return True
 
 
-def sound_disconnect_alert_loop():
+def sound_disconnect_alert_loop(my_gen=None):
     """Plays the calm 2-note descending connection-loss tone once immediately
-    and then repeats gently every 4.5 seconds until acknowledged or restored."""
+    and then repeats gently every 4.5 seconds until acknowledged or restored.
+    Pauses cleanly while Settings/modal temporarily suppresses audio."""
     global alarm_active
-    while (
-        alarm_active
-        and not cooldown_active
-        and not _settings_suppresses_alarms()
-    ):
+    while alarm_active and not cooldown_active:
+        if my_gen is not None and my_gen != _alarm_loop_gen:
+            break
         if not is_disconnect_alarm_reason(last_alarm_reason):
             break
+        if _settings_suppresses_alarms():
+            time.sleep(0.20)
+            continue
         if not config.get("mute_all_audio", False):
             play_disconnect_tone_once()
         # Wait 4.5s between gentle reminders in 0.15s slices for instant mute/recovery
@@ -13916,20 +14141,24 @@ def sound_disconnect_alert_loop():
                 or cooldown_active
                 or _settings_suppresses_alarms()
                 or not is_disconnect_alarm_reason(last_alarm_reason)
+                or (my_gen is not None and my_gen != _alarm_loop_gen)
             ):
                 break
             time.sleep(0.15)
 
 
-def sound_alarm_loop():
+def sound_alarm_loop(my_gen=None):
+    """Plays the high-priority emergency siren burst repeatedly while an alarm
+    is active, pausing cleanly without exiting when Settings temporarily holds
+    foreground focus."""
     global alarm_active
-    while (
-        alarm_active
-        and not cooldown_active
-        and not _settings_suppresses_alarms()
-    ):
-        if config.get("mute_all_audio", False):
-            time.sleep(0.25)
+    while alarm_active and not cooldown_active:
+        if my_gen is not None and my_gen != _alarm_loop_gen:
+            break
+        if is_disconnect_alarm_reason(last_alarm_reason):
+            break
+        if _settings_suppresses_alarms() or config.get("mute_all_audio", False):
+            time.sleep(0.20)
             continue
         for _ in range(10):
             if (
@@ -13937,6 +14166,8 @@ def sound_alarm_loop():
                 or cooldown_active
                 or _settings_suppresses_alarms()
                 or config.get("mute_all_audio", False)
+                or is_disconnect_alarm_reason(last_alarm_reason)
+                or (my_gen is not None and my_gen != _alarm_loop_gen)
             ):
                 break
             winsound.Beep(2600, 220)
@@ -13945,7 +14176,7 @@ def sound_alarm_loop():
 
 
 def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
-    global alarm_active, triggered_alarms, last_alarm_reason
+    global alarm_active, triggered_alarms, last_alarm_reason, _alarm_loop_gen
     r_up = str(reason or "").upper()
     is_repeatable_unfilled = (not alarm_active) and any(
         k in r_up
@@ -14035,7 +14266,10 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
         if is_disconnect_alarm_reason(reason)
         else sound_alarm_loop
     )
-    threading.Thread(target=loop_fn, daemon=True).start()
+    with _alarm_loop_lock:
+        _alarm_loop_gen += 1
+        gen_now = _alarm_loop_gen
+    threading.Thread(target=loop_fn, args=(gen_now,), daemon=True).start()
 
 
 def _flush_deferred_alarms(default_ui_button=None):
@@ -16403,8 +16637,44 @@ def flatten_equities(
             return "[]"
         return str([(x[0], x[1]) for x in opt_list])
 
-    def _mark_flatten_flat():
+    def _mark_flatten_flat(save_paired_opts=True):
         if adapter is not None:
+            if save_paired_opts and not include_options:
+                try:
+                    paired_opts = None
+                    if isinstance(adapter, DemoBrokerAdapter):
+                        paired_opts = _call_adapter_open_opt(
+                            adapter, allow_stale_cache=False
+                        )
+                    elif (
+                        getattr(adapter, "_cache_lock", None) is not None
+                        and isinstance(getattr(adapter, "_last_open_opt", None), dict)
+                    ):
+                        with adapter._cache_lock:
+                            cached_opt = adapter._last_open_opt.get(
+                                getattr(adapter, "account_id", None)
+                            )
+                        if (
+                            cached_opt
+                            and (time.time() - float(cached_opt[0])) < 1.0
+                        ):
+                            paired_opts = [
+                                item
+                                for item in cached_opt[1]
+                                if not is_position_ignored(item[0], is_opt=True)
+                            ]
+                    if paired_opts is not None:
+                        setattr(
+                            adapter,
+                            "_post_flatten_opt_verify",
+                            (
+                                time.time(),
+                                getattr(adapter, "account_id", ""),
+                                list(paired_opts),
+                            ),
+                        )
+                except Exception:
+                    pass
             try:
                 setattr(adapter, "_last_flatten_outcome", "FLAT")
             except Exception:
@@ -16415,9 +16685,12 @@ def flatten_equities(
 
     with _flatten_exec_lock:
         try:
+            if manual_panic or done_for_today:
+                _clear_launch_grace_state()
             try:
                 setattr(adapter, "_last_flatten_halted_with_working_exit", False)
                 setattr(adapter, "_last_flatten_outcome", "OPEN")
+                setattr(adapter, "_post_flatten_opt_verify", None)
             except Exception:
                 pass
             flatten_wave_start_ts = time.time()
@@ -17296,7 +17569,7 @@ def flatten_equities(
                         "Post-timeout verification confirmed 100% of remaining position(s) "
                         "have FILLED exit orders at broker (position endpoint lagging) — treating as flat.",
                     )
-                    return _mark_flatten_flat()
+                    return _mark_flatten_flat(save_paired_opts=False)
 
             unverified_at_timeout = (
                 (raw_final_eq is None or (include_options and raw_final_opt is None))
@@ -17340,23 +17613,39 @@ def flatten_equities(
 def _verify_post_flatten_unarmed_options(adapter):
     """Checks for non-ignored open option contracts when an equity-only flatten
     completed while Options Auto-Flatten was disabled or outside RTH.
-    Never auto-flattens options (AGENTS.md Invariant #2). Returns a 2-tuple:
+    Never auto-flattens options (AGENTS.md Invariant #2). Reuses a fresh (<2.0s)
+    paired check #3 snapshot saved by `flatten_equities()` when available so
+    confirmations never trigger an extra broker position burst. Returns a 2-tuple:
       ('FLAT' | 'OPTIONS_OPEN' | 'OPTIONS_UNVERIFIED', formatted_list_or_empty)."""
     if adapter is None or not hasattr(adapter, "get_open_option_positions"):
         return "FLAT", []
-    retry_sleep = 0.02 if isinstance(adapter, DemoBrokerAdapter) else 0.30
     raw_opt = None
-    for att in range(2):
-        try:
-            raw_opt = _call_adapter_open_opt(
-                adapter, allow_stale_cache=False, pace_for_verify=True
-            )
-        except Exception:
-            raw_opt = None
-        if raw_opt is not None:
-            break
-        if att == 0:
-            time.sleep(retry_sleep)
+    saved_v = getattr(adapter, "_post_flatten_opt_verify", None)
+    try:
+        setattr(adapter, "_post_flatten_opt_verify", None)
+    except Exception:
+        pass
+    if (
+        isinstance(saved_v, tuple)
+        and len(saved_v) == 3
+        and saved_v[2] is not None
+        and (time.time() - float(saved_v[0])) <= 2.0
+        and saved_v[1] == getattr(adapter, "account_id", "")
+    ):
+        raw_opt = list(saved_v[2])
+    else:
+        retry_sleep = 0.02 if isinstance(adapter, DemoBrokerAdapter) else 0.30
+        for att in range(2):
+            try:
+                raw_opt = _call_adapter_open_opt(
+                    adapter, allow_stale_cache=False, pace_for_verify=True
+                )
+            except Exception:
+                raw_opt = None
+            if raw_opt is not None:
+                break
+            if att == 0:
+                time.sleep(retry_sleep)
     if raw_opt is None:
         return "OPTIONS_UNVERIFIED", []
     open_opts = [
@@ -17396,6 +17685,7 @@ def trigger_manual_panic_flatten(
                     pass
             return False
         _manual_flatten_in_flight = True
+        _clear_launch_grace_state()
 
     def _worker():
         global _manual_flatten_in_flight
@@ -17856,6 +18146,7 @@ def activate_done_for_today(
     if ui_button is None and mute_btn is not None:
         ui_button = mute_btn
     done_for_today = True
+    _clear_launch_grace_state()
     save_session_state()
     target_adapter = adapter if adapter is not None else active_adapter
     log_event(
@@ -18674,6 +18965,8 @@ def trigger_open_pnl_flatten(
     _close_active_settings_window_on_breach(ui_button)
     cd_on = config.get("enable_open_cooldown", False)
     opt_armed = is_options_flatten_armed(config)
+    rth_now = is_market_hours()
+    opt_exec_now = bool(opt_armed and rth_now)
 
     if has_options and not opt_armed:
         opt_reason = f"{reason} — MANUAL OPTIONS EXIT REQUIRED!"
@@ -18689,7 +18982,7 @@ def trigger_open_pnl_flatten(
         )
         return
 
-    if has_options and opt_armed and not is_market_hours():
+    if has_options and opt_armed and not rth_now:
         opt_reason = f"{reason} — OPTIONS MARKET CLOSED (EXIT MANUALLY!)"
         log_event(
             "GUARDRAIL",
@@ -18712,13 +19005,13 @@ def trigger_open_pnl_flatten(
 
     log_event(
         "GUARDRAIL",
-        f"OPEN PnL AUTO-FLATTEN {'(EQUITIES + OPTIONS BETA) ' if (has_options and opt_armed) else ''}INITIATED: "
+        f"OPEN PnL AUTO-FLATTEN {'(EQUITIES + OPTIONS BETA) ' if opt_exec_now else ''}INITIATED: "
         f"{reason} | {context_str}"
     )
     all_flat = flatten_equities(
         adapter,
         force_flatten=True,
-        include_options=(has_options and opt_armed),
+        include_options=opt_exec_now,
     )
     with _in_flight_poll_lock:
         if _is_breach_epoch_superseded(adapter, eff_epoch):
@@ -18729,7 +19022,7 @@ def trigger_open_pnl_flatten(
         log_event(
             "GUARDRAIL",
             "Open PnL bailout (Equities + Options BETA) confirmed 100% flat."
-            if (has_options and opt_armed)
+            if opt_exec_now
             else "Open PnL equity bailout confirmed 100% flat."
         )
         if cd_on:
@@ -18753,7 +19046,12 @@ def trigger_open_pnl_flatten(
             "halted/unfilled shares close!"
         )
         _enter_halt_breach_watch(
-            "OPEN_PNL", reason, context_str, has_options, adapter, ui_button
+            "OPEN_PNL",
+            reason,
+            context_str,
+            bool(has_options or opt_exec_now),
+            adapter,
+            ui_button,
         )
 
 
@@ -18789,6 +19087,8 @@ def trigger_consec_loss_cooldown(
 
     cd_on = config.get("enable_open_cooldown", True)
     opt_armed = is_options_flatten_armed(config)
+    rth_now = is_market_hours()
+    opt_exec_now = bool(opt_armed and rth_now)
 
     if has_options and not opt_armed:
         opt_reason = f"{reason} — MANUAL OPTIONS EXIT REQUIRED!"
@@ -18804,7 +19104,7 @@ def trigger_consec_loss_cooldown(
         )
         return
 
-    if has_options and opt_armed and not is_market_hours():
+    if has_options and opt_armed and not rth_now:
         opt_reason = f"{reason} — OPTIONS MARKET CLOSED (EXIT MANUALLY!)"
         log_event(
             "GUARDRAIL",
@@ -18832,7 +19132,7 @@ def trigger_consec_loss_cooldown(
     all_flat = flatten_equities(
         adapter,
         force_flatten=True,
-        include_options=(has_options and opt_armed),
+        include_options=opt_exec_now,
     )
     with _in_flight_poll_lock:
         if _is_breach_epoch_superseded(adapter, eff_epoch):
@@ -18865,7 +19165,12 @@ def trigger_consec_loss_cooldown(
             "until halted/unfilled shares close!"
         )
         _enter_halt_breach_watch(
-            "CONSEC_LOSS", reason, context_str, has_options, adapter, ui_button
+            "CONSEC_LOSS",
+            reason,
+            context_str,
+            bool(has_options or opt_exec_now),
+            adapter,
+            ui_button,
         )
 
 
@@ -19020,7 +19325,8 @@ def trigger_lockdown(
         f"DAILY TERMINATION BREACHED: {reason} | {context_str}"
     )
 
-    opt_exec_now = bool(has_options and opt_armed and is_market_hours())
+    rth_now = is_market_hours()
+    opt_exec_now = bool(opt_armed and rth_now)
     dl_mins = float(config.get("daily_lock_mins", 15.0))
 
     all_flat = flatten_equities(
@@ -19047,16 +19353,17 @@ def trigger_lockdown(
         return
 
     if not all_flat:
+        opt_flag = bool(has_options or opt_exec_now)
         log_event(
             "CRITICAL",
             "OS ACTIONS ABORTED: Positions (Equities/Options) still open! "
             "Holding off on App Kill / OS Lock until halted/unfilled shares close!"
-            if has_options
+            if opt_flag
             else "OS ACTIONS ABORTED: Equity shares still open (halt / unfilled)! "
             "Holding off on App Kill / OS Lock until shares close!"
         )
         _enter_halt_breach_watch(
-            "DAILY", reason, context_str, has_options, adapter, ui_button
+            "DAILY", reason, context_str, opt_flag, adapter, ui_button
         )
         return
 
@@ -19251,11 +19558,107 @@ def trigger_lockdown(
 # ==========================================
 # 7. MAIN POLLING LOOP
 # ==========================================
+def _classify_round_trip_delta(delta, cfg=None):
+    """Scores a closed round-trip PnL delta for W/L trade counters and Tilt
+    Streak Cooldown. Returns (streak_note, consec_trigger_reason)."""
+    global win_trades, loss_trades, recent_loss_timestamps, _off_session_peak_reconstructed
+    eff_cfg = cfg if isinstance(cfg, dict) else config
+    _off_session_peak_reconstructed = False
+    ig_scratch_tol = (
+        float(active_adapter.get_flat_rounding_tolerance())
+        if (
+            _has_active_open_ignored_positions(active_adapter)
+            and active_adapter is not None
+            and hasattr(active_adapter, "get_flat_rounding_tolerance")
+        )
+        else 0.0
+    )
+    req_losses = max(
+        2, int(round(float(eff_cfg.get("consec_loss_count", 3))))
+    )
+    min_loss_mag = abs(
+        float(eff_cfg.get("consec_loss_min_dollars", 25.0))
+    )
+    win_mins = max(
+        0.5, float(eff_cfg.get("consec_loss_window_mins", 15.0))
+    )
+    now_ts = time.time()
+    recent_loss_timestamps[:] = [
+        ts
+        for ts in recent_loss_timestamps
+        if (now_ts - ts) <= (win_mins * 60.0)
+    ]
+    streak_note = ""
+    consec_trigger_reason = None
+    if delta > (ig_scratch_tol + 1e-9):
+        win_trades += 1
+        if recent_loss_timestamps:
+            min_win_to_reset = abs(
+                float(eff_cfg.get("consec_win_reset_dollars", 10.0))
+            )
+            if delta >= min_win_to_reset:
+                recent_loss_timestamps.clear()
+                if eff_cfg.get("enable_consec_loss_cooldown", False):
+                    streak_note = (
+                        f" | TiltStreak: 0/{req_losses} "
+                        f"(Reset by {format_dollar(delta)} qualifying win)"
+                    )
+            elif eff_cfg.get("enable_consec_loss_cooldown", False):
+                streak_note = (
+                    f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
+                    f"(Scratch win {format_dollar(delta)} < +${min_win_to_reset:,.0f} did not reset streak)"
+                )
+    elif delta < -(ig_scratch_tol + 1e-9):
+        loss_trades += 1
+        if not first_poll_of_launch:
+            if cooldown_active and "DAILY" in str(cooldown_label).upper():
+                recent_loss_timestamps.clear()
+                if eff_cfg.get("enable_consec_loss_cooldown", False):
+                    streak_note = (
+                        f" | TiltStreak: 0/{req_losses} "
+                        f"(Reset by Daily Breach Lockout)"
+                    )
+            elif abs(delta) >= min_loss_mag:
+                recent_loss_timestamps.append(now_ts)
+                cur_streak = len(recent_loss_timestamps)
+                if eff_cfg.get("enable_consec_loss_cooldown", False):
+                    streak_note = (
+                        f" | TiltStreak: {cur_streak}/{req_losses} "
+                        f"(in {win_mins:g}m)"
+                    )
+                    if cur_streak >= req_losses:
+                        recent_loss_timestamps.clear()
+                        if cooldown_active:
+                            streak_note = (
+                                f" | TiltStreak: {cur_streak}/{req_losses} -> "
+                                f"0/{req_losses} (Penalty Box Lock active)"
+                            )
+                        else:
+                            consec_trigger_reason = (
+                                f"Consecutive Loss Stop ({req_losses} Losses "
+                                f"<= -${min_loss_mag:,.0f} in {win_mins:g}m)"
+                            )
+            elif eff_cfg.get("enable_consec_loss_cooldown", False):
+                streak_note = (
+                    f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
+                    f"(Scratch {format_dollar(delta)} < -${min_loss_mag:,.0f} ignored)"
+                )
+    else:
+        if not first_poll_of_launch and eff_cfg.get("enable_consec_loss_cooldown", False):
+            streak_note = (
+                f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
+                f"($0.00 flat scratch ignored)"
+            )
+    return streak_note, consec_trigger_reason
+
+
 def log_position_transitions(
     pos_details, realized_pnl, open_pnl, net_pnl, session_high_pnl
 ):
-    global prev_pos_snapshot, win_trades, loss_trades, prev_flat_realized_pnl
-    global recent_loss_timestamps, _off_session_peak_reconstructed
+    global prev_pos_snapshot, prev_flat_realized_pnl
+    global _last_round_trip_close_ts, _pending_subpoll_consec_reason
+    pending_sub = _pending_subpoll_consec_reason
+    _pending_subpoll_consec_reason = None
     curr_sig_map = {
         s: (d["qty"], round(float(d.get("avg", 0.0)), 4))
         for s, d in pos_details.items()
@@ -19266,7 +19669,7 @@ def log_position_transitions(
     }
 
     if curr_sig_map == prev_sig_map:
-        return None
+        return pending_sub
 
     all_syms = sorted(set(curr_sig_map.keys()) | set(prev_sig_map.keys()))
     changes = []
@@ -19294,96 +19697,14 @@ def log_position_transitions(
             completed_round_trip = True
 
     if not changes:
-        return None
+        return pending_sub
 
     consec_trigger_reason = None
     streak_note = ""
     if completed_round_trip:
-        _off_session_peak_reconstructed = False
         delta = _round_cents(realized_pnl - prev_flat_realized_pnl)
-        ig_scratch_tol = (
-            float(active_adapter.get_flat_rounding_tolerance())
-            if (
-                _has_active_open_ignored_positions(active_adapter)
-                and active_adapter is not None
-                and hasattr(active_adapter, "get_flat_rounding_tolerance")
-            )
-            else 0.0
-        )
-        req_losses = max(
-            2, int(round(float(config.get("consec_loss_count", 3))))
-        )
-        min_loss_mag = abs(
-            float(config.get("consec_loss_min_dollars", 25.0))
-        )
-        win_mins = max(
-            0.5, float(config.get("consec_loss_window_mins", 15.0))
-        )
-        now_ts = time.time()
-        recent_loss_timestamps[:] = [
-            ts
-            for ts in recent_loss_timestamps
-            if (now_ts - ts) <= (win_mins * 60.0)
-        ]
-        if delta > (ig_scratch_tol + 1e-9):
-            win_trades += 1
-            if recent_loss_timestamps:
-                min_win_to_reset = abs(
-                    float(config.get("consec_win_reset_dollars", 10.0))
-                )
-                if delta >= min_win_to_reset:
-                    recent_loss_timestamps.clear()
-                    if config.get("enable_consec_loss_cooldown", False):
-                        streak_note = (
-                            f" | TiltStreak: 0/{req_losses} "
-                            f"(Reset by {format_dollar(delta)} qualifying win)"
-                        )
-                elif config.get("enable_consec_loss_cooldown", False):
-                    streak_note = (
-                        f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
-                        f"(Scratch win {format_dollar(delta)} < +${min_win_to_reset:,.0f} did not reset streak)"
-                    )
-        elif delta < -(ig_scratch_tol + 1e-9):
-            loss_trades += 1
-            if not first_poll_of_launch:
-                if cooldown_active and "DAILY" in str(cooldown_label).upper():
-                    recent_loss_timestamps.clear()
-                    if config.get("enable_consec_loss_cooldown", False):
-                        streak_note = (
-                            f" | TiltStreak: 0/{req_losses} "
-                            f"(Reset by Daily Breach Lockout)"
-                        )
-                elif abs(delta) >= min_loss_mag:
-                    recent_loss_timestamps.append(now_ts)
-                    cur_streak = len(recent_loss_timestamps)
-                    if config.get("enable_consec_loss_cooldown", False):
-                        streak_note = (
-                            f" | TiltStreak: {cur_streak}/{req_losses} "
-                            f"(in {win_mins:g}m)"
-                        )
-                        if cur_streak >= req_losses:
-                            recent_loss_timestamps.clear()
-                            if cooldown_active:
-                                streak_note = (
-                                    f" | TiltStreak: {cur_streak}/{req_losses} -> "
-                                    f"0/{req_losses} (Penalty Box Lock active)"
-                                )
-                            else:
-                                consec_trigger_reason = (
-                                    f"Consecutive Loss Stop ({req_losses} Losses "
-                                    f"<= -${min_loss_mag:,.0f} in {win_mins:g}m)"
-                                )
-                elif config.get("enable_consec_loss_cooldown", False):
-                    streak_note = (
-                        f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
-                        f"(Scratch {format_dollar(delta)} < -${min_loss_mag:,.0f} ignored)"
-                    )
-        else:
-            if not first_poll_of_launch and config.get("enable_consec_loss_cooldown", False):
-                streak_note = (
-                    f" | TiltStreak: {len(recent_loss_timestamps)}/{req_losses} "
-                    f"($0.00 flat scratch ignored)"
-                )
+        streak_note, consec_trigger_reason = _classify_round_trip_delta(delta)
+        _last_round_trip_close_ts = time.time()
         prev_flat_realized_pnl = realized_pnl
         save_session_state()
 
@@ -19396,7 +19717,7 @@ def log_position_transitions(
         f"Net: {format_dollar(net_pnl)} | "
         f"High: {format_dollar(session_high_pnl)}{streak_note}"
     )
-    return consec_trigger_reason
+    return consec_trigger_reason or pending_sub
 
 
 def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
@@ -19407,6 +19728,7 @@ def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
     trader does not start their day with a phantom fee PnL."""
     global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global prev_flat_realized_pnl, settled_realized_pnl
+    global _last_round_trip_close_ts, _pending_subpoll_consec_reason
     if (
         not is_fl_now
         or eq_now is None
@@ -19433,6 +19755,8 @@ def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
     last_flat_equity = new_start
     prev_flat_realized_pnl = 0.0
     settled_realized_pnl = 0.0
+    _last_round_trip_close_ts = 0.0
+    _pending_subpoll_consec_reason = None
     save_session_state()
     b_lbl = getattr(
         active_adapter, "name", config.get("active_broker", "SCHWAB")
@@ -19991,6 +20315,7 @@ def _stabilize_mid_fill_realized_and_equity(
     global last_flat_equity, max_equity, daily_max_equity, daily_min_equity
     global settled_realized_pnl, prev_flat_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol, _launch_fee_drift_checked
+    global _last_round_trip_close_ts, _pending_subpoll_consec_reason
 
     if first_poll_of_launch or settled_realized_pnl is None:
         if is_flat:
@@ -20026,6 +20351,7 @@ def _stabilize_mid_fill_realized_and_equity(
                 daily_min_equity = current_eq
             save_session_state()
             realized_pnl = _round_cents(last_flat_equity - start_equity)
+            prev_flat_realized_pnl = realized_pnl
             open_pnl = 0.0
             for k in list(triggered_alarms.keys()):
                 if k.startswith("Open PnL -"):
@@ -20102,6 +20428,7 @@ def _stabilize_mid_fill_realized_and_equity(
                 pending_scale_out_tol = 0.0
                 current_eq = last_flat_equity
                 realized_pnl = _round_cents(last_flat_equity - start_equity)
+                prev_flat_realized_pnl = realized_pnl
                 settled_realized_pnl = realized_pnl
             elif (
                 last_flat_equity is not None
@@ -20130,9 +20457,52 @@ def _stabilize_mid_fill_realized_and_equity(
                     daily_max_equity = current_eq
                 if daily_min_equity is None or current_eq < daily_min_equity:
                     daily_min_equity = current_eq
-                save_session_state()
                 realized_pnl = _round_cents(last_flat_equity - start_equity)
+                drift = _round_cents(realized_pnl - prev_flat_realized_pnl)
+                if not is_reverify and abs(drift) > (ig_flat_tol + 1e-9):
+                    now_f = time.time()
+                    if (
+                        _last_round_trip_close_ts > 0.0
+                        and 0.0 <= (now_f - _last_round_trip_close_ts) <= 90.0
+                    ):
+                        log_event(
+                            "POS_SETTLE",
+                            f"Post-close settlement drift while flat "
+                            f"({format_dollar(drift)}: "
+                            f"{format_dollar(prev_flat_realized_pnl)} -> "
+                            f"{format_dollar(realized_pnl)}) — baseline synced.",
+                        )
+                    elif not first_poll_of_launch:
+                        min_loss_mag = abs(
+                            float(config.get("consec_loss_min_dollars", 25.0))
+                        )
+                        min_win_rst = abs(
+                            float(config.get("consec_win_reset_dollars", 10.0))
+                        )
+                        if (
+                            drift <= -min_loss_mag
+                            or drift >= max(min_loss_mag, min_win_rst)
+                        ):
+                            sub_note, sub_reason = _classify_round_trip_delta(
+                                drift
+                            )
+                            if sub_reason:
+                                _pending_subpoll_consec_reason = sub_reason
+                            s_high = _round_cents(
+                                (daily_max_equity or start_equity)
+                                - start_equity
+                            )
+                            log_event(
+                                "POS_CHANGE",
+                                f"(Sub-poll flat round-trip) | "
+                                f"Realized: {format_dollar(realized_pnl)} | "
+                                f"Open: $0.00 | "
+                                f"Net: {format_dollar(realized_pnl)} | "
+                                f"High: {format_dollar(s_high)}{sub_note}",
+                            )
+                prev_flat_realized_pnl = realized_pnl
                 settled_realized_pnl = realized_pnl
+                save_session_state()
         else:
             est_open_sum = sum(
                 float(d.get("open_pnl", 0.0))
@@ -20436,6 +20806,7 @@ def evaluate_stop_decisions(
     global _launch_grace_ref_opnl, _launch_grace_ref_net
     global last_rth_mode, current_upside_tier
     global win_trades, loss_trades, recent_loss_timestamps, triggered_alarms
+    global _last_round_trip_close_ts, _pending_subpoll_consec_reason
 
     if cfg is None:
         cfg = config
@@ -20455,6 +20826,14 @@ def evaluate_stop_decisions(
             prev_pos_snapshot = dict(state["prev_pos_snapshot"])
         if "prev_flat_realized_pnl" in state:
             prev_flat_realized_pnl = float(state["prev_flat_realized_pnl"])
+        if "_last_round_trip_close_ts" in state:
+            _last_round_trip_close_ts = float(
+                state["_last_round_trip_close_ts"]
+            )
+        if "_pending_subpoll_consec_reason" in state:
+            _pending_subpoll_consec_reason = state[
+                "_pending_subpoll_consec_reason"
+            ]
         if "settled_realized_pnl" in state:
             settled_realized_pnl = float(state["settled_realized_pnl"])
         if "is_locked_down" in state:
@@ -20636,7 +21015,10 @@ def evaluate_stop_decisions(
         session_high_pnl,
     )
 
-    if _launch_grace_syms:
+    if done_for_today or _manual_flatten_in_flight:
+        if _launch_grace_syms or _launch_grace_pending:
+            _clear_launch_grace_state()
+    elif _launch_grace_syms:
         grace_bleed_limit = max(
             25.0,
             float(open_max)
@@ -20650,9 +21032,7 @@ def evaluate_stop_decisions(
         ):
             drop_net = round(float(net_pnl) - float(_launch_grace_ref_net), 2)
             g_ended = sorted(_launch_grace_syms.keys())
-            _launch_grace_syms.clear()
-            _launch_grace_ref_opnl.clear()
-            _launch_grace_ref_net = None
+            _clear_launch_grace_state()
             log_event(
                 "GUARDRAIL",
                 f"Startup position grace ended on {g_ended} (post-launch Net drawdown "
@@ -20707,10 +21087,15 @@ def evaluate_stop_decisions(
                     f"stop enforcement armed).",
                 )
             elif abs(cur_gq) < (abs(float(g_qty)) - 1e-6):
-                _launch_grace_syms[g_tag] = cur_gq
-                # Scale-out reduces remaining unrealized PnL proportionally; raise reference if cur_gop improved
-                if ref_gop is not None and cur_gop > float(ref_gop):
-                    _launch_grace_ref_opnl[g_tag] = cur_gop
+                if (
+                    g_tag in _launch_grace_syms
+                    and not done_for_today
+                    and not _manual_flatten_in_flight
+                ):
+                    _launch_grace_syms[g_tag] = cur_gq
+                    # Scale-out reduces remaining unrealized PnL proportionally; raise reference if cur_gop improved
+                    if ref_gop is not None and cur_gop > float(ref_gop):
+                        _launch_grace_ref_opnl[g_tag] = cur_gop
         if not _launch_grace_syms:
             _launch_grace_ref_opnl.clear()
             _launch_grace_ref_net = None
@@ -21400,6 +21785,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global active_adapter, first_poll_of_launch, _launch_grace_pending, _launch_grace_syms
     global current_upside_tier, last_rth_mode
     global win_trades, loss_trades, prev_flat_realized_pnl
+    global _last_round_trip_close_ts, _pending_subpoll_consec_reason
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
     global consecutive_api_failures, consecutive_loop_exceptions, api_disconnect_alerted
@@ -21412,6 +21798,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     consecutive_api_failures = 0
     consecutive_loop_exceptions = 0
     api_disconnect_alerted = False
+    rate_limit_hold_since = 0.0
     last_data_loop_heartbeat = time.time()
     _prev_poll_diag = {"open": None, "net": None, "ts": 0.0, "epoch": None}
 
@@ -21481,6 +21868,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
             reverify_deferred_cached = False
             if current_eq is not None and current_eq > 0:
+                if not snap_was_cached:
+                    rate_limit_hold_since = 0.0
                 if (
                     not snap_was_cached
                     and getattr(poll_ad, "last_positions_fetch_ok", True)
@@ -21610,6 +21999,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     loss_trades = 0
                     prev_flat_realized_pnl = 0.0
                     settled_realized_pnl = 0.0
+                    _last_round_trip_close_ts = 0.0
+                    _pending_subpoll_consec_reason = None
                     flat_desync_streak = 0
                     in_trade_desync_streak = 0
                     pending_scale_out_tol = 0.0
@@ -21701,6 +22092,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     loss_trades = 0
                     prev_flat_realized_pnl = 0.0
                     settled_realized_pnl = 0.0
+                    _last_round_trip_close_ts = 0.0
+                    _pending_subpoll_consec_reason = None
                     flat_desync_streak = 0
                     in_trade_desync_streak = 0
                     pending_scale_out_tol = 0.0
@@ -22481,148 +22874,166 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
             else:
                 if not _poll_still_valid():
                     continue
-                consecutive_api_failures += 1
                 raw_err = str(
                     getattr(poll_ad, "last_error", "")
                     or "Network / socket timeout"
                 ).strip()
                 err_lower = raw_err.lower()
-                is_tok_exp = any(
-                    k in err_lower
-                    for k in (
-                        "invalid_grant",
-                        "unsupported_token_type",
-                        "expired",
-                        "unauthorized",
-                        "http 401",
-                    )
+                is_rate_limited = (
+                    "429" in err_lower or "too many requests" in err_lower
                 )
-                if consecutive_api_failures == 1 and not is_tok_exp:
-                    if hasattr(poll_ad, "reconnect_session"):
-                        try:
-                            poll_ad.reconnect_session()
-                        except Exception:
-                            pass
-                    log_event(
-                        "WARN",
-                        f"Broker API poll failed (Attempt #1: {raw_err[:90]}) — "
-                        f"refreshed HTTP session & retrying automatically...",
+                now_rl = time.time()
+                rl_until = float(
+                    getattr(poll_ad, "_rate_limit_until", 0.0) or 0.0
+                )
+                hold_429_active = False
+                if is_rate_limited and rl_until > (now_rl - 0.5):
+                    if rate_limit_hold_since <= 0.0:
+                        rate_limit_hold_since = now_rl
+                    if (now_rl - rate_limit_hold_since) < 20.0:
+                        hold_429_active = True
+                        poll_sec = max(0.25, min(5.0, rl_until - now_rl + 0.05))
+                elif not is_rate_limited:
+                    rate_limit_hold_since = 0.0
+
+                if not hold_429_active:
+                    consecutive_api_failures += 1
+                    is_tok_exp = any(
+                        k in err_lower
+                        for k in (
+                            "invalid_grant",
+                            "unsupported_token_type",
+                            "expired",
+                            "unauthorized",
+                            "http 401",
+                        )
                     )
-                    if not alarm_active and not cooldown_active:
-                        retry_1_txt = (
-                            "⚠️ RETRYING API (#1)..."
-                            if is_compact_hud()
-                            else "⚠️ CONNECTION HICCUP — RETRYING BROKER API (ATTEMPT #1)..."
-                        )
-                        mute_btn.after(
-                            0,
-                            lambda t=retry_1_txt: mute_btn.config(
-                                text=t,
-                                bg="#78350f",
-                                fg="#fde68a",
-                                disabledforeground="#fde68a",
-                                state="disabled",
-                            ),
-                        )
-                elif is_tok_exp or consecutive_api_failures >= 2:
-                    if not is_tok_exp and hasattr(poll_ad, "reconnect_session"):
-                        if (
-                            consecutive_api_failures == 2
-                            or consecutive_api_failures % 3 == 0
-                        ):
+                    if consecutive_api_failures == 1 and not is_tok_exp:
+                        if hasattr(poll_ad, "reconnect_session"):
                             try:
                                 poll_ad.reconnect_session()
                             except Exception:
                                 pass
-                    lbl_1 = "TOKEN" if is_tok_exp else "OFFLINE"
-                    lbl_2 = (
-                        "EXPIRED"
-                        if is_tok_exp
-                        else f"RETRY #{consecutive_api_failures}"
-                    )
-                    col_2_bg = "#7b241c" if is_tok_exp else "#92400e"
-                    n_cols = max(1, len(get_active_hud_columns(config)))
-                    err_cols = []
-                    for idx in range(n_cols):
-                        if idx == 0:
-                            err_cols.append((lbl_1, "#7b241c"))
-                        elif idx == 1:
-                            err_cols.append((lbl_2, col_2_bg))
-                        else:
-                            err_cols.append(("---", "#444444"))
-                    root.after(
-                        0,
-                        lambda d=err_cols, f=current_is_flat: update_gui(
-                            ui_labels, d, f, settings_btn, close_btn
-                        )
-                    )
-                    if not api_disconnect_alerted:
-                        api_disconnect_alerted = True
-                        r_msg = (
-                            "BROKER TOKEN EXPIRED — RESTART APP TO RE-LOGIN"
-                            if is_tok_exp
-                            else f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{consecutive_api_failures})"
-                        )
-                        v_msg = (
-                            "Warning. Broker token expired. Please restart Enforcer to log in."
-                            if is_tok_exp
-                            else "Warning. Connection lost. Attempting to reconnect automatically."
-                        )
                         log_event(
                             "WARN",
-                            f"Connection lost ({poll_ad.name}: {raw_err[:90]}). "
-                            f"Auto-reconnecting (Attempt #{consecutive_api_failures})...",
+                            f"Broker API poll failed (Attempt #1: {raw_err[:90]}) — "
+                            f"refreshed HTTP session & retrying automatically...",
                         )
-                        speak_async(v_msg)
-                        trigger_alarm(
-                            r_msg,
-                            mute_btn,
-                            raw_err[:80],
+                        if not alarm_active and not cooldown_active:
+                            retry_1_txt = (
+                                "⚠️ RETRYING API (#1)..."
+                                if is_compact_hud()
+                                else "⚠️ CONNECTION HICCUP — RETRYING BROKER API (ATTEMPT #1)..."
+                            )
+                            mute_btn.after(
+                                0,
+                                lambda t=retry_1_txt: mute_btn.config(
+                                    text=t,
+                                    bg="#78350f",
+                                    fg="#fde68a",
+                                    disabledforeground="#fde68a",
+                                    state="disabled",
+                                ),
+                            )
+                    elif is_tok_exp or consecutive_api_failures >= 2:
+                        if not is_tok_exp and hasattr(poll_ad, "reconnect_session"):
+                            if (
+                                consecutive_api_failures == 2
+                                or consecutive_api_failures % 3 == 0
+                            ):
+                                try:
+                                    poll_ad.reconnect_session()
+                                except Exception:
+                                    pass
+                        lbl_1 = "TOKEN" if is_tok_exp else "OFFLINE"
+                        lbl_2 = (
+                            "EXPIRED"
+                            if is_tok_exp
+                            else f"RETRY #{consecutive_api_failures}"
                         )
-                    else:
-                        att = consecutive_api_failures
-                        if att % 5 == 0:
+                        col_2_bg = "#7b241c" if is_tok_exp else "#92400e"
+                        n_cols = max(1, len(get_active_hud_columns(config)))
+                        err_cols = []
+                        for idx in range(n_cols):
+                            if idx == 0:
+                                err_cols.append((lbl_1, "#7b241c"))
+                            elif idx == 1:
+                                err_cols.append((lbl_2, col_2_bg))
+                            else:
+                                err_cols.append(("---", "#444444"))
+                        root.after(
+                            0,
+                            lambda d=err_cols, f=current_is_flat: update_gui(
+                                ui_labels, d, f, settings_btn, close_btn
+                            )
+                        )
+                        if not api_disconnect_alerted:
+                            api_disconnect_alerted = True
+                            r_msg = (
+                                "BROKER TOKEN EXPIRED — RESTART APP TO RE-LOGIN"
+                                if is_tok_exp
+                                else f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{consecutive_api_failures})"
+                            )
+                            v_msg = (
+                                "Warning. Broker token expired. Please restart Enforcer to log in."
+                                if is_tok_exp
+                                else "Warning. Connection lost. Attempting to reconnect automatically."
+                            )
                             log_event(
                                 "WARN",
-                                f"Still offline — auto-reconnect attempt #{att} "
-                                f"({raw_err[:80]})...",
+                                f"Connection lost ({poll_ad.name}: {raw_err[:90]}). "
+                                f"Auto-reconnecting (Attempt #{consecutive_api_failures})...",
                             )
-                        if not is_tok_exp:
-                            if alarm_active:
-                                last_alarm_reason = (
-                                    f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})"
+                            speak_async(v_msg)
+                            trigger_alarm(
+                                r_msg,
+                                mute_btn,
+                                raw_err[:80],
+                            )
+                        else:
+                            att = consecutive_api_failures
+                            if att % 5 == 0:
+                                log_event(
+                                    "WARN",
+                                    f"Still offline — auto-reconnect attempt #{att} "
+                                    f"({raw_err[:80]})...",
                                 )
-                                al_btn_txt = (
-                                    f"🔔 RECONNECTING (#{att}) (MUTE)"
-                                    if is_compact_hud()
-                                    else f"🔔 CONNECTION LOST — RECONNECTING (ATTEMPT #{att}) (CLICK TO MUTE)"
-                                )
-                                mute_btn.after(
-                                    0,
-                                    lambda t=al_btn_txt: mute_btn.config(
-                                        text=t,
-                                        bg="#eab308",
-                                        fg="#090d16",
-                                        disabledforeground="#090d16",
-                                        state="normal",
-                                    ),
-                                )
-                            elif not cooldown_active:
-                                re_btn_txt = (
-                                    f"🔄 RECONNECTING (#{att})..."
-                                    if is_compact_hud()
-                                    else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
-                                )
-                                mute_btn.after(
-                                    0,
-                                    lambda t=re_btn_txt: mute_btn.config(
-                                        text=t,
-                                        bg="#78350f",
-                                        fg="#fde68a",
-                                        disabledforeground="#fde68a",
-                                        state="disabled",
-                                    ),
-                                )
+                            if not is_tok_exp:
+                                if alarm_active:
+                                    last_alarm_reason = (
+                                        f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})"
+                                    )
+                                    al_btn_txt = (
+                                        f"🔔 RECONNECTING (#{att}) (MUTE)"
+                                        if is_compact_hud()
+                                        else f"🔔 CONNECTION LOST — RECONNECTING (ATTEMPT #{att}) (CLICK TO MUTE)"
+                                    )
+                                    mute_btn.after(
+                                        0,
+                                        lambda t=al_btn_txt: mute_btn.config(
+                                            text=t,
+                                            bg="#eab308",
+                                            fg="#090d16",
+                                            disabledforeground="#090d16",
+                                            state="normal",
+                                        ),
+                                    )
+                                elif not cooldown_active:
+                                    re_btn_txt = (
+                                        f"🔄 RECONNECTING (#{att})..."
+                                        if is_compact_hud()
+                                        else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
+                                    )
+                                    mute_btn.after(
+                                        0,
+                                        lambda t=re_btn_txt: mute_btn.config(
+                                            text=t,
+                                            bg="#78350f",
+                                            fg="#fde68a",
+                                            disabledforeground="#fde68a",
+                                            state="disabled",
+                                        ),
+                                    )
             consecutive_loop_exceptions = 0
 
         except Exception as e:
@@ -39163,6 +39574,7 @@ def reset_demo_sandbox_state(on_done=None):
     simulated locks, cooldowns, halts, and alarms. Fail-closed: returns False
     immediately whenever active_adapter is not DemoBrokerAdapter."""
     global start_equity, last_flat_equity, prev_flat_realized_pnl
+    global _last_round_trip_close_ts, _pending_subpoll_consec_reason
     global settled_realized_pnl, max_equity, daily_max_equity, daily_min_equity
     global win_trades, loss_trades, is_locked_down, active_breach_source
     global last_breach_trigger_net_pnl, done_for_today
@@ -39199,6 +39611,8 @@ def reset_demo_sandbox_state(on_done=None):
         last_flat_equity = 25000.0
         prev_flat_realized_pnl = 0.0
         settled_realized_pnl = 0.0
+        _last_round_trip_close_ts = 0.0
+        _pending_subpoll_consec_reason = None
         max_equity = 25000.0
         daily_max_equity = 25000.0
         daily_min_equity = 25000.0
