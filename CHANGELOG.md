@@ -4,6 +4,18 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.77] — 2026-11-19
+### ⚡ Quick Summary
+- **One-Click `↺ Undo Edits` in Pre-Flight & Settings (`beta` Preview):** Clicked **`Standard Full Risk`**, **`50% Low Energy`**, or **`Restore Defaults`** while dialing in custom today settings? A clean contextual **`↺ Undo Edits`** button now appears right beside **`Save as Default`** whenever anything on screen differs from when you opened the window — snapping every checkbox, dollar threshold, HUD column, and preference back in one click without saving a thing.
+- **Clearer `"Loaded — Not Saved Yet"` Preset & Defaults Status Copy:** Clicking **`Standard Full Risk`**, **`50% Low Energy`**, or **`Restore Defaults`** now explicitly confirms the preset is **loaded, not saved yet** (with a calm hint pointing to **`↺ Undo Edits`** whenever changes exist), removing any guesswork before you hit `SAVE`.
+
+### 🔍 Detailed Breakdown
+- **Pre-Flight Deferred-State Snapshot, Dirty Detection & Contextual Undo (`show_preflight_window`, `undo_preflight_edits`, `_refresh_undo_edits_btn`, `apply_half_risk_preset`, `apply_standard_full_preset`, `restore_factory_defaults`):**
+  - Captures an in-memory window-open baseline of all deferred Pre-Flight controls (dollar thresholds, rulebook toggles, HUD column selection, poll interval, TTS voice, and audio toggles — strictly excluding immediate-persist controls like Privacy Mode, Mute All Audio, Debug Console, Auto-Share Logs, Broker/Account switches, Commit/Done Today locks, and ignored pre-existing holdings).
+  - Keeps the top `PRESETS:` row unchanged and displays **`↺ Undo Edits`** (compacting automatically to **`↺ Undo`** beside **`🧪 DEMO`** so Demo Mode stays unclipped at high DPI scaling) directly after **`Save as Default`** only when unsaved edits exist outside `In Trade` / `Commit Today` tamper locks, while respecting active Loss-Streak tamper locks and avoiding waiver pop-ups during undo.
+
+---
+
 ## [v0.9.76] — 2026-11-19
 ### ⚡ Quick Summary
 - **Clean Launch Past Startup `HTTP 429` Rate Limits (Webull & Schwab):** Cached snapshots replayed during an `HTTP 429` backoff no longer bypass baseline initialization or evaluate guardrails while an anchor or Force Re-Anchor is pending — eliminating the startup `'NoneType' and 'float'` `TypeError` alarm loop and pacing cleanly until the first live snapshot arrives (shoutout to **`T$MAC`** for the Safe Log catch!).

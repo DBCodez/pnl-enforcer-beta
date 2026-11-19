@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.76"
+APP_VERSION = "0.9.77"
 
 import os
 import sys
@@ -23590,6 +23590,7 @@ def show_preflight_window(
         "rulebook_after_id": None,
         "streak_after_id": None,
         "pulse_after_id": None,
+        "undo_after_id": None,
         "pulse_stop_fn": None,
         "card3_pulse_keys": (),
         "closing": False,
@@ -23725,7 +23726,12 @@ def show_preflight_window(
             pf.unbind("<Configure>")
         except Exception:
             pass
-        for k_id in ("rulebook_after_id", "streak_after_id", "pulse_after_id"):
+        for k_id in (
+            "rulebook_after_id",
+            "streak_after_id",
+            "pulse_after_id",
+            "undo_after_id",
+        ):
             aid = pf_timer_state.get(k_id)
             if aid is not None:
                 pf_timer_state[k_id] = None
@@ -26001,6 +26007,11 @@ def show_preflight_window(
     top_bar.pack_propagate(False)
 
     demo_footer_banner = None
+    demo_pf_banner_lbl = None
+    btn_undo_edits = None
+    _pf_undo_snapshot = {"ready": False, "data": None}
+    _pf_undo_busy = {"suppress": False}
+    _pf_undo_hooks = {"schedule": None}
 
     def _exit_demo_to_live_broker():
         global committed_for_today
@@ -26047,6 +26058,9 @@ def show_preflight_window(
                 and bool(demo_footer_banner.winfo_manager())
             ):
                 demo_footer_banner.pack_forget()
+        sched_undo = _pf_undo_hooks.get("schedule")
+        if callable(sched_undo):
+            sched_undo()
 
     # 1. Unified Broker & Account Frosted Glass Stadium Bar (Single Un-Nested Bar)
     broker_acct_capsule = tk.Canvas(
@@ -26763,6 +26777,9 @@ def show_preflight_window(
             selected_hud_columns.clear()
             selected_hud_columns.extend(chosen)
             hud_cols_btn.config(text=format_hud_cols_btn_label(chosen))
+            sched_undo = _pf_undo_hooks.get("schedule")
+            if callable(sched_undo):
+                sched_undo()
             _restore_pf_modal_focus(dlg)
 
         b_bar = tk.Frame(dlg, bg="#0d1117", pady=12)
@@ -28609,6 +28626,9 @@ def show_preflight_window(
                 hover_border="#475569",
                 fg="#94a3b8",
             )
+        sched_undo = _pf_undo_hooks.get("schedule")
+        if callable(sched_undo):
+            sched_undo()
 
     def apply_dollar_preset(preset_dict):
         if is_in_trade_tamper_locked():
@@ -28629,6 +28649,9 @@ def show_preflight_window(
             return
         _, half_dict = _get_preset_target_dicts()
         apply_dollar_preset(half_dict)
+        ref_undo = _pf_undo_hooks.get("refresh")
+        if callable(ref_undo):
+            ref_undo()
         if default_status_lbl is not None:
             src_name = "your saved Default" if config.get("user_defaults") else "Factory Default"
             lk_note = (
@@ -28636,8 +28659,14 @@ def show_preflight_window(
                 if is_tilt_streak_tamper_locked()
                 else ""
             )
+            undo_hint = (
+                " · ↺ Undo Edits to go back"
+                if callable(_pf_undo_hooks.get("is_dirty"))
+                and _pf_undo_hooks["is_dirty"]()
+                else ""
+            )
             default_status_lbl.config(
-                text=f"⚡ Applied 50% Low Energy preset (50% of {src_name}){lk_note}.",
+                text=f"⚡ 50% Low Energy loaded (50% of {src_name}) — not saved yet{undo_hint}{lk_note}.",
                 fg="#f5b041"
             )
 
@@ -28646,6 +28675,9 @@ def show_preflight_window(
             return
         base_src = config.get("user_defaults") or DEFAULT_CONFIG
         apply_dollar_preset(base_src)
+        ref_undo = _pf_undo_hooks.get("refresh")
+        if callable(ref_undo):
+            ref_undo()
         if default_status_lbl is not None:
             src_name = "your saved Default" if config.get("user_defaults") else "Factory Default"
             lk_note = (
@@ -28653,8 +28685,14 @@ def show_preflight_window(
                 if is_tilt_streak_tamper_locked()
                 else ""
             )
+            undo_hint = (
+                " · ↺ Undo Edits to go back"
+                if callable(_pf_undo_hooks.get("is_dirty"))
+                and _pf_undo_hooks["is_dirty"]()
+                else ""
+            )
             default_status_lbl.config(
-                text=f"✓ Applied Standard Full Risk preset (100% of {src_name}){lk_note}.",
+                text=f"✓ Standard Full Risk loaded (100% of {src_name}) — not saved yet{undo_hint}{lk_note}.",
                 fg="#5dade2"
             )
 
@@ -28726,6 +28764,262 @@ def show_preflight_window(
     btn_save_def = None
     btn_alarms_only = None
     btn_launch = None
+
+    def _norm_pf_num(raw_s, signed=False, is_int=False):
+        s = str(raw_s).strip()
+        if not s:
+            return ("RAW", "")
+        try:
+            v = float(s)
+            if not math.isfinite(v):
+                return ("RAW", s)
+        except Exception:
+            return ("RAW", s)
+        if v == 0.0:
+            v = 0.0
+        if is_int:
+            return ("INT", int(round(abs(v))))
+        return ("FLT", round(v if signed else abs(v), 4))
+
+    _pf_undo_bool_vars = {
+        "alarms_only": var_alarms_only,
+        "open_flat": var_open_flat,
+        "tilt_cd": var_tilt_cd,
+        "open_cd": var_open_cd,
+        "flatten": var_flatten,
+        "flatten_options": var_flatten_options,
+        "kill_tos": var_kill_tos,
+        "kill_wb": var_kill_wb,
+        "lock_os": var_lock_os,
+        "reset925": var_reset925,
+        "ignore_preexisting": var_ignore_preexisting,
+        "reanchor": var_reanchor,
+        "voice_cues": var_voice_cues,
+        "upside_chime": var_upside_chime,
+        "pm_w1_on": var_pm_w1_on,
+        "pm_w2_on": var_pm_w2_on,
+        "pm_lock_on": var_pm_lock_on,
+        "t1_w1_on": var_t1_w1_on,
+        "t1_w2_on": var_t1_w2_on,
+        "t2_on": var_t2_on,
+        "t3_on": var_t3_on,
+        "t4_on": var_t4_on,
+    }
+    _pf_undo_num_specs = {
+        "tilt_count": (var_tilt_count, False, True),
+        "tilt_window": (var_tilt_window, False, False),
+        "cd_mins": (var_cd_mins, False, False),
+        "daily_lock_mins": (var_daily_lock_mins, False, False),
+        "poll": (var_poll, False, True),
+    }
+
+    def _collect_pf_undo_state():
+        bools = {k: bool(v.get()) for k, v in _pf_undo_bool_vars.items()}
+        nums = {}
+        for k, (v_obj, is_signed, is_int) in _pf_undo_num_specs.items():
+            raw_v = str(v_obj.get())
+            nums[k] = (raw_v, _norm_pf_num(raw_v, signed=is_signed, is_int=is_int))
+        dollars = {}
+        for k in dollar_keys:
+            raw_d = str(dollar_vars[k].get())
+            dollars[k] = (
+                raw_d,
+                _norm_pf_num(raw_d, signed=(k in SIGNED_DOLLAR_KEYS), is_int=False),
+            )
+        return {
+            "bools": bools,
+            "nums": nums,
+            "tts_voice": str(var_tts_voice.get()),
+            "dollars": dollars,
+            "hud_columns": list(selected_hud_columns),
+        }
+
+    def _capture_pf_undo_snapshot():
+        _pf_undo_snapshot["data"] = _collect_pf_undo_state()
+        _pf_undo_snapshot["ready"] = True
+
+    def _has_unsaved_pf_edits():
+        if not _pf_undo_snapshot["ready"] or is_in_trade_tamper_locked():
+            return False
+        snap = _pf_undo_snapshot.get("data")
+        if not isinstance(snap, dict):
+            return False
+        cur = _collect_pf_undo_state()
+        tamper_lk = is_tilt_streak_tamper_locked()
+        open_cd_lk = bool(tamper_lk and config.get("enable_open_cooldown", False))
+        ao_lk = bool(tamper_lk and not config.get("alarms_only_mode", False))
+
+        for k, b_val in cur["bools"].items():
+            if tamper_lk and k == "tilt_cd":
+                continue
+            if open_cd_lk and k == "open_cd":
+                continue
+            if ao_lk and k == "alarms_only":
+                continue
+            if b_val != snap["bools"].get(k):
+                return True
+        for k, (_raw_v, norm_v) in cur["nums"].items():
+            if tamper_lk and k in ("tilt_count", "tilt_window"):
+                continue
+            if open_cd_lk and k == "cd_mins":
+                continue
+            if norm_v != snap["nums"][k][1]:
+                return True
+        if cur["tts_voice"] != snap["tts_voice"]:
+            return True
+        for k, (_raw_d, norm_d) in cur["dollars"].items():
+            if tamper_lk and k in (
+                "consec_loss_min_dollars",
+                "consec_win_reset_dollars",
+            ):
+                continue
+            if norm_d != snap["dollars"][k][1]:
+                return True
+        if cur["hud_columns"] != snap["hud_columns"]:
+            return True
+        return False
+
+    def _refresh_undo_edits_btn(*_):
+        aid = pf_timer_state.get("undo_after_id")
+        if aid is not None:
+            pf_timer_state["undo_after_id"] = None
+            try:
+                pf.after_cancel(aid)
+            except Exception:
+                pass
+        if pf_timer_state.get("closing") or btn_undo_edits is None:
+            return
+        try:
+            if not btn_undo_edits.winfo_exists():
+                return
+        except Exception:
+            return
+        is_demo_b = str(var_broker.get() or "").upper() == "DEMO"
+        dirty = bool(_has_unsaved_pf_edits())
+        if dirty:
+            btn_undo_edits.config(
+                text="↺ Undo" if is_demo_b else "↺ Undo Edits",
+                width=90 if is_demo_b else 128,
+            )
+            if (
+                demo_pf_banner_lbl is not None
+                and demo_pf_banner_lbl.winfo_exists()
+            ):
+                demo_pf_banner_lbl.config(
+                    text="🧪 DEMO" if is_demo_b else "🧪 DEMO SANDBOX ($25K)"
+                )
+            if not bool(btn_undo_edits.winfo_manager()):
+                if btn_save_def is not None and btn_save_def.winfo_exists():
+                    btn_undo_edits.pack(
+                        side="left", padx=(10, 0), after=btn_save_def
+                    )
+                else:
+                    btn_undo_edits.pack(side="left", padx=(10, 0))
+        else:
+            if bool(btn_undo_edits.winfo_manager()):
+                btn_undo_edits.pack_forget()
+            if (
+                demo_pf_banner_lbl is not None
+                and demo_pf_banner_lbl.winfo_exists()
+            ):
+                demo_pf_banner_lbl.config(text="🧪 DEMO SANDBOX ($25K)")
+
+    def _schedule_undo_btn_refresh(*_):
+        if _pf_undo_busy["suppress"] or pf_timer_state.get("closing"):
+            return
+        aid = pf_timer_state.get("undo_after_id")
+        if aid is not None:
+            pf_timer_state["undo_after_id"] = None
+            try:
+                pf.after_cancel(aid)
+            except Exception:
+                pass
+        try:
+            if pf.winfo_exists():
+                pf_timer_state["undo_after_id"] = pf.after(
+                    15, _refresh_undo_edits_btn
+                )
+        except Exception:
+            pass
+
+    _pf_undo_hooks["schedule"] = _schedule_undo_btn_refresh
+    _pf_undo_hooks["refresh"] = _refresh_undo_edits_btn
+    _pf_undo_hooks["capture"] = _capture_pf_undo_snapshot
+    _pf_undo_hooks["is_dirty"] = _has_unsaved_pf_edits
+
+    def undo_preflight_edits():
+        if is_in_trade_tamper_locked() or not _pf_undo_snapshot["ready"]:
+            return
+        snap = _pf_undo_snapshot.get("data")
+        if not isinstance(snap, dict):
+            return
+        tamper_lk = is_tilt_streak_tamper_locked()
+        open_cd_lk = bool(tamper_lk and config.get("enable_open_cooldown", False))
+        ao_lk = bool(tamper_lk and not config.get("alarms_only_mode", False))
+        _pf_undo_busy["suppress"] = True
+        _tilt_cd_popup_guard["suppress"] = True
+        _opt_waiver_guard["suppress"] = True
+        _ignore_prepos_guard["suppress"] = True
+        try:
+            # Restore Alarms Only before enforcement checkmarks so toggle-off state matches snapshot cleanly
+            if not ao_lk and "alarms_only" in snap["bools"]:
+                var_alarms_only.set(bool(snap["bools"]["alarms_only"]))
+            for k, v_obj in _pf_undo_bool_vars.items():
+                if k == "alarms_only":
+                    continue
+                if tamper_lk and k == "tilt_cd":
+                    continue
+                if open_cd_lk and k == "open_cd":
+                    continue
+                val_b = bool(snap["bools"].get(k, False))
+                if k == "flatten_options":
+                    val_b = bool(val_b and is_options_waiver_verified(config))
+                v_obj.set(val_b)
+            for k, (v_obj, _is_s, _is_i) in _pf_undo_num_specs.items():
+                if tamper_lk and k in ("tilt_count", "tilt_window"):
+                    continue
+                if open_cd_lk and k == "cd_mins":
+                    continue
+                v_obj.set(snap["nums"][k][0])
+            var_tts_voice.set(snap["tts_voice"])
+            selected_hud_columns.clear()
+            selected_hud_columns.extend(snap["hud_columns"])
+            hud_cols_btn.config(
+                text=format_hud_cols_btn_label(selected_hud_columns)
+            )
+            for k in dollar_keys:
+                if tamper_lk and k in (
+                    "consec_loss_min_dollars",
+                    "consec_win_reset_dollars",
+                ):
+                    continue
+                dollar_vars[k].set(snap["dollars"][k][0])
+        finally:
+            _ignore_prepos_guard["suppress"] = False
+            _opt_waiver_guard["suppress"] = False
+            _tilt_cd_popup_guard["suppress"] = False
+            _pf_undo_busy["suppress"] = False
+
+        for _, _, widget_ref, _ in _pf_numeric_field_specs:
+            if isinstance(widget_ref, tk.Entry) and widget_ref.winfo_exists():
+                try:
+                    widget_ref.config(
+                        highlightbackground=getattr(
+                            widget_ref, "_orig_rim", "#2e526e"
+                        )
+                    )
+                except Exception:
+                    pass
+        _sync_prev_toggle_state()
+        _refresh_dynamic_stop_box_colors()
+        refresh_preset_buttons_highlight()
+        refresh_smart_dimming()
+        _refresh_undo_edits_btn()
+        if default_status_lbl is not None:
+            default_status_lbl.config(
+                text="✓ Back to where you started — nothing was changed.",
+                fg="#58d68d",
+            )
 
     def restore_factory_defaults():
         if is_in_trade_tamper_locked():
@@ -28907,17 +29201,24 @@ def show_preflight_window(
         )
         apply_dollar_preset(src)
         refresh_smart_dimming()
+        _refresh_undo_edits_btn()
         if default_status_lbl is not None:
             lk_note = (
                 " (🔒 Active Loss Streak settings stayed locked)"
                 if tamper_lk
                 else ""
             )
-            msg = (
-                f"↺ Restored your saved defaults{lk_note}."
+            tpl_name = (
+                "Your Defaults"
                 if config.get("user_defaults")
-                else f"↺ Restored factory defaults{lk_note}."
+                else "Factory Defaults"
             )
+            undo_hint = (
+                " · ↺ Undo Edits to go back"
+                if _has_unsaved_pf_edits()
+                else ""
+            )
+            msg = f"{tpl_name} loaded — not saved yet{undo_hint}{lk_note}."
             default_status_lbl.config(text=msg, fg="#5dade2")
 
     _pf_numeric_field_specs = []
@@ -32549,6 +32850,8 @@ def show_preflight_window(
         activate_commit_for_today()
         _refresh_commit_today_pill()
         refresh_smart_dimming()
+        _capture_pf_undo_snapshot()
+        _refresh_undo_edits_btn()
         _render_card3_telemetry_live(force=True)
         if default_status_lbl is not None:
             default_status_lbl.config(
@@ -36082,6 +36385,7 @@ def show_preflight_window(
                 lbl_arrow.config(fg="#3b4756")
                 lbl_fl.config(fg="#526070")
                 ent_fl.config(state="disabled")
+        _schedule_undo_btn_refresh()
 
     var_open_flat.trace_add("write", _on_toggle_open_flat)
     var_tilt_cd.trace_add("write", _on_toggle_tilt_cd)
@@ -36094,6 +36398,23 @@ def show_preflight_window(
         var_t1_w1_on, var_t1_w2_on, var_t2_on, var_t3_on, var_t4_on
     ):
         trace_var.trace_add("write", refresh_smart_dimming)
+    for _uv_tr in (
+        var_tilt_count,
+        var_tilt_window,
+        var_cd_mins,
+        var_daily_lock_mins,
+        var_poll,
+        var_tts_voice,
+        var_reanchor,
+        var_voice_cues,
+        var_upside_chime,
+        var_ignore_preexisting,
+        var_reset925,
+        var_kill_tos,
+        var_kill_wb,
+        var_flatten_options,
+    ):
+        _uv_tr.trace_add("write", _schedule_undo_btn_refresh)
     refresh_smart_dimming()
 
     _pf_streak_prev_locked = {
@@ -36220,6 +36541,31 @@ def show_preflight_window(
         btn_save_def,
         "Saves every setting and dollar threshold currently on this screen as your personal\n"
         "Default profile (used by 'Restore Defaults', 'Standard Full Risk', and '50% Low Energy')."
+    )
+
+    btn_undo_edits = make_stadium_button(
+        btn_frame,
+        text="↺ Undo Edits",
+        font=("Arial", 10, "bold"),
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#7dd3fc",
+        hover_fill="#162231",
+        hover_fill_top="#1e2f44",
+        hover_border="#bae6fd",
+        fg="#bae6fd",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        width=128,
+        height=38,
+        pad_x=20,
+        auto_width=False,
+        command=undo_preflight_edits,
+    )
+    attach_tooltip(
+        btn_undo_edits,
+        "Puts every unsaved box and setting on this screen back to how it was when you opened Settings.\n"
+        "Nothing is saved or applied until you click SAVE."
     )
 
     def _on_toggle_alarms_only():
@@ -36398,6 +36744,8 @@ def show_preflight_window(
     default_status_lbl.pack(side="left")
 
     refresh_smart_dimming()
+    _capture_pf_undo_snapshot()
+    _refresh_undo_edits_btn()
 
     tk.Label(
         ver_frame,
