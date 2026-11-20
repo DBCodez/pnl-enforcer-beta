@@ -4,6 +4,22 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.79] — 2026-11-20
+### ⚡ Quick Summary
+- **Live Pre-Launch `FLIGHT PLAN` Strip & 2-Column Hover Card:** A plain-English status strip (`FLIGHT PLAN (RTH)` / `(Ext-Hours)` / `(Alarms Only)` / `(Done Today)` / `(DEMO $25K)`) now updates in real time right above the launch button as you tweak stops, alarms, options mode, or presets — plus a hover-or-click `ⓘ Full plan` card showing a clean two-column rulebook summary (`Early Alerts`, `Daily Stop`, `Options Mode`, `Hold-Off Rule`, `Trade & Tilt`, clamped `Profit Lock` / `Profit Ratchet` floors, and `9:30 AM Bell` behavior).
+- **`Start Automatically with Windows` (`OFF` by Default) & Cold-Boot `--startup` Resilience:** Optional toggle in **`⚙ Preferences & Audio... -> SYSTEM & TELEMETRY`** (`Win Boot: ON` in Card 3) that launches PnL Enforcer automatically on Windows login via `pythonw.exe ... --startup` — waiting patiently for boot Wi-Fi, protecting your saved 7-day Schwab token from captive-portal HTML or `<14h` boot refresh wipes, and deferring interactive browser logins until Pre-Flight is on screen.
+- **Zero Duplicate `36h` Order Fetch on Launch & Cleaner `[CONFIG]` Telemetry (Schwab & Webull):** Extending Pre-Flight's verified flat zero-delta `36h` order cache window to `60s` across launch (`HUD Poll #1`) avoids redundant broker `/orders` calls when reviewing settings for `>8s` (while invalidating instantly on any `$0.01` balance or position change), and fixes negative tier stops in `[CONFIG]` logs (`-$1,000` / `-$500` + `WinBoot=ON/OFF`).
+
+### 🔍 Detailed Breakdown
+- **Live Pre-Launch Flight Plan Strip, Dynamic Tooltip Card & Floor Clamping (`build_flight_plan_summary`, `elide_flight_plan_headline`, `_redraw_flight_plan_canvas`, `_populate_rich_tooltip_card`, `_normalize_tooltip_paragraphs_global`, `_get_effective_rth_tier_stops`, `attach_tooltip`):**
+  - Renders `cv_flight_plan` (`tk.Canvas`) with a colored `FLIGHT PLAN` prefix tag, clause-boundary elided headline (`elide_flight_plan_headline`), click-or-hover instant card display (`_show_tooltip_now_fn`), High-DPI overlap prevention against `"ⓘ Full plan"`, DPI-measured two-column `• Key | Value` grid alignment with `"---"` dividers and `("IMPORTANT:", "WARNING:", "CAUTION:")` / `!` warning styling, and `_get_effective_rth_tier_stops()` / `-stop_mag` floor clamping for RTH tiers and Extended-Hours Profit Lock.
+- **Windows Boot Auto-Start (`HKCU\...\Run`) & Cold-Boot `--startup` Hardening (`DEFAULT_CONFIG["start_with_windows"]`, `build_windows_startup_command`, `read_windows_startup_status`, `sync_windows_startup_registry`, `DeferredAuthRequired`, `run_startup_broker_connect`, `SchwabAdapter.authenticate`, `WebullAdapter.authenticate`, `_spawn_updated_enforcer`):**
+  - Registers `PnLEnforcerBeta` (`pythonw.exe` + `--startup`, forwarding `--startup` across self-updates and respecting Task Manager `StartupApproved\Run` status), retries pending boot network connections via `Case 3a` (`6x3s`) and `Case 3b` (`22x4s`) background reconnect without modal error popups or unwanted broker switches, preserves saved Schwab tokens against captive-portal `JSONDecodeError` or `<14h` silent boot expiry checks, and suppresses foreground stealing during silent `--startup` boots.
+- **`60s` Post-Reconcile Launch Order Cache & `[CONFIG]` Sign Fix (`SchwabAdapter.fetch_filled_orders_since`, `WebullAdapter.fetch_filled_orders_since`, `format_config_summary`):**
+  - Uses `eff_ord_ttl = 60.0` (with instant `$0.01` equity/holding signature invalidation via `_compute_orders_cache_inv_sig`) on both `SchwabAdapter` and `WebullAdapter` when `_off_session_reconciled and fast_recent_only` is active across the Pre-Flight to `HUD Poll #1` handoff, and formats negative `t2_max_loss` / `t3_max_loss` values cleanly via `_fp_fmt_signed()` alongside `WinBoot=ON/OFF`.
+
+---
+
 ## [v0.9.78] — 2026-11-19
 ### ⚡ Quick Summary
 - **Live HUD Data-Freshness LED & Hover Feed Status (Schwab, Webull & Demo):** Added a subtle real-time freshness dot directly inside the HUD center status pill (**`● GREEN`** when live, **`○ SYNCING`** hollow ring on startup or wake-from-sleep resync, **`● AMBER`** with compact age timer on Retry #1 or aging feed, and **`● RED`** on disconnects/stalls) plus live-ticking hover tooltip status (`Broker Feed LIVE · synced X.Xs ago · Poll: Ns`).
