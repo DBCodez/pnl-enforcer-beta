@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.79"
+APP_VERSION = "0.9.80"
 
 import os
 import sys
@@ -1605,6 +1605,31 @@ def center_dialog_over_parent(
             pass
 
 
+def _safe_unbind(widget, seq, funcid):
+    """Removes a single Tcl binding (`funcid`) from `widget` for `seq` without
+    wiping sibling `add='+'` bindings on Python < 3.13 (CPython gh-75666)."""
+    if widget is None or not funcid:
+        return
+    try:
+        existing = str(widget.bind(seq) or "")
+    except Exception:
+        return
+    if existing:
+        kept = [
+            ln
+            for ln in existing.splitlines()
+            if ln.strip() and (funcid not in ln)
+        ]
+        try:
+            widget.bind(seq, "\n".join(kept) if kept else "")
+        except Exception:
+            pass
+    try:
+        widget.deletecommand(funcid)
+    except Exception:
+        pass
+
+
 class DarkDropdownMenu:
     """Custom borderless dark-slate popup menu replacing native Win32 tk.Menu
     so dropdowns render with a crisp 1px #334155 dark border instead of
@@ -1635,6 +1660,7 @@ class DarkDropdownMenu:
         self._owner = None
         self._on_close = None
         self._top_bind_ids = []
+        self._focus_check_after_id = None
         self._last_close_ts = 0.0
 
     def add_command(
@@ -1678,15 +1704,21 @@ class DarkDropdownMenu:
     def close(self, _event=None):
         if DarkDropdownMenu._active_instance is self:
             DarkDropdownMenu._active_instance = None
-        top = None
-        try:
-            top = self._parent.winfo_toplevel()
-        except Exception:
-            pass
-        if top is not None and self._top_bind_ids:
-            for seq, bid in self._top_bind_ids:
+        if self._focus_check_after_id is not None and self._win is not None:
+            try:
+                self._win.after_cancel(self._focus_check_after_id)
+            except Exception:
+                pass
+        self._focus_check_after_id = None
+        if self._top_bind_ids:
+            for item_b in self._top_bind_ids:
                 try:
-                    top.unbind(seq, bid)
+                    if len(item_b) == 3:
+                        w_b, seq, bid = item_b
+                    else:
+                        seq, bid = item_b
+                        w_b = self._parent.winfo_toplevel()
+                    _safe_unbind(w_b, seq, bid)
                 except Exception:
                     pass
         self._top_bind_ids = []
@@ -1852,18 +1884,97 @@ class DarkDropdownMenu:
             except Exception:
                 pass
 
+            top_ref = None
+            init_top_geom = None
+            try:
+                top_ref = self._parent.winfo_toplevel()
+                init_top_geom = (
+                    int(top_ref.winfo_rootx()),
+                    int(top_ref.winfo_rooty()),
+                    int(top_ref.winfo_width()),
+                    int(top_ref.winfo_height()),
+                )
+            except Exception:
+                top_ref = None
+                init_top_geom = None
+
+            def _check_app_focus_lost():
+                self._focus_check_after_id = None
+                if self._win is not tw:
+                    return
+                try:
+                    if not tw.winfo_exists():
+                        return
+                    if tw.focus_displayof() is None:
+                        self.close()
+                except Exception:
+                    pass
+
+            def _on_tw_focus_out(_ev=None):
+                if self._win is not tw:
+                    return
+                if self._focus_check_after_id is not None:
+                    try:
+                        tw.after_cancel(self._focus_check_after_id)
+                    except Exception:
+                        pass
+                try:
+                    self._focus_check_after_id = tw.after(35, _check_app_focus_lost)
+                except Exception:
+                    pass
+
             tw.bind("<Escape>", self.close)
-            tw.bind("<FocusOut>", self.close)
+            tw.bind("<FocusOut>", _on_tw_focus_out)
+
+            def _on_top_button1(ev=None):
+                try:
+                    w_ev = getattr(ev, "widget", None)
+                    if w_ev is not None and str(w_ev).startswith(str(tw)):
+                        return
+                except Exception:
+                    pass
+                self.close()
+
+            def _on_top_configure(ev=None):
+                if top_ref is None or getattr(ev, "widget", None) is not top_ref:
+                    return
+                try:
+                    cur_geom = (
+                        int(top_ref.winfo_rootx()),
+                        int(top_ref.winfo_rooty()),
+                        int(top_ref.winfo_width()),
+                        int(top_ref.winfo_height()),
+                    )
+                    if init_top_geom is not None and cur_geom == init_top_geom:
+                        return
+                except Exception:
+                    pass
+                self.close()
+
+            def _on_top_unmap(ev=None):
+                if top_ref is None or getattr(ev, "widget", None) is not top_ref:
+                    return
+                self.close()
 
             def _bind_outside_dismiss():
                 if self._win is None or not self._win.winfo_exists():
                     return
                 try:
-                    top = self._parent.winfo_toplevel()
-                    for seq in ("<Button-1>", "<Configure>", "<Unmap>"):
-                        bid = top.bind(seq, self.close, add="+")
-                        if bid:
-                            self._top_bind_ids.append((seq, bid))
+                    if top_ref is not None and top_ref.winfo_exists():
+                        for seq, cb in (
+                            ("<Button-1>", _on_top_button1),
+                            ("<Configure>", _on_top_configure),
+                            ("<Unmap>", _on_top_unmap),
+                            ("<Escape>", self.close),
+                        ):
+                            bid = top_ref.bind(seq, cb, add="+")
+                            if bid:
+                                self._top_bind_ids.append((top_ref, seq, bid))
+                    hr = globals().get("hud_root")
+                    if hr is not None and hr is not top_ref and hr.winfo_exists():
+                        bid_h = hr.bind("<Button-1>", self.close, add="+")
+                        if bid_h:
+                            self._top_bind_ids.append((hr, "<Button-1>", bid_h))
                 except Exception:
                     pass
 
@@ -8853,6 +8964,12 @@ class SchwabAdapter:
                     self.account_id, item[0], item[1]
                 )
             ]
+        if pace_for_verify:
+            rl_rem = float(getattr(self, "_rate_limit_until", 0.0) or 0.0) - time.time()
+            if rl_rem > 0.0:
+                _touch_data_loop_heartbeat()
+                time.sleep(min(3.0, rl_rem))
+                _touch_data_loop_heartbeat()
         try:
             try:
                 resp = self.client.get_account(
@@ -8984,6 +9101,12 @@ class SchwabAdapter:
                 for item in cached[1]
                 if not is_position_ignored(item[0], is_opt=True)
             ]
+        if pace_for_verify:
+            rl_rem = float(getattr(self, "_rate_limit_until", 0.0) or 0.0) - time.time()
+            if rl_rem > 0.0:
+                _touch_data_loop_heartbeat()
+                time.sleep(min(3.0, rl_rem))
+                _touch_data_loop_heartbeat()
         try:
             try:
                 resp = self.client.get_account(
@@ -12135,6 +12258,13 @@ class WebullAdapter:
             ]
         if pace_for_verify:
             self._pace_position_verify_call()
+        else:
+            with self._pos_pace_lock:
+                now_u = time.time()
+                self._last_pos_call_ts = now_u
+                self._next_pos_slot_ts = max(
+                    self._next_pos_slot_ts, now_u + WEBULL_POS_MIN_INTERVAL_SEC
+                )
         try:
             res = self._call_get_positions()
             if res.status_code == 200:
@@ -12275,6 +12405,13 @@ class WebullAdapter:
             ]
         if pace_for_verify:
             self._pace_position_verify_call()
+        else:
+            with self._pos_pace_lock:
+                now_u = time.time()
+                self._last_pos_call_ts = now_u
+                self._next_pos_slot_ts = max(
+                    self._next_pos_slot_ts, now_u + WEBULL_POS_MIN_INTERVAL_SEC
+                )
         try:
             res = self._call_get_positions()
             if res.status_code == 200:
@@ -15175,6 +15312,10 @@ def get_full_idle_button_text():
             )
             or "OPEN SHARES"
         )
+        if bool(pending_halt_breach.get("manual_options_only", False)):
+            return _with_mute_idle_prefix(
+                f"⚠️ MANUAL OPTIONS WATCH ({w_syms}): CLOSE OPTIONS MANUALLY"
+            )
         rem_h = (
             active_adapter.get_halt_remaining_seconds()
             if hasattr(active_adapter, "get_halt_remaining_seconds")
@@ -15294,6 +15435,10 @@ def get_medium_idle_button_text():
             )
             or "OPEN"
         )
+        if bool(pending_halt_breach.get("manual_options_only", False)):
+            return _with_mute_idle_prefix(
+                f"⚠️ OPTIONS WATCH ({w_syms}): CLOSE MANUALLY"
+            )
         rem_h = (
             active_adapter.get_halt_remaining_seconds()
             if hasattr(active_adapter, "get_halt_remaining_seconds")
@@ -15402,6 +15547,8 @@ def get_idle_button_text():
                 )
                 or "OPEN"
             )
+            if bool(pending_halt_breach.get("manual_options_only", False)):
+                return _with_mute_idle_prefix(f"⚠️ OPT WATCH ({w_syms})", compact=True)
             rem_h = (
                 active_adapter.get_halt_remaining_seconds()
                 if hasattr(active_adapter, "get_halt_remaining_seconds")
@@ -15868,10 +16015,41 @@ def apply_idle_button_config(ui_button):
         pass
 
 
+def _humanize_alarm_reason(reason, for_tts=False):
+    """Formats internal Tier/Ext-Hours warning alarm keys into plain-English copy
+    for the HUD pill and spoken alerts without altering `triggered_alarms` keys."""
+    r_str = str(reason or "").strip()
+    m1 = re.match(r"^Hit (-\$[\d,]+(?:\.\d+)?) \(Tier (\d+)\)$", r_str)
+    if m1:
+        amt, _tier = m1.group(1), m1.group(2)
+        if for_tts:
+            return f"Net PnL {amt} early warning, heads-up only, not a stop"
+        return f"Net {amt} Warn · No Stop"
+    m2 = re.match(r"^Hit \$0 \(Tier (\d+)\)$", r_str)
+    if m2:
+        tier = m2.group(1)
+        if for_tts:
+            return (
+                f"Net PnL breakeven pullback warning on Tier {tier}, "
+                f"heads-up only, not a stop"
+            )
+        return f"Net $0 Pullback Warn · Tier {tier}"
+    m3 = re.match(r"^Ext-Hours (-\$[\d,]+(?:\.\d+)?) Warn (\d+)$", r_str)
+    if m3:
+        amt, wnum = m3.group(1), m3.group(2)
+        if for_tts:
+            return (
+                f"Extended-hours Net PnL {amt} early warning {wnum}, "
+                f"heads-up only, not a stop"
+            )
+        return f"Ext Net {amt} Warn · No Stop"
+    return r_str
+
+
 def format_alarm_button_text(reason):
     if is_compact_hud():
         return "🔔 DISMISS ALARM"
-    return f"ACKNOWLEDGE ALARM ({reason})"
+    return f"ACKNOWLEDGE ALARM ({_humanize_alarm_reason(reason, for_tts=False)})"
 
 
 def is_disconnect_alarm_reason(reason):
@@ -16066,13 +16244,15 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
                     except Exception:
                         pass
                 threading.Thread(target=_one_shot_modal_alert, daemon=True).start()
-                speak_async(f"Alert: {reason}")
+                speak_async(f"Alert: {_humanize_alarm_reason(reason, for_tts=True)}")
         return
 
     _deferred_alarms.pop(reason, None)
     triggered_alarms[reason] = time.time()
     last_alarm_reason = reason
-    log_event("ALARM", f"Triggered: {reason}{extra}")
+    hum_ui = _humanize_alarm_reason(reason, for_tts=False)
+    disp_sfx = f" [{hum_ui}]" if hum_ui and hum_ui != str(reason).strip() else ""
+    log_event("ALARM", f"Triggered: {reason}{disp_sfx}{extra}")
     alarm_active = True
     btn_txt = format_alarm_button_text(reason)
     if ui_button is not None:
@@ -18792,7 +18972,9 @@ def flatten_equities(
                     "⏳  2. Daytrade Positions: Inspecting open daytrade positions...",
                     False,
                 )
-                peek_pos = _clean_pos(_call_adapter_open_eq(adapter))
+                peek_pos = _clean_pos(
+                    _call_adapter_open_eq(adapter, cache_empty_ok=True)
+                )
                 peek_opt = _clean_pos(
                     _call_adapter_open_opt(adapter, reuse_paired_eq_read=True)
                     if include_options and hasattr(adapter, "get_open_option_positions")
@@ -20303,6 +20485,57 @@ def _query_uncached_positions_with_retry(adapter, retries=3, delay_s=0.35):
     return last_eq, last_opt
 
 
+def _compute_open_pnl_recovery_threshold(open_max_val):
+    """Returns the conservative Open PnL recovery threshold (-open_max + buffer)
+    required before disarming a manual-options Open PnL watch or skipping its
+    deferred Penalty Box lock."""
+    om = abs(float(open_max_val))
+    rec_buf = min(100.0, max(25.0, round(0.15 * om, 2)))
+    return round(-om + rec_buf, 2)
+
+
+def _is_manual_options_alarm_reason(reason_txt):
+    ru = str(reason_txt or "").upper()
+    return (
+        ("MANUAL OPTIONS EXIT" in ru)
+        or ("OPTIONS MARKET CLOSED" in ru)
+        or ("CHECK OPTIONS MANUALLY" in ru)
+    )
+
+
+def _purge_manual_options_deferred_alarms():
+    for k_def in list(_deferred_alarms.keys()):
+        if _is_manual_options_alarm_reason(k_def):
+            _deferred_alarms.pop(k_def, None)
+
+
+def _format_manual_options_alarm_reason(base_reason):
+    r_str = str(base_reason or "")
+    ru = r_str.upper()
+    if ("MANUAL OPTIONS EXIT" in ru) or ("CHECK OPTIONS MANUALLY" in ru):
+        return r_str
+    return f"{r_str} — CHECK OPTIONS MANUALLY!"
+
+
+def _prev_snapshot_has_no_equities():
+    """Returns True when the just-verified `prev_pos_snapshot` contains one or
+    more option contracts and zero open non-option equity positions."""
+    if not isinstance(prev_pos_snapshot, dict) or not prev_pos_snapshot:
+        return False
+    has_opt = False
+    for _k_ps, d_ps in prev_pos_snapshot.items():
+        if not isinstance(d_ps, dict):
+            continue
+        q_ps = float(d_ps.get("qty", 0.0) or 0.0)
+        if abs(q_ps) <= 1e-6:
+            continue
+        if str(d_ps.get("asset_type", "")).upper() == "OPTION":
+            has_opt = True
+        else:
+            return False
+    return has_opt
+
+
 def _enter_halt_breach_watch(
     breach_type,
     reason,
@@ -20311,6 +20544,8 @@ def _enter_halt_breach_watch(
     adapter,
     ui_button,
     force_armed=False,
+    manual_options_only=False,
+    seed_from_prev_snapshot=False,
 ):
     """Transitions an unflattened breach (e.g. a stock stuck in an LULD volatility
     halt with a working Market close order queued, or unflattened options) into
@@ -20321,24 +20556,32 @@ def _enter_halt_breach_watch(
     global pending_halt_breach, alarm_active, active_non_breach_halted_syms
     active_non_breach_halted_syms.clear()
     watched = {}
-    try:
-        if adapter is not None:
-            rem_eq = _call_adapter_open_eq(
-                adapter, allow_stale_cache=False, pace_for_verify=True
-            )
-            for item in (rem_eq or []):
-                watched[str(item[0])] = float(item[1])
-            if has_options and hasattr(adapter, "get_open_option_positions"):
-                rem_opt = _call_adapter_open_opt(
-                    adapter,
-                    allow_stale_cache=False,
-                    pace_for_verify=True,
-                    reuse_paired_eq_read=True,
+    if seed_from_prev_snapshot and isinstance(prev_pos_snapshot, dict):
+        for k, d in prev_pos_snapshot.items():
+            if not isinstance(d, dict):
+                continue
+            q = float(d.get("qty", 0.0) or 0.0)
+            if abs(q) > 1e-6:
+                watched[str(k)] = q
+    if not watched:
+        try:
+            if adapter is not None:
+                rem_eq = _call_adapter_open_eq(
+                    adapter, allow_stale_cache=False, pace_for_verify=True
                 )
-                for item in (rem_opt or []):
-                    watched[f"{item[0]} (OPT)"] = float(item[1])
-    except Exception:
-        pass
+                for item in (rem_eq or []):
+                    watched[str(item[0])] = float(item[1])
+                if has_options and hasattr(adapter, "get_open_option_positions"):
+                    rem_opt = _call_adapter_open_opt(
+                        adapter,
+                        allow_stale_cache=False,
+                        pace_for_verify=True,
+                        reuse_paired_eq_read=True,
+                    )
+                    for item in (rem_opt or []):
+                        watched[f"{item[0]} (OPT)"] = float(item[1])
+        except Exception:
+            pass
     if not watched and isinstance(prev_pos_snapshot, dict):
         for k, d in prev_pos_snapshot.items():
             q = float(d.get("qty", 0.0))
@@ -20355,9 +20598,20 @@ def _enter_halt_breach_watch(
         if isinstance(pending_halt_breach, dict)
         else False
     )
+    prev_saw_inc = bool(
+        pending_halt_breach.get("saw_increase", False)
+        if isinstance(pending_halt_breach, dict)
+        else False
+    )
+    prev_pre_flat = (
+        pending_halt_breach.get("pre_watch_flat_realized")
+        if isinstance(pending_halt_breach, dict)
+        else None
+    )
     curr_af = _is_halt_breach_auto_flatten_armed({"type": breach_type})
     auto_flatten_armed = bool(force_armed or prev_af or curr_af)
     eff_type = "DAILY" if (prev_type == "DAILY" or breach_type == "DAILY") else breach_type
+    eff_manual_opt = bool(manual_options_only and eff_type != "DAILY")
     eff_reason = (
         pending_halt_breach.get("reason", reason)
         if (prev_type == "DAILY" and breach_type != "DAILY" and isinstance(pending_halt_breach, dict))
@@ -20380,6 +20634,13 @@ def _enter_halt_breach_watch(
         "has_options": bool(has_options),
         "halted_with_working_exit": halted_with_working_exit,
         "auto_flatten_armed": auto_flatten_armed,
+        "manual_options_only": eff_manual_opt,
+        "pre_watch_flat_realized": float(
+            prev_pre_flat
+            if prev_pre_flat is not None
+            else (prev_flat_realized_pnl or 0.0)
+        ),
+        "saw_increase": prev_saw_inc,
         "watched_positions": watched,
         "started_ts": now_hb_init,
         "last_reprice_ts": now_hb_init,
@@ -20388,13 +20649,22 @@ def _enter_halt_breach_watch(
     }
     syms_label = ", ".join(watched.keys()) if watched else "OPEN SHARES"
     lock_en_hb, lock_m_hb, _ = _get_halt_breach_lockout_info(pending_halt_breach)
-    log_event(
-        "GUARDRAIL",
-        f"Entering Halt / Unfilled Position Watch ({eff_type}): "
-        f"{watched or 'unverified open shares'}. Working exit order(s) preserved "
-        f"in broker queue; suppressing repeat flatten loops and deferring "
-        f"OS Lock ({'ON: ' + str(lock_m_hb) + 'm' if lock_en_hb else 'OFF'}) / App Kill until 100% flat.",
-    )
+    if eff_manual_opt:
+        log_event(
+            "GUARDRAIL",
+            f"Entering Manual-Options Breach Watch ({eff_type}): "
+            f"{watched or 'unverified open options'}. Options Auto-Flatten is OFF/closed; "
+            f"monitoring until closed flat or recovered above stop threshold "
+            f"(OS Lock {'ON: ' + str(lock_m_hb) + 'm' if lock_en_hb else 'OFF'} / App Kill deferred).",
+        )
+    else:
+        log_event(
+            "GUARDRAIL",
+            f"Entering Halt / Unfilled Position Watch ({eff_type}): "
+            f"{watched or 'unverified open shares'}. Working exit order(s) preserved "
+            f"in broker queue; suppressing repeat flatten loops and deferring "
+            f"OS Lock ({'ON: ' + str(lock_m_hb) + 'm' if lock_en_hb else 'OFF'}) / App Kill until 100% flat.",
+        )
     if halted_with_working_exit:
         alarm_active = False
         if lock_en_hb and lock_m_hb > 0:
@@ -20426,7 +20696,7 @@ def _enter_halt_breach_watch(
                 pass
     else:
         fail_reason = (
-            f"{eff_reason} — CHECK OPTIONS MANUALLY!"
+            _format_manual_options_alarm_reason(eff_reason)
             if has_options
             else f"{eff_reason} (HALT/UNFILLED: {syms_label})"
         )
@@ -20451,9 +20721,12 @@ def _handle_pending_halt_breach(
     """Monitors an active Halt / Unfilled Position Watch (`pending_halt_breach`).
     - Auto-flattens any new/increased position or any position that moves into
       auto-flatten territory while preserving queued closing orders on halted shares.
-    - Once `is_flat` is confirmed True, executes the full deferred lockout duration.
+    - For unarmed/off-RTH manual-options OPEN_PNL watches, clears automatically
+      if watched Open PnL recovers above `-open_max + rec_buf` without averaging
+      down, and skips Penalty Box lockout when closed flat above that threshold.
+    - Once `is_flat` is confirmed True otherwise, executes the full deferred lockout.
     """
-    global pending_halt_breach, alarm_active
+    global pending_halt_breach, alarm_active, last_alarm_reason
     if pending_halt_breach is None:
         return False
     eff_adapter = adapter if adapter is not None else active_adapter
@@ -20461,6 +20734,7 @@ def _handle_pending_halt_breach(
     hb_type = hb.get("type", "DAILY")
     hb_reason = hb.get("reason", "Daily Stop Breach")
     watched = hb.get("watched_positions") or {}
+    orig_watched_keys = set(watched.keys())
     has_opt_flag = bool(
         has_options
         or opt_pos
@@ -20567,6 +20841,40 @@ def _handle_pending_halt_breach(
                     except Exception:
                         pass
         elif hb_type == "OPEN_PNL":
+            _purge_manual_options_deferred_alarms()
+            rec_thresh = _compute_open_pnl_recovery_threshold(open_max)
+            if bool(hb.get("manual_options_only", False)) and not bool(
+                hb.get("saw_increase", False)
+            ):
+                pre_flat_r = float(
+                    hb.get("pre_watch_flat_realized", net_pnl) or 0.0
+                )
+                closed_delta = _round_cents(float(net_pnl) - pre_flat_r)
+                if closed_delta >= rec_thresh:
+                    if alarm_active and _is_manual_options_alarm_reason(
+                        last_alarm_reason
+                    ):
+                        alarm_active = False
+                        last_alarm_reason = ""
+                    log_event(
+                        "SESSION",
+                        f"Manual-options Open PnL watch closed flat above stop recovery "
+                        f"threshold (Trade PnL {format_dollar(closed_delta)} >= "
+                        f"{format_dollar(rec_thresh)} for -${open_max:,.0f} stop) — "
+                        f"skipping Penalty Box lock.",
+                    )
+                    if not alarm_active and not cooldown_active and mute_btn is not None:
+                        try:
+                            mute_btn.after(
+                                0,
+                                lambda: (
+                                    apply_idle_button_config(mute_btn),
+                                    _sync_hud_breach_banner(True),
+                                ),
+                            )
+                        except Exception:
+                            pass
+                    return True
             if config.get("enable_open_cooldown", False):
                 alarm_active = False
                 cd_mins = float(config.get("open_cooldown_mins", 1.0))
@@ -20577,7 +20885,9 @@ def _handle_pending_halt_breach(
                     adapter=eff_adapter,
                     reason_text=hb_reason,
                     context_str=ctx,
-                    deferred_from_halt=True,
+                    deferred_from_halt=bool(
+                        hb.get("halted_with_working_exit", False)
+                    ),
                 )
             elif not alarm_active and not cooldown_active and mute_btn is not None:
                 try:
@@ -20588,6 +20898,7 @@ def _handle_pending_halt_breach(
                 except Exception:
                     pass
         elif hb_type == "CONSEC_LOSS":
+            _purge_manual_options_deferred_alarms()
             if config.get("enable_open_cooldown", True):
                 alarm_active = False
                 cd_mins = float(config.get("open_cooldown_mins", 1.0))
@@ -20598,7 +20909,9 @@ def _handle_pending_halt_breach(
                     adapter=eff_adapter,
                     reason_text=hb_reason,
                     context_str=ctx,
-                    deferred_from_halt=True,
+                    deferred_from_halt=bool(
+                        hb.get("halted_with_working_exit", False)
+                    ),
                 )
             elif not alarm_active and not cooldown_active and mute_btn is not None:
                 try:
@@ -20624,6 +20937,7 @@ def _handle_pending_halt_breach(
         _, _, _, tier_short_u, _, _ = describe_active_floor(config, rth_now)
         hb["type"] = "DAILY"
         hb_type = "DAILY"
+        hb["manual_options_only"] = False
         hb["reason"] = (
             f"Breached {tier_short_u} "
             f"({format_dollar(round(active_floor_now - (start_equity or 0.0), 2))})"
@@ -20674,9 +20988,79 @@ def _handle_pending_halt_breach(
             unauthorized.append((sym_k, curr_q))
         new_watched[sym_k] = curr_q
     hb["watched_positions"] = new_watched
+    if unauthorized:
+        hb["saw_increase"] = True
 
+    has_eq_open_now = any(
+        isinstance(d_k, dict)
+        and d_k.get("asset_type") != "OPTION"
+        and abs(float(d_k.get("qty", 0.0) or 0.0)) > 1e-6
+        for d_k in (pos_details or {}).values()
+    )
+    if has_eq_open_now:
+        hb["manual_options_only"] = False
+
+    recovered_now = False
     if (
-        unauthorized or newly_armed_auto_flatten
+        hb.get("type") == "OPEN_PNL"
+        and bool(hb.get("manual_options_only", False))
+        and not has_eq_open_now
+    ):
+        watched_norm = {
+            (str(wk)[:-6].strip() if str(wk).endswith(" (OPT)") else str(wk).strip())
+            for wk in orig_watched_keys
+        }
+        matched_vals = []
+        for pk_w, dv_w in (pos_details or {}).items():
+            if not isinstance(dv_w, dict):
+                continue
+            pk_norm = (
+                str(pk_w)[:-6].strip()
+                if str(pk_w).endswith(" (OPT)")
+                else str(pk_w).strip()
+            )
+            if (
+                str(pk_w) in orig_watched_keys
+                or pk_norm in watched_norm
+            ) and dv_w.get("open_pnl") is not None:
+                matched_vals.append(float(dv_w.get("open_pnl") or 0.0))
+        watched_open_pnl = (
+            round(sum(matched_vals), 2) if matched_vals else float(open_pnl)
+        )
+        eff_rec_open_pnl = min(float(open_pnl), watched_open_pnl)
+        rec_thresh = _compute_open_pnl_recovery_threshold(open_max)
+        recovered_now = bool(eff_rec_open_pnl >= rec_thresh)
+        if recovered_now and not bool(hb.get("saw_increase", False)):
+            pending_halt_breach = None
+            _purge_manual_options_deferred_alarms()
+            if alarm_active and _is_manual_options_alarm_reason(last_alarm_reason):
+                alarm_active = False
+                last_alarm_reason = ""
+            log_event(
+                "SESSION",
+                f"Manual-options Open PnL Stop watch cleared after recovery "
+                f"(Open PnL {format_dollar(eff_rec_open_pnl)} recovered above "
+                f"{format_dollar(rec_thresh)} re-arm threshold for -${open_max:,.0f} stop).",
+            )
+            if not alarm_active and not cooldown_active and mute_btn is not None:
+                try:
+                    mute_btn.after(
+                        0,
+                        lambda: (
+                            apply_idle_button_config(mute_btn),
+                            _sync_hud_breach_banner(False),
+                        ),
+                    )
+                except Exception:
+                    pass
+            return True
+
+    unauth_flattenable = any(
+        (not str(s_u).endswith(" (OPT)")) or opt_armed_now
+        for s_u, _ in unauthorized
+    )
+    if (
+        (unauthorized and unauth_flattenable) or newly_armed_auto_flatten
     ) and _is_halt_breach_auto_flatten_armed(hb):
         if unauthorized:
             log_event(
@@ -20724,11 +21108,16 @@ def _handle_pending_halt_breach(
             hb["watched_positions"] = refreshed_w
         hb["last_reprice_ts"] = time.time()
     else:
-        if unauthorized and not _is_halt_breach_auto_flatten_armed(hb):
+        if unauthorized and (
+            not _is_halt_breach_auto_flatten_armed(hb)
+            or not unauth_flattenable
+        ):
             now_uv = time.time()
             log_event(
                 "GUARDRAIL",
-                f"New/increased position detected during Observation/Manual Halt Watch: {unauthorized}!",
+                f"New/increased position detected during "
+                f"{'Manual-Options Watch' if hb.get('manual_options_only') else 'Observation/Manual Halt Watch'}: "
+                f"{unauthorized}!",
             )
             if now_uv - float(hb.get("last_unauth_voice_ts", 0.0)) >= 10.0:
                 hb["last_unauth_voice_ts"] = now_uv
@@ -20743,10 +21132,16 @@ def _handle_pending_halt_breach(
         b_name_hb = getattr(eff_adapter, "name", "SCHWAB")
         sess_open_hb = is_any_equity_session_open(b_name_hb)
         remind_iv = 30.0 if sess_open_hb else 900.0
+        suppress_recovered_rem = bool(
+            hb_type == "OPEN_PNL"
+            and bool(hb.get("manual_options_only", False))
+            and recovered_now
+        )
         if (
             not alarm_active
             and not cooldown_active
             and not hb.get("halted_with_working_exit", False)
+            and not suppress_recovered_rem
             and (now_hb - float(hb.get("last_remind_ts", 0.0))) >= remind_iv
         ):
             hb["last_remind_ts"] = now_hb
@@ -20756,7 +21151,7 @@ def _handle_pending_halt_breach(
                 else "OPEN POSITIONS"
             )
             rem_msg = (
-                f"{hb_reason} — CHECK OPTIONS MANUALLY!"
+                _format_manual_options_alarm_reason(hb_reason)
                 if has_opt_flag
                 else f"{hb_reason} (UNFILLED: {syms_lbl})"
             )
@@ -20876,10 +21271,38 @@ def trigger_open_pnl_flatten(
             f"Options Auto-Flatten (BETA) is OFF; flattening any equities and "
             f"waiting for manual options exit."
         )
-        flatten_equities(adapter, force_flatten=True, include_options=False)
-        _enter_halt_breach_watch(
-            "OPEN_PNL", opt_reason, context_str, True, adapter, ui_button
-        )
+        if _prev_snapshot_has_no_equities():
+            _enter_halt_breach_watch(
+                "OPEN_PNL",
+                opt_reason,
+                context_str,
+                True,
+                adapter,
+                ui_button,
+                manual_options_only=True,
+                seed_from_prev_snapshot=True,
+            )
+            if adapter is not None and hasattr(adapter, "cancel_all_working_orders"):
+                try:
+                    adapter.cancel_all_working_orders(
+                        preserve_market_close_map={},
+                        cancel_options=False,
+                    )
+                except Exception:
+                    pass
+        else:
+            eq_flat_ok = bool(
+                flatten_equities(adapter, force_flatten=True, include_options=False)
+            )
+            _enter_halt_breach_watch(
+                "OPEN_PNL",
+                opt_reason,
+                context_str,
+                True,
+                adapter,
+                ui_button,
+                manual_options_only=eq_flat_ok,
+            )
         return
 
     if has_options and opt_armed and not rth_now:
@@ -20890,10 +21313,38 @@ def trigger_open_pnl_flatten(
             f"Options cannot be market-flattened outside 9:30–16:00 ET; "
             f"flattening any equities and sounding siren."
         )
-        flatten_equities(adapter, force_flatten=True, include_options=False)
-        _enter_halt_breach_watch(
-            "OPEN_PNL", opt_reason, context_str, True, adapter, ui_button
-        )
+        if _prev_snapshot_has_no_equities():
+            _enter_halt_breach_watch(
+                "OPEN_PNL",
+                opt_reason,
+                context_str,
+                True,
+                adapter,
+                ui_button,
+                manual_options_only=True,
+                seed_from_prev_snapshot=True,
+            )
+            if adapter is not None and hasattr(adapter, "cancel_all_working_orders"):
+                try:
+                    adapter.cancel_all_working_orders(
+                        preserve_market_close_map={},
+                        cancel_options=False,
+                    )
+                except Exception:
+                    pass
+        else:
+            eq_flat_ok = bool(
+                flatten_equities(adapter, force_flatten=True, include_options=False)
+            )
+            _enter_halt_breach_watch(
+                "OPEN_PNL",
+                opt_reason,
+                context_str,
+                True,
+                adapter,
+                ui_button,
+                manual_options_only=eq_flat_ok,
+            )
         return
 
     if not cd_on:
@@ -20998,10 +21449,30 @@ def trigger_consec_loss_cooldown(
             f"Options Auto-Flatten (BETA) is OFF; flattening any equities and "
             f"waiting for manual options exit."
         )
-        flatten_equities(adapter, force_flatten=True, include_options=False)
-        _enter_halt_breach_watch(
-            "CONSEC_LOSS", opt_reason, context_str, True, adapter, ui_button
-        )
+        if _prev_snapshot_has_no_equities():
+            _enter_halt_breach_watch(
+                "CONSEC_LOSS",
+                opt_reason,
+                context_str,
+                True,
+                adapter,
+                ui_button,
+                manual_options_only=False,
+                seed_from_prev_snapshot=True,
+            )
+            if adapter is not None and hasattr(adapter, "cancel_all_working_orders"):
+                try:
+                    adapter.cancel_all_working_orders(
+                        preserve_market_close_map={},
+                        cancel_options=False,
+                    )
+                except Exception:
+                    pass
+        else:
+            flatten_equities(adapter, force_flatten=True, include_options=False)
+            _enter_halt_breach_watch(
+                "CONSEC_LOSS", opt_reason, context_str, True, adapter, ui_button
+            )
         return
 
     if has_options and opt_armed and not rth_now:
@@ -21012,10 +21483,30 @@ def trigger_consec_loss_cooldown(
             f"Options cannot be market-flattened outside 9:30–16:00 ET; "
             f"flattening any equities and sounding siren."
         )
-        flatten_equities(adapter, force_flatten=True, include_options=False)
-        _enter_halt_breach_watch(
-            "CONSEC_LOSS", opt_reason, context_str, True, adapter, ui_button
-        )
+        if _prev_snapshot_has_no_equities():
+            _enter_halt_breach_watch(
+                "CONSEC_LOSS",
+                opt_reason,
+                context_str,
+                True,
+                adapter,
+                ui_button,
+                manual_options_only=False,
+                seed_from_prev_snapshot=True,
+            )
+            if adapter is not None and hasattr(adapter, "cancel_all_working_orders"):
+                try:
+                    adapter.cancel_all_working_orders(
+                        preserve_market_close_map={},
+                        cancel_options=False,
+                    )
+                except Exception:
+                    pass
+        else:
+            flatten_equities(adapter, force_flatten=True, include_options=False)
+            _enter_halt_breach_watch(
+                "CONSEC_LOSS", opt_reason, context_str, True, adapter, ui_button
+            )
         return
 
     if not cd_on:
@@ -30370,6 +30861,14 @@ def show_preflight_window(
         center_dialog_over_parent(dlg, parent=parent_win)
 
     def send_today_safe_log_now():
+        def _restore_logs_btn():
+            try:
+                if btn_logs_menu is not None and btn_logs_menu.winfo_exists():
+                    btn_logs_menu.config(text="📜 Logs ▾", state="normal")
+                    _refresh_logs_menu_btn_style()
+            except Exception:
+                pass
+
         try:
             if not os.path.exists(LOG_PATH):
                 init_daily_log()
@@ -30386,6 +30885,11 @@ def show_preflight_window(
             )
             upload_fname = f"enforcer_log_{get_today_str()}_manual_sanitized.txt"
 
+            try:
+                if btn_logs_menu is not None and btn_logs_menu.winfo_exists():
+                    btn_logs_menu.config(text="⏳ Sending...", state="disabled")
+            except Exception:
+                pass
             if default_status_lbl is not None:
                 default_status_lbl.config(
                     text=(
@@ -30401,6 +30905,7 @@ def show_preflight_window(
                 )
 
                 def _finish():
+                    _restore_logs_btn()
                     if ok:
                         log_event(
                             "TELEMETRY",
@@ -30442,6 +30947,7 @@ def show_preflight_window(
 
             threading.Thread(target=_worker, daemon=True).start()
         except Exception as e:
+            _restore_logs_btn()
             messagebox.showerror(
                 "Safe Log Upload Error",
                 f"Could not prepare today's sanitized log for upload:\n{e}",
@@ -43099,7 +43605,13 @@ def attach_hud_mute_tooltip(widget, hud_win):
                 lock_en_hb, lock_m_hb, _ = _get_halt_breach_lockout_info(
                     pending_halt_breach
                 )
-                if lock_en_hb and lock_m_hb > 0:
+                if bool(pending_halt_breach.get("manual_options_only", False)):
+                    hb_tip_txt = (
+                        f"MANUAL OPTIONS STOP WATCH ({w_syms} — Options Auto-Flatten OFF):\n"
+                        f"▸ Open PnL crossed your stop while Options Auto-Flatten is OFF.\n"
+                        f"▸ Close your option contract(s) manually in your broker platform, or watch clears automatically if the trade recovers cleanly above your stop threshold."
+                    )
+                elif lock_en_hb and lock_m_hb > 0:
                     hb_tip_txt = (
                         f"HALT BREACH WATCH ({w_syms} — Exit Order Queued at Broker):\n"
                         f"▸ Windows OS Lockout is paused only while {w_syms} is in a trading halt.\n"
@@ -43811,6 +44323,11 @@ def open_demo_simulator_pad(parent_win=None, from_user_click=False):
                 )
                 or "NVDA"
             )
+            if bool(pending_halt_breach.get("manual_options_only", False)):
+                return (
+                    f"⚠️ ACTIVE: Manual-Options Watch on {w_syms} (close manually or recover)",
+                    "#fde68a",
+                )
             lock_en_hb, lock_m_hb, _ = _get_halt_breach_lockout_info(
                 pending_halt_breach
             )
@@ -46005,10 +46522,7 @@ def _build_changelog_nav_bar(parent_card, txt_box, nav_ctrl):
     def _close_ver_popup(*_):
         top_win = parent_card.winfo_toplevel()
         for seq, bid in nav_state.get("top_bind_ids", []):
-            try:
-                top_win.unbind(seq, bid)
-            except Exception:
-                pass
+            _safe_unbind(top_win, seq, bid)
         nav_state["top_bind_ids"] = []
         pop = nav_state.get("popup")
         nav_state["popup"] = None
@@ -46134,6 +46648,34 @@ def _build_changelog_nav_bar(parent_card, txt_box, nav_ctrl):
                     pass
                 _close_ver_popup()
 
+            init_ver_top_geom = (
+                int(top_win.winfo_rootx()),
+                int(top_win.winfo_rooty()),
+                int(top_win.winfo_width()),
+                int(top_win.winfo_height()),
+            )
+
+            def _on_ver_top_configure(evt):
+                if getattr(evt, "widget", None) is not top_win:
+                    return
+                try:
+                    cur_g = (
+                        int(top_win.winfo_rootx()),
+                        int(top_win.winfo_rooty()),
+                        int(top_win.winfo_width()),
+                        int(top_win.winfo_height()),
+                    )
+                    if cur_g == init_ver_top_geom:
+                        return
+                except Exception:
+                    pass
+                _close_ver_popup()
+
+            def _on_ver_top_unmap(evt):
+                if getattr(evt, "widget", None) is not top_win:
+                    return
+                _close_ver_popup()
+
             def _bind_outside_dismiss():
                 if nav_state.get("popup") is not pop or not pop.winfo_exists():
                     return
@@ -46141,8 +46683,12 @@ def _build_changelog_nav_bar(parent_card, txt_box, nav_ctrl):
                     b1 = top_win.bind("<Button-1>", _on_top_click, add="+")
                     if b1:
                         nav_state["top_bind_ids"].append(("<Button-1>", b1))
-                    for seq in ("<Configure>", "<Unmap>", "<Escape>"):
-                        bid = top_win.bind(seq, _close_ver_popup, add="+")
+                    for seq, cb in (
+                        ("<Configure>", _on_ver_top_configure),
+                        ("<Unmap>", _on_ver_top_unmap),
+                        ("<Escape>", _close_ver_popup),
+                    ):
+                        bid = top_win.bind(seq, cb, add="+")
                         if bid:
                             nav_state["top_bind_ids"].append((seq, bid))
                 except Exception:
