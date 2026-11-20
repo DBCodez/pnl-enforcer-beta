@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.78"
+APP_VERSION = "0.9.79"
 
 import os
 import sys
@@ -23,6 +23,7 @@ import webbrowser
 import threading
 import tkinter as tk
 from tkinter import messagebox
+import tkinter.font as tkfont
 import winsound
 import logging
 import traceback
@@ -2379,6 +2380,7 @@ DEFAULT_CONFIG = {
     "auto_share_sanitized_logs": False,
     "show_debug_console": False,
     "check_updates_on_startup": True,
+    "start_with_windows": False,
     "skipped_update_version": "",
     "last_uploaded_sanitized_log": "",
     "anonymous_tester_id": "",
@@ -4536,6 +4538,743 @@ if __name__ == "__main__":
     _install_global_error_hooks()
 
 
+WINDOWS_STARTUP_REG_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WINDOWS_STARTUP_APPROVED_SUBKEY = (
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+)
+WINDOWS_STARTUP_VALUE_NAME = "PnLEnforcerBeta"
+IS_WINDOWS_BOOT_STARTUP = "--startup" in sys.argv
+_last_boot_deferred_auth_msg = ""
+
+
+class DeferredAuthRequired(RuntimeError):
+    """Raised during --startup boot reconnect when interactive OAuth is deferred."""
+
+
+def should_abort_startup_retry(
+    closing_flag,
+    launched_flag,
+    cur_epoch,
+    expected_epoch,
+    cur_broker=None,
+    expected_broker=None,
+):
+    """Returns True when a cold-boot reconnect/sync retry loop should exit immediately."""
+    if bool(closing_flag) or bool(launched_flag):
+        return True
+    if cur_epoch != expected_epoch:
+        return True
+    if (
+        expected_broker is not None
+        and cur_broker is not None
+        and str(cur_broker).upper() != str(expected_broker).upper()
+    ):
+        return True
+    return False
+
+
+def sleep_with_startup_abort(seconds, abort_fn, sleep_fn=time.sleep):
+    """Sleeps up to `seconds` in <=0.25s slices, returning True cleanly if aborted early."""
+    if callable(abort_fn) and abort_fn():
+        return True
+    rem_s = max(0.0, float(seconds or 0.0))
+    while rem_s > 0.0:
+        step_s = min(0.25, rem_s)
+        sleep_fn(step_s)
+        if callable(abort_fn) and abort_fn():
+            return True
+        rem_s -= step_s
+    return bool(callable(abort_fn) and abort_fn())
+
+
+def _parse_startup_cmd_quoted_paths(cmd_str):
+    """Extracts quoted executable/script paths from a Windows Run registry command string."""
+    return re.findall(r'"([^"]+)"', str(cmd_str or ""))
+
+
+def build_windows_startup_command(
+    executable=None,
+    script_path=None,
+    frozen=None,
+    local_appdata=None,
+    path_exists_fn=None,
+):
+    """Builds the quoted HKCU Run command launching Enforcer cleanly at Windows login."""
+    chk_exists = path_exists_fn if callable(path_exists_fn) else os.path.exists
+    is_frz = bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
+    raw_exe = os.path.abspath(executable if executable else sys.executable)
+    if is_frz:
+        return f'"{raw_exe}" --startup'
+    scr_abs = os.path.abspath(script_path if script_path else __file__)
+    exe_use = raw_exe
+    if "windowsapps" in raw_exe.lower():
+        lad_dir = (
+            local_appdata
+            if local_appdata is not None
+            else os.environ.get("LOCALAPPDATA", "")
+        )
+        if lad_dir:
+            for cand_name in ("pythonw.exe", "python.exe"):
+                alias_cand = os.path.join(
+                    lad_dir, "Microsoft", "WindowsApps", cand_name
+                )
+                if chk_exists(alias_cand):
+                    exe_use = alias_cand
+                    break
+    elif raw_exe.lower().endswith("python.exe"):
+        pyw_cand = os.path.join(os.path.dirname(raw_exe), "pythonw.exe")
+        if chk_exists(pyw_cand):
+            exe_use = pyw_cand
+    return f'"{exe_use}" "{scr_abs}" --startup'
+
+
+def read_windows_startup_status(reg_backend=None):
+    """Reads per-user HKCU Run + StartupApproved status safely without touching real HKCU in tests."""
+    if reg_backend is None and ((not _IS_MAIN_PROCESS) or (sys.platform != "win32")):
+        return {
+            "ok": True,
+            "sandboxed": True,
+            "enabled": False,
+            "raw_cmd": "",
+            "windows_disabled": False,
+            "error": "",
+        }
+    try:
+        raw_cmd = ""
+        raw_app = b""
+        if reg_backend is not None:
+            if reg_backend.get("raise_error") is not None:
+                raise reg_backend["raise_error"]
+            run_map = reg_backend.setdefault("run", {})
+            app_map = reg_backend.setdefault("approved", {})
+            raw_cmd = str(run_map.get(WINDOWS_STARTUP_VALUE_NAME, "") or "")
+            raw_app = app_map.get(WINDOWS_STARTUP_VALUE_NAME, b"")
+        else:
+            import winreg
+
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    WINDOWS_STARTUP_REG_SUBKEY,
+                    0,
+                    winreg.KEY_QUERY_VALUE,
+                ) as k_run:
+                    val_r, _t_r = winreg.QueryValueEx(
+                        k_run, WINDOWS_STARTUP_VALUE_NAME
+                    )
+                    raw_cmd = str(val_r or "")
+            except FileNotFoundError:
+                raw_cmd = ""
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    WINDOWS_STARTUP_APPROVED_SUBKEY,
+                    0,
+                    winreg.KEY_QUERY_VALUE,
+                ) as k_app:
+                    val_a, _t_a = winreg.QueryValueEx(
+                        k_app, WINDOWS_STARTUP_VALUE_NAME
+                    )
+                    raw_app = val_a
+            except FileNotFoundError:
+                raw_app = b""
+        win_dis = bool(
+            isinstance(raw_app, (bytes, bytearray))
+            and len(raw_app) >= 1
+            and (int(raw_app[0]) & 1) == 1
+        )
+        return {
+            "ok": True,
+            "sandboxed": False,
+            "enabled": bool(raw_cmd.strip()),
+            "raw_cmd": raw_cmd,
+            "windows_disabled": win_dis,
+            "error": "",
+        }
+    except OSError as err:
+        return {
+            "ok": False,
+            "sandboxed": False,
+            "enabled": False,
+            "raw_cmd": "",
+            "windows_disabled": False,
+            "error": str(err),
+        }
+
+
+def sync_windows_startup_registry(
+    enabled,
+    refresh_only=False,
+    reg_backend=None,
+    executable=None,
+    script_path=None,
+    frozen=None,
+    local_appdata=None,
+    path_exists_fn=None,
+):
+    """Creates, refreshes, or removes HKCU Run entry for Enforcer without mutating StartupApproved."""
+    chk_exists = path_exists_fn if callable(path_exists_fn) else os.path.exists
+    want_en = bool(enabled)
+    if reg_backend is None and ((not _IS_MAIN_PROCESS) or (sys.platform != "win32")):
+        return {
+            "ok": True,
+            "sandboxed": True,
+            "enabled": want_en,
+            "raw_cmd": "",
+            "windows_disabled": False,
+            "changed": False,
+            "skipped_other_install": False,
+            "error": "",
+        }
+    desired_cmd = build_windows_startup_command(
+        executable=executable,
+        script_path=script_path,
+        frozen=frozen,
+        local_appdata=local_appdata,
+        path_exists_fn=chk_exists,
+    )
+    my_scr = os.path.abspath(script_path if script_path else __file__)
+    cur_st = read_windows_startup_status(reg_backend=reg_backend)
+    if not cur_st["ok"]:
+        return {
+            "ok": False,
+            "sandboxed": False,
+            "enabled": False,
+            "raw_cmd": "",
+            "windows_disabled": False,
+            "changed": False,
+            "skipped_other_install": False,
+            "error": cur_st["error"],
+        }
+    cur_cmd = cur_st["raw_cmd"]
+    win_dis = cur_st["windows_disabled"]
+    try:
+        if want_en:
+            if cur_cmd and os.path.normcase(cur_cmd.strip()) == os.path.normcase(
+                desired_cmd.strip()
+            ):
+                return {
+                    "ok": True,
+                    "sandboxed": False,
+                    "enabled": True,
+                    "raw_cmd": cur_cmd,
+                    "windows_disabled": win_dis,
+                    "changed": False,
+                    "skipped_other_install": False,
+                    "error": "",
+                }
+            if refresh_only and cur_cmd:
+                q_pts = _parse_startup_cmd_quoted_paths(cur_cmd)
+                is_frz = (
+                    bool(getattr(sys, "frozen", False))
+                    if frozen is None
+                    else bool(frozen)
+                )
+                if (
+                    (not is_frz)
+                    and len(q_pts) >= 2
+                    and os.path.normcase(q_pts[1]) != os.path.normcase(my_scr)
+                    and chk_exists(q_pts[0])
+                    and chk_exists(q_pts[1])
+                ):
+                    return {
+                        "ok": True,
+                        "sandboxed": False,
+                        "enabled": True,
+                        "raw_cmd": cur_cmd,
+                        "windows_disabled": win_dis,
+                        "changed": False,
+                        "skipped_other_install": True,
+                        "error": "",
+                    }
+            if reg_backend is not None:
+                if reg_backend.get("raise_error") is not None:
+                    raise reg_backend["raise_error"]
+                reg_backend.setdefault("run", {})[WINDOWS_STARTUP_VALUE_NAME] = desired_cmd
+            else:
+                import winreg
+
+                with winreg.CreateKeyEx(
+                    winreg.HKEY_CURRENT_USER,
+                    WINDOWS_STARTUP_REG_SUBKEY,
+                    0,
+                    winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE,
+                ) as k_run:
+                    winreg.SetValueEx(
+                        k_run,
+                        WINDOWS_STARTUP_VALUE_NAME,
+                        0,
+                        winreg.REG_SZ,
+                        desired_cmd,
+                    )
+            return {
+                "ok": True,
+                "sandboxed": False,
+                "enabled": True,
+                "raw_cmd": desired_cmd,
+                "windows_disabled": win_dis,
+                "changed": True,
+                "skipped_other_install": False,
+                "error": "",
+            }
+
+        did_del = False
+        if cur_cmd:
+            if reg_backend is not None:
+                if reg_backend.get("raise_error") is not None:
+                    raise reg_backend["raise_error"]
+                if WINDOWS_STARTUP_VALUE_NAME in reg_backend.setdefault("run", {}):
+                    reg_backend["run"].pop(WINDOWS_STARTUP_VALUE_NAME, None)
+                    did_del = True
+            else:
+                import winreg
+
+                try:
+                    with winreg.OpenKey(
+                        winreg.HKEY_CURRENT_USER,
+                        WINDOWS_STARTUP_REG_SUBKEY,
+                        0,
+                        winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE,
+                    ) as k_run:
+                        try:
+                            winreg.DeleteValue(k_run, WINDOWS_STARTUP_VALUE_NAME)
+                            did_del = True
+                        except FileNotFoundError:
+                            did_del = False
+                except FileNotFoundError:
+                    did_del = False
+        return {
+            "ok": True,
+            "sandboxed": False,
+            "enabled": False,
+            "raw_cmd": "",
+            "windows_disabled": win_dis,
+            "changed": did_del,
+            "skipped_other_install": False,
+            "error": "",
+        }
+    except OSError as err:
+        return {
+            "ok": False,
+            "sandboxed": False,
+            "enabled": bool(cur_cmd.strip()),
+            "raw_cmd": cur_cmd,
+            "windows_disabled": win_dis,
+            "changed": False,
+            "skipped_other_install": False,
+            "error": str(err),
+        }
+
+
+def _fp_safe_num(val, default=0.0):
+    try:
+        raw_s = str(val if val is not None else "").replace("$", "").replace(",", "").strip()
+        if not raw_s:
+            return float(default)
+        num_v = float(raw_s)
+        return num_v if math.isfinite(num_v) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _fp_fmt_loss(mag):
+    m = abs(float(mag))
+    if abs(m - round(m)) < 1e-6:
+        return f"-${m:,.0f}"
+    return f"-${m:,.2f}"
+
+
+def _fp_fmt_dollar_unsigned(mag):
+    m = abs(float(mag))
+    if abs(m - round(m)) < 1e-6:
+        return f"${m:,.0f}"
+    return f"${m:,.2f}"
+
+
+def _fp_fmt_signed(val):
+    v = float(val)
+    if abs(v) < 1e-6:
+        return "$0"
+    if abs(v - round(v)) < 1e-6:
+        return f"+${v:,.0f}" if v > 0 else f"-${abs(v):,.0f}"
+    return f"+${v:,.2f}" if v > 0 else f"-${abs(v):,.2f}"
+
+
+def _fp_join_and(items):
+    seq = [str(x) for x in items if str(x)]
+    if not seq:
+        return ""
+    if len(seq) == 1:
+        return seq[0]
+    if len(seq) == 2:
+        return f"{seq[0]} and {seq[1]}"
+    return ", ".join(seq[:-1]) + f" and {seq[-1]}"
+
+
+def elide_flight_plan_headline(full_text, max_px, measure_fn):
+    """Elides a Flight Plan headline cleanly at ' · ' clause boundaries without cutting numbers."""
+    txt = str(full_text or "").strip()
+    if not txt or max_px is None or max_px <= 0 or not callable(measure_fn):
+        return txt
+    try:
+        if measure_fn(txt) <= max_px:
+            return txt
+    except Exception:
+        return txt
+    parts = [p.strip() for p in txt.split(" · ") if p.strip()]
+    if len(parts) > 1:
+        for k in range(len(parts) - 1, 0, -1):
+            cand = " · ".join(parts[:k]) + " ..."
+            try:
+                if measure_fn(cand) <= max_px:
+                    return cand
+            except Exception:
+                break
+    words = (parts[0] if parts else txt).split()
+    for w_end in range(len(words) - 1, 0, -1):
+        cand_w = " ".join(words[:w_end]) + " ..."
+        try:
+            if measure_fn(cand_w) <= max_px:
+                return cand_w
+        except Exception:
+            break
+    return (parts[0] if parts else txt)[:12] + "..."
+
+
+def build_flight_plan_summary(fp_state):
+    """Builds `(headline, tooltip_text, style_mode)` directly matching Enforcer engine rules."""
+    st_d = fp_state if isinstance(fp_state, dict) else {}
+    b_up = str(st_d.get("broker_name", "SCHWAB") or "SCHWAB").upper()
+    is_demo_b = b_up == "DEMO"
+    st_done = bool(st_d.get("done_for_today", False))
+    st_comm = bool(st_d.get("committed_today", False))
+    st_ao = bool(st_d.get("alarms_only_mode", False))
+    muted = bool(st_d.get("mute_all_audio", False))
+    mkt_closed = bool(st_d.get("market_closed_day", False))
+    if "is_rth_now" in st_d:
+        rth_live = bool(st_d["is_rth_now"]) and not mkt_closed
+    else:
+        et_chk = int(_fp_safe_num(st_d.get("et_mins", 600), 600))
+        rth_live = (570 <= et_chk < 960) and not mkt_closed
+    et_mins_v = int(_fp_safe_num(st_d.get("et_mins", 600 if rth_live else 500), 600))
+
+    flat_on = (not st_ao) and bool(st_d.get("enable_auto_flatten", False))
+    kill_tos_on = (not st_ao) and bool(st_d.get("enable_kill_tos", False))
+    kill_wb_on = (not st_ao) and bool(st_d.get("enable_kill_webull", False))
+    lock_on = (not st_ao) and bool(st_d.get("enable_lock_os", False))
+    dl_mins = max(0.0, _fp_safe_num(st_d.get("daily_lock_mins", 15.0), 15.0))
+
+    opt_checked = bool(st_d.get("enable_flatten_options", False))
+    opt_waived = bool(st_d.get("options_waiver_verified", False))
+    has_open_opts = bool(st_d.get("has_open_options", False))
+    opt_armed = bool(flat_on and opt_checked and opt_waived)
+    opt_done_armed = bool(st_done and opt_checked and opt_waived)
+    opt_exec_now = bool((opt_armed or opt_done_armed) and rth_live)
+
+    open_flat_on = (not st_ao) and bool(st_d.get("enable_open_flatten", False))
+    open_loss_mag = abs(_fp_safe_num(st_d.get("open_max_loss", 500.0), 500.0))
+    open_cd_on = (not st_ao) and open_flat_on and bool(st_d.get("enable_open_cooldown", False))
+    open_cd_mins = max(0.1, _fp_safe_num(st_d.get("open_cooldown_mins", 1.0), 1.0))
+    tilt_cd_on = (not st_ao) and bool(st_d.get("enable_consec_loss_cooldown", False))
+    tilt_cnt = max(2, int(round(abs(_fp_safe_num(st_d.get("consec_loss_count", 3), 3.0)))))
+    tilt_win = max(0.5, _fp_safe_num(st_d.get("consec_loss_window_mins", 15.0), 15.0))
+
+    if rth_live:
+        w1_on = bool(st_d.get("enable_t1_warn_1", True))
+        w2_on = bool(st_d.get("enable_t1_warn_2", True))
+        w1_mag = abs(_fp_safe_num(st_d.get("t1_warn_1", 1000.0), 1000.0))
+        w2_mag = abs(_fp_safe_num(st_d.get("t1_warn_2", 1500.0), 1500.0))
+        stop_mag = abs(_fp_safe_num(st_d.get("t1_max_loss", 2000.0), 2000.0))
+        sess_tag = "RTH"
+        sess_full = "Regular Hours (9:30 AM – 4:00 PM ET)"
+    else:
+        w1_on = bool(st_d.get("enable_pm_warn_1", True))
+        w2_on = bool(st_d.get("enable_pm_warn_2", True))
+        w1_mag = abs(_fp_safe_num(st_d.get("pm_warn_1", 500.0), 500.0))
+        w2_mag = abs(_fp_safe_num(st_d.get("pm_warn_2", 1000.0), 1000.0))
+        stop_mag = abs(_fp_safe_num(st_d.get("pm_max_loss", 1500.0), 1500.0))
+        if mkt_closed:
+            sess_tag = "Market Closed · Ext-Hours"
+            sess_full = "Market Closed (Weekend/Holiday — Extended Hours Rulebook preview)"
+        elif et_mins_v < 570:
+            sess_tag = "Ext-Hours"
+            sess_full = "Pre-Market / Extended Hours (switches at 9:30 AM ET)"
+        else:
+            sess_tag = "Ext-Hours"
+            sess_full = "After-Hours / Extended Hours"
+
+    alert_word = "Visual alert" if muted else "Warning"
+    alert_plural = "Visual alerts (Muted)" if muted else "Warnings"
+    warn_vals = []
+    if w1_on:
+        warn_vals.append(_fp_fmt_loss(w1_mag))
+    if w2_on:
+        warn_vals.append(_fp_fmt_loss(w2_mag))
+    if len(warn_vals) == 2:
+        warn_clause = f"{alert_plural} at {warn_vals[0]} and {warn_vals[1]}"
+    elif len(warn_vals) == 1:
+        warn_clause = (
+            f"{alert_plural} at {warn_vals[0]}"
+            if muted
+            else f"{alert_word} at {warn_vals[0]}"
+        )
+    else:
+        warn_clause = ""
+
+    warn_past_stop = bool(
+        (w1_on and w1_mag >= stop_mag) or (w2_on and w2_mag >= stop_mag)
+    )
+
+    actions = []
+    if flat_on:
+        actions.append("close all stocks")
+    if kill_tos_on:
+        actions.append("close thinkorswim")
+    if kill_wb_on:
+        actions.append("close Webull")
+    if lock_on:
+        actions.append(
+            "lock Windows once (no timer)"
+            if dl_mins <= 0.0
+            else f"lock Windows {dl_mins:g}m"
+        )
+
+    passive_daily_txt = (
+        "visual alert only (Muted — stocks NOT auto-closed)"
+        if muted
+        else "siren only (stocks NOT auto-closed)"
+    )
+
+    if st_done:
+        if opt_done_armed and rth_live:
+            opt_clause = "Options: auto-close RTH (Beta)"
+        elif opt_done_armed:
+            opt_clause = (
+                "Options: visual now · auto-close 9:30–4:00 ET"
+                if muted
+                else "Options: alert now · auto-close 9:30–4:00 ET"
+            )
+        else:
+            opt_clause = (
+                "Options: visual only (Muted)" if muted else "Options: siren only"
+            )
+    elif st_ao:
+        opt_clause = "Options: visual only (Muted)" if muted else "Options: siren only"
+    elif opt_armed and rth_live:
+        opt_clause = "Options: auto-close RTH (Beta)"
+    elif opt_armed:
+        opt_clause = (
+            "Options: visual now · auto-close 9:30–4:00 ET"
+            if muted
+            else "Options: alert now · auto-close 9:30–4:00 ET"
+        )
+    elif flat_on and opt_checked and not opt_waived:
+        opt_clause = (
+            "Options: visual only (waiver needed to arm)"
+            if muted
+            else "Options: siren only (waiver needed to arm)"
+        )
+    else:
+        opt_clause = "Options: visual only (Muted)" if muted else "Options: siren only"
+
+    if st_done:
+        style_mode = "done_today"
+    elif is_demo_b:
+        style_mode = "demo"
+    elif st_ao:
+        style_mode = "alarms_only"
+    elif (not actions) and (not open_flat_on) and (not tilt_cd_on):
+        style_mode = "passive_warn"
+    elif st_comm:
+        style_mode = "committed"
+    else:
+        style_mode = "normal"
+
+    stop_str = _fp_fmt_loss(stop_mag)
+    if st_done:
+        stop_clause = (
+            "Any new tracked stock entry auto-closes until Midnight ET · NO PC lock"
+        )
+    elif st_ao:
+        stop_clause = (
+            f"At {stop_str}: {'visual alert only (Muted)' if muted else 'alert only'} · "
+            "NO orders sent, NO apps closed, NO PC lock"
+        )
+    elif actions:
+        act_str = _fp_join_and(actions)
+        no_flat_note = "" if flat_on else " (stocks NOT auto-closed)"
+        pfx_demo = "Sim " if is_demo_b else ""
+        stop_clause = f"At {stop_str}: {pfx_demo}{act_str}{no_flat_note}"
+    else:
+        stop_clause = f"At {stop_str}: {passive_daily_txt}"
+
+    open_stop_short = ""
+    if st_done:
+        open_stop_short = ""
+    elif open_flat_on:
+        open_cd_txt = f" + {open_cd_mins:g}m lock" if open_cd_on else ""
+        open_stop_short = f"Open stop {_fp_fmt_loss(open_loss_mag)}{open_cd_txt}"
+    tilt_short = (
+        f"Tilt {tilt_cnt}L/{tilt_win:g}m"
+        if (tilt_cd_on and not st_done)
+        else ""
+    )
+
+    if st_done:
+        badge = "FLIGHT PLAN (DONE FOR TODAY)"
+    elif is_demo_b:
+        badge = f"FLIGHT PLAN (DEMO $25K · ZERO REAL ORDERS · {sess_tag})"
+    elif st_ao:
+        badge = f"FLIGHT PLAN (ALARMS ONLY · {sess_tag})"
+    elif st_comm:
+        badge = f"FLIGHT PLAN (COMMITTED · {sess_tag})"
+    else:
+        badge = f"FLIGHT PLAN ({sess_tag})"
+
+    hl_segments = []
+    if st_done:
+        hl_segments.append(f"{badge}: {stop_clause}")
+    elif warn_clause:
+        hl_segments.append(f"{badge}: {warn_clause}")
+        hl_segments.append(stop_clause)
+    else:
+        hl_segments.append(f"{badge}: {stop_clause}")
+    hl_segments.append(opt_clause)
+    if (kill_tos_on or kill_wb_on or lock_on) and (not opt_exec_now) and has_open_opts and (not st_done):
+        hl_segments.append("app close/PC lock waits until options are closed by hand")
+    if open_stop_short:
+        hl_segments.append(open_stop_short)
+    if tilt_short:
+        hl_segments.append(tilt_short)
+    headline = " · ".join(hl_segments)
+
+    # Full Rich Hover Tooltip (clean grouped 2-column Key | Value layout)
+    tt_lines = []
+    if st_done:
+        tt_lines.append("FLIGHT PLAN — DONE FOR TODAY (UNTIL MIDNIGHT ET):")
+        tt_lines.append(
+            "• Session Lock | Overrides Alarms Only — any new tracked equity entry auto-closes until Midnight ET (no PC lock)"
+        )
+    elif is_demo_b:
+        tt_lines.append("FLIGHT PLAN — DEMO SANDBOX ($25K PAPER):")
+        tt_lines.append(
+            "• Paper Sandbox | $25,000 virtual account — simulated fills and alerts only (zero real orders, no real OS lock)"
+        )
+    elif st_ao:
+        tt_lines.append("FLIGHT PLAN — ALARMS ONLY (PASSIVE OBSERVATION):")
+        tt_lines.append(
+            "• Passive Mode | !NO orders sent, NO apps closed, NO PC lock — live tracking and alerts only"
+        )
+    else:
+        if rth_live:
+            hdr_base = "FLIGHT PLAN — REGULAR HOURS (9:30 AM – 4:00 PM ET)"
+        elif mkt_closed:
+            hdr_base = "FLIGHT PLAN — MARKET CLOSED (EXTENDED-HOURS PREVIEW)"
+        elif et_mins_v < 570:
+            hdr_base = "FLIGHT PLAN — PRE-MARKET (ACTIVE UNTIL 9:30 AM ET)"
+        else:
+            hdr_base = "FLIGHT PLAN — AFTER-HOURS (EXTENDED SESSION)"
+        hdr_sfx = " · COMMITTED" if st_comm else ""
+        tt_lines.append(f"{hdr_base}{hdr_sfx}:")
+
+    if not st_done:
+        if warn_vals:
+            warn_pfx = "Visual alerts (Muted) at " if muted else "Sirens at "
+            warn_val_str = warn_pfx + " and ".join(warn_vals)
+        else:
+            warn_val_str = "Off"
+        if warn_past_stop:
+            warn_val_str += " (note: sits at/past your stop)"
+        tt_lines.append(f"• Early Alerts | {warn_val_str}")
+
+    stop_detail = stop_clause
+    if flat_on and (not rth_live or (et_mins_v < 570)) and (not st_done):
+        stop_detail += " (outside 9:30–4:00 ET, stocks close via marketable limit orders)"
+    tt_lines.append(f"• Daily Stop | {stop_detail}")
+
+    opt_val_s = (
+        opt_clause[9:].strip() if opt_clause.startswith("Options: ") else opt_clause
+    )
+    opt_val_s = (
+        opt_val_s[0].upper() + opt_val_s[1:] if opt_val_s else opt_clause
+    )
+    tt_lines.append(f"• Options Mode | {opt_val_s}")
+
+    if (kill_tos_on or kill_wb_on or lock_on) and (not opt_exec_now) and not st_done:
+        tt_lines.append(
+            "• Hold-Off Rule | !App close / Windows PC lock waits until options are closed by hand"
+        )
+
+    if not st_done:
+        tt_lines.append("---")
+        c1_parts = []
+        if open_flat_on:
+            c1_parts.append(
+                f"Open stop {_fp_fmt_loss(open_loss_mag)}"
+                + (f" (+{open_cd_mins:g}m PC lock)" if open_cd_on else "")
+            )
+        if tilt_cd_on:
+            c1_parts.append(f"Tilt lock after {tilt_cnt} losses in {tilt_win:g}m")
+        tt_lines.append(
+            "• Trade & Tilt | " + (" · ".join(c1_parts) if c1_parts else "Off")
+        )
+
+        if rth_live:
+            r_parts = []
+            _fp_t2_on = bool(st_d.get("enable_t2", True))
+            _fp_t3_on = bool(st_d.get("enable_t3", True))
+            _fp_b_t1, _fp_eff_t2, _fp_eff_t3 = _get_effective_rth_tier_stops(
+                stop_mag,
+                _fp_t2_on,
+                _fp_safe_num(st_d.get("t2_max_loss", -1000.0), -1000.0),
+                _fp_t3_on,
+                _fp_safe_num(st_d.get("t3_max_loss", -500.0), -500.0),
+            )
+            if _fp_t2_on:
+                r_parts.append(
+                    f"T2 +{_fp_fmt_dollar_unsigned(_fp_safe_num(st_d.get('t2_trigger', 250.0), 250.0))}->{_fp_fmt_signed(_fp_eff_t2)}"
+                )
+            if _fp_t3_on:
+                r_parts.append(
+                    f"T3 +{_fp_fmt_dollar_unsigned(_fp_safe_num(st_d.get('t3_trigger', 500.0), 500.0))}->{_fp_fmt_signed(_fp_eff_t3)}"
+                )
+            if st_d.get("enable_t4", True):
+                r_parts.append(
+                    f"T4 +{_fp_fmt_dollar_unsigned(_fp_safe_num(st_d.get('t4_trigger', 1000.0), 1000.0))} (trail {_fp_fmt_dollar_unsigned(_fp_safe_num(st_d.get('t4_trail', 500.0), 500.0))})"
+                )
+            r_desc = ", ".join(r_parts) if r_parts else "Off"
+            tt_lines.append(f"• Profit Ratchet | {r_desc}")
+        else:
+            if st_d.get("enable_pm_lock", True):
+                pm_tr_v = abs(_fp_safe_num(st_d.get("pm_lock_trigger", 500.0), 500.0))
+                pm_cu_v = abs(_fp_safe_num(st_d.get("pm_trail_cushion", 500.0), 500.0))
+                pm_init_fl = max(-stop_mag, pm_tr_v - pm_cu_v)
+                fl_note = (
+                    f"starts stop at {_fp_fmt_signed(pm_init_fl)}"
+                    if abs(pm_init_fl) >= 1e-6
+                    else "starts stop at $0 breakeven"
+                )
+                tt_lines.append(
+                    f"• Profit Lock | At +{_fp_fmt_dollar_unsigned(pm_tr_v)} peak, "
+                    f"trails by {_fp_fmt_dollar_unsigned(pm_cu_v)} ({fl_note})"
+                )
+            else:
+                tt_lines.append("• Profit Lock | Off")
+            if et_mins_v < 570 and not mkt_closed:
+                rth_stop_v = abs(_fp_safe_num(st_d.get("t1_max_loss", 2000.0), 2000.0))
+                rst_note = (
+                    "resets PnL baseline"
+                    if st_d.get("reset_at_925", True)
+                    else "carries PnL into RTH"
+                )
+                tt_lines.append(
+                    f"• 9:30 AM Bell | Switches to RTH Tier 1 {_fp_fmt_loss(rth_stop_v)} ({rst_note})"
+                )
+
+    tooltip_text = "\n".join(tt_lines)
+    return headline, tooltip_text, style_mode
+
+
 def format_config_summary(cfg):
     broker = cfg.get("active_broker", "SCHWAB")
     cd_str = (
@@ -4558,13 +5297,15 @@ def format_config_summary(cfg):
         if cfg.get("enable_pm_lock", True)
         else "OFF"
     )
+    t2_fl = _fp_fmt_signed(_fp_safe_num(cfg.get("t2_max_loss", -1000), -1000.0))
     t2_str = (
-        f"ON(+${cfg.get('t2_trigger', 250):,.0f}->${cfg.get('t2_max_loss', -1000):+,.0f})"
+        f"ON(+${cfg.get('t2_trigger', 250):,.0f}->{t2_fl})"
         if cfg.get("enable_t2", True)
         else "OFF"
     )
+    t3_fl = _fp_fmt_signed(_fp_safe_num(cfg.get("t3_max_loss", -500), -500.0))
     t3_str = (
-        f"ON(+${cfg.get('t3_trigger', 500):,.0f}->${cfg.get('t3_max_loss', -500):+,.0f})"
+        f"ON(+${cfg.get('t3_trigger', 500):,.0f}->{t3_fl})"
         if cfg.get("enable_t3", True)
         else "OFF"
     )
@@ -4594,7 +5335,8 @@ def format_config_summary(cfg):
         f"EH_Max=-${cfg.get('pm_max_loss', 0):,.0f} | "
         f"EH_Lock={eh_lock_str} | "
         f"T1_Max=-${cfg.get('t1_max_loss', 0):,.0f} | "
-        f"T2={t2_str} | T3={t3_str} | T4={t4_str}"
+        f"T2={t2_str} | T3={t3_str} | T4={t4_str} | "
+        f"WinBoot={'ON' if cfg.get('start_with_windows', False) else 'OFF'}"
     )
 
 
@@ -6579,10 +7321,14 @@ class SchwabAdapter:
             self.last_error = str(e)
         return False
 
-    def authenticate(self, fast_cached_accounts=None):
+    def authenticate(self, fast_cached_accounts=None, allow_interactive_oauth=True):
         try:
             from schwab.auth import client_from_manual_flow, client_from_token_file
         except ImportError:
+            if not allow_interactive_oauth:
+                raise DeferredAuthRequired(
+                    "Schwab SDK (schwab-py) not installed — deferred during startup boot."
+                )
             print("[SETUP] Installing required Schwab SDK (schwab-py)...")
             py_cli = sys.executable
             if py_cli.lower().endswith("pythonw.exe"):
@@ -6607,6 +7353,10 @@ class SchwabAdapter:
             if os.path.exists(SCHWAB_TOKEN_PATH):
                 rem_hrs = get_schwab_token_remaining_hours()
                 if rem_hrs is not None and rem_hrs < 14.0:
+                    if not allow_interactive_oauth:
+                        raise DeferredAuthRequired(
+                            f"Schwab sign-in needs a refresh ({max(0.0, rem_hrs):.1f}h left) — click API Keys / Reconnect when ready."
+                        )
                     raise RuntimeError(
                         f"Schwab 7-day token has {max(0.0, rem_hrs):.1f}h remaining "
                         f"(<14h safety buffer) — refreshing proactively before session"
@@ -6643,21 +7393,22 @@ class SchwabAdapter:
                     f"Schwab API temporary HTTP {resp.status_code}"
                 )
         except Exception as e:
+            if isinstance(e, DeferredAuthRequired):
+                raise
             err_l = str(e).lower()
-            is_token_invalid = any(
-                k in err_l
-                for k in (
-                    "safety buffer",
-                    "invalid_grant",
-                    "unsupported_token_type",
-                    "token rejected",
-                    "expired",
-                    "unauthorized",
-                    "http 401",
-                    "http 400",
-                    "jsondecodeerror",
-                )
-            )
+            tok_invalid_keys = [
+                "safety buffer",
+                "invalid_grant",
+                "unsupported_token_type",
+                "token rejected",
+                "expired",
+                "unauthorized",
+                "http 401",
+                "http 400",
+            ]
+            if allow_interactive_oauth:
+                tok_invalid_keys.append("jsondecodeerror")
+            is_token_invalid = any(k in err_l for k in tok_invalid_keys)
             if not is_token_invalid:
                 log_event(
                     "WARN",
@@ -6667,6 +7418,14 @@ class SchwabAdapter:
                 raise RuntimeError(
                     f"Network connection failed while reaching Schwab API ({e}).\n"
                     f"Your saved 7-day token was preserved — please check your internet connection and retry."
+                ) from e
+            if not allow_interactive_oauth:
+                log_event(
+                    "SESSION",
+                    f"Saved Schwab token needs refresh ({e}); deferring interactive OAuth during startup boot.",
+                )
+                raise DeferredAuthRequired(
+                    "Schwab sign-in needs a refresh — click API Keys / Reconnect when ready."
                 ) from e
             log_event(
                 "SESSION",
@@ -6678,6 +7437,11 @@ class SchwabAdapter:
                     os.remove(SCHWAB_TOKEN_PATH)
                 except Exception:
                     pass
+
+        if not allow_interactive_oauth:
+            raise DeferredAuthRequired(
+                "Schwab sign-in required — click API Keys / Reconnect when ready."
+            )
 
         print("\n=======================================================")
         print("  SCHWAB OAUTH LOGIN — OPENING BROWSER & PASTE DIALOG")
@@ -7805,7 +8569,12 @@ class SchwabAdapter:
         buy_instrs = {"BUY", "BUY_TO_COVER", "BUY_TO_OPEN", "BUY_TO_CLOSE"}
         sell_instrs = {"SELL", "SELL_SHORT", "SELL_TO_OPEN", "SELL_TO_CLOSE"}
         try:
-            sc_orders = self._get_orders_window_cached(win_tag)
+            eff_ord_ttl = (
+                60.0 if (_off_session_reconciled and fast_recent_only) else 8.0
+            )
+            sc_orders = self._get_orders_window_cached(
+                win_tag, ttl_sec=eff_ord_ttl
+            )
             if not isinstance(sc_orders, list):
                 return None
 
@@ -9598,7 +10367,7 @@ class WebullAdapter:
             self.last_error = str(e)
         return False
 
-    def authenticate(self, fast_cached_accounts=None):
+    def authenticate(self, fast_cached_accounts=None, allow_interactive_oauth=True):
         logging.getLogger("webull").setLevel(logging.CRITICAL)
         logging.getLogger("webull.core").setLevel(logging.CRITICAL)
         try:
@@ -9607,6 +10376,10 @@ class WebullAdapter:
             from webull.core.client import ApiClient
             from webull.trade.trade_client import TradeClient
         except ImportError:
+            if not allow_interactive_oauth:
+                raise DeferredAuthRequired(
+                    "Webull SDK (webull-openapi-python-sdk) not installed — deferred during startup boot."
+                )
             print("[SETUP] Installing required Webull OpenAPI SDK & dependencies...")
             py_cli = sys.executable
             if py_cli.lower().endswith("pythonw.exe"):
@@ -11013,7 +11786,12 @@ class WebullAdapter:
             return json.loads(json.dumps(fs_hit[1]))
 
         try:
-            wb_raw_orders = self._get_orders_window_cached()
+            eff_ord_ttl = (
+                60.0 if (_off_session_reconciled and fast_recent_only) else 8.0
+            )
+            wb_raw_orders = self._get_orders_window_cached(
+                ttl_sec=eff_ord_ttl
+            )
             if not isinstance(wb_raw_orders, list):
                 return None
 
@@ -12590,7 +13368,7 @@ class DemoBrokerAdapter:
     def invalidate_cached_snapshots(self):
         return None
 
-    def authenticate(self, fast_cached_accounts=None):
+    def authenticate(self, fast_cached_accounts=None, allow_interactive_oauth=True):
         self.last_positions_fetch_ok = True
         return True
 
@@ -14175,11 +14953,17 @@ def show_broker_setup_wizard(broker_name, parent=None):
 
 
 def connect_broker_adapter(
-    broker_name, parent=None, force_wizard=False, fast_startup=False
+    broker_name,
+    parent=None,
+    force_wizard=False,
+    fast_startup=False,
+    suppress_error_modal=False,
+    allow_interactive_oauth=True,
 ):
     """Ensures credentials exist for broker_name, authenticates, and
     returns an initialized SchwabAdapter, WebullAdapter, or DemoBrokerAdapter."""
-    global _last_real_broker
+    global _last_real_broker, _last_boot_deferred_auth_msg
+    _last_boot_deferred_auth_msg = ""
     if str(broker_name or "").upper() == "DEMO":
         adapter = DemoBrokerAdapter()
         adapter.authenticate()
@@ -14194,6 +14978,12 @@ def connect_broker_adapter(
     load_config()
     b_cfg = config.get("brokers", {}).get(broker_name, {})
     if force_wizard or not b_cfg.get("app_key") or not b_cfg.get("app_secret"):
+        if suppress_error_modal or not allow_interactive_oauth:
+            log_event(
+                "SESSION",
+                f"{broker_name} API keys missing or deferred during startup boot — opening Pre-Flight.",
+            )
+            return None
         ok = show_broker_setup_wizard(broker_name, parent=parent)
         if not ok:
             return None
@@ -14212,9 +15002,19 @@ def connect_broker_adapter(
             else None
         )
         try:
-            adapter.authenticate(fast_cached_accounts=cached_accts)
+            adapter.authenticate(
+                fast_cached_accounts=cached_accts,
+                allow_interactive_oauth=allow_interactive_oauth,
+            )
         except TypeError:
-            adapter.authenticate()
+            if sys.exc_info()[2].tb_next is not None:
+                raise
+            try:
+                adapter.authenticate(fast_cached_accounts=cached_accts)
+            except TypeError:
+                if sys.exc_info()[2].tb_next is not None:
+                    raise
+                adapter.authenticate()
 
         saved_acct = b_cfg.get("selected_account_id", "")
         valid_ids = [a["id"] for a in adapter.accounts]
@@ -14243,6 +15043,17 @@ def connect_broker_adapter(
             save_config(config)
         return adapter
     except Exception as e:
+        if isinstance(e, DeferredAuthRequired):
+            _last_boot_deferred_auth_msg = str(e)
+            if suppress_error_modal:
+                log_event("SESSION", f"{broker_name} OAuth refresh deferred: {e}")
+                return None
+        if suppress_error_modal:
+            log_event(
+                "WARN",
+                f"{broker_name} startup connection deferred (network pending): {e}",
+            )
+            return None
         log_event("ERROR", f"{broker_name} connection error: {e}")
         extra_hint = (
             "\n\n⚠️ NOTE FOR WEBULL USERS:\n"
@@ -14263,6 +15074,31 @@ def connect_broker_adapter(
                 broker_name, parent=parent, force_wizard=True
             )
         return None
+
+
+def run_startup_broker_connect(startup_boot=False):
+    """Connects initial broker at startup, suppressing fallback switches & blocking
+    error popups when booting with Windows (--startup) while network may be pending."""
+    init_b = config.get("active_broker", "SCHWAB")
+    boot_ad = connect_broker_adapter(
+        init_b,
+        fast_startup=True,
+        suppress_error_modal=bool(startup_boot),
+        allow_interactive_oauth=(not bool(startup_boot)),
+    )
+    if boot_ad is None and not bool(startup_boot):
+        fb_b = "SCHWAB" if init_b == "WEBULL" else "WEBULL"
+        fb_cfg_d = config.get("brokers", {}).get(fb_b, {})
+        if fb_cfg_d.get("app_key") and fb_cfg_d.get("app_secret"):
+            log_event(
+                "SESSION",
+                f"{init_b} connection failed. "
+                f"Falling back to configured broker {fb_b}...",
+            )
+            config["active_broker"] = fb_b
+            save_config(config)
+            boot_ad = connect_broker_adapter(fb_b, fast_startup=True)
+    return boot_ad
 
 
 # ==========================================
@@ -24638,6 +25474,7 @@ def _normalize_tooltip_paragraphs_global(raw_text):
         "▸",
         "- ",
         "* ",
+        "---",
         "(Example",
         "(Options",
         "(Note",
@@ -24649,7 +25486,12 @@ def _normalize_tooltip_paragraphs_global(raw_text):
     )
     for ln in lines[1:]:
         prev = paragraphs[-1]
-        if prev.endswith(":") or ln.startswith(new_para_prefixes):
+        if (
+            prev.endswith(":")
+            or prev == "---"
+            or ln == "---"
+            or ln.startswith(new_para_prefixes)
+        ):
             paragraphs.append(ln)
         else:
             paragraphs[-1] = f"{prev} {ln}"
@@ -24659,7 +25501,7 @@ def _normalize_tooltip_paragraphs_global(raw_text):
 def _populate_rich_tooltip_card(tw, raw_text, max_wrap_px=440):
     """Populates an overrideredirect tooltip Toplevel (`tw`) with clean,
     un-scrunched Verdana 9 pixel-wrapped paragraphs, a cohesive sky-blue
-    accent bar, and consistent hanging-indent bullet rows."""
+    accent bar, and consistent hanging-indent or aligned Key | Value rows."""
     paragraphs = _normalize_tooltip_paragraphs_global(raw_text)
     bg_card = "#131d2a"
     body_wrap_px = max(300, int(max_wrap_px) - 24)
@@ -24672,6 +25514,20 @@ def _populate_rich_tooltip_card(tw, raw_text, max_wrap_px=440):
     )
     inner = tk.Frame(card_wrap, bg=bg_card, padx=14, pady=10)
     inner.pack(side="left", fill="both", expand=True)
+
+    _tt_kv_col0_min = 124
+    try:
+        _tt_kv_fnt = tkfont.Font(root=tw, family="Verdana", size=9, weight="bold")
+        for _tt_p_kv in paragraphs:
+            if _tt_p_kv.startswith(("•", "▸", "- ", "* ")):
+                _tt_b_kv = re.sub(r"^[•▸\-*]+\s*", "", _tt_p_kv).strip()
+                if " | " in _tt_b_kv:
+                    _tt_k_kv = _tt_b_kv.split(" | ", 1)[0].strip()
+                    _tt_kv_col0_min = max(
+                        _tt_kv_col0_min, int(_tt_kv_fnt.measure(_tt_k_kv)) + 14
+                    )
+    except Exception:
+        pass
 
     last_idx = len(paragraphs) - 1
     for p_idx, para in enumerate(paragraphs):
@@ -24694,12 +25550,54 @@ def _populate_rich_tooltip_card(tw, raw_text, max_wrap_px=440):
                 )
             continue
 
+        if para == "---":
+            tk.Frame(inner, bg="#233549", height=1).pack(
+                fill="x", pady=(4, 5)
+            )
+            continue
+
         is_bullet = para.startswith(("•", "▸", "- ", "* "))
         if is_bullet:
             body_str = re.sub(r"^[•▸\-*]+\s*", "", para).strip()
+            if " | " in body_str:
+                k_lbl, v_txt = [
+                    s_part.strip() for s_part in body_str.split(" | ", 1)
+                ]
+                is_row_warn = v_txt.startswith("!") or v_txt.upper().startswith(
+                    ("IMPORTANT:", "WARNING:", "CAUTION:")
+                )
+                if v_txt.startswith("!"):
+                    v_txt = v_txt[1:].strip()
+                k_col = "#fbbf24" if is_row_warn else "#7dd3fc"
+                v_col = "#fde68a" if is_row_warn else "#e2eaf3"
+                kv_wrap_px = max(240, int(max_wrap_px) - _tt_kv_col0_min - 48)
+                b_row = tk.Frame(inner, bg=bg_card)
+                b_row.pack(fill="x", pady=(2, 3 if p_idx < last_idx else 0))
+                b_row.columnconfigure(0, minsize=_tt_kv_col0_min)
+                b_row.columnconfigure(1, weight=1)
+                tk.Label(
+                    b_row,
+                    text=k_lbl,
+                    font=("Verdana", 9, "bold"),
+                    fg=k_col,
+                    bg=bg_card,
+                    justify="left",
+                    anchor="nw",
+                ).grid(row=0, column=0, sticky="nw", padx=(0, 10))
+                tk.Label(
+                    b_row,
+                    text=v_txt,
+                    font=("Verdana", 9),
+                    fg=v_col,
+                    bg=bg_card,
+                    justify="left",
+                    anchor="nw",
+                    wraplength=kv_wrap_px,
+                ).grid(row=0, column=1, sticky="nw")
+                continue
             upper_b = body_str.upper()
             is_warn = upper_b.startswith(
-                ("IMPORTANT", "WARNING", "CAUTION")
+                ("IMPORTANT:", "WARNING:", "CAUTION:")
             )
             dot_col = "#fbbf24" if is_warn else "#38bdf8"
             txt_col = "#fde68a" if is_warn else "#e2eaf3"
@@ -24918,13 +25816,17 @@ def resync_live_hud_for_active_broker(mute_button=None):
 
 
 def show_preflight_window(
-    parent=None, mute_btn=None, post_daily_breach_prompt=False
+    parent=None, mute_btn=None, post_daily_breach_prompt=False, startup_boot=None
 ):
     global settings_win_open, triggered_alarms, active_preflight_close_fn
     global active_preflight_win, last_preflight_pos, _active_hide_tooltips_fn
     global force_reanchor, is_locked_down, current_is_flat
     global active_adapter, start_equity, daily_breach_settings_prompted
     global _demo_sim_pad_win, alarm_active, last_alarm_reason
+
+    eff_startup_boot = bool(
+        IS_WINDOWS_BOOT_STARTUP if startup_boot is None else startup_boot
+    ) and (parent is None)
 
     hide_all_tooltips()
     if parent is not None and mute_btn is None and hud_mute_btn is not None:
@@ -24995,6 +25897,7 @@ def show_preflight_window(
         "streak_after_id": None,
         "pulse_after_id": None,
         "undo_after_id": None,
+        "flight_plan_after_id": None,
         "pulse_stop_fn": None,
         "card3_pulse_keys": (),
         "closing": False,
@@ -25017,7 +25920,7 @@ def show_preflight_window(
     pf.config(
         bg="#0d1117",
         padx=24,
-        pady=16,
+        pady=10,
         highlightthickness=2,
         highlightbackground="#0d1117",
         highlightcolor="#0d1117",
@@ -25081,8 +25984,21 @@ def show_preflight_window(
         "lbl_silent_badge": None,
         "btn_test_audio": None,
         "btn_done": None,
+        "cb_win_boot": None,
+        "lbl_win_boot_warn": None,
         "cleanup_fn": None,
     }
+    _fp_refs = {
+        "frame": None,
+        "canvas": None,
+        "font": None,
+        "hint_font": None,
+        "style_mode": "normal",
+        "full_headline": "",
+        "tooltip": "",
+        "last_w": 0,
+    }
+    _fp_hooks = {"schedule": lambda *_: None, "refresh": lambda *_: None}
 
     def _remember_pf_pos(flush_disk=False):
         global last_preflight_pos
@@ -25135,6 +26051,7 @@ def show_preflight_window(
             "streak_after_id",
             "pulse_after_id",
             "undo_after_id",
+            "flight_plan_after_id",
         ):
             aid = pf_timer_state.get(k_id)
             if aid is not None:
@@ -25271,8 +26188,8 @@ def show_preflight_window(
 
     _active_hide_tooltips_fn = _pf_hide_tooltips
 
-    def attach_tooltip(widget, text):
-        """Attaches a clean dark-themed hover tooltip card to any widget."""
+    def attach_tooltip(widget, text, max_wrap_px=440, fallback_text=""):
+        """Attaches a clean dark-themed hover tooltip card (static or dynamic callable) to any widget."""
         tip_state = {"win": None, "after_id": None}
 
         def show_tip():
@@ -25289,11 +26206,22 @@ def show_preflight_window(
                 cur_grab = host_win.grab_current()
                 if cur_grab is not None and cur_grab is not host_win:
                     return
+                if callable(text):
+                    try:
+                        resolved_tip = str(text() or "")
+                    except Exception:
+                        resolved_tip = str(fallback_text or "")
+                else:
+                    resolved_tip = str(text or "")
+                if not resolved_tip.strip():
+                    return
                 tw = tk.Toplevel(host_win)
                 tw.withdraw()
                 tw.wm_overrideredirect(True)
                 tw.attributes("-topmost", True)
-                _populate_rich_tooltip_card(tw, text, max_wrap_px=440)
+                _populate_rich_tooltip_card(
+                    tw, resolved_tip, max_wrap_px=max_wrap_px
+                )
                 tw.update_idletasks()
                 tip_w = tw.winfo_reqwidth()
                 tip_h = tw.winfo_reqheight()
@@ -25362,6 +26290,7 @@ def show_preflight_window(
 
         _all_hide_tip_callbacks.append(hide_tip)
         widget._hide_tooltip_fn = hide_tip
+        widget._show_tooltip_now_fn = show_tip
         widget.bind("<Enter>", schedule_tip, add="+")
         widget.bind("<Leave>", hide_tip, add="+")
         widget.bind("<ButtonPress>", hide_tip, add="+")
@@ -25437,6 +26366,14 @@ def show_preflight_window(
         value=bool(config.get("auto_share_sanitized_logs", False))
     )
     _auto_share_guard = {"suppress": False}
+    _win_boot_reg_init = read_windows_startup_status()
+    if _win_boot_reg_init.get("ok") and not _win_boot_reg_init.get("sandboxed"):
+        _init_win_boot = bool(_win_boot_reg_init.get("enabled", False))
+        _init_win_boot_dis = bool(_win_boot_reg_init.get("windows_disabled", False))
+        config["start_with_windows"] = _init_win_boot
+    else:
+        _init_win_boot = bool(config.get("start_with_windows", False))
+        _init_win_boot_dis = False
     _prefs_trace_state = {
         "suppress_user_toggle": False,
         "debug": bool(
@@ -25445,7 +26382,102 @@ def show_preflight_window(
         ),
         "updates": bool(config.get("check_updates_on_startup", True)),
         "mute": bool(config.get("mute_all_audio", False)),
+        "start_win": _init_win_boot,
+        "win_disabled": _init_win_boot_dis,
     }
+    var_start_with_windows = tk.BooleanVar(value=_prefs_trace_state["start_win"])
+
+    def _on_toggle_start_with_windows(*_):
+        want_win_boot = bool(var_start_with_windows.get())
+        if want_win_boot == _prefs_trace_state["start_win"]:
+            return
+        reg_res = sync_windows_startup_registry(want_win_boot)
+        if not reg_res.get("ok"):
+            prev_wb = bool(_prefs_trace_state["start_win"])
+            try:
+                var_start_with_windows.set(prev_wb)
+            except Exception:
+                pass
+            err_txt = str(
+                reg_res.get("error") or "Permission denied or Registry unavailable."
+            )
+            log_event(
+                "ERROR", f"Failed to update Windows Startup Registry entry: {err_txt}"
+            )
+            err_parent = _prefs_modal_refs.get("dlg") or pf
+            try:
+                if err_parent is not None and err_parent.winfo_exists():
+                    err_parent.after_idle(
+                        lambda ep=err_parent, msg=err_txt: (
+                            hide_all_tooltips(),
+                            messagebox.showerror(
+                                "Windows Startup Error",
+                                f"Could not update your Windows Startup setting:\n\n{msg}",
+                                parent=ep,
+                            ),
+                        )
+                    )
+            except Exception:
+                pass
+            return
+        _prefs_trace_state["start_win"] = want_win_boot
+        _prefs_trace_state["win_disabled"] = bool(
+            reg_res.get("windows_disabled", False)
+        )
+        config["start_with_windows"] = want_win_boot
+        save_config(config)
+        log_event(
+            "CONFIG",
+            "Windows automatic startup ENABLED (HKCU Run -> Pre-Flight on login)."
+            if want_win_boot
+            else "Windows automatic startup DISABLED (HKCU Run entry removed).",
+        )
+        lbl_wb_w = _prefs_modal_refs.get("lbl_win_boot_warn")
+        if lbl_wb_w is not None:
+            try:
+                if lbl_wb_w.winfo_exists():
+                    if want_win_boot and _prefs_trace_state["win_disabled"]:
+                        if not lbl_wb_w.winfo_manager():
+                            lbl_wb_w.pack(fill="x", padx=(22, 0), pady=(2, 0))
+                    elif lbl_wb_w.winfo_manager():
+                        lbl_wb_w.pack_forget()
+            except Exception:
+                pass
+        if (
+            want_win_boot
+            and _prefs_trace_state["win_disabled"]
+            and not _prefs_trace_state["suppress_user_toggle"]
+        ):
+            warn_parent = _prefs_modal_refs.get("dlg") or pf
+            try:
+                if warn_parent is not None and warn_parent.winfo_exists():
+                    def _prompt_open_startup_apps(wp=warn_parent):
+                        try:
+                            if not wp.winfo_exists():
+                                return
+                            hide_all_tooltips()
+                            open_ms = messagebox.askyesno(
+                                "Paused in Windows Startup Apps",
+                                "PnL Enforcer Beta's startup entry was added, but Windows currently has it paused/disabled under Startup Apps (Task Manager / Windows Settings).\n\n"
+                                "Would you like to open Windows Startup Apps settings so you can turn it back ON?",
+                                parent=wp,
+                            )
+                            if open_ms:
+                                try:
+                                    os.startfile("ms-settings:startupapps")
+                                except Exception as st_e:
+                                    log_event(
+                                        "WARN",
+                                        f"Could not open ms-settings:startupapps: {st_e}",
+                                    )
+                        except Exception:
+                            pass
+
+                    warn_parent.after_idle(_prompt_open_startup_apps)
+            except Exception:
+                pass
+
+    var_start_with_windows.trace_add("write", _on_toggle_start_with_windows)
     var_debug_console = tk.BooleanVar(value=_prefs_trace_state["debug"])
 
     def _on_toggle_debug_console(*_):
@@ -27439,7 +28471,7 @@ def show_preflight_window(
         pady=7,
         height=48,
     )
-    top_bar.pack(fill="x", pady=(0, 12))
+    top_bar.pack(fill="x", pady=(0, 7))
     top_bar.pack_propagate(False)
 
     demo_footer_banner = None
@@ -30841,6 +31873,9 @@ def show_preflight_window(
             new_cfg["check_updates_on_startup"] = bool(
                 var_check_updates_on_startup.get()
             )
+            new_cfg["start_with_windows"] = bool(
+                var_start_with_windows.get()
+            )
             save_config(new_cfg)
             lk_reason_str = (
                 "while in an active daytrade"
@@ -31032,6 +32067,9 @@ def show_preflight_window(
             new_cfg["show_debug_console"] = bool(var_debug_console.get())
             new_cfg["check_updates_on_startup"] = bool(
                 var_check_updates_on_startup.get()
+            )
+            new_cfg["start_with_windows"] = bool(
+                var_start_with_windows.get()
             )
             new_cfg["last_uploaded_sanitized_log"] = config.get(
                 "last_uploaded_sanitized_log", ""
@@ -31473,7 +32511,7 @@ def show_preflight_window(
             padx=1,
             pady=1
         )
-        halo0.pack(fill="both", expand=expand, pady=4)
+        halo0.pack(fill="both", expand=expand, pady=3)
         outer = tk.Frame(
             halo0,
             bg="#131922",
@@ -31487,7 +32525,7 @@ def show_preflight_window(
         )
         accent_bar.pack(side="left", fill="y")
         card = tk.Frame(
-            outer, bg="#131922", padx=14, pady=11
+            outer, bg="#131922", padx=14, pady=8
         )
         card.pack(side="left", fill="both", expand=True)
         hdr_row = tk.Frame(card, bg="#131922")
@@ -31514,8 +32552,8 @@ def show_preflight_window(
                 fg="#8b9bb0",
                 bg="#131922",
                 anchor="w"
-            ).pack(fill="x", pady=(2, 6))
-        tk.Frame(card, bg="#222d3d", height=1).pack(fill="x", pady=(0, 6))
+            ).pack(fill="x", pady=(1, 4))
+        tk.Frame(card, bg="#222d3d", height=1).pack(fill="x", pady=(0, 4))
         if return_parts:
             return (
                 card,
@@ -35528,6 +36566,66 @@ def show_preflight_window(
             "  updates manually via 'Inspect Source ↗'."
         )
 
+        _wb_dlg_st = read_windows_startup_status()
+        if _wb_dlg_st.get("ok") and not _wb_dlg_st.get("sandboxed"):
+            _prefs_trace_state["win_disabled"] = bool(
+                _wb_dlg_st.get("windows_disabled", False)
+            )
+            _cur_reg_wb = bool(_wb_dlg_st.get("enabled", False))
+            _prefs_trace_state["start_win"] = _cur_reg_wb
+            config["start_with_windows"] = _cur_reg_wb
+            if bool(var_start_with_windows.get()) != _cur_reg_wb:
+                var_start_with_windows.set(_cur_reg_wb)
+
+        r_win_boot = tk.Frame(sec3, bg="#131922")
+        r_win_boot.pack(fill="x", pady=(6, 0))
+        cb_win_boot = make_glass_checkbutton(
+            r_win_boot,
+            text="Start Automatically with Windows (opens Pre-Flight · applies instantly)",
+            variable=var_start_with_windows,
+            font=("Arial", 10, "bold"),
+            fg="#cbd5e1",
+            bg="#131922",
+            accent_hex="#0284c7",
+            check_hex="#38bdf8",
+            anchor="w",
+        )
+        cb_win_boot.pack(side="left")
+        _prefs_modal_refs["cb_win_boot"] = cb_win_boot
+        attach_tooltip(
+            cb_win_boot,
+            "Start Automatically with Windows (OFF by default · applies instantly):\n"
+            "• When checked, adds a per-user Windows login entry so PnL Enforcer opens straight\n"
+            "  to this Pre-Flight Rulebook window when you sign into Windows (never arms orders silently).\n"
+            "• Runs cleanly with no flashing command terminal and waits politely if Wi-Fi is still\n"
+            "  connecting right after a reboot.\n"
+            "• Kept separate from 'Restore Defaults' and 'Undo Edits' so risk preset resets never\n"
+            "  change your Windows startup setting."
+        )
+
+        lbl_win_boot_warn = tk.Label(
+            sec3,
+            text="⚠️ Windows has Enforcer paused under Startup Apps (Task Manager) — click to open Settings ↗",
+            font=("Arial", 8, "bold"),
+            fg="#fbbf24",
+            bg="#131922",
+            anchor="w",
+            cursor="hand2",
+        )
+        lbl_win_boot_warn.bind(
+            "<Button-1>",
+            lambda _e: (
+                os.startfile("ms-settings:startupapps")
+                if sys.platform == "win32"
+                else None
+            ),
+        )
+        _prefs_modal_refs["lbl_win_boot_warn"] = lbl_win_boot_warn
+        if var_start_with_windows.get() and _prefs_trace_state.get(
+            "win_disabled", False
+        ):
+            lbl_win_boot_warn.pack(fill="x", padx=(22, 0), pady=(2, 0))
+
         lbl_poll_err = tk.Label(
             sec3,
             text="",
@@ -35703,12 +36801,13 @@ def show_preflight_window(
         except Exception:
             p_sec = "?"
         log_txt = "ON" if var_auto_share_logs.get() else "OFF"
+        wb_sfx = " · Win Boot: ON" if var_start_with_windows.get() else ""
         sim_sfx = " · 🚨 Breach Sim: ON" if breach_visual_sim_active else ""
         try:
             lbl_prefs_summary.config(
                 text=(
                     f"9:30/4:00 Ratchets: {sw_txt} · Swings: {pos_txt} · "
-                    f"{audio_txt} · Poll: {p_sec}s · Safe Logs: {log_txt}{sim_sfx}"
+                    f"{audio_txt} · Poll: {p_sec}s · Safe Logs: {log_txt}{wb_sfx}{sim_sfx}"
                 ),
                 fg=(
                     "#f87171"
@@ -35727,6 +36826,7 @@ def show_preflight_window(
         var_upside_chime,
         var_poll,
         var_auto_share_logs,
+        var_start_with_windows,
     ):
         _pv.trace_add("write", _refresh_card3_prefs_summary)
     _refresh_card3_prefs_summary()
@@ -36396,6 +37496,7 @@ def show_preflight_window(
                     fg="#6ee7b7",
                     state="normal",
                 )
+        _fp_hooks["schedule"]()
 
     btn_prefs_card3 = make_stadium_button(
         r_c3_actions,
@@ -36457,7 +37558,7 @@ def show_preflight_window(
         "Open Preferences & Audio Settings:\n"
         "• Session Behavior: Reset Profit Ratchets at 9:30 AM & 4:00 PM Switch & Swing Filter\n"
         "• Audio & Voice Cues: Silent Mode (Mute All), Voice Cues, Upside Chime & Sound/Dry-Run Tester\n"
-        "• System & Telemetry: API Poll Interval (s), Debug Terminal, Startup Update Check & Safe Logs"
+        "• System & Telemetry: API Poll Interval (s), Debug Terminal, Startup Update Check, Windows Startup & Safe Logs"
     )
 
     # ==========================================================
@@ -36638,6 +37739,7 @@ def show_preflight_window(
         _apply_rulebook_aura(
             c4_halos, c4_bar, c4_title_lbl, c4_badge_pill, is_active=(not rth_now)
         )
+        _fp_hooks["schedule"]()
         if not pf_timer_state["closing"]:
             try:
                 pf_timer_state["rulebook_after_id"] = pf.after(
@@ -37890,6 +38992,7 @@ def show_preflight_window(
                 lbl_fl.config(fg="#526070")
                 ent_fl.config(state="disabled")
         _schedule_undo_btn_refresh()
+        _fp_hooks["schedule"]()
 
     var_open_flat.trace_add("write", _on_toggle_open_flat)
     var_tilt_cd.trace_add("write", _on_toggle_tilt_cd)
@@ -37994,9 +39097,292 @@ def show_preflight_window(
 
     _tick_preflight_streak()
 
+    # --- LIVE PRE-LAUNCH PLAIN-LANGUAGE "FLIGHT PLAN" BAR ---
+    _fp_style_map = {
+        "done_today": ("#0d281e", "#10b981", "#34d399", "#a7f3d0", "#6ee7b7"),
+        "demo": ("#1e1238", "#7c3aed", "#c084fc", "#e9d5ff", "#a78bfa"),
+        "alarms_only": ("#231c12", "#b45309", "#fbbf24", "#fde68a", "#d97706"),
+        "passive_warn": ("#231c12", "#b45309", "#fbbf24", "#fde68a", "#d97706"),
+        "committed": ("#0f2233", "#0284c7", "#38bdf8", "#bae6fd", "#7dd3fc"),
+        "normal": ("#111822", "#243040", "#7dd3fc", "#cbd5e1", "#64748b"),
+    }
+
+    def _collect_ui_flight_plan_state():
+        now_et_fp = get_eastern_now()
+        et_mins_fp = (now_et_fp.hour * 60) + now_et_fp.minute
+        mkt_closed_fp = bool(
+            now_et_fp.weekday() >= 5
+            or (now_et_fp.strftime("%Y-%m-%d") in NYSE_FULL_HOLIDAY_DATES)
+        )
+        rth_live_fp = bool((not mkt_closed_fp) and is_market_hours())
+        has_open_opts_fp = False
+        try:
+            if active_adapter is not None:
+                raw_pos_fp = active_adapter.get_last_raw_pos_details() or {}
+                ig_on_fp = bool(var_ignore_preexisting.get())
+                for sym_fp, pd_fp in raw_pos_fp.items():
+                    if not isinstance(pd_fp, dict):
+                        continue
+                    if str(pd_fp.get("asset_type", "")).upper() != "OPTION":
+                        continue
+                    qty_fp = float(pd_fp.get("qty", 0.0) or 0.0)
+                    if ig_on_fp and sym_fp in ignored_positions:
+                        ref_fp = float(
+                            ignored_positions[sym_fp].get("ref_qty", 0.0) or 0.0
+                        )
+                        if abs(qty_fp - ref_fp) < 1e-6:
+                            continue
+                    if abs(qty_fp) >= 1e-6:
+                        has_open_opts_fp = True
+                        break
+        except Exception:
+            has_open_opts_fp = False
+
+        fp_dict = {
+            "broker_name": str(var_broker.get() or "SCHWAB").upper(),
+            "done_for_today": bool(done_for_today),
+            "committed_today": bool(is_committed_for_today()),
+            "alarms_only_mode": bool(var_alarms_only.get()),
+            "mute_all_audio": bool(var_mute_all_audio.get()),
+            "is_rth_now": rth_live_fp,
+            "et_mins": et_mins_fp,
+            "market_closed_day": mkt_closed_fp,
+            "enable_open_flatten": bool(var_open_flat.get()),
+            "open_max_loss": dollar_vars["open_max_loss"].get(),
+            "enable_open_cooldown": bool(var_open_cd.get()),
+            "open_cooldown_mins": var_cd_mins.get(),
+            "enable_consec_loss_cooldown": bool(var_tilt_cd.get()),
+            "consec_loss_count": var_tilt_count.get(),
+            "consec_loss_window_mins": var_tilt_window.get(),
+            "enable_auto_flatten": bool(var_flatten.get()),
+            "enable_flatten_options": bool(var_flatten_options.get()),
+            "options_waiver_verified": bool(is_options_waiver_verified(config)),
+            "has_open_options": has_open_opts_fp,
+            "enable_kill_tos": bool(var_kill_tos.get()),
+            "enable_kill_webull": bool(var_kill_wb.get()),
+            "enable_lock_os": bool(var_lock_os.get()),
+            "daily_lock_mins": var_daily_lock_mins.get(),
+            "reset_at_925": bool(var_reset925.get()),
+            "ignore_preexisting_positions": bool(var_ignore_preexisting.get()),
+            "enable_pm_warn_1": bool(var_pm_w1_on.get()),
+            "enable_pm_warn_2": bool(var_pm_w2_on.get()),
+            "enable_pm_lock": bool(var_pm_lock_on.get()),
+            "pm_warn_1": dollar_vars["pm_warn_1"].get(),
+            "pm_warn_2": dollar_vars["pm_warn_2"].get(),
+            "pm_max_loss": dollar_vars["pm_max_loss"].get(),
+            "pm_lock_trigger": dollar_vars["pm_lock_trigger"].get(),
+            "pm_trail_cushion": dollar_vars["pm_trail_cushion"].get(),
+            "enable_t1_warn_1": bool(var_t1_w1_on.get()),
+            "enable_t1_warn_2": bool(var_t1_w2_on.get()),
+            "enable_t2": bool(var_t2_on.get()),
+            "enable_t3": bool(var_t3_on.get()),
+            "enable_t4": bool(var_t4_on.get()),
+            "t1_warn_1": dollar_vars["t1_warn_1"].get(),
+            "t1_warn_2": dollar_vars["t1_warn_2"].get(),
+            "t1_max_loss": dollar_vars["t1_max_loss"].get(),
+            "t2_trigger": dollar_vars["t2_trigger"].get(),
+            "t2_max_loss": dollar_vars["t2_max_loss"].get(),
+            "t3_trigger": dollar_vars["t3_trigger"].get(),
+            "t3_max_loss": dollar_vars["t3_max_loss"].get(),
+            "t4_trigger": dollar_vars["t4_trigger"].get(),
+            "t4_trail": dollar_vars["t4_trail"].get(),
+        }
+        return fp_dict
+
+    def _redraw_flight_plan_canvas(avail_px=None):
+        cv_w = _fp_refs.get("canvas")
+        font_obj = _fp_refs.get("font")
+        hint_font_obj = _fp_refs.get("hint_font")
+        if cv_w is None or font_obj is None:
+            return
+        try:
+            if not cv_w.winfo_exists():
+                return
+            fr_w = _fp_refs.get("frame")
+            cw = (
+                int(avail_px)
+                if (avail_px is not None and int(avail_px) >= 50)
+                else int(cv_w.winfo_width())
+            )
+            if cw < 50:
+                fw_now = (
+                    int(fr_w.winfo_width())
+                    if (fr_w is not None and fr_w.winfo_exists())
+                    else 0
+                )
+                cw = max(240, fw_now - 2) if fw_now >= 50 else 1280
+            cv_h = int(cv_w.winfo_height())
+            ch = max(22, cv_h if cv_h >= 16 else (fp_bar_h - 2))
+            full_hl = str(_fp_refs.get("full_headline", "") or "")
+            if ": " in full_hl:
+                tag_raw, body_raw = full_hl.split(": ", 1)
+                tag_str = tag_raw + ":"
+            else:
+                tag_str = ""
+                body_raw = full_hl
+            st_m_now = str(_fp_refs.get("style_mode", "normal") or "normal")
+            fp_bg, _fp_rim, fp_tag_fg, fp_body_fg, fp_hint_fg = _fp_style_map.get(
+                st_m_now, _fp_style_map["normal"]
+            )
+            hint_txt = "ⓘ Full plan"
+            tag_w = font_obj.measure(tag_str + "  ") if tag_str else 0
+            hint_w = (
+                hint_font_obj.measure("   " + hint_txt)
+                if hint_font_obj is not None
+                else 76
+            )
+            body_max_px = max(48, cw - tag_w - hint_w - 22)
+            shown_body = elide_flight_plan_headline(
+                body_raw, body_max_px, font_obj.measure
+            )
+            cv_w.config(bg=fp_bg)
+            cv_w.delete("all")
+            if tag_str:
+                cv_w.create_text(
+                    10,
+                    ch // 2,
+                    text=tag_str,
+                    font=font_obj,
+                    fill=fp_tag_fg,
+                    anchor="w",
+                    tags=("fp_tag",),
+                )
+            cv_w.create_text(
+                10 + tag_w,
+                ch // 2,
+                text=shown_body,
+                font=font_obj,
+                fill=fp_body_fg,
+                anchor="w",
+                tags=("fp_body",),
+            )
+            if hint_font_obj is not None and (
+                10 + tag_w + font_obj.measure(shown_body) + 8
+            ) <= (cw - hint_w):
+                cv_w.create_text(
+                    cw - 10,
+                    ch // 2,
+                    text=hint_txt,
+                    font=hint_font_obj,
+                    fill=fp_hint_fg,
+                    anchor="e",
+                    tags=("fp_hint",),
+                )
+            cv_w._fp_full_text = full_hl
+        except Exception:
+            pass
+
+    def _refresh_flight_plan_bar(*_):
+        pf_timer_state["flight_plan_after_id"] = None
+        if pf_timer_state.get("closing"):
+            return
+        fr_w = _fp_refs.get("frame")
+        cv_w = _fp_refs.get("canvas")
+        if fr_w is None or cv_w is None:
+            return
+        try:
+            if not pf.winfo_exists() or not fr_w.winfo_exists() or not cv_w.winfo_exists():
+                return
+            hl_fp, tt_fp, st_mode_fp = build_flight_plan_summary(
+                _collect_ui_flight_plan_state()
+            )
+            _fp_refs["full_headline"] = hl_fp
+            _fp_refs["tooltip"] = tt_fp
+            _fp_refs["style_mode"] = st_mode_fp
+            fp_bg, fp_rim, _fp_tag_fg, _fp_body_fg, _fp_hint_fg = _fp_style_map.get(
+                st_mode_fp, _fp_style_map["normal"]
+            )
+            fr_w.config(bg=fp_bg, highlightbackground=fp_rim)
+            _redraw_flight_plan_canvas()
+        except Exception:
+            pass
+
+    def _schedule_flight_plan_refresh(*_):
+        if pf_timer_state.get("closing"):
+            return
+        if pf_timer_state.get("flight_plan_after_id") is not None:
+            return
+        try:
+            if pf.winfo_exists():
+                pf_timer_state["flight_plan_after_id"] = pf.after(
+                    35, _refresh_flight_plan_bar
+                )
+        except Exception:
+            pass
+
+    _fp_hooks["schedule"] = _schedule_flight_plan_refresh
+    _fp_hooks["refresh"] = _refresh_flight_plan_bar
+
+    fp_font = tkfont.Font(root=pf, family="Arial", size=9, weight="bold")
+    fp_hint_font = tkfont.Font(root=pf, family="Arial", size=8, weight="bold")
+    fp_bar_h = max(24, int(fp_font.metrics("linespace")) + 6)
+    flight_plan_frame = tk.Frame(
+        pf,
+        bg="#111822",
+        height=fp_bar_h,
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#243040",
+    )
+    flight_plan_frame.pack(fill="x", pady=(4, 0))
+    flight_plan_frame.pack_propagate(False)
+
+    cv_flight_plan = tk.Canvas(
+        flight_plan_frame,
+        bg="#111822",
+        bd=0,
+        highlightthickness=0,
+        cursor="hand2",
+    )
+    cv_flight_plan.pack(fill="both", expand=True)
+    _fp_refs["frame"] = flight_plan_frame
+    _fp_refs["canvas"] = cv_flight_plan
+    _fp_refs["font"] = fp_font
+    _fp_refs["hint_font"] = fp_hint_font
+    attach_tooltip(
+        cv_flight_plan,
+        lambda: _fp_refs.get("tooltip", ""),
+        max_wrap_px=520,
+    )
+    cv_flight_plan.bind(
+        "<ButtonRelease-1>",
+        lambda _e: getattr(cv_flight_plan, "_show_tooltip_now_fn", lambda: None)(),
+        add="+",
+    )
+
+    def _on_fp_configure(ev=None):
+        if ev is None or pf_timer_state.get("closing"):
+            return
+        w_ev = int(getattr(ev, "width", 0) or 0)
+        if w_ev < 50:
+            return
+        if abs(w_ev - int(_fp_refs.get("last_w", 0) or 0)) < 2:
+            return
+        _fp_refs["last_w"] = w_ev
+        _redraw_flight_plan_canvas(w_ev)
+
+    cv_flight_plan.bind("<Configure>", _on_fp_configure)
+
+    for _fp_tv in (
+        var_broker,
+        var_mute_all_audio,
+        var_tilt_count,
+        var_tilt_window,
+        var_cd_mins,
+        var_daily_lock_mins,
+        var_reset925,
+        var_ignore_preexisting,
+        var_flatten_options,
+        var_kill_tos,
+        var_kill_wb,
+    ):
+        _fp_tv.trace_add("write", _schedule_flight_plan_refresh)
+    for _fp_dk in dollar_keys:
+        dollar_vars[_fp_dk].trace_add("write", _schedule_flight_plan_refresh)
+
     # --- BOTTOM ACTION BAR (GLASSMORPHIC STADIUMS) ---
     btn_frame = tk.Frame(pf, bg="#0d1117", height=38)
-    btn_frame.pack(fill="x", pady=(10, 2))
+    btn_frame.pack(fill="x", pady=(5, 2))
     btn_frame.pack_propagate(False)
 
     btn_restore_def = make_stadium_button(
@@ -38109,6 +39495,12 @@ def show_preflight_window(
         command=save_and_launch,
     )
     btn_launch.pack(side="right")
+    attach_tooltip(
+        btn_launch,
+        lambda: _fp_refs.get("tooltip", ""),
+        max_wrap_px=520,
+    )
+    _refresh_flight_plan_bar()
 
     btn_alarms_only = make_stadium_button(
         btn_frame,
@@ -38208,7 +39600,7 @@ def show_preflight_window(
     _sync_demo_pf_chrome()
 
     ver_outer = tk.Frame(pf, bg="#0d1117", height=22)
-    ver_outer.pack(fill="x", pady=(6, 0))
+    ver_outer.pack(fill="x", pady=(4, 0))
     ver_outer.pack_propagate(False)
 
     ver_frame = tk.Frame(ver_outer, bg="#0d1117")
@@ -39615,6 +41007,25 @@ def show_preflight_window(
 
     _pf_initial_shown["done"] = True
 
+    if eff_startup_boot:
+        def _boot_lift_pf():
+            try:
+                if (
+                    not pf_timer_state.get("closing")
+                    and pf.winfo_exists()
+                    and pf.grab_current() is None
+                ):
+                    pf.attributes("-topmost", False)
+                    pf.attributes("-topmost", True)
+                    pf.lift()
+            except Exception:
+                pass
+
+        try:
+            pf.after(600, _boot_lift_pf)
+        except Exception:
+            pass
+
     if parent is None:
         _clear_boot_pending_marker()
         if _IS_MAIN_PROCESS:
@@ -39626,18 +41037,37 @@ def show_preflight_window(
             _bg_sync_epoch = get_adapter_epoch()
             _bg_init_acct_id = str(getattr(active_adapter, "account_id", "") or "")
 
+            def _bg_sync_abort():
+                return should_abort_startup_retry(
+                    pf_timer_state.get("closing"),
+                    launched["status"],
+                    get_adapter_epoch(),
+                    _bg_sync_epoch,
+                )
+
             def _bg_preflight_broker_sync():
                 ad = active_adapter
-                if ad is None or get_adapter_epoch() != _bg_sync_epoch:
+                if ad is None or _bg_sync_abort():
                     return
                 verified_accts = False
                 resolved_acct_id = str(getattr(ad, "account_id", "") or "")
+                boot_retried_net = False
                 if getattr(ad, "_fast_auth_deferred", False) and hasattr(
                     ad, "verify_accounts_live"
                 ):
-                    verified_accts = bool(ad.verify_accounts_live())
-                    if get_adapter_epoch() != _bg_sync_epoch:
-                        return
+                    _max_v_tries = 6 if eff_startup_boot else 1
+                    for _v_try in range(_max_v_tries):
+                        if _bg_sync_abort():
+                            return
+                        verified_accts = bool(ad.verify_accounts_live())
+                        if _bg_sync_abort():
+                            return
+                        if verified_accts:
+                            break
+                        if _v_try + 1 < _max_v_tries:
+                            boot_retried_net = True
+                            if sleep_with_startup_abort(3.0, _bg_sync_abort):
+                                return
                     if verified_accts and ad.accounts:
                         saved_id = (
                             config.get("brokers", {})
@@ -39676,77 +41106,86 @@ def show_preflight_window(
                     and not acct_changed_from_init
                     and get_adapter_epoch() == _bg_sync_epoch
                 ):
-                    try:
-                        snap = ad.fetch_account_data()
-                        if pf_timer_state.get("closing") or launched["status"]:
-                            if launched["status"] and verified_accts:
-                                pf_timer_state.pop("bg_auth_pending", None)
-                                _enqueue_postlaunch_preflight_auth(
-                                    ad, _bg_sync_epoch, verified_accts, resolved_acct_id
-                                )
+                    _max_s_tries = 6 if eff_startup_boot else 1
+                    for _s_try in range(_max_s_tries):
+                        if _bg_sync_abort():
                             return
-                        if (
-                            snap
-                            and snap[0] is not None
-                            and snap[0] > 0
-                            and get_adapter_epoch() == _bg_sync_epoch
-                        ):
-                            if _is_untouched_fee_drift_candidate(
-                                snap[0], snap[1], adapter_override=ad
-                            ) and hasattr(ad, "has_any_filled_orders_today"):
-                                ad.has_any_filled_orders_today()
-                            eff_bg_since = (
-                                float(_reconciled_through_epoch)
-                                if float(_reconciled_through_epoch or 0.0) > 0.0
-                                else float(_restored_session_saved_epoch or 0.0)
-                            )
-                            if eff_bg_since > 0.0 and hasattr(
-                                ad, "fetch_filled_orders_since"
+                        try:
+                            snap = ad.fetch_account_data()
+                            if pf_timer_state.get("closing") or launched["status"]:
+                                if launched["status"] and verified_accts:
+                                    pf_timer_state.pop("bg_auth_pending", None)
+                                    _enqueue_postlaunch_preflight_auth(
+                                        ad, _bg_sync_epoch, verified_accts, resolved_acct_id
+                                    )
+                                return
+                            if (
+                                snap
+                                and snap[0] is not None
+                                and snap[0] > 0
+                                and get_adapter_epoch() == _bg_sync_epoch
                             ):
-                                bg_ref_flat = (
-                                    last_flat_equity
-                                    if last_flat_equity is not None and float(last_flat_equity) > 0.0
-                                    else start_equity
+                                if _is_untouched_fee_drift_candidate(
+                                    snap[0], snap[1], adapter_override=ad
+                                ) and hasattr(ad, "has_any_filled_orders_today"):
+                                    ad.has_any_filled_orders_today()
+                                eff_bg_since = (
+                                    float(_reconciled_through_epoch)
+                                    if float(_reconciled_through_epoch or 0.0) > 0.0
+                                    else float(_restored_session_saved_epoch or 0.0)
                                 )
-                                bg_use_fast = bool(
-                                    snap[1]
-                                    and _restored_session_was_flat
-                                    and bg_ref_flat is not None
-                                    and float(bg_ref_flat) > 0.0
-                                    and abs(round(float(snap[0]) - float(bg_ref_flat), 2)) < 0.01
-                                    and (time.time() - eff_bg_since) < (30.0 * 3600.0)
-                                )
-                                bg_prefetched_win = "36h" if bg_use_fast else "58d"
-                                bg_prefetched_fills = _call_fetch_filled_orders_since(
-                                    ad, eff_bg_since, fast_recent_only=bg_use_fast
-                                )
-                                if bg_use_fast and (
-                                    bg_prefetched_fills is None
-                                    or len(bg_prefetched_fills) > 0
+                                if eff_bg_since > 0.0 and hasattr(
+                                    ad, "fetch_filled_orders_since"
                                 ):
-                                    bg_prefetched_win = "58d"
+                                    bg_ref_flat = (
+                                        last_flat_equity
+                                        if last_flat_equity is not None and float(last_flat_equity) > 0.0
+                                        else start_equity
+                                    )
+                                    bg_use_fast = bool(
+                                        snap[1]
+                                        and _restored_session_was_flat
+                                        and bg_ref_flat is not None
+                                        and float(bg_ref_flat) > 0.0
+                                        and abs(round(float(snap[0]) - float(bg_ref_flat), 2)) < 0.01
+                                        and (time.time() - eff_bg_since) < (30.0 * 3600.0)
+                                    )
+                                    bg_prefetched_win = "36h" if bg_use_fast else "58d"
                                     bg_prefetched_fills = _call_fetch_filled_orders_since(
-                                        ad, eff_bg_since, fast_recent_only=False
+                                        ad, eff_bg_since, fast_recent_only=bg_use_fast
                                     )
-                                if (
-                                    bg_prefetched_fills is None
-                                    and snap[1]
-                                    and hasattr(
-                                        ad,
-                                        "has_non_ignored_closing_fills_since",
-                                    )
-                                ):
-                                    bg_prefetched_closing = bool(
-                                        ad.has_non_ignored_closing_fills_since(
-                                            eff_bg_since,
-                                            was_flat_at_save=_restored_session_was_flat,
+                                    if bg_use_fast and (
+                                        bg_prefetched_fills is None
+                                        or len(bg_prefetched_fills) > 0
+                                    ):
+                                        bg_prefetched_win = "58d"
+                                        bg_prefetched_fills = _call_fetch_filled_orders_since(
+                                            ad, eff_bg_since, fast_recent_only=False
                                         )
-                                    )
-                    except Exception:
-                        snap = None
-                        bg_prefetched_fills = None
-                        bg_prefetched_closing = None
-                        bg_prefetched_win = None
+                                    if (
+                                        bg_prefetched_fills is None
+                                        and snap[1]
+                                        and hasattr(
+                                            ad,
+                                            "has_non_ignored_closing_fills_since",
+                                        )
+                                    ):
+                                        bg_prefetched_closing = bool(
+                                            ad.has_non_ignored_closing_fills_since(
+                                                eff_bg_since,
+                                                was_flat_at_save=_restored_session_was_flat,
+                                            )
+                                        )
+                                break
+                        except Exception:
+                            snap = None
+                            bg_prefetched_fills = None
+                            bg_prefetched_closing = None
+                            bg_prefetched_win = None
+                        if _s_try + 1 < _max_s_tries:
+                            boot_retried_net = True
+                            if sleep_with_startup_abort(3.0, _bg_sync_abort):
+                                return
 
                 if launched["status"] and verified_accts:
                     pf_timer_state.pop("bg_auth_pending", None)
@@ -39793,6 +41232,10 @@ def show_preflight_window(
                             f"{b_n} API authenticated ({len(ad.accounts)} account(s) found).",
                         )
                         populate_account_dropdown()
+                        if boot_retried_net and _IS_MAIN_PROCESS:
+                            start_background_update_check(
+                                pf, cancel_pf_fn=_cancel_pf_timers
+                            )
                     if acct_changed_from_init:
                         _pf_initial_shown["needs_bg_sync"] = False
                         refresh_baseline_preview(force_restore=True)
@@ -39890,6 +41333,157 @@ def show_preflight_window(
             threading.Thread(
                 target=_bg_preflight_broker_sync, daemon=True
             ).start()
+        elif eff_startup_boot and active_adapter is None:
+            def_auth_boot_msg = str(_last_boot_deferred_auth_msg or "").strip()
+            if def_auth_boot_msg:
+                if default_status_lbl is not None:
+                    try:
+                        default_status_lbl.config(
+                            text=f"🔑 {def_auth_boot_msg}", fg="#fbbf24"
+                        )
+                    except Exception:
+                        pass
+            else:
+                boot_rc_b = str(
+                    var_broker.get() or config.get("active_broker", "SCHWAB")
+                ).upper()
+                boot_rc_cfg = config.get("brokers", {}).get(boot_rc_b, {})
+                if (
+                    boot_rc_b in ("SCHWAB", "WEBULL")
+                    and boot_rc_cfg.get("app_key")
+                    and boot_rc_cfg.get("app_secret")
+                ):
+                    if default_status_lbl is not None:
+                        try:
+                            default_status_lbl.config(
+                                text=f"⏳ Waiting for network to connect {boot_rc_b}...",
+                                fg="#7dd3fc",
+                            )
+                        except Exception:
+                            pass
+                    _boot_rc_ep = get_adapter_epoch()
+                    _boot_rc_watch = {"broker": boot_rc_b}
+
+                    def _on_boot_rc_broker_var(*_):
+                        try:
+                            _boot_rc_watch["broker"] = str(
+                                var_broker.get() or ""
+                            ).upper()
+                        except Exception:
+                            pass
+
+                    var_broker.trace_add("write", _on_boot_rc_broker_var)
+
+                    def _boot_rc_abort():
+                        return should_abort_startup_retry(
+                            pf_timer_state.get("closing"),
+                            launched["status"],
+                            get_adapter_epoch(),
+                            _boot_rc_ep,
+                            cur_broker=_boot_rc_watch["broker"],
+                            expected_broker=boot_rc_b,
+                        )
+
+                    def _bg_startup_reconnect_worker():
+                        for _rc_i in range(22):
+                            wait_s = 3.0 if _rc_i == 0 else 4.0
+                            if sleep_with_startup_abort(wait_s, _boot_rc_abort):
+                                return
+                            if active_adapter is not None:
+                                return
+                            new_rc_ad = connect_broker_adapter(
+                                boot_rc_b,
+                                parent=None,
+                                force_wizard=False,
+                                fast_startup=False,
+                                suppress_error_modal=True,
+                                allow_interactive_oauth=False,
+                            )
+                            if _boot_rc_abort():
+                                return
+                            def_msg_rc = str(
+                                _last_boot_deferred_auth_msg or ""
+                            ).strip()
+                            if new_rc_ad is None and def_msg_rc:
+                                def _show_def_rc_on_ui(msg_t=def_msg_rc):
+                                    if _boot_rc_abort() or active_adapter is not None:
+                                        return
+                                    if default_status_lbl is not None:
+                                        try:
+                                            default_status_lbl.config(
+                                                text=f"🔑 {msg_t}", fg="#fbbf24"
+                                            )
+                                        except Exception:
+                                            pass
+
+                                try:
+                                    pf.after(0, _show_def_rc_on_ui)
+                                except Exception:
+                                    pass
+                                return
+                            if new_rc_ad is not None:
+                                def _finish_boot_reconnect_on_ui(ad_res=new_rc_ad):
+                                    global active_adapter, _initial_positions_verified
+                                    if (
+                                        _boot_rc_abort()
+                                        or active_adapter is not None
+                                    ):
+                                        return
+                                    try:
+                                        if not pf.winfo_exists():
+                                            return
+                                    except Exception:
+                                        return
+                                    with _in_flight_poll_lock:
+                                        _bump_adapter_epoch()
+                                        _deferred_alarms.clear()
+                                        _pf_initial_shown["needs_bg_sync"] = False
+                                        _initial_positions_verified = False
+                                        active_adapter = ad_res
+                                        config["active_broker"] = boot_rc_b
+                                        populate_account_dropdown()
+                                        refresh_baseline_preview(force_restore=True)
+                                    _sync_broker_acct_pills()
+                                    _fp_hooks["schedule"]()
+                                    if default_status_lbl is not None:
+                                        try:
+                                            default_status_lbl.config(
+                                                text=f"✓ Connected {boot_rc_b} automatically once network came online.",
+                                                fg="#34d399",
+                                            )
+                                        except Exception:
+                                            pass
+                                    if _IS_MAIN_PROCESS:
+                                        start_background_update_check(
+                                            pf, cancel_pf_fn=_cancel_pf_timers
+                                        )
+
+                                try:
+                                    pf.after(0, _finish_boot_reconnect_on_ui)
+                                except Exception:
+                                    pass
+                                return
+
+                        def _show_offline_rc_on_ui():
+                            if _boot_rc_abort() or active_adapter is not None:
+                                return
+                            if default_status_lbl is not None:
+                                try:
+                                    default_status_lbl.config(
+                                        text=f"⚠️ Still offline — could not reach {boot_rc_b} at startup. Click API Keys or retry when online.",
+                                        fg="#fbbf24",
+                                    )
+                                except Exception:
+                                    pass
+
+                        try:
+                            pf.after(0, _show_offline_rc_on_ui)
+                        except Exception:
+                            pass
+
+                    threading.Thread(
+                        target=_bg_startup_reconnect_worker, daemon=True
+                    ).start()
 
     if post_daily_breach_prompt:
         pf.after(150, show_daily_breach_return_notice)
@@ -46444,7 +48038,7 @@ def _spawn_updated_enforcer(target_py):
     """Launches the newly updated enforcer.py process without a visible console
     window (unless '--console' was passed or show_debug_console is enabled)."""
     want_con = _peek_saved_debug_console_pref()
-    extra_args = ["--console"] if "--console" in sys.argv else []
+    extra_args = [fl for fl in ("--console", "--startup") if fl in sys.argv]
     if not want_con:
         py_dir = os.path.dirname(os.path.abspath(sys.executable))
         pyw_cand = os.path.join(py_dir, "pythonw.exe")
@@ -46488,29 +48082,16 @@ if __name__ == "__main__":
             sys.exit(0)
 
         load_config(log_restore=True)
-        initial_broker = config.get("active_broker", "SCHWAB")
-        active_adapter = connect_broker_adapter(
-            initial_broker, fast_startup=True
-        )
-
-        # Safe fallback: if the active broker failed to connect and the other
-        # broker already has saved credentials, switch to it automatically.
-        if active_adapter is None:
-            fallback_broker = (
-                "SCHWAB" if initial_broker == "WEBULL" else "WEBULL"
-            )
-            fb_cfg = config.get("brokers", {}).get(fallback_broker, {})
-            if fb_cfg.get("app_key") and fb_cfg.get("app_secret"):
+        if (not _config_load_corrupt) and bool(config.get("start_with_windows", False)):
+            _sh_reg = sync_windows_startup_registry(True, refresh_only=True)
+            if _sh_reg.get("changed"):
                 log_event(
-                    "SESSION",
-                    f"{initial_broker} connection failed. "
-                    f"Falling back to configured broker {fallback_broker}..."
+                    "CONFIG",
+                    "Refreshed Windows Startup Registry path for PnLEnforcerBeta.",
                 )
-                config["active_broker"] = fallback_broker
-                save_config(config)
-                active_adapter = connect_broker_adapter(
-                    fallback_broker, fast_startup=True
-                )
+        active_adapter = run_startup_broker_connect(
+            startup_boot=IS_WINDOWS_BOOT_STARTUP
+        )
 
         # Always open Pre-Flight even if active_adapter is None so the user
         # is never locked out of the Broker dropdown or API Keys button.
