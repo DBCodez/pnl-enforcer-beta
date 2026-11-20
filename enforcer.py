@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.76"
+APP_VERSION = "0.9.78"
 
 import os
 import sys
@@ -552,6 +552,90 @@ def _get_glow_dot_photo(widget, bg_hex="#141c28", dot_hex="#00e676", size=18):
     return photo
 
 
+def _get_capsule_led_photo(
+    widget, bg_hex="#181d26", led_hex="#22c55e", style="solid", size=12
+):
+    """Renders an anti-aliased 12x12 capsule status LED ('solid' orb or hollow
+    'ring') blended onto bg_hex with a dark contrast collar so it stays sharp
+    across dark-slate, emerald, amber, red, violet, and alarm-gold pills."""
+    norm_style = "ring" if str(style).lower() == "ring" else "solid"
+    bytes_key = ("capsule_led_v1", bg_hex, led_hex, norm_style, int(size))
+    tk_id = id(widget.tk)
+    photo_key = (tk_id, bytes_key)
+    cached = _GLASS_PHOTO_CACHE.get(photo_key)
+    if cached is not None:
+        return cached
+    png_bytes = _GLASS_PNG_BYTES_CACHE.get(bytes_key)
+    if png_bytes is None:
+        bg_r, bg_g, bg_b = _hex_to_rgb_tuple(bg_hex, (24, 29, 38))
+        dt_r, dt_g, dt_b = _hex_to_rgb_tuple(led_hex, (34, 197, 94))
+        col_r, col_g, col_b = _hex_to_rgb_tuple(
+            _blend_hex(bg_hex, "#05070b", 0.55), (10, 12, 17)
+        )
+        cx = (size - 1) / 2.0
+        cy = (size - 1) / 2.0
+        rows = []
+        for y in range(size):
+            row = bytearray(b"\x00")
+            for x in range(size):
+                dist = math.hypot(x - cx, y - cy)
+                if norm_style == "ring":
+                    outer_r = 4.0
+                    inner_r = 2.2
+                    ring_cov = min(
+                        max(0.0, min(1.0, (outer_r + 0.5) - dist)),
+                        max(0.0, min(1.0, dist - (inner_r - 0.5))),
+                    )
+                    collar_cov = max(0.0, min(1.0, (outer_r + 1.2) - dist))
+                    bg_cr = bg_r * (1.0 - collar_cov * 0.65) + col_r * (collar_cov * 0.65)
+                    bg_cg = bg_g * (1.0 - collar_cov * 0.65) + col_g * (collar_cov * 0.65)
+                    bg_cb = bg_b * (1.0 - collar_cov * 0.65) + col_b * (collar_cov * 0.65)
+                    fr = int(bg_cr * (1.0 - ring_cov) + dt_r * ring_cov)
+                    fg = int(bg_cg * (1.0 - ring_cov) + dt_g * ring_cov)
+                    fb = int(bg_cb * (1.0 - ring_cov) + dt_b * ring_cov)
+                else:
+                    core_r = 3.6
+                    collar_cov = max(0.0, min(1.0, (core_r + 1.25) - dist))
+                    base_r = bg_r * (1.0 - collar_cov * 0.65) + col_r * (collar_cov * 0.65)
+                    base_g = bg_g * (1.0 - collar_cov * 0.65) + col_g * (collar_cov * 0.65)
+                    base_b = bg_b * (1.0 - collar_cov * 0.65) + col_b * (collar_cov * 0.65)
+                    if dist <= core_r + 0.5:
+                        cov = max(0.0, min(1.0, (core_r + 0.5) - dist))
+                        spec = max(
+                            0.0,
+                            1.0 - math.hypot(x - (cx - 1.1), y - (cy - 1.1)) / 2.6,
+                        ) * 0.60
+                        cr = dt_r + (255 - dt_r) * spec
+                        cg = dt_g + (255 - dt_g) * spec
+                        cb = dt_b + (255 - dt_b) * spec
+                        ga = 0.40
+                        or_ = base_r + (dt_r - base_r) * ga
+                        og_ = base_g + (dt_g - base_g) * ga
+                        ob_ = base_b + (dt_b - base_b) * ga
+                        fr = int(or_ * (1.0 - cov) + cr * cov)
+                        fg = int(og_ * (1.0 - cov) + cg * cov)
+                        fb = int(ob_ * (1.0 - cov) + cb * cov)
+                    else:
+                        ga = 0.35 * math.exp(-(dist - core_r) * 0.70)
+                        fr = int(base_r + (dt_r - base_r) * ga)
+                        fg = int(base_g + (dt_g - base_g) * ga)
+                        fb = int(base_b + (dt_b - base_b) * ga)
+                row += bytes(
+                    (
+                        max(0, min(255, fr)),
+                        max(0, min(255, fg)),
+                        max(0, min(255, fb)),
+                        255,
+                    )
+                )
+            rows.append(bytes(row))
+        png_bytes = _pack_rgba_png(size, size, b"".join(rows))
+        _GLASS_PNG_BYTES_CACHE[bytes_key] = png_bytes
+    photo = tk.PhotoImage(master=widget, data=png_bytes)
+    _GLASS_PHOTO_CACHE[photo_key] = photo
+    return photo
+
+
 def _get_glass_checkbox_photo(
     widget,
     bg_hex="#131922",
@@ -1006,8 +1090,9 @@ class RulebookPillBadge(tk.Canvas):
 
 class HudCapsulePill(tk.Canvas):
     """Anti-aliased flat-glass stadium capsule widget for the HUD bottom bar
-    with a single 1px border, flat dark fill, and drop-in tk.Button / tk.Label
-    .config() compatibility."""
+    with a single 1px border, flat dark fill, optional anti-aliased status LED
+    (with fast itemconfig updates), and drop-in tk.Button / tk.Label .config()
+    compatibility."""
 
     def __init__(
         self,
@@ -1024,7 +1109,10 @@ class HudCapsulePill(tk.Canvas):
         command=None,
         cursor="",
         auto_width=False,
-        pad_x=26
+        pad_x=26,
+        show_status_led=False,
+        led_hex="#7dd3fc",
+        led_style="ring",
     ):
         super().__init__(
             parent,
@@ -1047,7 +1135,13 @@ class HudCapsulePill(tk.Canvas):
         self._min_width = int(width)
         self._auto_width = bool(auto_width)
         self._pad_x = int(pad_x)
+        self._show_status_led = bool(show_status_led)
+        self._led_hex = str(led_hex)
+        self._led_style = str(led_style)
+        self._eff_fill_hex = bg if bg != "#282c31" else "#181d26"
         self._bg_photo = None
+        self._led_photo = None
+        self._led_img_id = None
         self.bind("<Configure>", self._redraw)
         self.bind("<Button-1>", self._on_click)
 
@@ -1058,77 +1152,133 @@ class HudCapsulePill(tk.Canvas):
     def config(self, **kwargs):
         self.configure(**kwargs)
 
+    @staticmethod
+    def _map_bg_palette(new_bg):
+        if new_bg in ("#333333", "#222629", "#262626", "#282c31"):
+            return "#1b222c", "#475569", "#3b4c63"
+        if new_bg in ("#ff0000", "#8b0000", "#922b21"):
+            return "#45141e", "#ff5252", "#ff1744"
+        if new_bg in ("yellow", "#facc15", "#eab308", "#f59e0b", "#fbbf24"):
+            return "#eab308", "#fef08a", "#facc15"
+        if new_bg in (
+            "#00e676", "#2ecc71", "#27ae60", "#1e8449", "#196f3d", "#145a32"
+        ):
+            return "#10452c", "#00e676", "#00e676"
+        auto_rim = _blend_hex(new_bg, "#ffffff", 0.32)
+        return new_bg, auto_rim, auto_rim
+
     def configure(self, **kwargs):
         redraw_needed = False
+        led_only_change = False
         if "text" in kwargs:
-            self._text = kwargs.pop("text")
-            redraw_needed = True
+            new_t = kwargs.pop("text")
+            if new_t != self._text:
+                self._text = new_t
+                redraw_needed = True
         if "bg" in kwargs:
-            new_bg = kwargs.pop("bg")
-            if new_bg in ("#333333", "#222629", "#262626", "#282c31"):
-                self._bg = "#1b222c"
-                self._rim = "#475569"
-                self._glow = "#3b4c63"
-            elif new_bg in ("#ff0000", "#8b0000", "#922b21"):
-                self._bg = "#45141e"
-                self._rim = "#ff5252"
-                self._glow = "#ff1744"
-            elif new_bg in ("yellow", "#facc15", "#eab308", "#f59e0b", "#fbbf24"):
-                self._bg = "#eab308"
-                self._rim = "#fef08a"
-                self._glow = "#facc15"
-            elif new_bg in (
-                "#00e676", "#2ecc71", "#27ae60", "#1e8449", "#196f3d", "#145a32"
+            new_bg_raw = kwargs.pop("bg")
+            mapped_bg, mapped_rim, mapped_glow = self._map_bg_palette(new_bg_raw)
+            if "rim" in kwargs:
+                mapped_rim = kwargs.pop("rim")
+            if "glow" in kwargs:
+                mapped_glow = kwargs.pop("glow")
+            if (
+                mapped_bg != self._bg
+                or mapped_rim != self._rim
+                or mapped_glow != self._glow
             ):
-                self._bg = "#10452c"
-                self._rim = "#00e676"
-                self._glow = "#00e676"
-            else:
-                self._bg = new_bg
-                self._rim = _blend_hex(new_bg, "#ffffff", 0.32)
-                self._glow = self._rim
-            redraw_needed = True
+                self._bg = mapped_bg
+                self._rim = mapped_rim
+                self._glow = mapped_glow
+                redraw_needed = True
         if "rim" in kwargs:
-            self._rim = kwargs.pop("rim")
-            redraw_needed = True
+            new_rim = kwargs.pop("rim")
+            if new_rim != self._rim:
+                self._rim = new_rim
+                redraw_needed = True
         if "glow" in kwargs:
-            self._glow = kwargs.pop("glow")
-            redraw_needed = True
+            new_glow = kwargs.pop("glow")
+            if new_glow != self._glow:
+                self._glow = new_glow
+                redraw_needed = True
         if "font" in kwargs:
-            self._font = kwargs.pop("font")
-            redraw_needed = True
+            new_font = kwargs.pop("font")
+            if new_font != self._font:
+                self._font = new_font
+                redraw_needed = True
         if "fg" in kwargs:
-            self._fg = kwargs.pop("fg")
-            redraw_needed = True
+            new_fg = kwargs.pop("fg")
+            if new_fg != self._fg:
+                self._fg = new_fg
+                redraw_needed = True
         if "disabledforeground" in kwargs:
-            self._disabled_fg = kwargs.pop("disabledforeground")
-            redraw_needed = True
+            new_dfg = kwargs.pop("disabledforeground")
+            if new_dfg != self._disabled_fg:
+                self._disabled_fg = new_dfg
+                redraw_needed = True
         if "state" in kwargs:
-            self._state = kwargs.pop("state")
-            self.configure(
-                cursor="hand2"
-                if (self._state == "normal" and self._command is not None)
+            new_st = kwargs.pop("state")
+            new_cur = (
+                "hand2"
+                if (new_st == "normal" and self._command is not None)
                 else ""
             )
-            redraw_needed = True
+            if str(self.cget("cursor") or "") != new_cur:
+                super().configure(cursor=new_cur)
+            if new_st != self._state:
+                self._state = new_st
+                redraw_needed = True
         if "command" in kwargs:
             self._command = kwargs.pop("command")
         if "min_width" in kwargs:
-            self._min_width = int(kwargs.pop("min_width"))
-            redraw_needed = True
+            new_mw = int(kwargs.pop("min_width"))
+            if new_mw != self._min_width:
+                self._min_width = new_mw
+                redraw_needed = True
         if "pad_x" in kwargs:
-            self._pad_x = int(kwargs.pop("pad_x"))
-            redraw_needed = True
+            new_px = int(kwargs.pop("pad_x"))
+            if new_px != self._pad_x:
+                self._pad_x = new_px
+                redraw_needed = True
+        if "show_status_led" in kwargs:
+            new_sled = bool(kwargs.pop("show_status_led"))
+            if new_sled != self._show_status_led:
+                self._show_status_led = new_sled
+                redraw_needed = True
+        if "led_hex" in kwargs:
+            new_lh = str(kwargs.pop("led_hex"))
+            if new_lh != self._led_hex:
+                self._led_hex = new_lh
+                led_only_change = True
+        if "led_style" in kwargs:
+            new_ls = str(kwargs.pop("led_style"))
+            if new_ls != self._led_style:
+                self._led_style = new_ls
+                led_only_change = True
         if kwargs:
             try:
                 super().configure(**kwargs)
             except tk.TclError:
                 pass
-        if redraw_needed:
-            self._redraw()
+        if redraw_needed or (led_only_change and (not self._show_status_led or self._led_img_id is None)):
+            if redraw_needed or (self._show_status_led and self._led_img_id is None):
+                self._redraw()
+        elif led_only_change and self._show_status_led and self._led_img_id is not None:
+            self._led_photo = _get_capsule_led_photo(
+                self,
+                bg_hex=self._eff_fill_hex,
+                led_hex=self._led_hex,
+                style=self._led_style,
+                size=12,
+            )
+            try:
+                self.itemconfig(self._led_img_id, image=self._led_photo)
+            except tk.TclError:
+                self._redraw()
 
     def _redraw(self, event=None):
         self.delete("all")
+        self._led_img_id = None
         w = self.winfo_width()
         h = self.winfo_height()
         if w <= 10:
@@ -1138,6 +1288,13 @@ class HudCapsulePill(tk.Canvas):
 
         render_font = self._font
         render_text = self._text
+        if self._show_status_led and render_text:
+            if render_text.startswith("● "):
+                render_text = render_text[2:]
+            elif render_text.startswith("🔇 ● "):
+                render_text = "🔇 " + render_text[4:]
+        led_slot = 16 if self._show_status_led else 0
+        final_txt_w = 0
         if render_text:
             probe_id = self.create_text(
                 0, 0, text=render_text, font=self._font, anchor="nw"
@@ -1145,12 +1302,17 @@ class HudCapsulePill(tk.Canvas):
             bbox = self.bbox(probe_id)
             self.delete(probe_id)
             text_w = (bbox[2] - bbox[0]) if bbox else 0
+            final_txt_w = text_w
             if self._auto_width:
-                target_w = max(self._min_width, int(text_w + self._pad_x))
+                target_w = max(self._min_width, int(text_w + self._pad_x + led_slot))
                 if abs(int(self["width"]) - target_w) > 1:
                     super().configure(width=target_w)
                 w = max(w, target_w) if w <= target_w + 4 else target_w
-            elif text_w > (w - 14) and isinstance(self._font, tuple) and len(self._font) >= 2:
+            elif (
+                text_w > (w - 14 - led_slot)
+                and isinstance(self._font, tuple)
+                and len(self._font) >= 2
+            ):
                 smaller_pt = max(7, int(self._font[1]) - 1)
                 render_font = (self._font[0], smaller_pt) + tuple(self._font[2:])
                 probe_id2 = self.create_text(
@@ -1159,7 +1321,8 @@ class HudCapsulePill(tk.Canvas):
                 bbox2 = self.bbox(probe_id2)
                 self.delete(probe_id2)
                 text_w2 = (bbox2[2] - bbox2[0]) if bbox2 else 0
-                max_txt_w = max(24, w - 12)
+                final_txt_w = text_w2
+                max_txt_w = max(24, w - 12 - led_slot)
                 if text_w2 > max_txt_w and len(render_text) > 4:
                     trimmed = render_text
                     while len(trimmed) > 3:
@@ -1170,16 +1333,20 @@ class HudCapsulePill(tk.Canvas):
                         )
                         bb = self.bbox(pid)
                         self.delete(pid)
-                        if not bb or (bb[2] - bb[0]) <= max_txt_w:
+                        cand_w = (bb[2] - bb[0]) if bb else 0
+                        if not bb or cand_w <= max_txt_w:
                             render_text = cand
+                            final_txt_w = cand_w
                             break
 
+        fill_hex = self._bg if self._bg != "#282c31" else "#181d26"
+        self._eff_fill_hex = fill_hex
         self._bg_photo = _get_glass_pill_photo(
             self,
             w,
             h,
             bg_hex="#1a1a1a",
-            fill_hex=self._bg if self._bg != "#282c31" else "#181d26",
+            fill_hex=fill_hex,
             border_hex=self._rim if self._rim != "#6c757d" else "#364152",
             glow_hex=self._glow,
             hover=False,
@@ -1189,13 +1356,36 @@ class HudCapsulePill(tk.Canvas):
         txt_col = (
             self._fg if self._state == "normal" else (self._disabled_fg or self._fg)
         )
-        self.create_text(
-            int(w // 2),
-            int(h // 2),
-            text=render_text,
-            font=render_font,
-            fill=txt_col
-        )
+        if self._show_status_led:
+            gap_px = 4 if render_text else 0
+            group_w = 12 + gap_px + final_txt_w
+            left_x = max(6, int((w - group_w) // 2))
+            self._led_photo = _get_capsule_led_photo(
+                self,
+                bg_hex=fill_hex,
+                led_hex=self._led_hex,
+                style=self._led_style,
+                size=12,
+            )
+            self._led_img_id = self.create_image(
+                left_x + 6, int(h // 2), image=self._led_photo, anchor="center"
+            )
+            if render_text:
+                self.create_text(
+                    left_x + 12 + gap_px + int(final_txt_w // 2),
+                    int(h // 2),
+                    text=render_text,
+                    font=render_font,
+                    fill=txt_col,
+                )
+        else:
+            self.create_text(
+                int(w // 2),
+                int(h // 2),
+                text=render_text,
+                font=render_font,
+                fill=txt_col
+            )
 
 
 class _WIN32_POINT(ctypes.Structure):
@@ -2413,6 +2603,9 @@ has_reset_at_close = False
 is_locked_down = False
 active_breach_source = ""
 last_breach_trigger_net_pnl = None
+_breach_pin_rt_pending = False
+_breach_pin_retired = False
+_lock_from_presync_save = False
 done_for_today = False
 committed_for_today = False
 force_reanchor = False
@@ -2423,6 +2616,7 @@ _launch_grace_syms = {}
 _launch_grace_ref_opnl = {}
 _launch_grace_ref_net = None
 _launch_fee_drift_checked = False
+_launch_live_sync_deferred = False
 _restored_session_saved_epoch = 0.0
 _restored_session_was_flat = True
 _restored_open_positions_at_save = {}
@@ -2432,6 +2626,9 @@ _reconciled_order_qty = {}
 _off_session_peak_reconstructed = False
 _off_session_reconciled = False
 _cold_launch_ignored_qty_mutated = False
+_last_live_hud_snapshot = None
+_pending_postlaunch_auth = None
+_postlaunch_auth_lock = threading.Lock()
 
 alarm_active = False
 _alarm_loop_gen = 0
@@ -2480,6 +2677,13 @@ active_session_date = None
 _uncloseable_fractional_syms = set()
 _initial_positions_verified = False
 last_data_loop_heartbeat = 0.0
+_last_data_loop_hb_mono = 0.0
+_last_fresh_poll_info = None
+_feed_degrade_streak = 0
+_feed_wake_resync_until_fresh = False
+_feed_clock_probe = {"mono": 0.0, "wall": 0.0}
+_hud_compact_had_age_suffix = False
+_upside_glow_until_mono = 0.0
 _calendar_table_warned = False
 active_preflight_close_fn = None
 active_preflight_win = None
@@ -2572,13 +2776,31 @@ _adapter_epoch = 0
 _adapter_epoch_lock = threading.Lock()
 
 
+def _touch_data_loop_heartbeat():
+    """Updates both wall-clock and monotonic data_loop heartbeats together so
+    stall detection never triggers falsely on Windows/NTP clock adjustments."""
+    global last_data_loop_heartbeat, _last_data_loop_hb_mono
+    last_data_loop_heartbeat = time.time()
+    _last_data_loop_hb_mono = time.monotonic()
+
+
 def _bump_adapter_epoch():
     """Atomically increments _adapter_epoch whenever the active broker, account,
     or Demo Sandbox state is swapped/reset so any in-flight data_loop() poll
     from the previous epoch aborts cleanly without mutating the new session."""
-    global _adapter_epoch
+    global _adapter_epoch, _last_fresh_poll_info, _feed_degrade_streak
+    global _feed_wake_resync_until_fresh, _last_live_hud_snapshot
+    global _pending_postlaunch_auth
+    with _postlaunch_auth_lock:
+        _pending_postlaunch_auth = None
     with _adapter_epoch_lock:
         _adapter_epoch += 1
+        _last_fresh_poll_info = None
+        _feed_degrade_streak = 0
+        _feed_wake_resync_until_fresh = False
+        _feed_clock_probe["wall"] = 0.0
+        _feed_clock_probe["mono"] = 0.0
+        _last_live_hud_snapshot = None
         return _adapter_epoch
 
 
@@ -4382,24 +4604,27 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     global start_equity, max_equity, daily_max_equity, daily_min_equity
     global last_flat_equity, anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close, is_locked_down, active_breach_source
-    global last_breach_trigger_net_pnl
+    global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
+    global _last_fresh_poll_info, _feed_degrade_streak, _feed_wake_resync_until_fresh
     global done_for_today, committed_for_today
     global win_trades, loss_trades, prev_flat_realized_pnl
     global _last_round_trip_close_ts, _pending_subpoll_consec_reason
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
-    global current_upside_tier, first_poll_of_launch, _launch_fee_drift_checked
+    global current_upside_tier, first_poll_of_launch, _launch_fee_drift_checked, _launch_live_sync_deferred
     global _launch_grace_pending, _launch_grace_syms, _launch_grace_ref_opnl, _launch_grace_ref_net
     global _restored_session_saved_epoch, _restored_session_was_flat
     global _restored_open_positions_at_save, _restored_has_open_pos_snapshot
     global _reconciled_through_epoch, _reconciled_order_qty
     global _off_session_peak_reconstructed
     global _off_session_reconciled, _cold_launch_ignored_qty_mutated
+    global _last_live_hud_snapshot
     global recent_loss_timestamps, ignored_positions, pending_halt_breach
     global active_non_breach_halted_syms, _notified_non_breach_halt_syms
     global active_session_date
 
     _launch_fee_drift_checked = False
+    _launch_live_sync_deferred = False
     _launch_grace_pending = True
     _launch_grace_syms.clear()
     _launch_grace_ref_opnl.clear()
@@ -4415,6 +4640,15 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     _cold_launch_ignored_qty_mutated = False
     active_breach_source = ""
     last_breach_trigger_net_pnl = None
+    _breach_pin_rt_pending = False
+    _breach_pin_retired = False
+    _lock_from_presync_save = False
+    _last_fresh_poll_info = None
+    _feed_degrade_streak = 0
+    _feed_wake_resync_until_fresh = False
+    _feed_clock_probe["wall"] = 0.0
+    _feed_clock_probe["mono"] = 0.0
+    _last_live_hud_snapshot = None
     recent_loss_timestamps.clear()
     ignored_positions.clear()
     pending_halt_breach = None
@@ -4519,9 +4753,21 @@ def restore_account_session(broker_name, account_id, log_restore=False):
                         last_breach_trigger_net_pnl = round(float(raw_btrig), 2)
                     except Exception:
                         last_breach_trigger_net_pnl = None
+                _breach_pin_rt_pending = bool(
+                    s_data.get("breach_pin_rt_pending", not _restored_session_was_flat)
+                ) if last_breach_trigger_net_pnl is not None else False
+                _breach_pin_retired = bool(
+                    s_data.get("breach_pin_retired", False)
+                ) if last_breach_trigger_net_pnl is None else False
+                _lock_from_presync_save = bool(
+                    s_data.get("lock_from_presync_save", False)
+                )
             else:
                 active_breach_source = ""
                 last_breach_trigger_net_pnl = None
+                _breach_pin_rt_pending = False
+                _breach_pin_retired = False
+                _lock_from_presync_save = False
             done_for_today = bool(
                 s_data.get("done_for_today", False)
                 and s_data.get("done_for_today_date") == today_str
@@ -4985,6 +5231,19 @@ def save_session_state(
                 round(float(last_breach_trigger_net_pnl), 2)
                 if (is_locked_down and last_breach_trigger_net_pnl is not None)
                 else None
+            ),
+            "breach_pin_rt_pending": bool(
+                _breach_pin_rt_pending
+                and is_locked_down
+                and last_breach_trigger_net_pnl is not None
+            ),
+            "breach_pin_retired": bool(
+                _breach_pin_retired
+                and is_locked_down
+                and last_breach_trigger_net_pnl is None
+            ),
+            "lock_from_presync_save": bool(
+                _lock_from_presync_save and is_locked_down
             ),
             "done_for_today": bool(done_for_today),
             "done_for_today_date": today_str if done_for_today else "",
@@ -6058,6 +6317,52 @@ def prompt_schwab_oauth_url_dialog(auth_url=""):
     return result["url"]
 
 
+def _compute_orders_cache_inv_sig(ad_obj, acct_k):
+    """Returns `(pos_sig, settled_eq_sig)` for `acct_k` so `_get_orders_window_cached`,
+    `_filled_since_cache`, and `_filled_today_cache` automatically invalidate cached
+    `/orders` responses whenever open inventory or settled equity changes (including
+    round-trips closed while holding ignored swing positions) between Pre-Flight sync
+    and HUD Poll #1."""
+    raw_pos_map = getattr(ad_obj, "_last_raw_pos_details", None)
+    acct_pos = (
+        raw_pos_map.get(acct_k, {})
+        if isinstance(raw_pos_map, dict)
+        else {}
+    )
+    pos_sig = tuple(
+        sorted(
+            (
+                str(pk),
+                round(float(pv.get("qty", 0.0) or 0.0), 6),
+                round(float(pv.get("avg", 0.0) or 0.0), 4),
+            )
+            for pk, pv in (acct_pos or {}).items()
+            if isinstance(pv, dict) and abs(float(pv.get("qty", 0.0) or 0.0)) > 1e-6
+        )
+    )
+    open_pnl_sum = sum(
+        float(pv.get("open_pnl", 0.0) or 0.0)
+        for pv in (acct_pos or {}).values()
+        if isinstance(pv, dict)
+    )
+    raw_eq_map = getattr(ad_obj, "_last_raw_adj_eq", None)
+    raw_eq_v = (
+        raw_eq_map.get(acct_k)
+        if isinstance(raw_eq_map, dict)
+        else None
+    )
+    settled_eq_sig = (
+        (
+            round(float(raw_eq_v), 2)
+            if not pos_sig
+            else round(float(raw_eq_v) - open_pnl_sum, 1)
+        )
+        if raw_eq_v is not None
+        else None
+    )
+    return (pos_sig, settled_eq_sig)
+
+
 class SchwabAdapter:
     name = "SCHWAB"
 
@@ -6068,6 +6373,7 @@ class SchwabAdapter:
         self.account_id = None
         self.accounts = []
         self._cache_lock = threading.Lock()
+        self._orders_fetch_lock = threading.Lock()
         self._snapshot_gen = 0
         self.last_snapshot_was_cached = False
         self._last_flatten_outcome = "FLAT"
@@ -6084,6 +6390,8 @@ class SchwabAdapter:
         self._last_intraday_cash_flow = {}
         self._last_snapshot_epoch = {}
         self._filled_since_cache = {}
+        self._filled_today_cache = {}
+        self._raw_orders_window_cache = {}
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
         self.last_coverage_lookup_failed = False
@@ -6097,16 +6405,30 @@ class SchwabAdapter:
         self._trade_perm_cache = {}
         self.last_error = ""
 
+    def _ensure_orders_cache_infra(self):
+        if not hasattr(self, "_cache_lock") or self._cache_lock is None:
+            self._cache_lock = threading.Lock()
+        if not hasattr(self, "_orders_fetch_lock") or self._orders_fetch_lock is None:
+            self._orders_fetch_lock = threading.Lock()
+        if not hasattr(self, "_snapshot_gen"):
+            self._snapshot_gen = 0
+        if not isinstance(getattr(self, "_raw_orders_window_cache", None), dict):
+            self._raw_orders_window_cache = {}
+        if not isinstance(getattr(self, "_filled_since_cache", None), dict):
+            self._filled_since_cache = {}
+        if not isinstance(getattr(self, "_filled_today_cache", None), dict):
+            self._filled_today_cache = {}
+
     def invalidate_cached_snapshots(self):
+        self._ensure_orders_cache_infra()
         with self._cache_lock:
             self._snapshot_gen += 1
             self._last_good_snapshot.clear()
             self._last_open_eq.clear()
             self._last_open_opt.clear()
-            if hasattr(self, "_filled_since_cache") and isinstance(
-                self._filled_since_cache, dict
-            ):
-                self._filled_since_cache.clear()
+            self._filled_since_cache.clear()
+            self._filled_today_cache.clear()
+            self._raw_orders_window_cache.clear()
 
     def _prune_pending_flatten_cids(self, acct_id, live_qty_map):
         if not acct_id or not self._pending_flatten_cids:
@@ -6437,6 +6759,12 @@ class SchwabAdapter:
                 except Exception:
                     pass
                 self.client = new_client
+                self._ensure_orders_cache_infra()
+                with self._cache_lock:
+                    self._snapshot_gen += 1
+                    self._raw_orders_window_cache.clear()
+                    self._filled_since_cache.clear()
+                    self._filled_today_cache.clear()
                 self._trade_perm_cache.pop(self.account_id, None)
                 return True
         except Exception as e:
@@ -7125,37 +7453,184 @@ class SchwabAdapter:
         except Exception:
             return s[:10]
 
+    def _get_orders_window_cached(self, window_tag="58d", ttl_sec=8.0):
+        """Coalesces concurrent Schwab order-history queries behind a timeout-
+        bounded single-flight lock and caches the raw JSON list for `ttl_sec`
+        seconds keyed by `(account_id, _snapshot_gen, window_tag)` so
+        Pre-Flight sync, fee-drift checks, and data_loop Poll #1 share one
+        fetch while `reconnect_session()` / `invalidate_cached_snapshots()`
+        always isolate stale responses."""
+        self._ensure_orders_cache_infra()
+        if not self.client or not self.account_id:
+            return None
+        win_tag = "36h" if str(window_tag) == "36h" else "58d"
+
+        def _lookup_cached_locked(
+            acct_k, gen_k, cl_obj, inv_sig, cur_snap_ep, now_t
+        ):
+            cand = self._raw_orders_window_cache.get((acct_k, gen_k, win_tag))
+            if cand is None and win_tag == "36h":
+                cand = self._raw_orders_window_cache.get((acct_k, gen_k, "58d"))
+            if (
+                isinstance(cand, tuple)
+                and len(cand) >= 7
+                and (now_t - float(cand[0])) < float(ttl_sec)
+                and cand[2] is cl_obj
+                and cand[3] is self._filled_since_cache
+                and cand[4] is self._filled_today_cache
+                and cand[5] == inv_sig
+                and (
+                    cur_snap_ep <= 0.0
+                    or float(cand[1]) <= 0.0
+                    or abs(cur_snap_ep - float(cand[1])) < float(ttl_sec)
+                )
+            ):
+                return list(cand[6])
+            return None
+
+        acct_cur = str(self.account_id)
+        inv_sig_cur = _compute_orders_cache_inv_sig(self, acct_cur)
+        snap_ep_cur = self.get_last_snapshot_epoch()
+        with self._cache_lock:
+            hit = _lookup_cached_locked(
+                acct_cur,
+                self._snapshot_gen,
+                self.client,
+                inv_sig_cur,
+                snap_ep_cur,
+                time.time(),
+            )
+        if hit is not None:
+            return hit
+
+        acquired = self._orders_fetch_lock.acquire(timeout=6.0)
+        try:
+            with self._cache_lock:
+                gen_before = self._snapshot_gen
+                cl_before = self.client
+                acct_before = str(self.account_id or "")
+                fs_before = self._filled_since_cache
+                ft_before = self._filled_today_cache
+                inv_sig_before = _compute_orders_cache_inv_sig(self, acct_before)
+                snap_ep_before = self.get_last_snapshot_epoch()
+                hit2 = _lookup_cached_locked(
+                    acct_before,
+                    gen_before,
+                    cl_before,
+                    inv_sig_before,
+                    snap_ep_before,
+                    time.time(),
+                )
+            if hit2 is not None:
+                return hit2
+            if not cl_before or not acct_before:
+                return None
+
+            now_utc = datetime.now(timezone.utc)
+            from_dt = (
+                now_utc - timedelta(hours=36)
+                if win_tag == "36h"
+                else now_utc - timedelta(days=58)
+            )
+            to_dt = now_utc + timedelta(hours=1)
+            t0 = time.monotonic()
+            try:
+                resp = cl_before.get_orders_for_account(
+                    acct_before,
+                    from_entered_datetime=from_dt,
+                    to_entered_datetime=to_dt,
+                    max_results=3000,
+                )
+            except TypeError:
+                try:
+                    resp = cl_before.get_orders_for_account(
+                        acct_before,
+                        from_entered_datetime=from_dt,
+                        to_entered_datetime=to_dt,
+                    )
+                except TypeError:
+                    resp = cl_before.get_orders_for_account(acct_before)
+            if resp is None or getattr(resp, "status_code", None) != 200:
+                return None
+            orders = resp.json()
+            if not isinstance(orders, list):
+                return None
+            dt_ms = (time.monotonic() - t0) * 1000.0
+            try:
+                resp_kb = len(getattr(resp, "content", b"") or b"") / 1024.0
+            except Exception:
+                resp_kb = 0.0
+            if (
+                dt_ms >= 250.0
+                or first_poll_of_launch
+                or not _initial_positions_verified
+            ):
+                log_event(
+                    "PERF",
+                    f"Schwab get_orders_for_account({win_tag}) fetched "
+                    f"{len(orders)} order(s) ({resp_kb:.1f} KB) in {dt_ms:.0f}ms.",
+                )
+            if len(orders) >= 3000:
+                log_event(
+                    "WARN",
+                    f"Schwab {win_tag} order query returned {len(orders)} orders "
+                    f"(reached 3,000-order cap); oldest orders in window may be truncated.",
+                )
+            with self._cache_lock:
+                if (
+                    self._snapshot_gen == gen_before
+                    and self.client is cl_before
+                    and str(self.account_id or "") == acct_before
+                ):
+                    if len(self._raw_orders_window_cache) > 24:
+                        self._raw_orders_window_cache.clear()
+                    self._raw_orders_window_cache[(acct_before, gen_before, win_tag)] = (
+                        time.time(),
+                        snap_ep_before,
+                        cl_before,
+                        fs_before,
+                        ft_before,
+                        inv_sig_before,
+                        list(orders),
+                    )
+            return orders
+        except Exception:
+            return None
+        finally:
+            if acquired:
+                try:
+                    self._orders_fetch_lock.release()
+                except Exception:
+                    pass
+
     def has_any_filled_orders_today(self):
         """Returns False ONLY when the broker API confirms zero orders have been
         filled (or partially filled) on today's US/Eastern calendar date.
         Defaults to True on any API error so baseline fee-drift absorption is
         100% fail-safe."""
+        self._ensure_orders_cache_infra()
         if not self.client or not self.account_id:
             return True
         today_str = get_today_str()
-        cache_map = getattr(self, "_filled_today_cache", None)
-        if not isinstance(cache_map, dict):
-            cache_map = {}
-            self._filled_today_cache = cache_map
+        gen_cur = int(getattr(self, "_snapshot_gen", 0))
+        cl_cur = self.client
+        inv_sig_cur = _compute_orders_cache_inv_sig(self, str(self.account_id))
+        cache_map = self._filled_today_cache
         c_key = (str(self.account_id), today_str)
         now_ts = time.time()
         cached = cache_map.get(c_key)
-        if cached is not None:
-            c_ts, c_val = cached
-            if c_val or (now_ts - c_ts) < 30.0:
-                return bool(c_val)
-        try:
-            now_utc = datetime.now(timezone.utc)
-            from_dt = now_utc - timedelta(days=58)
-            to_dt = now_utc + timedelta(hours=1)
-            resp = self.client.get_orders_for_account(
-                self.account_id,
-                from_entered_datetime=from_dt,
-                to_entered_datetime=to_dt,
-            )
-            if resp.status_code != 200:
+        if isinstance(cached, tuple) and len(cached) >= 5 and cached[2] is cl_cur:
+            c_ts, c_val = float(cached[0]), bool(cached[1])
+            if c_val:
                 return True
-            orders = resp.json()
+            if (
+                cached[3] == gen_cur
+                and cached[4] == inv_sig_cur
+                and (now_ts - c_ts) < 30.0
+            ):
+                return False
+        try:
+            orders = self._get_orders_window_cached("58d")
             if not isinstance(orders, list):
                 return True
             for o in orders:
@@ -7183,9 +7658,29 @@ class SchwabAdapter:
                                 if d_str:
                                     candidate_dates.add(d_str)
                 if today_str in candidate_dates:
-                    cache_map[c_key] = (now_ts, True)
+                    if (
+                        self.client is cl_cur
+                        and int(getattr(self, "_snapshot_gen", 0)) == gen_cur
+                    ):
+                        cache_map[c_key] = (
+                            now_ts,
+                            True,
+                            cl_cur,
+                            gen_cur,
+                            inv_sig_cur,
+                        )
                     return True
-            cache_map[c_key] = (now_ts, False)
+            if (
+                self.client is cl_cur
+                and int(getattr(self, "_snapshot_gen", 0)) == gen_cur
+            ):
+                cache_map[c_key] = (
+                    now_ts,
+                    False,
+                    cl_cur,
+                    gen_cur,
+                    inv_sig_cur,
+                )
             return False
         except Exception:
             return True
@@ -7212,20 +7707,7 @@ class SchwabAdapter:
             "BUY_TO_CLOSE",
         }
         try:
-            now_utc = datetime.now(timezone.utc)
-            from_dt = now_utc - timedelta(days=58)
-            to_dt = now_utc + timedelta(hours=1)
-            try:
-                resp = self.client.get_orders_for_account(
-                    self.account_id,
-                    from_entered_datetime=from_dt,
-                    to_entered_datetime=to_dt,
-                )
-            except TypeError:
-                resp = self.client.get_orders_for_account(self.account_id)
-            if resp.status_code != 200:
-                return False
-            orders = resp.json()
+            orders = self._get_orders_window_cached("58d")
             if not isinstance(orders, list):
                 return False
             for o in orders:
@@ -7282,11 +7764,12 @@ class SchwabAdapter:
         except Exception:
             return False
 
-    def fetch_filled_orders_since(self, since_epoch):
+    def fetch_filled_orders_since(self, since_epoch, fast_recent_only=False):
         """Fetches normalized execution fills on today's ET date at or after
-        `since_epoch` (with 58-day GTC lookback and recursive childOrderStrategies
-        traversal). Returns a chronologically sorted list of fill dicts, or None
-        on API failure."""
+        `since_epoch` (with 58-day GTC lookback, optional `36h` fast-path for
+        zero-delta flat launches, and recursive childOrderStrategies traversal).
+        Returns a chronologically sorted list of fill dicts, or None on API failure."""
+        self._ensure_orders_cache_infra()
         if (
             not self.client
             or not self.account_id
@@ -7296,33 +7779,33 @@ class SchwabAdapter:
             return None
         today_str = get_today_str()
         cutoff = float(since_epoch) - 2.0
-        fs_cache = getattr(self, "_filled_since_cache", None)
-        if not isinstance(fs_cache, dict):
-            fs_cache = {}
-            self._filled_since_cache = fs_cache
-        fs_key = (str(self.account_id), today_str, round(cutoff, 0))
+        win_tag = "36h" if fast_recent_only else "58d"
+        gen_start = int(getattr(self, "_snapshot_gen", 0))
+        cl_start = self.client
+        inv_sig = _compute_orders_cache_inv_sig(self, str(self.account_id))
+        fs_cache = self._filled_since_cache
+        fs_key = (
+            str(self.account_id),
+            today_str,
+            round(cutoff, 0),
+            gen_start,
+            win_tag,
+            inv_sig,
+        )
         now_ts = time.time()
         fs_hit = fs_cache.get(fs_key)
-        if fs_hit is not None and (now_ts - float(fs_hit[0])) < 6.0:
+        if (
+            fs_hit is not None
+            and len(fs_hit) >= 3
+            and fs_hit[2] is self.client
+            and (now_ts - float(fs_hit[0])) < 6.0
+        ):
             return json.loads(json.dumps(fs_hit[1]))
 
         buy_instrs = {"BUY", "BUY_TO_COVER", "BUY_TO_OPEN", "BUY_TO_CLOSE"}
         sell_instrs = {"SELL", "SELL_SHORT", "SELL_TO_OPEN", "SELL_TO_CLOSE"}
         try:
-            now_utc = datetime.now(timezone.utc)
-            from_dt = now_utc - timedelta(days=58)
-            to_dt = now_utc + timedelta(hours=1)
-            try:
-                resp = self.client.get_orders_for_account(
-                    self.account_id,
-                    from_entered_datetime=from_dt,
-                    to_entered_datetime=to_dt,
-                )
-            except TypeError:
-                resp = self.client.get_orders_for_account(self.account_id)
-            if resp.status_code != 200:
-                return None
-            sc_orders = resp.json()
+            sc_orders = self._get_orders_window_cached(win_tag)
             if not isinstance(sc_orders, list):
                 return None
 
@@ -7547,7 +8030,16 @@ class SchwabAdapter:
             sc_out.sort(key=lambda r: (float(r["fill_epoch"]), int(r["_seq"])))
             for r in sc_out:
                 r.pop("_seq", None)
-            fs_cache[fs_key] = (time.time(), json.loads(json.dumps(sc_out)))
+            with self._cache_lock:
+                if (
+                    int(getattr(self, "_snapshot_gen", 0)) == gen_start
+                    and self.client is cl_start
+                ):
+                    self._filled_since_cache[fs_key] = (
+                        time.time(),
+                        json.loads(json.dumps(sc_out)),
+                        cl_start,
+                    )
             return sc_out
         except Exception:
             return None
@@ -8741,6 +9233,7 @@ class WebullAdapter:
         self._pos_pace_lock = threading.Lock()
         self._next_pos_slot_ts = 0.0
         self._cache_lock = threading.Lock()
+        self._orders_fetch_lock = threading.Lock()
         self._snapshot_gen = 0
         self.last_snapshot_was_cached = False
         self._last_flatten_outcome = "FLAT"
@@ -8757,6 +9250,8 @@ class WebullAdapter:
         self._last_intraday_cash_flow = {}
         self._last_snapshot_epoch = {}
         self._filled_since_cache = {}
+        self._filled_today_cache = {}
+        self._raw_orders_window_cache = {}
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
         self.last_coverage_lookup_failed = False
@@ -8770,22 +9265,35 @@ class WebullAdapter:
         self._trade_perm_cache = {}
         self.last_error = ""
 
+    def _ensure_orders_cache_infra(self):
+        if not hasattr(self, "_cache_lock") or self._cache_lock is None:
+            self._cache_lock = threading.Lock()
+        if not hasattr(self, "_orders_fetch_lock") or self._orders_fetch_lock is None:
+            self._orders_fetch_lock = threading.Lock()
+        if not hasattr(self, "_snapshot_gen"):
+            self._snapshot_gen = 0
+        if not isinstance(getattr(self, "_raw_orders_window_cache", None), dict):
+            self._raw_orders_window_cache = {}
+        if not isinstance(getattr(self, "_filled_since_cache", None), dict):
+            self._filled_since_cache = {}
+        if not isinstance(getattr(self, "_filled_today_cache", None), dict):
+            self._filled_today_cache = {}
+
     def invalidate_cached_snapshots(self):
+        self._ensure_orders_cache_infra()
         with self._cache_lock:
             self._snapshot_gen += 1
             self._last_good_snapshot.clear()
             self._last_open_eq.clear()
             self._last_open_opt.clear()
-            if hasattr(self, "_filled_since_cache") and isinstance(
-                self._filled_since_cache, dict
-            ):
-                self._filled_since_cache.clear()
+            self._filled_since_cache.clear()
+            self._filled_today_cache.clear()
+            self._raw_orders_window_cache.clear()
 
     def _reserve_pos_slot(self, own_gap=None, owner="verify"):
         """Serializes Webull `/account/position` requests across `data_loop`
         and flatten/watchdog threads under `_pos_pace_lock`, stamping
         `_last_pos_call_ts` on claim and re-checking mid-sleep 429 backoffs."""
-        global last_data_loop_heartbeat
         if own_gap is None:
             own_gap = WEBULL_POS_MIN_INTERVAL_SEC
         while True:
@@ -8820,10 +9328,10 @@ class WebullAdapter:
                     return
             chunk_s = min(wait_s, 0.25)
             t_pre_sl = time.time()
-            last_data_loop_heartbeat = t_pre_sl
+            _touch_data_loop_heartbeat()
             time.sleep(chunk_s)
             t_post_sl = time.time()
-            last_data_loop_heartbeat = t_post_sl
+            _touch_data_loop_heartbeat()
             if chunk_s >= 0.10 and (t_post_sl - t_pre_sl) < (chunk_s * 0.4):
                 with self._pos_pace_lock:
                     now_f = time.time()
@@ -9240,6 +9748,12 @@ class WebullAdapter:
                 self.data_client = DataClient(new_api)
             except Exception:
                 self.data_client = None
+            self._ensure_orders_cache_infra()
+            with self._cache_lock:
+                self._snapshot_gen += 1
+                self._raw_orders_window_cache.clear()
+                self._filled_since_cache.clear()
+                self._filled_today_cache.clear()
             self._trade_perm_cache.pop(self.account_id, None)
             return True
         except Exception as e:
@@ -9946,63 +10460,349 @@ class WebullAdapter:
             log_event("ERROR", f"Webull cancel working orders exception: {e}")
         return False
 
+    def _get_orders_window_cached(self, ttl_sec=8.0):
+        """Coalesces concurrent Webull order-history queries behind a timeout-
+        bounded single-flight lock and caches the raw today order list for
+        `ttl_sec` seconds keyed by `(account_id, _snapshot_gen, today_str)`
+        while isolating `reconnect_session()` / `invalidate_cached_snapshots()`."""
+        self._ensure_orders_cache_infra()
+        if not self.trade_client or not self.account_id:
+            return None
+        today_str = get_today_str()
+
+        def _lookup_wb_locked(
+            acct_k, gen_k, tc_obj, inv_sig, cur_snap_ep, now_t
+        ):
+            cand = self._raw_orders_window_cache.get((acct_k, gen_k, today_str))
+            if (
+                isinstance(cand, tuple)
+                and len(cand) >= 7
+                and (now_t - float(cand[0])) < float(ttl_sec)
+                and cand[2] is tc_obj
+                and cand[3] is self._filled_since_cache
+                and cand[4] is self._filled_today_cache
+                and cand[5] == inv_sig
+                and (
+                    cur_snap_ep <= 0.0
+                    or float(cand[1]) <= 0.0
+                    or abs(cur_snap_ep - float(cand[1])) < float(ttl_sec)
+                )
+            ):
+                return list(cand[6])
+            return None
+
+        acct_cur = str(self.account_id)
+        inv_sig_cur = _compute_orders_cache_inv_sig(self, acct_cur)
+        snap_ep_cur = self.get_last_snapshot_epoch()
+        with self._cache_lock:
+            hit = _lookup_wb_locked(
+                acct_cur,
+                self._snapshot_gen,
+                self.trade_client,
+                inv_sig_cur,
+                snap_ep_cur,
+                time.time(),
+            )
+        if hit is not None:
+            return hit
+
+        acquired = self._orders_fetch_lock.acquire(timeout=6.0)
+        try:
+            with self._cache_lock:
+                gen_before = self._snapshot_gen
+                tc_before = self.trade_client
+                acct_before = str(self.account_id or "")
+                fs_before = self._filled_since_cache
+                ft_before = self._filled_today_cache
+                inv_sig_before = _compute_orders_cache_inv_sig(self, acct_before)
+                snap_ep_before = self.get_last_snapshot_epoch()
+                hit2 = _lookup_wb_locked(
+                    acct_before,
+                    gen_before,
+                    tc_before,
+                    inv_sig_before,
+                    snap_ep_before,
+                    time.time(),
+                )
+            if hit2 is not None:
+                return hit2
+            if not tc_before or not acct_before:
+                return None
+
+            wb_raw_orders = []
+            wb_seen_ids = set()
+            wb_fetch_ok = False
+            t0 = time.monotonic()
+
+            def _extract_wb_items(payload):
+                items = (
+                    payload
+                    if isinstance(payload, list)
+                    else payload.get("data", payload.get("orders", []))
+                    if isinstance(payload, dict)
+                    else []
+                )
+                if not isinstance(items, list):
+                    return [], None
+                added = []
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    sub_ords = it.get("orders")
+                    has_own_qty = any(
+                        it.get(k) is not None
+                        for k in (
+                            "filled_quantity",
+                            "filled_qty",
+                            "total_filled_quantity",
+                            "filledQuantity",
+                        )
+                    )
+                    if isinstance(sub_ords, list) and sub_ords and not has_own_qty:
+                        for sub_it in sub_ords:
+                            if isinstance(sub_it, dict):
+                                added.append(sub_it)
+                    else:
+                        added.append(it)
+                next_tok = None
+                if isinstance(payload, dict):
+                    next_tok = (
+                        payload.get("pagination_key")
+                        or payload.get("next_pagination_key")
+                        or payload.get("next_page_token")
+                    )
+                return added, next_tok
+
+            def _register_wb_batch(batch_list):
+                new_cnt = 0
+                last_cid = None
+                for item_o in batch_list:
+                    cid_v = str(
+                        item_o.get("client_order_id")
+                        or item_o.get("order_id")
+                        or ""
+                    ).strip()
+                    if cid_v:
+                        last_cid = (
+                            str(item_o.get("client_order_id") or "").strip()
+                            or last_cid
+                        )
+                        if cid_v in wb_seen_ids:
+                            continue
+                        wb_seen_ids.add(cid_v)
+                    else:
+                        ptr_k = f"PTR_{id(item_o)}"
+                        if ptr_k in wb_seen_ids:
+                            continue
+                        wb_seen_ids.add(ptr_k)
+                    wb_raw_orders.append(item_o)
+                    new_cnt += 1
+                return new_cnt, last_cid
+
+            if hasattr(tc_before, "order_v3") and hasattr(
+                tc_before.order_v3, "get_order_history"
+            ):
+                last_cid_cursor = None
+                for _ in range(10):
+                    try:
+                        if last_cid_cursor:
+                            res_h = tc_before.order_v3.get_order_history(
+                                account_id=acct_before,
+                                page_size=100,
+                                start_date=today_str,
+                                end_date=today_str,
+                                last_client_order_id=last_cid_cursor,
+                            )
+                        else:
+                            res_h = tc_before.order_v3.get_order_history(
+                                account_id=acct_before,
+                                page_size=100,
+                                start_date=today_str,
+                                end_date=today_str,
+                            )
+                    except TypeError:
+                        if last_cid_cursor:
+                            break
+                        res_h = tc_before.order_v3.get_order_history(
+                            account_id=acct_before, page_size=100
+                        )
+                    if res_h is None or getattr(res_h, "status_code", None) != 200:
+                        break
+                    wb_fetch_ok = True
+                    b_items, _ = _extract_wb_items(res_h.json())
+                    if not b_items:
+                        break
+                    n_added, next_cid = _register_wb_batch(b_items)
+                    if n_added <= 0 or len(b_items) < 100 or not next_cid:
+                        break
+                    last_cid_cursor = next_cid
+
+            if (
+                not wb_fetch_ok
+                and hasattr(tc_before, "order_v3")
+                and hasattr(tc_before.order_v3, "list_order_history")
+            ):
+                pg_key = None
+                seen_pg = set()
+                for _ in range(10):
+                    if pg_key:
+                        if pg_key in seen_pg:
+                            break
+                        seen_pg.add(pg_key)
+                        res_lh = tc_before.order_v3.list_order_history(
+                            acct_before, pagination_key=pg_key
+                        )
+                    else:
+                        res_lh = tc_before.order_v3.list_order_history(
+                            acct_before
+                        )
+                    if res_lh is None or getattr(res_lh, "status_code", None) != 200:
+                        break
+                    wb_fetch_ok = True
+                    b_items, next_pg = _extract_wb_items(res_lh.json())
+                    if not b_items:
+                        break
+                    n_added, _ = _register_wb_batch(b_items)
+                    if n_added <= 0 or not next_pg:
+                        break
+                    pg_key = str(next_pg)
+
+            if (
+                not wb_fetch_ok
+                and hasattr(tc_before, "order_v2")
+                and hasattr(tc_before.order_v2, "get_order_history")
+            ):
+                last_cid_v2 = None
+                for _ in range(10):
+                    try:
+                        if last_cid_v2:
+                            res_v2 = tc_before.order_v2.get_order_history(
+                                account_id=acct_before,
+                                page_size=100,
+                                start_date=today_str,
+                                end_date=today_str,
+                                last_client_order_id=last_cid_v2,
+                            )
+                        else:
+                            res_v2 = tc_before.order_v2.get_order_history(
+                                account_id=acct_before,
+                                page_size=100,
+                                start_date=today_str,
+                                end_date=today_str,
+                            )
+                    except TypeError:
+                        if last_cid_v2:
+                            break
+                        res_v2 = tc_before.order_v2.get_order_history(
+                            account_id=acct_before, page_size=100
+                        )
+                    if res_v2 is None or getattr(res_v2, "status_code", None) != 200:
+                        break
+                    wb_fetch_ok = True
+                    b_items, _ = _extract_wb_items(res_v2.json())
+                    if not b_items:
+                        break
+                    n_added, next_cid = _register_wb_batch(b_items)
+                    if n_added <= 0 or len(b_items) < 100 or not next_cid:
+                        break
+                    last_cid_v2 = next_cid
+
+            if (
+                not wb_fetch_ok
+                and hasattr(tc_before, "order")
+                and hasattr(tc_before.order, "list_today_orders")
+            ):
+                last_cid_td = None
+                for _ in range(10):
+                    if last_cid_td:
+                        res_td = tc_before.order.list_today_orders(
+                            acct_before,
+                            page_size=100,
+                            last_client_order_id=last_cid_td,
+                        )
+                    else:
+                        res_td = tc_before.order.list_today_orders(
+                            acct_before, page_size=100
+                        )
+                    if res_td is None or getattr(res_td, "status_code", None) != 200:
+                        break
+                    wb_fetch_ok = True
+                    b_items, _ = _extract_wb_items(res_td.json())
+                    if not b_items:
+                        break
+                    n_added, next_cid = _register_wb_batch(b_items)
+                    if n_added <= 0 or len(b_items) < 100 or not next_cid:
+                        break
+                    last_cid_td = next_cid
+
+            if not wb_fetch_ok:
+                return None
+
+            dt_ms = (time.monotonic() - t0) * 1000.0
+            if (
+                dt_ms >= 250.0
+                or first_poll_of_launch
+                or not _initial_positions_verified
+            ):
+                log_event(
+                    "PERF",
+                    f"Webull order_history fetched {len(wb_raw_orders)} order(s) in {dt_ms:.0f}ms.",
+                )
+            with self._cache_lock:
+                if (
+                    self._snapshot_gen == gen_before
+                    and self.trade_client is tc_before
+                    and str(self.account_id or "") == acct_before
+                ):
+                    if len(self._raw_orders_window_cache) > 24:
+                        self._raw_orders_window_cache.clear()
+                    self._raw_orders_window_cache[(acct_before, gen_before, today_str)] = (
+                        time.time(),
+                        snap_ep_before,
+                        tc_before,
+                        fs_before,
+                        ft_before,
+                        inv_sig_before,
+                        list(wb_raw_orders),
+                    )
+            return wb_raw_orders
+        except Exception:
+            return None
+        finally:
+            if acquired:
+                try:
+                    self._orders_fetch_lock.release()
+                except Exception:
+                    pass
+
     def has_any_filled_orders_today(self):
         """Returns False ONLY when the Webull API confirms zero orders have been
         filled (or partially filled) on today's US/Eastern calendar date.
         Defaults to True on any API error so baseline fee-drift absorption is
         100% fail-safe."""
+        self._ensure_orders_cache_infra()
         if not self.trade_client or not self.account_id:
             return True
         today_str = get_today_str()
-        cache_map = getattr(self, "_filled_today_cache", None)
-        if not isinstance(cache_map, dict):
-            cache_map = {}
-            self._filled_today_cache = cache_map
+        gen_cur = int(getattr(self, "_snapshot_gen", 0))
+        tc_cur = self.trade_client
+        inv_sig_cur = _compute_orders_cache_inv_sig(self, str(self.account_id))
+        cache_map = self._filled_today_cache
         c_key = (str(self.account_id), today_str)
         now_ts = time.time()
         cached = cache_map.get(c_key)
-        if cached is not None:
-            c_ts, c_val = cached
-            if c_val or (now_ts - c_ts) < 30.0:
-                return bool(c_val)
-        try:
-            res = None
-            if hasattr(self.trade_client, "order_v3") and hasattr(
-                self.trade_client.order_v3, "get_order_history"
-            ):
-                try:
-                    res = self.trade_client.order_v3.get_order_history(
-                        account_id=self.account_id,
-                        page_size=50,
-                        start_date=today_str,
-                        end_date=today_str,
-                    )
-                except TypeError:
-                    res = self.trade_client.order_v3.get_order_history(
-                        account_id=self.account_id, page_size=50
-                    )
-            elif hasattr(self.trade_client, "order_v2") and hasattr(
-                self.trade_client.order_v2, "get_order_history"
-            ):
-                try:
-                    res = self.trade_client.order_v2.get_order_history(
-                        account_id=self.account_id,
-                        page_size=50,
-                        start_date=today_str,
-                        end_date=today_str,
-                    )
-                except TypeError:
-                    res = self.trade_client.order_v2.get_order_history(
-                        account_id=self.account_id, page_size=50
-                    )
-            if res is None or res.status_code != 200:
+        if isinstance(cached, tuple) and len(cached) >= 5 and cached[2] is tc_cur:
+            c_ts, c_val = float(cached[0]), bool(cached[1])
+            if c_val:
                 return True
-            payload = res.json()
-            orders = (
-                payload
-                if isinstance(payload, list)
-                else payload.get("data", payload.get("orders", []))
-            )
+            if (
+                cached[3] == gen_cur
+                and cached[4] == inv_sig_cur
+                and (now_ts - c_ts) < 30.0
+            ):
+                return False
+        try:
+            orders = self._get_orders_window_cached()
             if not isinstance(orders, list):
                 return True
             for o in orders:
@@ -10039,9 +10839,29 @@ class WebullAdapter:
                     or not re.search(r"\d{4}-\d{2}-\d{2}", raw_t)
                     or SchwabAdapter._order_ts_to_eastern_date(raw_t) == today_str
                 ):
-                    cache_map[c_key] = (now_ts, True)
+                    if (
+                        self.trade_client is tc_cur
+                        and int(getattr(self, "_snapshot_gen", 0)) == gen_cur
+                    ):
+                        cache_map[c_key] = (
+                            now_ts,
+                            True,
+                            tc_cur,
+                            gen_cur,
+                            inv_sig_cur,
+                        )
                     return True
-            cache_map[c_key] = (now_ts, False)
+            if (
+                self.trade_client is tc_cur
+                and int(getattr(self, "_snapshot_gen", 0)) == gen_cur
+            ):
+                cache_map[c_key] = (
+                    now_ts,
+                    False,
+                    tc_cur,
+                    gen_cur,
+                    inv_sig_cur,
+                )
             return False
         except Exception:
             return True
@@ -10084,46 +10904,9 @@ class WebullAdapter:
             or float(since_epoch) <= 0.0
         ):
             return False
-        today_str = get_today_str()
         cutoff = float(since_epoch) - 2.0
         try:
-            res = None
-            if hasattr(self.trade_client, "order_v3") and hasattr(
-                self.trade_client.order_v3, "get_order_history"
-            ):
-                try:
-                    res = self.trade_client.order_v3.get_order_history(
-                        account_id=self.account_id,
-                        page_size=50,
-                        start_date=today_str,
-                        end_date=today_str,
-                    )
-                except TypeError:
-                    res = self.trade_client.order_v3.get_order_history(
-                        account_id=self.account_id, page_size=50
-                    )
-            elif hasattr(self.trade_client, "order_v2") and hasattr(
-                self.trade_client.order_v2, "get_order_history"
-            ):
-                try:
-                    res = self.trade_client.order_v2.get_order_history(
-                        account_id=self.account_id,
-                        page_size=50,
-                        start_date=today_str,
-                        end_date=today_str,
-                    )
-                except TypeError:
-                    res = self.trade_client.order_v2.get_order_history(
-                        account_id=self.account_id, page_size=50
-                    )
-            if res is None or res.status_code != 200:
-                return False
-            payload = res.json()
-            orders = (
-                payload
-                if isinstance(payload, list)
-                else payload.get("data", payload.get("orders", []))
-            )
+            orders = self._get_orders_window_cached()
             if not isinstance(orders, list):
                 return False
             for o in orders:
@@ -10193,11 +10976,12 @@ class WebullAdapter:
         except Exception:
             return False
 
-    def fetch_filled_orders_since(self, since_epoch):
+    def fetch_filled_orders_since(self, since_epoch, fast_recent_only=False):
         """Fetches normalized filled Webull orders on today's ET date at or after
-        `since_epoch` (using paginated order_v3.get_order_history with clean SDK
-        fallbacks). Returns a chronologically sorted list of fill dicts, or None
-        on API failure."""
+        `since_epoch` (using single-flight cached paginated order_v3.get_order_history
+        with clean SDK fallbacks). Returns a chronologically sorted list of fill dicts,
+        or None on API failure."""
+        self._ensure_orders_cache_infra()
         if (
             not self.trade_client
             or not self.account_id
@@ -10207,214 +10991,30 @@ class WebullAdapter:
             return None
         today_str = get_today_str()
         cutoff = float(since_epoch) - 2.0
-        fs_cache = getattr(self, "_filled_since_cache", None)
-        if not isinstance(fs_cache, dict):
-            fs_cache = {}
-            self._filled_since_cache = fs_cache
-        fs_key = (str(self.account_id), today_str, round(cutoff, 0))
+        gen_start = int(getattr(self, "_snapshot_gen", 0))
+        tc_start = self.trade_client
+        inv_sig = _compute_orders_cache_inv_sig(self, str(self.account_id))
+        fs_cache = self._filled_since_cache
+        fs_key = (
+            str(self.account_id),
+            today_str,
+            round(cutoff, 0),
+            gen_start,
+            inv_sig,
+        )
         now_ts = time.time()
         fs_hit = fs_cache.get(fs_key)
-        if fs_hit is not None and (now_ts - float(fs_hit[0])) < 6.0:
+        if (
+            fs_hit is not None
+            and len(fs_hit) >= 3
+            and fs_hit[2] is self.trade_client
+            and (now_ts - float(fs_hit[0])) < 6.0
+        ):
             return json.loads(json.dumps(fs_hit[1]))
 
-        wb_raw_orders = []
-        wb_seen_ids = set()
-        wb_fetch_ok = False
-
-        def _extract_wb_items(payload):
-            items = (
-                payload
-                if isinstance(payload, list)
-                else payload.get("data", payload.get("orders", []))
-                if isinstance(payload, dict)
-                else []
-            )
-            if not isinstance(items, list):
-                return [], None
-            added = []
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                sub_ords = it.get("orders")
-                has_own_qty = any(
-                    it.get(k) is not None
-                    for k in (
-                        "filled_quantity",
-                        "filled_qty",
-                        "total_filled_quantity",
-                        "filledQuantity",
-                    )
-                )
-                if isinstance(sub_ords, list) and sub_ords and not has_own_qty:
-                    for sub_it in sub_ords:
-                        if isinstance(sub_it, dict):
-                            added.append(sub_it)
-                else:
-                    added.append(it)
-            next_tok = None
-            if isinstance(payload, dict):
-                next_tok = (
-                    payload.get("pagination_key")
-                    or payload.get("next_pagination_key")
-                    or payload.get("next_page_token")
-                )
-            return added, next_tok
-
-        def _register_wb_batch(batch_list):
-            new_cnt = 0
-            last_cid = None
-            for item_o in batch_list:
-                cid_v = str(
-                    item_o.get("client_order_id")
-                    or item_o.get("order_id")
-                    or ""
-                ).strip()
-                if cid_v:
-                    last_cid = str(item_o.get("client_order_id") or "").strip() or last_cid
-                    if cid_v in wb_seen_ids:
-                        continue
-                    wb_seen_ids.add(cid_v)
-                else:
-                    ptr_k = f"PTR_{id(item_o)}"
-                    if ptr_k in wb_seen_ids:
-                        continue
-                    wb_seen_ids.add(ptr_k)
-                wb_raw_orders.append(item_o)
-                new_cnt += 1
-            return new_cnt, last_cid
-
         try:
-            if hasattr(self.trade_client, "order_v3") and hasattr(
-                self.trade_client.order_v3, "get_order_history"
-            ):
-                last_cid_cursor = None
-                for _ in range(10):
-                    try:
-                        if last_cid_cursor:
-                            res_h = self.trade_client.order_v3.get_order_history(
-                                account_id=self.account_id,
-                                page_size=100,
-                                start_date=today_str,
-                                end_date=today_str,
-                                last_client_order_id=last_cid_cursor,
-                            )
-                        else:
-                            res_h = self.trade_client.order_v3.get_order_history(
-                                account_id=self.account_id,
-                                page_size=100,
-                                start_date=today_str,
-                                end_date=today_str,
-                            )
-                    except TypeError:
-                        if last_cid_cursor:
-                            break
-                        res_h = self.trade_client.order_v3.get_order_history(
-                            account_id=self.account_id, page_size=100
-                        )
-                    if res_h is None or getattr(res_h, "status_code", None) != 200:
-                        break
-                    wb_fetch_ok = True
-                    b_items, _ = _extract_wb_items(res_h.json())
-                    if not b_items:
-                        break
-                    n_added, next_cid = _register_wb_batch(b_items)
-                    if n_added <= 0 or len(b_items) < 100 or not next_cid:
-                        break
-                    last_cid_cursor = next_cid
-
-            if not wb_fetch_ok and hasattr(self.trade_client, "order_v3") and hasattr(
-                self.trade_client.order_v3, "list_order_history"
-            ):
-                pg_key = None
-                seen_pg = set()
-                for _ in range(10):
-                    if pg_key:
-                        if pg_key in seen_pg:
-                            break
-                        seen_pg.add(pg_key)
-                        res_lh = self.trade_client.order_v3.list_order_history(
-                            self.account_id, pagination_key=pg_key
-                        )
-                    else:
-                        res_lh = self.trade_client.order_v3.list_order_history(
-                            self.account_id
-                        )
-                    if res_lh is None or getattr(res_lh, "status_code", None) != 200:
-                        break
-                    wb_fetch_ok = True
-                    b_items, next_pg = _extract_wb_items(res_lh.json())
-                    if not b_items:
-                        break
-                    n_added, _ = _register_wb_batch(b_items)
-                    if n_added <= 0 or not next_pg:
-                        break
-                    pg_key = str(next_pg)
-
-            if not wb_fetch_ok and hasattr(self.trade_client, "order_v2") and hasattr(
-                self.trade_client.order_v2, "get_order_history"
-            ):
-                last_cid_v2 = None
-                for _ in range(10):
-                    try:
-                        if last_cid_v2:
-                            res_v2 = self.trade_client.order_v2.get_order_history(
-                                account_id=self.account_id,
-                                page_size=100,
-                                start_date=today_str,
-                                end_date=today_str,
-                                last_client_order_id=last_cid_v2,
-                            )
-                        else:
-                            res_v2 = self.trade_client.order_v2.get_order_history(
-                                account_id=self.account_id,
-                                page_size=100,
-                                start_date=today_str,
-                                end_date=today_str,
-                            )
-                    except TypeError:
-                        if last_cid_v2:
-                            break
-                        res_v2 = self.trade_client.order_v2.get_order_history(
-                            account_id=self.account_id, page_size=100
-                        )
-                    if res_v2 is None or getattr(res_v2, "status_code", None) != 200:
-                        break
-                    wb_fetch_ok = True
-                    b_items, _ = _extract_wb_items(res_v2.json())
-                    if not b_items:
-                        break
-                    n_added, next_cid = _register_wb_batch(b_items)
-                    if n_added <= 0 or len(b_items) < 100 or not next_cid:
-                        break
-                    last_cid_v2 = next_cid
-
-            if not wb_fetch_ok and hasattr(self.trade_client, "order") and hasattr(
-                self.trade_client.order, "list_today_orders"
-            ):
-                last_cid_td = None
-                for _ in range(10):
-                    if last_cid_td:
-                        res_td = self.trade_client.order.list_today_orders(
-                            self.account_id,
-                            page_size=100,
-                            last_client_order_id=last_cid_td,
-                        )
-                    else:
-                        res_td = self.trade_client.order.list_today_orders(
-                            self.account_id, page_size=100
-                        )
-                    if res_td is None or getattr(res_td, "status_code", None) != 200:
-                        break
-                    wb_fetch_ok = True
-                    b_items, _ = _extract_wb_items(res_td.json())
-                    if not b_items:
-                        break
-                    n_added, next_cid = _register_wb_batch(b_items)
-                    if n_added <= 0 or len(b_items) < 100 or not next_cid:
-                        break
-                    last_cid_td = next_cid
-
-            if not wb_fetch_ok:
+            wb_raw_orders = self._get_orders_window_cached()
+            if not isinstance(wb_raw_orders, list):
                 return None
 
             wb_out = []
@@ -10591,7 +11191,16 @@ class WebullAdapter:
             wb_out.sort(key=lambda r: (float(r["fill_epoch"]), int(r["_seq"])))
             for r in wb_out:
                 r.pop("_seq", None)
-            fs_cache[fs_key] = (time.time(), json.loads(json.dumps(wb_out)))
+            with self._cache_lock:
+                if (
+                    int(getattr(self, "_snapshot_gen", 0)) == gen_start
+                    and self.trade_client is tc_start
+                ):
+                    self._filled_since_cache[fs_key] = (
+                        time.time(),
+                        json.loads(json.dumps(wb_out)),
+                        tc_start,
+                    )
             return wb_out
         except Exception:
             return None
@@ -12231,7 +12840,7 @@ class DemoBrokerAdapter:
     ):
         return False
 
-    def fetch_filled_orders_since(self, since_epoch):
+    def fetch_filled_orders_since(self, since_epoch, fast_recent_only=False):
         return []
 
     def sim_reset_account(self, start_cash=25000.0):
@@ -14020,12 +14629,395 @@ def get_idle_button_style():
     return ("#282c31", "#ffca58", "#6c757d", "#343a40")
 
 
+def _record_fresh_hud_poll(poll_ad, poll_sec, poll_epoch):
+    """Records a fresh, non-cached snapshot accepted for HUD display using
+    monotonic time, along with the effective cadence so Poll=10s->2s switches
+    get one poll of grace before aging."""
+    global _last_fresh_poll_info, _feed_degrade_streak, _feed_wake_resync_until_fresh
+    b_name = getattr(poll_ad, "name", "") if poll_ad is not None else ""
+    a_id = getattr(poll_ad, "account_id", "") if poll_ad is not None else ""
+    eff_p = float(poll_sec or 2)
+    if str(b_name).upper() == "WEBULL":
+        eff_p = max(eff_p, float(globals().get("WEBULL_POS_MIN_INTERVAL_SEC", 0.0) or 0.0))
+    _last_fresh_poll_info = (
+        time.monotonic(),
+        time.time(),
+        eff_p,
+        poll_epoch,
+        b_name,
+        a_id,
+    )
+    _feed_degrade_streak = 0
+    _feed_wake_resync_until_fresh = False
+
+
+def _format_feed_age_short(age_sec):
+    """Formats stale poll age concisely ('9s'..'59s', capped at '1m+'..'9m+')
+    so Option C inline indicators keep fixed compact width."""
+    if age_sec is None:
+        return ""
+    s_i = max(1, int(round(float(age_sec))))
+    if s_i >= 60:
+        mins_i = min(9, max(1, s_i // 60))
+        return f"{mins_i}m+"
+    return f"{s_i}s"
+
+
+def _get_feed_health_state(now_mono=None, now_wall=None, advance_streak=False):
+    """Returns a snapshot dict describing live broker feed health & Option C
+    freshness dot presentation across Schwab, Webull, and Demo modes."""
+    global _feed_degrade_streak, _feed_wake_resync_until_fresh, _last_data_loop_hb_mono
+    now_m = float(time.monotonic() if now_mono is None else now_mono)
+    now_w = float(time.time() if now_wall is None else now_wall)
+
+    if advance_streak:
+        prev_w = float(_feed_clock_probe.get("wall", 0.0) or 0.0)
+        prev_m = float(_feed_clock_probe.get("mono", 0.0) or 0.0)
+        if prev_w > 0.0 and prev_m > 0.0:
+            dw = now_w - prev_w
+            dm = now_m - prev_m
+            if abs(dw - dm) > 5.0:
+                _feed_wake_resync_until_fresh = True
+                _last_data_loop_hb_mono = now_m
+        _feed_clock_probe["wall"] = now_w
+        _feed_clock_probe["mono"] = now_m
+
+    try:
+        cur_poll_s = float(min(10, max(1, int(float(config.get("poll_interval", 2))))))
+    except Exception:
+        cur_poll_s = 2.0
+
+    cur_ep = get_adapter_epoch()
+    cur_broker = (
+        getattr(active_adapter, "name", "")
+        if active_adapter is not None
+        else str(config.get("active_broker", "SCHWAB") or "SCHWAB")
+    )
+    cur_acct = getattr(active_adapter, "account_id", "") if active_adapter is not None else ""
+    if str(cur_broker).upper() == "WEBULL":
+        cur_poll_s = max(
+            cur_poll_s,
+            float(globals().get("WEBULL_POS_MIN_INTERVAL_SEC", 0.0) or 0.0),
+        )
+
+    if is_demo_mode_active():
+        return {
+            "state": "DEMO",
+            "led_hex": "#38bdf8",
+            "led_style": "solid",
+            "age_sec": None,
+            "age_tag": "",
+            "is_stalled": False,
+            "hb_age": 0.0,
+            "tooltip_line": "● Simulated Sandbox ($25k Paper)  ·  Zero Live Broker Orders",
+            "tooltip_fg": "#bae6fd",
+        }
+
+    info = _last_fresh_poll_info
+    has_match = (
+        isinstance(info, tuple)
+        and len(info) >= 6
+        and info[3] == cur_ep
+        and info[4] == cur_broker
+        and info[5] == cur_acct
+    )
+    poll_age = max(0.0, now_m - float(info[0])) if has_match else None
+    p_eff = max(cur_poll_s, float(info[2])) if has_match else cur_poll_s
+
+    if float(last_data_loop_heartbeat or 0.0) <= 0.0:
+        hb_age = 0.0
+    elif float(_last_data_loop_hb_mono or 0.0) > 0.0:
+        hb_age = max(0.0, now_m - float(_last_data_loop_hb_mono))
+    else:
+        hb_age = max(0.0, now_w - float(last_data_loop_heartbeat))
+
+    if not _feed_wake_resync_until_fresh and hb_age > 45.0:
+        stall_sec = max(hb_age, poll_age or 0.0)
+        return {
+            "state": "RED",
+            "led_hex": "#ef4444",
+            "led_style": "solid",
+            "age_sec": stall_sec,
+            "age_tag": _format_feed_age_short(stall_sec),
+            "is_stalled": True,
+            "hb_age": hb_age,
+            "tooltip_line": (
+                f"● Feed Stalled — No poll loop activity for {int(round(hb_age))}s  "
+                f"·  Poll: {int(round(cur_poll_s))}s"
+            ),
+            "tooltip_fg": "#fca5a5",
+        }
+
+    if api_disconnect_alerted or consecutive_api_failures >= 2:
+        att_n = max(2, int(consecutive_api_failures))
+        age_t = _format_feed_age_short(poll_age)
+        sync_sfx = f" (last sync {age_t} ago)" if age_t else ""
+        return {
+            "state": "RED",
+            "led_hex": "#ef4444",
+            "led_style": "solid",
+            "age_sec": poll_age,
+            "age_tag": age_t,
+            "is_stalled": False,
+            "hb_age": hb_age,
+            "tooltip_line": (
+                f"● Offline — Reconnecting (Attempt #{att_n}){sync_sfx}  "
+                f"·  Poll: {int(round(cur_poll_s))}s"
+            ),
+            "tooltip_fg": "#fca5a5",
+        }
+
+    if _feed_wake_resync_until_fresh or not has_match:
+        if consecutive_api_failures == 1:
+            return {
+                "state": "AMBER",
+                "led_hex": "#f59e0b",
+                "led_style": "solid",
+                "age_sec": None,
+                "age_tag": "",
+                "is_stalled": False,
+                "hb_age": hb_age,
+                "tooltip_line": (
+                    f"● Connection Hiccup — Retrying API (Attempt #1)  "
+                    f"·  Poll: {int(round(cur_poll_s))}s"
+                ),
+                "tooltip_fg": "#fde68a",
+            }
+        sync_desc = (
+            "Wake Resync — Waiting for fresh broker poll"
+            if _feed_wake_resync_until_fresh
+            else "Connecting — Waiting for first live broker poll"
+        )
+        return {
+            "state": "SYNCING",
+            "led_hex": "#7dd3fc",
+            "led_style": "ring",
+            "age_sec": None,
+            "age_tag": "",
+            "is_stalled": False,
+            "hb_age": hb_age,
+            "tooltip_line": f"○ {sync_desc}  ·  Poll: {int(round(cur_poll_s))}s",
+            "tooltip_fg": "#bae6fd",
+        }
+
+    green_limit = max(2.5 * p_eff + 2.0, 7.0)
+    red_limit = max(6.0 * p_eff + 4.0, 22.0)
+    age_disp = f"{poll_age:.1f}s" if poll_age < 60.0 else _format_feed_age_short(poll_age)
+
+    if poll_age <= green_limit:
+        if advance_streak:
+            _feed_degrade_streak = 0
+        if consecutive_api_failures == 1:
+            return {
+                "state": "AMBER",
+                "led_hex": "#f59e0b",
+                "led_style": "solid",
+                "age_sec": poll_age,
+                "age_tag": _format_feed_age_short(poll_age) if poll_age >= 1.5 else "",
+                "is_stalled": False,
+                "hb_age": hb_age,
+                "tooltip_line": (
+                    f"● Connection Hiccup (Retry #1)  ·  last live sync {age_disp} ago  "
+                    f"·  Poll: {int(round(cur_poll_s))}s"
+                ),
+                "tooltip_fg": "#fde68a",
+            }
+        return {
+            "state": "GREEN",
+            "led_hex": "#22c55e",
+            "led_style": "solid",
+            "age_sec": poll_age,
+            "age_tag": "",
+            "is_stalled": False,
+            "hb_age": hb_age,
+            "tooltip_line": (
+                f"● Broker Feed LIVE  ·  synced {age_disp} ago  "
+                f"·  Poll: {int(round(cur_poll_s))}s"
+            ),
+            "tooltip_fg": "#6ee7b7",
+        }
+
+    if advance_streak:
+        _feed_degrade_streak += 1
+    if (
+        consecutive_api_failures == 0
+        and _feed_degrade_streak < 2
+        and poll_age <= (green_limit + 1.0)
+    ):
+        return {
+            "state": "GREEN",
+            "led_hex": "#22c55e",
+            "led_style": "solid",
+            "age_sec": poll_age,
+            "age_tag": "",
+            "is_stalled": False,
+            "hb_age": hb_age,
+            "tooltip_line": (
+                f"● Broker Feed LIVE  ·  synced {age_disp} ago  "
+                f"·  Poll: {int(round(cur_poll_s))}s"
+            ),
+            "tooltip_fg": "#6ee7b7",
+        }
+
+    age_t = _format_feed_age_short(poll_age)
+    if poll_age <= red_limit:
+        return {
+            "state": "AMBER",
+            "led_hex": "#f59e0b",
+            "led_style": "solid",
+            "age_sec": poll_age,
+            "age_tag": age_t,
+            "is_stalled": False,
+            "hb_age": hb_age,
+            "tooltip_line": (
+                f"● Feed Aging (Retry #1)  ·  last live sync {age_disp} ago  ·  Poll: {int(round(cur_poll_s))}s"
+                if consecutive_api_failures == 1
+                else f"● Feed Aging  ·  last live sync {age_disp} ago  ·  Poll: {int(round(cur_poll_s))}s"
+            ),
+            "tooltip_fg": "#fde68a",
+        }
+    return {
+        "state": "RED",
+        "led_hex": "#ef4444",
+        "led_style": "solid",
+        "age_sec": poll_age,
+        "age_tag": age_t,
+        "is_stalled": False,
+        "hb_age": hb_age,
+        "tooltip_line": (
+            f"● Feed Delayed  ·  last live sync {age_disp} ago  "
+            f"·  Poll: {int(round(cur_poll_s))}s"
+        ),
+        "tooltip_fg": "#fca5a5",
+    }
+
+
+def _apply_hud_status_pill_state(ui_button, advance_streak=False):
+    """Single source of truth for HUD middle status pill text, colors, and
+    Option C freshness LED across idle, aging, retry, reconnect, stall, alarm,
+    and cooldown states."""
+    global _hud_compact_had_age_suffix
+    if ui_button is None:
+        return
+    try:
+        fh = _get_feed_health_state(advance_streak=advance_streak)
+        led_on = bool(getattr(ui_button, "_show_status_led", False))
+        compact_now = is_compact_hud()
+
+        if alarm_active or cooldown_active:
+            if led_on:
+                ui_button.config(led_hex=fh["led_hex"], led_style=fh["led_style"])
+            return
+
+        if fh["is_stalled"]:
+            st_age = fh["age_tag"] or ">45s"
+            st_txt = (
+                f"⚠️ POLL STALLED · {st_age}"
+                if compact_now
+                else f"⚠️ DATA LOOP STALLED ({st_age}) — CHECK NETWORK OR RESTART"
+            )
+            cfg_kw = {
+                "text": st_txt,
+                "bg": "#78350f",
+                "fg": "#fde68a",
+                "disabledforeground": "#fde68a",
+                "state": "disabled",
+            }
+            if led_on:
+                cfg_kw["led_hex"] = fh["led_hex"]
+                cfg_kw["led_style"] = fh["led_style"]
+            ui_button.config(**cfg_kw)
+        elif consecutive_api_failures >= 2 or api_disconnect_alerted:
+            att = max(2, int(consecutive_api_failures))
+            age_sfx = f" · {fh['age_tag']}" if fh["age_tag"] else ""
+            re_txt = (
+                f"🔄 RECONNECTING (#{att}){age_sfx}"
+                if compact_now
+                else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att}){age_sfx}..."
+            )
+            cfg_kw = {
+                "text": re_txt,
+                "bg": "#78350f",
+                "fg": "#fde68a",
+                "disabledforeground": "#fde68a",
+                "state": "disabled",
+            }
+            if led_on:
+                cfg_kw["led_hex"] = fh["led_hex"]
+                cfg_kw["led_style"] = fh["led_style"]
+            ui_button.config(**cfg_kw)
+        elif consecutive_api_failures == 1:
+            age_sfx = f" · {fh['age_tag']}" if fh["age_tag"] else ""
+            r1_txt = (
+                f"⚠️ RETRYING API (#1){age_sfx}"
+                if compact_now
+                else f"⚠️ CONNECTION HICCUP — RETRYING BROKER API (ATTEMPT #1){age_sfx}..."
+            )
+            cfg_kw = {
+                "text": r1_txt,
+                "bg": "#78350f",
+                "fg": "#fde68a",
+                "disabledforeground": "#fde68a",
+                "state": "disabled",
+            }
+            if led_on:
+                cfg_kw["led_hex"] = fh["led_hex"]
+                cfg_kw["led_style"] = fh["led_style"]
+            ui_button.config(**cfg_kw)
+        elif (
+            time.monotonic() < float(_upside_glow_until_mono or 0.0)
+            and led_on
+        ):
+            ui_button.config(led_hex=fh["led_hex"], led_style=fh["led_style"])
+            return
+        else:
+            bg_c, fg_c, rim_c, glow_c = get_idle_button_style()
+            base_txt = get_idle_button_text()
+            disp_txt = base_txt
+            if led_on and fh["state"] in ("AMBER", "RED") and fh["age_tag"]:
+                disp_txt = (
+                    f"{base_txt} · {fh['age_tag']}"
+                    if compact_now
+                    else f"{fh['age_tag']} · {base_txt}"
+                )
+                if bg_c == "#282c31":
+                    rim_c = "#d97706" if fh["state"] == "AMBER" else "#ef4444"
+                    glow_c = rim_c
+            cfg_kw = {
+                "text": disp_txt,
+                "bg": bg_c,
+                "fg": fg_c,
+                "disabledforeground": fg_c,
+                "rim": rim_c,
+                "glow": glow_c,
+                "state": "disabled",
+            }
+            if led_on:
+                cfg_kw["led_hex"] = fh["led_hex"]
+                cfg_kw["led_style"] = fh["led_style"]
+            ui_button.config(**cfg_kw)
+
+        has_age_now = bool(led_on and fh["age_tag"] and compact_now)
+        if compact_now and ui_button is hud_mute_btn and has_age_now != _hud_compact_had_age_suffix:
+            _hud_compact_had_age_suffix = has_age_now
+            _sync_hud_bottom_bar_layout()
+    except Exception:
+        pass
+
+
 def apply_idle_button_config(ui_button):
     """Applies the current idle or Post-Breach Force-Flatten text and color
     palette to the HUD middle status pill."""
     if ui_button is None:
         return
     try:
+        if getattr(ui_button, "_show_status_led", False):
+            _apply_hud_status_pill_state(ui_button, advance_streak=False)
+            return
+        fh_chk = _get_feed_health_state(advance_streak=False)
+        if fh_chk["is_stalled"] and not alarm_active and not cooldown_active:
+            _apply_hud_status_pill_state(ui_button, advance_streak=False)
+            return
         bg_c, fg_c, rim_c, glow_c = get_idle_button_style()
         ui_button.config(
             text=get_idle_button_text(),
@@ -14354,19 +15346,22 @@ def mute_alarm(ui_button):
     log_event("ALARM", "User acknowledged and muted siren.")
     if not cooldown_active:
         if api_disconnect_alerted or consecutive_api_failures >= 2:
-            att = max(1, consecutive_api_failures)
-            re_txt = (
-                f"🔄 RECONNECTING (#{att})..."
-                if is_compact_hud()
-                else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
-            )
-            ui_button.config(
-                text=re_txt,
-                bg="#78350f",
-                fg="#fde68a",
-                disabledforeground="#fde68a",
-                state="disabled",
-            )
+            if getattr(ui_button, "_show_status_led", False):
+                _apply_hud_status_pill_state(ui_button)
+            else:
+                att = max(1, consecutive_api_failures)
+                re_txt = (
+                    f"🔄 RECONNECTING (#{att})..."
+                    if is_compact_hud()
+                    else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
+                )
+                ui_button.config(
+                    text=re_txt,
+                    bg="#78350f",
+                    fg="#fde68a",
+                    disabledforeground="#fde68a",
+                    state="disabled",
+                )
         else:
             apply_idle_button_config(ui_button)
             if is_locked_down and not daily_breach_settings_prompted:
@@ -14546,6 +15541,7 @@ def trigger_upside_tier_glow(
     """Logs the tier ratchet (or connection recovery when log_tag='SESSION')
     and, if enabled, plays the upside chime and pulses the bottom HUD status
     bar with a 3-second emerald glow."""
+    global _upside_glow_until_mono
     log_event(log_tag, log_msg)
     if not config.get("enable_upside_chime", True):
         return
@@ -14553,6 +15549,7 @@ def trigger_upside_tier_glow(
         return
 
     play_upside_tier_chime()
+    _upside_glow_until_mono = time.monotonic() + 3.2
 
     # 6 steps x 500ms = 3.0 seconds total
     glow_steps = [
@@ -14565,7 +15562,9 @@ def trigger_upside_tier_glow(
     ]
 
     def _step(idx=0):
+        global _upside_glow_until_mono
         if alarm_active or cooldown_active:
+            _upside_glow_until_mono = 0.0
             return
         if idx < len(glow_steps):
             bg_c, fg_c = glow_steps[idx]
@@ -14581,6 +15580,7 @@ def trigger_upside_tier_glow(
             )
             ui_button.after(500, lambda: _step(idx + 1))
         else:
+            _upside_glow_until_mono = 0.0
             if not alarm_active and not cooldown_active:
                 apply_idle_button_config(ui_button)
 
@@ -19343,6 +20343,7 @@ def trigger_lockdown(
     breach_epoch=None,
 ):
     global is_locked_down, active_breach_source, last_breach_trigger_net_pnl
+    global _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
     global alarm_active, pending_halt_breach
     global daily_breach_settings_prompted, recent_loss_timestamps
     global _active_penalty_box_overlay, cooldown_active, cooldown_label, _cooldown_seq_id
@@ -19369,6 +20370,11 @@ def trigger_lockdown(
         is_locked_down = True
         active_breach_source = "LIVE"
         last_breach_trigger_net_pnl = trig_net_captured
+        _breach_pin_rt_pending = bool(
+            (not deferred_from_halt) and len(prev_pos_snapshot) > 0
+        )
+        _breach_pin_retired = False
+        _lock_from_presync_save = False
         daily_breach_settings_prompted = False
         save_session_state()
         trigger_alarm(reason, ui_button, context_str)
@@ -19481,6 +20487,11 @@ def trigger_lockdown(
         is_locked_down = True
         active_breach_source = "LIVE"
         last_breach_trigger_net_pnl = trig_net_captured
+        _breach_pin_rt_pending = bool(
+            (not deferred_from_halt) and len(prev_pos_snapshot) > 0
+        )
+        _breach_pin_retired = False
+        _lock_from_presync_save = False
         daily_breach_settings_prompted = False
         recent_loss_timestamps.clear()
     save_session_state(expected_epoch=eff_epoch, adapter_override=adapter)
@@ -19745,11 +20756,35 @@ def _classify_round_trip_delta(delta, cfg=None):
     return streak_note, consec_trigger_reason
 
 
+def _retire_stale_breach_trigger_pin(source_label="subsequent trade"):
+    """Clears `last_breach_trigger_net_pnl` once any subsequent round-trip
+    closes after the breach trade has already settled flat, so an earlier
+    intraday trigger cannot linger past later recoveries and block valid
+    Daily Stop re-arming or skew HUD breach banners."""
+    global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired
+    _breach_pin_rt_pending = False
+    if last_breach_trigger_net_pnl is not None:
+        old_trig = float(last_breach_trigger_net_pnl)
+        last_breach_trigger_net_pnl = None
+        _breach_pin_retired = True
+        try:
+            log_event(
+                "GUARDRAIL",
+                f"Retired prior breach trigger reference ({format_dollar(old_trig)}): "
+                f"{source_label} closed after breach exit settled flat.",
+            )
+        except Exception:
+            pass
+        return True
+    return False
+
+
 def log_position_transitions(
     pos_details, realized_pnl, open_pnl, net_pnl, session_high_pnl
 ):
     global prev_pos_snapshot, prev_flat_realized_pnl
     global _last_round_trip_close_ts, _pending_subpoll_consec_reason
+    global _breach_pin_rt_pending
     pending_sub = _pending_subpoll_consec_reason
     _pending_subpoll_consec_reason = None
     curr_sig_map = {
@@ -19799,6 +20834,11 @@ def log_position_transitions(
         streak_note, consec_trigger_reason = _classify_round_trip_delta(delta)
         _last_round_trip_close_ts = time.time()
         prev_flat_realized_pnl = realized_pnl
+        if _breach_pin_rt_pending:
+            if len(curr_sig_map) == 0:
+                _breach_pin_rt_pending = False
+        elif is_locked_down and last_breach_trigger_net_pnl is not None:
+            _retire_stale_breach_trigger_pin("live round-trip")
         save_session_state()
 
     prev_pos_snapshot = pos_details.copy()
@@ -19813,15 +20853,12 @@ def log_position_transitions(
     return consec_trigger_reason or pending_sub
 
 
-def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
-    """If an account anchored its baseline earlier today (e.g. overnight before
-    the broker's 4:00-5:00 AM ET clearing/fee batch) and current flat equity
-    differs from start_equity while 0 trades have been filled today on the
-    brokerage account, automatically re-aligns start_equity to eq_now so the
-    trader does not start their day with a phantom fee PnL."""
-    global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
-    global prev_flat_realized_pnl, settled_realized_pnl
-    global _last_round_trip_close_ts, _pending_subpoll_consec_reason
+def _is_untouched_fee_drift_candidate(eq_now, is_fl_now, adapter_override=None):
+    """Returns True ONLY when the account is flat with 0 trades and 0 streak
+    losses today AND current flat equity differs from start_equity by a
+    fee-plausible amount ($0.01–$2,500), meaning has_any_filled_orders_today()
+    could actually enable untouched baseline fee-drift absorption."""
+    ad_ref = adapter_override if adapter_override is not None else active_adapter
     if (
         not is_fl_now
         or eq_now is None
@@ -19831,12 +20868,36 @@ def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
         or int(win_trades) != 0
         or int(loss_trades) != 0
         or len(recent_loss_timestamps) > 0
-        or active_adapter is None
+        or ad_ref is None
     ):
         return False
     drift = round(float(eq_now) - float(start_equity), 2)
-    if abs(drift) < 0.01 or abs(drift) > 2500.0:
+    return 0.01 <= abs(drift) <= 2500.0
+
+
+def _call_fetch_filled_orders_since(ad_obj, since_ep, fast_recent_only=False):
+    """Invokes `ad_obj.fetch_filled_orders_since` with optional `fast_recent_only`
+    keyword while cleanly supporting 1-argument mock adapters."""
+    try:
+        return ad_obj.fetch_filled_orders_since(
+            since_ep, fast_recent_only=fast_recent_only
+        )
+    except TypeError:
+        return ad_obj.fetch_filled_orders_since(since_ep)
+
+
+def _maybe_absorb_untouched_flat_fee_drift(eq_now, is_fl_now):
+    """If an account anchored its baseline earlier today (e.g. overnight before
+    the broker's 4:00-5:00 AM ET clearing/fee batch) and current flat equity
+    differs from start_equity while 0 trades have been filled today on the
+    brokerage account, automatically re-aligns start_equity to eq_now so the
+    trader does not start their day with a phantom fee PnL."""
+    global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
+    global prev_flat_realized_pnl, settled_realized_pnl
+    global _last_round_trip_close_ts, _pending_subpoll_consec_reason
+    if not _is_untouched_fee_drift_candidate(eq_now, is_fl_now):
         return False
+    drift = round(float(eq_now) - float(start_equity), 2)
     if active_adapter.has_any_filled_orders_today():
         return False
     old_start = round(float(start_equity), 2)
@@ -19871,6 +20932,7 @@ def _reconcile_off_session_activity(
     prefetched_fills=None,
     prefetched_closing_confirmed=None,
     allow_network=True,
+    prefetched_window=None,
 ):
     """Incrementally reconciles off-session broker executions since
     `_reconciled_through_epoch` (whether resuming flat or holding an open trade):
@@ -19892,6 +20954,7 @@ def _reconcile_off_session_activity(
     global _off_session_reconciled, _reconciled_through_epoch, _reconciled_order_qty
     global _restored_session_was_flat, _restored_open_positions_at_save
     global _restored_has_open_pos_snapshot, _off_session_peak_reconstructed
+    global last_breach_trigger_net_pnl, _breach_pin_rt_pending
 
     if (
         eq_now is None
@@ -19901,6 +20964,7 @@ def _reconcile_off_session_activity(
     ):
         return False
 
+    was_flat_before_reconcile = bool(_restored_session_was_flat)
     live_pos_map = pos_details if isinstance(pos_details, dict) else {}
     settled_flat_eq_now = (
         _round_cents(float(eq_now))
@@ -19945,28 +21009,12 @@ def _reconcile_off_session_activity(
             }
         return out_seed
 
-    if (
-        eff_since > 0.0
-        and not _cold_launch_ignored_qty_mutated
-        and active_adapter is not None
-        and not is_demo_mode_active(active_adapter)
-    ):
-        raw_fills = prefetched_fills
-        if (
-            raw_fills is None
-            and allow_network
-            and hasattr(active_adapter, "fetch_filled_orders_since")
-        ):
-            try:
-                raw_fills = active_adapter.fetch_filled_orders_since(eff_since)
-            except Exception:
-                raw_fills = None
-
-        inc_fills = []
-        new_roq_updates = {}
-        max_fill_ep = eff_since
-        if isinstance(raw_fills, list):
-            for f_idx, f_rec in enumerate(raw_fills):
+    def _filter_inc_fills(raw_list):
+        out_inc = []
+        out_roq = {}
+        out_max_ep = eff_since
+        if isinstance(raw_list, list):
+            for f_idx, f_rec in enumerate(raw_list):
                 if not isinstance(f_rec, dict):
                     continue
                 o_key = str(f_rec.get("order_key") or "").strip()
@@ -19989,17 +21037,82 @@ def _reconcile_off_session_activity(
                     and abs(actual_off_delta) < 0.05
                     and is_fl_now == bool(_restored_session_was_flat)
                 ):
-                    new_roq_updates[o_key] = tot_fq
+                    out_roq[o_key] = tot_fq
                     continue
-                if f_ep > max_fill_ep:
-                    max_fill_ep = f_ep
-                new_roq_updates[o_key] = max(
-                    tot_fq, float(new_roq_updates.get(o_key, 0.0))
+                if f_ep > out_max_ep:
+                    out_max_ep = f_ep
+                out_roq[o_key] = max(
+                    tot_fq, float(out_roq.get(o_key, 0.0))
                 )
                 rec_copy = dict(f_rec)
                 rec_copy["delta_qty"] = delta_q
                 rec_copy["_idx"] = f_idx
-                inc_fills.append(rec_copy)
+                out_inc.append(rec_copy)
+        return out_inc, out_roq, out_max_ep
+
+    if (
+        eff_since > 0.0
+        and not _cold_launch_ignored_qty_mutated
+        and active_adapter is not None
+        and not is_demo_mode_active(active_adapter)
+    ):
+        # Strict Clause (F5 Case b): only allow the 36h fast-path when flat
+        # before AND now, |delta| < $0.01, save was <30h ago, and zero
+        # incremental fills appear; everything else escalates to full 58d.
+        eligible_36h_zero_delta = bool(
+            was_flat_before_reconcile
+            and is_fl_now
+            and abs(actual_off_delta) < 0.01
+            and (time.time() - eff_since) < (30.0 * 3600.0)
+        )
+        raw_fills = prefetched_fills
+        if (
+            raw_fills is None
+            and allow_network
+            and hasattr(active_adapter, "fetch_filled_orders_since")
+        ):
+            try:
+                if eligible_36h_zero_delta:
+                    cand_36h = _call_fetch_filled_orders_since(
+                        active_adapter, eff_since, fast_recent_only=True
+                    )
+                    if isinstance(cand_36h, list):
+                        chk_inc, _, _ = _filter_inc_fills(cand_36h)
+                        if len(chk_inc) == 0:
+                            raw_fills = cand_36h
+                        else:
+                            raw_fills = _call_fetch_filled_orders_since(
+                                active_adapter, eff_since, fast_recent_only=False
+                            )
+                    else:
+                        raw_fills = _call_fetch_filled_orders_since(
+                            active_adapter, eff_since, fast_recent_only=False
+                        )
+                else:
+                    raw_fills = _call_fetch_filled_orders_since(
+                        active_adapter, eff_since, fast_recent_only=False
+                    )
+            except Exception:
+                raw_fills = None
+        elif (
+            isinstance(raw_fills, list)
+            and prefetched_window == "36h"
+        ):
+            chk_inc, _, _ = _filter_inc_fills(raw_fills)
+            if (not eligible_36h_zero_delta) or len(chk_inc) > 0:
+                if allow_network and hasattr(
+                    active_adapter, "fetch_filled_orders_since"
+                ):
+                    try:
+                        raw_fills = _call_fetch_filled_orders_since(
+                            active_adapter, eff_since, fast_recent_only=False
+                        )
+                    except Exception:
+                        raw_fills = None
+                else:
+                    return False
+
+        inc_fills, new_roq_updates, max_fill_ep = _filter_inc_fills(raw_fills)
 
         ig_scratch_tol = (
             float(active_adapter.get_flat_rounding_tolerance())
@@ -20243,13 +21356,19 @@ def _reconcile_off_session_activity(
                     f", Ord: {'/'.join(masked_oids[:3])}" if masked_oids else ""
                 )
                 approx_real = _round_cents(running_flat_eq - float(start_equity))
+                rt_end_lbl = "FLAT" if rt.get("all_flat_after") else "FLIP"
                 log_event(
                     "OFF_SESSION",
                     f"Reconstructed off-session trade ({et_str}): {rt['symbol']} "
-                    f"({rt['closed_qty']:g} closed -> FLAT{oid_sfx}) | "
+                    f"({rt['closed_qty']:g} closed -> {rt_end_lbl}{oid_sfx}) | "
                     f"TradePnL: {format_dollar(d_pnl)} | "
                     f"FlatRealized(checkpoint): {format_dollar(approx_real)}",
                 )
+                if _breach_pin_rt_pending and not was_flat_before_reconcile:
+                    if rt.get("all_flat_after"):
+                        _breach_pin_rt_pending = False
+                elif is_locked_down and last_breach_trigger_net_pnl is not None:
+                    _retire_stale_breach_trigger_pin("off-session round-trip")
             if (
                 daily_max_equity is not None
                 and daily_max_equity > max(pre_high_eq, settled_flat_eq_now) + 0.01
@@ -20329,6 +21448,10 @@ def _reconcile_off_session_activity(
                     win_trades += 1
                 else:
                     loss_trades += 1
+                if _breach_pin_rt_pending and not was_flat_before_reconcile:
+                    _breach_pin_rt_pending = False
+                elif is_locked_down and last_breach_trigger_net_pnl is not None:
+                    _retire_stale_breach_trigger_pin("off-session closed activity")
                 log_event(
                     "SESSION",
                     f"Reconciled off-session closed trade activity "
@@ -20398,6 +21521,42 @@ def _reconcile_off_session_flat_delta(eq_now, is_fl_now):
     return _reconcile_off_session_activity(eq_now, True, 0.0, {})
 
 
+def _recheck_presync_save_lock_after_sync(settled_flat_eq):
+    """If Settings saved while Pre-Flight background sync was still pending and
+    newly engaged `is_locked_down` against stale pre-sync equity, re-evaluates
+    once after Poll #1 finishes off-session catch-up."""
+    global is_locked_down, active_breach_source, last_breach_trigger_net_pnl
+    global _breach_pin_rt_pending, _breach_pin_retired, daily_breach_settings_prompted
+    global _lock_from_presync_save
+    if not _lock_from_presync_save:
+        return False
+    _lock_from_presync_save = False
+    if (
+        not is_locked_down
+        or is_committed_for_today()
+        or start_equity is None
+        or settled_flat_eq is None
+    ):
+        return False
+    fl_eq, _, _, tier_short, _, _ = describe_active_floor(config)
+    if fl_eq is not None and float(settled_flat_eq) > float(fl_eq):
+        is_locked_down = False
+        active_breach_source = ""
+        last_breach_trigger_net_pnl = None
+        _breach_pin_rt_pending = False
+        _breach_pin_retired = False
+        daily_breach_settings_prompted = False
+        save_session_state()
+        log_event(
+            "SESSION",
+            f"Pre-sync Daily Stop lock cleared after Poll #1 off-session catch-up "
+            f"({format_dollar(round(float(settled_flat_eq) - float(fl_eq), 2))} buffer above "
+            f"{format_dollar(round(float(fl_eq) - float(start_equity), 2))} [{tier_short}]).",
+        )
+        return True
+    return False
+
+
 def _stabilize_mid_fill_realized_and_equity(
     current_eq, is_flat, live_open_pnl, pos_details, is_reverify=False
 ):
@@ -20409,8 +21568,19 @@ def _stabilize_mid_fill_realized_and_equity(
     global settled_realized_pnl, prev_flat_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol, _launch_fee_drift_checked
     global _last_round_trip_close_ts, _pending_subpoll_consec_reason
+    global _breach_pin_rt_pending, _launch_live_sync_deferred
 
-    if first_poll_of_launch or settled_realized_pnl is None:
+    if first_poll_of_launch or settled_realized_pnl is None or _launch_live_sync_deferred:
+        if is_reverify:
+            _launch_live_sync_deferred = True
+            if is_flat:
+                realized_pnl = _round_cents(current_eq - start_equity)
+                open_pnl = 0.0
+            else:
+                open_pnl = live_open_pnl
+                realized_pnl = _round_cents((current_eq - start_equity) - open_pnl)
+            return current_eq, realized_pnl, open_pnl
+        _launch_live_sync_deferred = False
         if is_flat:
             ig_launch_tol = (
                 float(active_adapter.get_flat_rounding_tolerance())
@@ -20435,6 +21605,7 @@ def _stabilize_mid_fill_realized_and_equity(
                 _launch_fee_drift_checked = True
                 if not _maybe_absorb_untouched_flat_fee_drift(current_eq, is_flat):
                     _reconcile_off_session_activity(current_eq, True, 0.0, {})
+            _recheck_presync_save_lock_after_sync(current_eq)
             last_flat_equity = current_eq
             if current_eq > max_equity:
                 max_equity = current_eq
@@ -20461,6 +21632,7 @@ def _stabilize_mid_fill_realized_and_equity(
                 )
             realized_pnl = _round_cents((current_eq - start_equity) - open_pnl)
             last_flat_equity = _round_cents(start_equity + realized_pnl)
+            _recheck_presync_save_lock_after_sync(last_flat_equity)
             prev_flat_realized_pnl = realized_pnl
         settled_realized_pnl = realized_pnl
         flat_desync_streak = 0
@@ -20581,6 +21753,10 @@ def _stabilize_mid_fill_realized_and_equity(
                             )
                             if sub_reason:
                                 _pending_subpoll_consec_reason = sub_reason
+                            if _breach_pin_rt_pending:
+                                _breach_pin_rt_pending = False
+                            elif is_locked_down and last_breach_trigger_net_pnl is not None:
+                                _retire_stale_breach_trigger_pin("sub-poll round-trip")
                             s_high = _round_cents(
                                 (daily_max_equity or start_equity)
                                 - start_equity
@@ -20892,6 +22068,7 @@ def evaluate_stop_decisions(
     global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global prev_pos_snapshot, prev_flat_realized_pnl, settled_realized_pnl
     global is_locked_down, active_breach_source, last_breach_trigger_net_pnl
+    global _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
     global daily_breach_settings_prompted, done_for_today
     global cooldown_active, pending_halt_breach
     global active_non_breach_halted_syms, _notified_non_breach_halt_syms
@@ -20936,6 +22113,18 @@ def evaluate_stop_decisions(
             last_breach_trigger_net_pnl = state["last_breach_trigger_net_pnl"]
         elif not is_locked_down:
             last_breach_trigger_net_pnl = None
+        if "_breach_pin_rt_pending" in state:
+            _breach_pin_rt_pending = bool(state["_breach_pin_rt_pending"])
+        elif not is_locked_down:
+            _breach_pin_rt_pending = False
+        if "_breach_pin_retired" in state:
+            _breach_pin_retired = bool(state["_breach_pin_retired"])
+        elif not is_locked_down:
+            _breach_pin_retired = False
+        if "_lock_from_presync_save" in state:
+            _lock_from_presync_save = bool(state["_lock_from_presync_save"])
+        elif not is_locked_down:
+            _lock_from_presync_save = False
         if "done_for_today" in state:
             done_for_today = bool(state["done_for_today"])
         if "cooldown_active" in state:
@@ -21259,6 +22448,8 @@ def evaluate_stop_decisions(
             if not is_locked_down:
                 is_locked_down = True
                 last_breach_trigger_net_pnl = net_pnl
+                _breach_pin_rt_pending = False
+                _breach_pin_retired = False
                 if not active_breach_source:
                     active_breach_source = "OFF_SESSION"
     elif first_poll_of_launch and _launch_grace_pending and not is_flat:
@@ -21270,6 +22461,8 @@ def evaluate_stop_decisions(
         if past_daily_at_launch and not is_locked_down:
             is_locked_down = True
             last_breach_trigger_net_pnl = net_pnl
+            _breach_pin_rt_pending = False
+            _breach_pin_retired = False
             if not active_breach_source:
                 active_breach_source = "OFF_SESSION"
         if (
@@ -21660,6 +22853,9 @@ def evaluate_stop_decisions(
         is_locked_down = False
         active_breach_source = ""
         last_breach_trigger_net_pnl = None
+        _breach_pin_rt_pending = False
+        _breach_pin_retired = False
+        _lock_from_presync_save = False
         daily_breach_settings_prompted = False
         actions.append(
             {
@@ -21872,11 +23068,200 @@ def _wake_data_loop():
         pass
 
 
+def _build_hud_column_display_data(
+    realized_pnl,
+    open_pnl,
+    net_pnl,
+    terminate_pnl_level,
+    distance_to_terminate,
+    session_high_pnl,
+    leash_pct,
+    base_leash,
+    hud_breach_active,
+    eff_start_eq,
+    eff_last_flat_eq,
+    eff_daily_min_eq,
+    neutral_pending=False,
+):
+    """Builds the 10-column HUD display dict cleanly from explicit values. Used by
+    both live `data_loop()` updates and side-effect-free `0ms` cold HUD seeding."""
+    eff_min_eq = (
+        eff_daily_min_eq
+        if eff_daily_min_eq is not None
+        else min(
+            eff_start_eq,
+            eff_last_flat_eq if eff_last_flat_eq is not None else eff_start_eq,
+        )
+    )
+    session_low_pnl = round(eff_min_eq - eff_start_eq, 2)
+    giveback_val = (
+        round(net_pnl - session_high_pnl, 2) if session_high_pnl > 0 else 0.0
+    )
+    ls_txt, ls_bg = format_loss_streak_multiline()
+
+    if neutral_pending:
+        c1_bg = c2_bg = net_bg = c3_bg = c5_bg = "#262a2e"
+        sl_bg = c4_bg = fh_bg = wl_bg = ls_bg = "#262a2e"
+    else:
+        c1_bg = (
+            "#1e8449" if realized_pnl > 0
+            else ("#b03a2e" if realized_pnl < 0 else "#2c3e50")
+        )
+        c2_bg = (
+            "#1e8449" if open_pnl > 0
+            else ("#b03a2e" if open_pnl < 0 else "#2c3e50")
+        )
+        net_bg = (
+            "#1e8449" if net_pnl > 0
+            else ("#b03a2e" if net_pnl < 0 else "#2c3e50")
+        )
+        c3_bg = "#1e8449" if terminate_pnl_level > 0 else "#1f538d"
+        c5_bg = "#1e8449" if session_high_pnl > 0 else "#2c3e50"
+        wl_bg = "#2c3e50"
+        sl_bg = "#6e2c2c" if session_low_pnl < 0 else "#2c3e50"
+        c4_bg, fh_bg = _compute_dist_and_giveback_bgs(
+            distance_to_terminate=distance_to_terminate,
+            leash_pct=leash_pct,
+            hud_breach_active=hud_breach_active,
+            session_high_pnl=session_high_pnl,
+            giveback_val=giveback_val,
+            base_leash=base_leash,
+        )
+        if _off_session_peak_reconstructed and fh_bg == "#b03a2e":
+            fh_bg = "#2c3e50"
+
+    return {
+        "realized_pnl": (format_dollar(realized_pnl), c1_bg),
+        "open_pnl": (format_dollar(open_pnl), c2_bg),
+        "net_pnl": (format_dollar(net_pnl), net_bg),
+        "terminate_lvl": (format_dollar(terminate_pnl_level), c3_bg),
+        "dist_to_term": (
+            format_dist_to_stop_hud(
+                -142.50
+                if (
+                    breach_visual_sim_active
+                    and not is_locked_down
+                    and distance_to_terminate > 0
+                )
+                else distance_to_terminate,
+                hud_breach_active,
+            ),
+            c4_bg,
+        ),
+        "session_high": (format_dollar(session_high_pnl), c5_bg),
+        "session_low": (format_dollar(session_low_pnl), sl_bg),
+        "from_high": (format_dollar(giveback_val), fh_bg),
+        "trades_wl": (
+            format_trades_wl_multiline(win_trades, loss_trades),
+            wl_bg,
+        ),
+        "loss_streak": (ls_txt, ls_bg),
+    }
+
+
+def _apply_postlaunch_preflight_auth(
+    ad, bg_ep, verified_accts, resolved_acct_id
+):
+    """Applies deferred Pre-Flight `verify_accounts_live()` results safely on
+    the UI thread after an early SAVE & LAUNCH: saves `cached_accounts`, logs
+    `API authenticated`, and if an invalid cached account resolved to a
+    different sub-account, switches with an isolated baseline + [GUARDRAIL] log."""
+    global force_reanchor, _initial_positions_verified, current_is_flat
+    if (
+        ad is None
+        or active_adapter is not ad
+        or get_adapter_epoch() != bg_ep
+    ):
+        return False
+    b_n = getattr(ad, "name", "")
+    if verified_accts and getattr(ad, "accounts", None):
+        b_map = config.setdefault("brokers", {}).setdefault(b_n, {})
+        if b_map.get("cached_accounts") != ad.accounts:
+            b_map["cached_accounts"] = [dict(a) for a in ad.accounts]
+            save_config(config)
+        log_event(
+            "SESSION",
+            f"{b_n} API authenticated ({len(ad.accounts)} account(s) found).",
+        )
+        valid_ids = [
+            a["id"]
+            for a in ad.accounts
+            if isinstance(a, dict) and a.get("id")
+        ]
+        cur_aid = str(getattr(ad, "account_id", "") or "")
+        if (
+            cur_aid not in valid_ids
+            and resolved_acct_id
+            and resolved_acct_id in valid_ids
+            and resolved_acct_id != cur_aid
+        ):
+            with _in_flight_poll_lock:
+                if active_adapter is not ad or get_adapter_epoch() != bg_ep:
+                    return False
+                _bump_adapter_epoch()
+                _deferred_alarms.clear()
+                _initial_positions_verified = False
+                current_is_flat = True
+                old_masked = _mask_last4(cur_aid)
+                new_masked = _mask_last4(resolved_acct_id)
+                ad.account_id = resolved_acct_id
+                config.setdefault("brokers", {}).setdefault(b_n, {})[
+                    "selected_account_id"
+                ] = resolved_acct_id
+                had_s = restore_account_session(
+                    b_n, resolved_acct_id, log_restore=True
+                )
+                force_reanchor = not had_s
+                save_config(config)
+                log_event(
+                    "GUARDRAIL",
+                    f"Post-launch broker sync detected stale cached account ({old_masked}); "
+                    f"switched cleanly to {b_n} account {new_masked} with isolated baseline.",
+                )
+            if hud_root is not None:
+                try:
+                    if hud_root.winfo_exists():
+                        resync_live_hud_for_active_broker()
+                except Exception:
+                    pass
+    return True
+
+
+def _enqueue_postlaunch_preflight_auth(
+    ad, bg_ep, verified_accts, resolved_acct_id
+):
+    global _pending_postlaunch_auth
+    with _postlaunch_auth_lock:
+        _pending_postlaunch_auth = (
+            ad,
+            bg_ep,
+            bool(verified_accts),
+            str(resolved_acct_id or ""),
+        )
+    if hud_root is not None:
+        try:
+            if hud_root.winfo_exists():
+                hud_root.after(0, _flush_pending_postlaunch_auth)
+        except Exception:
+            pass
+
+
+def _flush_pending_postlaunch_auth():
+    global _pending_postlaunch_auth
+    with _postlaunch_auth_lock:
+        pending = _pending_postlaunch_auth
+        _pending_postlaunch_auth = None
+    if not pending:
+        return False
+    return _apply_postlaunch_preflight_auth(*pending)
+
+
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close, is_locked_down, active_breach_source
-    global last_breach_trigger_net_pnl, force_reanchor
+    global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
+    global force_reanchor
     global done_for_today, committed_for_today, breach_visual_sim_active
     global triggered_alarms, prev_pos_snapshot, current_is_flat
     global active_adapter, first_poll_of_launch, _launch_grace_pending, _launch_grace_syms
@@ -21889,8 +23274,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global alarm_active, last_alarm_reason, daily_breach_settings_prompted
     global pending_halt_breach, active_session_date
     global _initial_positions_verified, last_data_loop_heartbeat
-    global _launch_fee_drift_checked, _off_session_reconciled
+    global _launch_fee_drift_checked, _launch_live_sync_deferred, _off_session_reconciled
     global _reconciled_through_epoch, _reconciled_order_qty, _off_session_peak_reconstructed
+    global _last_live_hud_snapshot
 
     consecutive_api_failures = 0
     consecutive_loop_exceptions = 0
@@ -21898,14 +23284,17 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     rate_limit_hold_since = 0.0
     rate_limit_anchor_hold_logged = False
     _data_loop_wake_event.clear()
-    last_data_loop_heartbeat = time.time()
+    _touch_data_loop_heartbeat()
     _prev_poll_diag = {"open": None, "net": None, "ts": 0.0, "epoch": None}
 
     while True:
-        last_data_loop_heartbeat = time.time()
+        _touch_data_loop_heartbeat()
         poll_sec = 2
         poll_ad = None
         snap_was_cached = False
+        poll_iter_t0 = time.monotonic()
+        was_poll_1_launch = bool(first_poll_of_launch)
+        acct_fetch_ms = 0.0
         try:
             try:
                 poll_sec = min(
@@ -21937,9 +23326,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     poll_epoch = get_adapter_epoch()
                     poll_broker = getattr(poll_ad, "name", "")
                     poll_acct = getattr(poll_ad, "account_id", "")
+                    t_acct0 = time.monotonic()
                     current_eq, is_flat, live_open_pnl, pos_details, has_options = (
                         poll_ad.fetch_account_data()
                     )
+                    acct_fetch_ms = (time.monotonic() - t_acct0) * 1000.0
                     snap_was_cached = bool(
                         getattr(poll_ad, "last_snapshot_was_cached", False)
                     )
@@ -22089,6 +23480,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     is_locked_down = False
                     active_breach_source = ""
                     last_breach_trigger_net_pnl = None
+                    _breach_pin_rt_pending = False
+                    _breach_pin_retired = False
+                    _lock_from_presync_save = False
                     done_for_today = False
                     committed_for_today = False
                     breach_visual_sim_active = False
@@ -22118,6 +23512,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     first_poll_of_launch = True
                     _launch_grace_pending = False
                     _launch_fee_drift_checked = True
+                    _launch_live_sync_deferred = False
                     _off_session_reconciled = True
                     save_session_state(
                         expected_epoch=poll_epoch, adapter_override=poll_ad
@@ -22151,7 +23546,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     consecutive_loop_exceptions = 0
                     if _data_loop_wake_event.wait(timeout=hold_s):
                         _data_loop_wake_event.clear()
-                        last_data_loop_heartbeat = time.time()
+                        _touch_data_loop_heartbeat()
                     continue
 
                 if (
@@ -22212,6 +23607,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     is_locked_down = False
                     active_breach_source = ""
                     last_breach_trigger_net_pnl = None
+                    _breach_pin_rt_pending = False
+                    _breach_pin_retired = False
+                    _lock_from_presync_save = False
                     daily_breach_settings_prompted = False
                     pending_halt_breach = None
                     win_trades = 0
@@ -22234,6 +23632,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     first_poll_of_launch = True
                     _launch_grace_pending = False
                     _launch_fee_drift_checked = True
+                    _launch_live_sync_deferred = False
                     _off_session_reconciled = True
                     save_session_state(
                         expected_epoch=poll_epoch, adapter_override=poll_ad
@@ -22280,6 +23679,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         is_locked_down = False
                         active_breach_source = ""
                         last_breach_trigger_net_pnl = None
+                        _breach_pin_rt_pending = False
+                        _breach_pin_retired = False
+                        _lock_from_presync_save = False
                         daily_breach_settings_prompted = False
                         if is_flat:
                             pending_halt_breach = None
@@ -22325,6 +23727,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         is_locked_down = False
                         active_breach_source = ""
                         last_breach_trigger_net_pnl = None
+                        _breach_pin_rt_pending = False
+                        _breach_pin_retired = False
+                        _lock_from_presync_save = False
                         daily_breach_settings_prompted = False
                         if is_flat:
                             pending_halt_breach = None
@@ -22901,73 +24306,21 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     if hud_breach_active
                     else dec["leash_pct"]
                 )
-
-                c1_bg = (
-                    "#1e8449" if realized_pnl > 0
-                    else ("#b03a2e" if realized_pnl < 0 else "#2c3e50")
-                )
-                c2_bg = (
-                    "#1e8449" if open_pnl > 0
-                    else ("#b03a2e" if open_pnl < 0 else "#2c3e50")
-                )
-                net_bg = (
-                    "#1e8449" if net_pnl > 0
-                    else ("#b03a2e" if net_pnl < 0 else "#2c3e50")
-                )
-                c3_bg = "#1e8449" if terminate_pnl_level > 0 else "#1f538d"
-                c5_bg = "#1e8449" if session_high_pnl > 0 else "#2c3e50"
-                eff_min_eq = (
-                    daily_min_equity
-                    if daily_min_equity is not None
-                    else min(
-                        start_equity,
-                        last_flat_equity
-                        if last_flat_equity is not None
-                        else start_equity,
-                    )
-                )
-                session_low_pnl = round(eff_min_eq - start_equity, 2)
-                sl_bg = "#6e2c2c" if session_low_pnl < 0 else "#2c3e50"
-
-                giveback_val = (
-                    round(net_pnl - session_high_pnl, 2)
-                    if session_high_pnl > 0 else 0.0
-                )
-                c4_bg, fh_bg = _compute_dist_and_giveback_bgs(
+                all_col_values = _build_hud_column_display_data(
+                    realized_pnl=realized_pnl,
+                    open_pnl=open_pnl,
+                    net_pnl=net_pnl,
+                    terminate_pnl_level=terminate_pnl_level,
                     distance_to_terminate=distance_to_terminate,
-                    leash_pct=leash_pct,
-                    hud_breach_active=hud_breach_active,
                     session_high_pnl=session_high_pnl,
-                    giveback_val=giveback_val,
+                    leash_pct=leash_pct,
                     base_leash=dec.get("base_leash", 1500.0),
+                    hud_breach_active=hud_breach_active,
+                    eff_start_eq=start_equity,
+                    eff_last_flat_eq=last_flat_equity,
+                    eff_daily_min_eq=daily_min_equity,
+                    neutral_pending=False,
                 )
-                if _off_session_peak_reconstructed and fh_bg == "#b03a2e":
-                    fh_bg = "#2c3e50"
-                wl_bg = "#2c3e50"
-
-                all_col_values = {
-                    "realized_pnl": (format_dollar(realized_pnl), c1_bg),
-                    "open_pnl": (format_dollar(open_pnl), c2_bg),
-                    "net_pnl": (format_dollar(net_pnl), net_bg),
-                    "terminate_lvl": (format_dollar(terminate_pnl_level), c3_bg),
-                    "dist_to_term": (
-                        format_dist_to_stop_hud(
-                            -142.50
-                            if (breach_visual_sim_active and not is_locked_down and distance_to_terminate > 0)
-                            else distance_to_terminate,
-                            hud_breach_active,
-                        ),
-                        c4_bg,
-                    ),
-                    "session_high": (format_dollar(session_high_pnl), c5_bg),
-                    "session_low": (format_dollar(session_low_pnl), sl_bg),
-                    "from_high": (format_dollar(giveback_val), fh_bg),
-                    "trades_wl": (
-                        format_trades_wl_multiline(win_trades, loss_trades),
-                        wl_bg
-                    ),
-                    "loss_streak": format_loss_streak_multiline(),
-                }
                 active_cols = get_active_hud_columns(config)
                 col_data = [
                     all_col_values.get(cid, ("---", "#2c3e50"))
@@ -22979,18 +24332,47 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     _prev_poll_diag["net"] = net_pnl
                     _prev_poll_diag["ts"] = time.time()
                     _prev_poll_diag["epoch"] = poll_epoch
+                    _last_live_hud_snapshot = {
+                        "epoch": poll_epoch,
+                        "broker": poll_broker,
+                        "acct_id": poll_acct,
+                        "cols": dict(all_col_values),
+                        "leash_pct": leash_pct,
+                        "is_flat": bool(is_flat),
+                    }
+                    _record_fresh_hud_poll(poll_ad, poll_sec, poll_epoch)
+                    if was_poll_1_launch and not first_poll_of_launch:
+                        total_p1_ms = (time.monotonic() - poll_iter_t0) * 1000.0
+                        log_event(
+                            "PERF",
+                            f"HUD Poll #1 live sync completed in {total_p1_ms:.0f}ms "
+                            f"(account_fetch={acct_fetch_ms:.0f}ms).",
+                        )
                 if not _poll_still_valid():
                     continue
+                is_fresh_hud_snap = bool(
+                    not snap_was_cached and not reverify_deferred_cached
+                )
                 root.after(
                     0,
-                    lambda d=col_data, f=is_flat, lp=leash_pct, ep=poll_epoch: (
-                        update_gui(
-                            ui_labels,
-                            d,
-                            f,
-                            settings_btn,
-                            close_btn,
-                            leash_pct=lp,
+                    lambda d=col_data, f=is_flat, lp=leash_pct, ep=poll_epoch, fr=is_fresh_hud_snap: (
+                        (
+                            update_gui(
+                                ui_labels,
+                                d,
+                                f,
+                                settings_btn,
+                                close_btn,
+                                leash_pct=lp,
+                            ),
+                            _apply_hud_status_pill_state(mute_btn, advance_streak=False)
+                            if (
+                                fr
+                                and mute_btn is not None
+                                and not alarm_active
+                                and not cooldown_active
+                            )
+                            else None,
                         )
                         if (
                             get_adapter_epoch() == ep
@@ -23048,21 +24430,29 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             f"refreshed HTTP session & retrying automatically...",
                         )
                         if not alarm_active and not cooldown_active:
-                            retry_1_txt = (
-                                "⚠️ RETRYING API (#1)..."
-                                if is_compact_hud()
-                                else "⚠️ CONNECTION HICCUP — RETRYING BROKER API (ATTEMPT #1)..."
-                            )
-                            mute_btn.after(
-                                0,
-                                lambda t=retry_1_txt: mute_btn.config(
-                                    text=t,
-                                    bg="#78350f",
-                                    fg="#fde68a",
-                                    disabledforeground="#fde68a",
-                                    state="disabled",
-                                ),
-                            )
+                            if getattr(mute_btn, "_show_status_led", False):
+                                mute_btn.after(
+                                    0,
+                                    lambda: _apply_hud_status_pill_state(
+                                        mute_btn, advance_streak=False
+                                    ),
+                                )
+                            else:
+                                retry_1_txt = (
+                                    "⚠️ RETRYING API (#1)..."
+                                    if is_compact_hud()
+                                    else "⚠️ CONNECTION HICCUP — RETRYING BROKER API (ATTEMPT #1)..."
+                                )
+                                mute_btn.after(
+                                    0,
+                                    lambda t=retry_1_txt: mute_btn.config(
+                                        text=t,
+                                        bg="#78350f",
+                                        fg="#fde68a",
+                                        disabledforeground="#fde68a",
+                                        state="disabled",
+                                    ),
+                                )
                     elif is_tok_exp or consecutive_api_failures >= 2:
                         if not is_tok_exp and hasattr(poll_ad, "reconnect_session"):
                             if (
@@ -23136,32 +24526,46 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                         if is_compact_hud()
                                         else f"🔔 CONNECTION LOST — RECONNECTING (ATTEMPT #{att}) (CLICK TO MUTE)"
                                     )
+                                    al_led_kw = (
+                                        {"led_hex": "#ef4444", "led_style": "solid"}
+                                        if getattr(mute_btn, "_show_status_led", False)
+                                        else {}
+                                    )
                                     mute_btn.after(
                                         0,
-                                        lambda t=al_btn_txt: mute_btn.config(
+                                        lambda t=al_btn_txt, kw=al_led_kw: mute_btn.config(
                                             text=t,
                                             bg="#eab308",
                                             fg="#090d16",
                                             disabledforeground="#090d16",
                                             state="normal",
+                                            **kw,
                                         ),
                                     )
                                 elif not cooldown_active:
-                                    re_btn_txt = (
-                                        f"🔄 RECONNECTING (#{att})..."
-                                        if is_compact_hud()
-                                        else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
-                                    )
-                                    mute_btn.after(
-                                        0,
-                                        lambda t=re_btn_txt: mute_btn.config(
-                                            text=t,
-                                            bg="#78350f",
-                                            fg="#fde68a",
-                                            disabledforeground="#fde68a",
-                                            state="disabled",
-                                        ),
-                                    )
+                                    if getattr(mute_btn, "_show_status_led", False):
+                                        mute_btn.after(
+                                            0,
+                                            lambda: _apply_hud_status_pill_state(
+                                                mute_btn, advance_streak=False
+                                            ),
+                                        )
+                                    else:
+                                        re_btn_txt = (
+                                            f"🔄 RECONNECTING (#{att})..."
+                                            if is_compact_hud()
+                                            else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
+                                        )
+                                        mute_btn.after(
+                                            0,
+                                            lambda t=re_btn_txt: mute_btn.config(
+                                                text=t,
+                                                bg="#78350f",
+                                                fg="#fde68a",
+                                                disabledforeground="#fde68a",
+                                                state="disabled",
+                                            ),
+                                        )
             consecutive_loop_exceptions = 0
 
         except Exception as e:
@@ -23190,10 +24594,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
             sl_step = min(0.25, rem_sleep)
             if _data_loop_wake_event.wait(timeout=sl_step):
                 _data_loop_wake_event.clear()
-                last_data_loop_heartbeat = time.time()
+                _touch_data_loop_heartbeat()
                 break
             rem_sleep -= sl_step
-            last_data_loop_heartbeat = time.time()
+            _touch_data_loop_heartbeat()
 
 
 # ==========================================
@@ -23590,6 +24994,7 @@ def show_preflight_window(
         "rulebook_after_id": None,
         "streak_after_id": None,
         "pulse_after_id": None,
+        "undo_after_id": None,
         "pulse_stop_fn": None,
         "card3_pulse_keys": (),
         "closing": False,
@@ -23725,7 +25130,12 @@ def show_preflight_window(
             pf.unbind("<Configure>")
         except Exception:
             pass
-        for k_id in ("rulebook_after_id", "streak_after_id", "pulse_after_id"):
+        for k_id in (
+            "rulebook_after_id",
+            "streak_after_id",
+            "pulse_after_id",
+            "undo_after_id",
+        ):
             aid = pf_timer_state.get(k_id)
             if aid is not None:
                 pf_timer_state[k_id] = None
@@ -25192,12 +26602,15 @@ def show_preflight_window(
                                     and sw_snap[0] > 0
                                     and get_adapter_epoch() == _acct_sw_ep
                                 ):
-                                    if sw_snap[1] and hasattr(
+                                    if _is_untouched_fee_drift_candidate(
+                                        sw_snap[0], sw_snap[1], adapter_override=_acct_sw_ad
+                                    ) and hasattr(
                                         _acct_sw_ad, "has_any_filled_orders_today"
                                     ):
                                         _acct_sw_ad.has_any_filled_orders_today()
                                     sw_prefetched_fills = None
                                     sw_prefetched_closing = None
+                                    sw_prefetched_win = None
                                     eff_sw_since = (
                                         float(_reconciled_through_epoch)
                                         if float(_reconciled_through_epoch or 0.0) > 0.0
@@ -25206,9 +26619,35 @@ def show_preflight_window(
                                     if eff_sw_since > 0.0 and hasattr(
                                         _acct_sw_ad, "fetch_filled_orders_since"
                                     ):
-                                        sw_prefetched_fills = _acct_sw_ad.fetch_filled_orders_since(
-                                            eff_sw_since
+                                        sw_ref_flat = (
+                                            last_flat_equity
+                                            if last_flat_equity is not None and float(last_flat_equity) > 0.0
+                                            else start_equity
                                         )
+                                        sw_use_fast = bool(
+                                            sw_snap[1]
+                                            and _restored_session_was_flat
+                                            and sw_ref_flat is not None
+                                            and float(sw_ref_flat) > 0.0
+                                            and abs(round(float(sw_snap[0]) - float(sw_ref_flat), 2)) < 0.01
+                                            and (time.time() - eff_sw_since) < (30.0 * 3600.0)
+                                        )
+                                        sw_prefetched_win = "36h" if sw_use_fast else "58d"
+                                        sw_prefetched_fills = _call_fetch_filled_orders_since(
+                                            _acct_sw_ad,
+                                            eff_sw_since,
+                                            fast_recent_only=sw_use_fast,
+                                        )
+                                        if sw_use_fast and (
+                                            sw_prefetched_fills is None
+                                            or len(sw_prefetched_fills) > 0
+                                        ):
+                                            sw_prefetched_win = "58d"
+                                            sw_prefetched_fills = _call_fetch_filled_orders_since(
+                                                _acct_sw_ad,
+                                                eff_sw_since,
+                                                fast_recent_only=False,
+                                            )
                                         if (
                                             sw_prefetched_fills is None
                                             and sw_snap[1]
@@ -25227,6 +26666,7 @@ def show_preflight_window(
                                 sw_snap = None
                                 sw_prefetched_fills = None
                                 sw_prefetched_closing = None
+                                sw_prefetched_win = None
 
                             def _apply_acct_sw_on_ui():
                                 global _initial_positions_verified, current_is_flat
@@ -25266,6 +26706,7 @@ def show_preflight_window(
                                                 prefetched_fills=sw_prefetched_fills,
                                                 prefetched_closing_confirmed=sw_prefetched_closing,
                                                 allow_network=False,
+                                                prefetched_window=sw_prefetched_win,
                                             )
                                     else:
                                         _reconcile_off_session_activity(
@@ -25276,6 +26717,7 @@ def show_preflight_window(
                                             prefetched_fills=sw_prefetched_fills,
                                             prefetched_closing_confirmed=sw_prefetched_closing,
                                             allow_network=False,
+                                            prefetched_window=sw_prefetched_win,
                                         )
                                 _refresh_ignored_positions_pill()
                                 _render_card3_telemetry_live(force=True)
@@ -26001,6 +27443,11 @@ def show_preflight_window(
     top_bar.pack_propagate(False)
 
     demo_footer_banner = None
+    demo_pf_banner_lbl = None
+    btn_undo_edits = None
+    _pf_undo_snapshot = {"ready": False, "data": None}
+    _pf_undo_busy = {"suppress": False}
+    _pf_undo_hooks = {"schedule": None}
 
     def _exit_demo_to_live_broker():
         global committed_for_today
@@ -26047,6 +27494,9 @@ def show_preflight_window(
                 and bool(demo_footer_banner.winfo_manager())
             ):
                 demo_footer_banner.pack_forget()
+        sched_undo = _pf_undo_hooks.get("schedule")
+        if callable(sched_undo):
+            sched_undo()
 
     # 1. Unified Broker & Account Frosted Glass Stadium Bar (Single Un-Nested Bar)
     broker_acct_capsule = tk.Canvas(
@@ -26763,6 +28213,9 @@ def show_preflight_window(
             selected_hud_columns.clear()
             selected_hud_columns.extend(chosen)
             hud_cols_btn.config(text=format_hud_cols_btn_label(chosen))
+            sched_undo = _pf_undo_hooks.get("schedule")
+            if callable(sched_undo):
+                sched_undo()
             _restore_pf_modal_focus(dlg)
 
         b_bar = tk.Frame(dlg, bg="#0d1117", pady=12)
@@ -28609,6 +30062,9 @@ def show_preflight_window(
                 hover_border="#475569",
                 fg="#94a3b8",
             )
+        sched_undo = _pf_undo_hooks.get("schedule")
+        if callable(sched_undo):
+            sched_undo()
 
     def apply_dollar_preset(preset_dict):
         if is_in_trade_tamper_locked():
@@ -28629,6 +30085,9 @@ def show_preflight_window(
             return
         _, half_dict = _get_preset_target_dicts()
         apply_dollar_preset(half_dict)
+        ref_undo = _pf_undo_hooks.get("refresh")
+        if callable(ref_undo):
+            ref_undo()
         if default_status_lbl is not None:
             src_name = "your saved Default" if config.get("user_defaults") else "Factory Default"
             lk_note = (
@@ -28636,8 +30095,14 @@ def show_preflight_window(
                 if is_tilt_streak_tamper_locked()
                 else ""
             )
+            undo_hint = (
+                " · ↺ Undo Edits to go back"
+                if callable(_pf_undo_hooks.get("is_dirty"))
+                and _pf_undo_hooks["is_dirty"]()
+                else ""
+            )
             default_status_lbl.config(
-                text=f"⚡ Applied 50% Low Energy preset (50% of {src_name}){lk_note}.",
+                text=f"⚡ 50% Low Energy loaded (50% of {src_name}) — not saved yet{undo_hint}{lk_note}.",
                 fg="#f5b041"
             )
 
@@ -28646,6 +30111,9 @@ def show_preflight_window(
             return
         base_src = config.get("user_defaults") or DEFAULT_CONFIG
         apply_dollar_preset(base_src)
+        ref_undo = _pf_undo_hooks.get("refresh")
+        if callable(ref_undo):
+            ref_undo()
         if default_status_lbl is not None:
             src_name = "your saved Default" if config.get("user_defaults") else "Factory Default"
             lk_note = (
@@ -28653,8 +30121,14 @@ def show_preflight_window(
                 if is_tilt_streak_tamper_locked()
                 else ""
             )
+            undo_hint = (
+                " · ↺ Undo Edits to go back"
+                if callable(_pf_undo_hooks.get("is_dirty"))
+                and _pf_undo_hooks["is_dirty"]()
+                else ""
+            )
             default_status_lbl.config(
-                text=f"✓ Applied Standard Full Risk preset (100% of {src_name}){lk_note}.",
+                text=f"✓ Standard Full Risk loaded (100% of {src_name}) — not saved yet{undo_hint}{lk_note}.",
                 fg="#5dade2"
             )
 
@@ -28726,6 +30200,262 @@ def show_preflight_window(
     btn_save_def = None
     btn_alarms_only = None
     btn_launch = None
+
+    def _norm_pf_num(raw_s, signed=False, is_int=False):
+        s = str(raw_s).strip()
+        if not s:
+            return ("RAW", "")
+        try:
+            v = float(s)
+            if not math.isfinite(v):
+                return ("RAW", s)
+        except Exception:
+            return ("RAW", s)
+        if v == 0.0:
+            v = 0.0
+        if is_int:
+            return ("INT", int(round(abs(v))))
+        return ("FLT", round(v if signed else abs(v), 4))
+
+    _pf_undo_bool_vars = {
+        "alarms_only": var_alarms_only,
+        "open_flat": var_open_flat,
+        "tilt_cd": var_tilt_cd,
+        "open_cd": var_open_cd,
+        "flatten": var_flatten,
+        "flatten_options": var_flatten_options,
+        "kill_tos": var_kill_tos,
+        "kill_wb": var_kill_wb,
+        "lock_os": var_lock_os,
+        "reset925": var_reset925,
+        "ignore_preexisting": var_ignore_preexisting,
+        "reanchor": var_reanchor,
+        "voice_cues": var_voice_cues,
+        "upside_chime": var_upside_chime,
+        "pm_w1_on": var_pm_w1_on,
+        "pm_w2_on": var_pm_w2_on,
+        "pm_lock_on": var_pm_lock_on,
+        "t1_w1_on": var_t1_w1_on,
+        "t1_w2_on": var_t1_w2_on,
+        "t2_on": var_t2_on,
+        "t3_on": var_t3_on,
+        "t4_on": var_t4_on,
+    }
+    _pf_undo_num_specs = {
+        "tilt_count": (var_tilt_count, False, True),
+        "tilt_window": (var_tilt_window, False, False),
+        "cd_mins": (var_cd_mins, False, False),
+        "daily_lock_mins": (var_daily_lock_mins, False, False),
+        "poll": (var_poll, False, True),
+    }
+
+    def _collect_pf_undo_state():
+        bools = {k: bool(v.get()) for k, v in _pf_undo_bool_vars.items()}
+        nums = {}
+        for k, (v_obj, is_signed, is_int) in _pf_undo_num_specs.items():
+            raw_v = str(v_obj.get())
+            nums[k] = (raw_v, _norm_pf_num(raw_v, signed=is_signed, is_int=is_int))
+        dollars = {}
+        for k in dollar_keys:
+            raw_d = str(dollar_vars[k].get())
+            dollars[k] = (
+                raw_d,
+                _norm_pf_num(raw_d, signed=(k in SIGNED_DOLLAR_KEYS), is_int=False),
+            )
+        return {
+            "bools": bools,
+            "nums": nums,
+            "tts_voice": str(var_tts_voice.get()),
+            "dollars": dollars,
+            "hud_columns": list(selected_hud_columns),
+        }
+
+    def _capture_pf_undo_snapshot():
+        _pf_undo_snapshot["data"] = _collect_pf_undo_state()
+        _pf_undo_snapshot["ready"] = True
+
+    def _has_unsaved_pf_edits():
+        if not _pf_undo_snapshot["ready"] or is_in_trade_tamper_locked():
+            return False
+        snap = _pf_undo_snapshot.get("data")
+        if not isinstance(snap, dict):
+            return False
+        cur = _collect_pf_undo_state()
+        tamper_lk = is_tilt_streak_tamper_locked()
+        open_cd_lk = bool(tamper_lk and config.get("enable_open_cooldown", False))
+        ao_lk = bool(tamper_lk and not config.get("alarms_only_mode", False))
+
+        for k, b_val in cur["bools"].items():
+            if tamper_lk and k == "tilt_cd":
+                continue
+            if open_cd_lk and k == "open_cd":
+                continue
+            if ao_lk and k == "alarms_only":
+                continue
+            if b_val != snap["bools"].get(k):
+                return True
+        for k, (_raw_v, norm_v) in cur["nums"].items():
+            if tamper_lk and k in ("tilt_count", "tilt_window"):
+                continue
+            if open_cd_lk and k == "cd_mins":
+                continue
+            if norm_v != snap["nums"][k][1]:
+                return True
+        if cur["tts_voice"] != snap["tts_voice"]:
+            return True
+        for k, (_raw_d, norm_d) in cur["dollars"].items():
+            if tamper_lk and k in (
+                "consec_loss_min_dollars",
+                "consec_win_reset_dollars",
+            ):
+                continue
+            if norm_d != snap["dollars"][k][1]:
+                return True
+        if cur["hud_columns"] != snap["hud_columns"]:
+            return True
+        return False
+
+    def _refresh_undo_edits_btn(*_):
+        aid = pf_timer_state.get("undo_after_id")
+        if aid is not None:
+            pf_timer_state["undo_after_id"] = None
+            try:
+                pf.after_cancel(aid)
+            except Exception:
+                pass
+        if pf_timer_state.get("closing") or btn_undo_edits is None:
+            return
+        try:
+            if not btn_undo_edits.winfo_exists():
+                return
+        except Exception:
+            return
+        is_demo_b = str(var_broker.get() or "").upper() == "DEMO"
+        dirty = bool(_has_unsaved_pf_edits())
+        if dirty:
+            btn_undo_edits.config(
+                text="↺ Undo" if is_demo_b else "↺ Undo Edits",
+                width=90 if is_demo_b else 128,
+            )
+            if (
+                demo_pf_banner_lbl is not None
+                and demo_pf_banner_lbl.winfo_exists()
+            ):
+                demo_pf_banner_lbl.config(
+                    text="🧪 DEMO" if is_demo_b else "🧪 DEMO SANDBOX ($25K)"
+                )
+            if not bool(btn_undo_edits.winfo_manager()):
+                if btn_save_def is not None and btn_save_def.winfo_exists():
+                    btn_undo_edits.pack(
+                        side="left", padx=(10, 0), after=btn_save_def
+                    )
+                else:
+                    btn_undo_edits.pack(side="left", padx=(10, 0))
+        else:
+            if bool(btn_undo_edits.winfo_manager()):
+                btn_undo_edits.pack_forget()
+            if (
+                demo_pf_banner_lbl is not None
+                and demo_pf_banner_lbl.winfo_exists()
+            ):
+                demo_pf_banner_lbl.config(text="🧪 DEMO SANDBOX ($25K)")
+
+    def _schedule_undo_btn_refresh(*_):
+        if _pf_undo_busy["suppress"] or pf_timer_state.get("closing"):
+            return
+        aid = pf_timer_state.get("undo_after_id")
+        if aid is not None:
+            pf_timer_state["undo_after_id"] = None
+            try:
+                pf.after_cancel(aid)
+            except Exception:
+                pass
+        try:
+            if pf.winfo_exists():
+                pf_timer_state["undo_after_id"] = pf.after(
+                    15, _refresh_undo_edits_btn
+                )
+        except Exception:
+            pass
+
+    _pf_undo_hooks["schedule"] = _schedule_undo_btn_refresh
+    _pf_undo_hooks["refresh"] = _refresh_undo_edits_btn
+    _pf_undo_hooks["capture"] = _capture_pf_undo_snapshot
+    _pf_undo_hooks["is_dirty"] = _has_unsaved_pf_edits
+
+    def undo_preflight_edits():
+        if is_in_trade_tamper_locked() or not _pf_undo_snapshot["ready"]:
+            return
+        snap = _pf_undo_snapshot.get("data")
+        if not isinstance(snap, dict):
+            return
+        tamper_lk = is_tilt_streak_tamper_locked()
+        open_cd_lk = bool(tamper_lk and config.get("enable_open_cooldown", False))
+        ao_lk = bool(tamper_lk and not config.get("alarms_only_mode", False))
+        _pf_undo_busy["suppress"] = True
+        _tilt_cd_popup_guard["suppress"] = True
+        _opt_waiver_guard["suppress"] = True
+        _ignore_prepos_guard["suppress"] = True
+        try:
+            # Restore Alarms Only before enforcement checkmarks so toggle-off state matches snapshot cleanly
+            if not ao_lk and "alarms_only" in snap["bools"]:
+                var_alarms_only.set(bool(snap["bools"]["alarms_only"]))
+            for k, v_obj in _pf_undo_bool_vars.items():
+                if k == "alarms_only":
+                    continue
+                if tamper_lk and k == "tilt_cd":
+                    continue
+                if open_cd_lk and k == "open_cd":
+                    continue
+                val_b = bool(snap["bools"].get(k, False))
+                if k == "flatten_options":
+                    val_b = bool(val_b and is_options_waiver_verified(config))
+                v_obj.set(val_b)
+            for k, (v_obj, _is_s, _is_i) in _pf_undo_num_specs.items():
+                if tamper_lk and k in ("tilt_count", "tilt_window"):
+                    continue
+                if open_cd_lk and k == "cd_mins":
+                    continue
+                v_obj.set(snap["nums"][k][0])
+            var_tts_voice.set(snap["tts_voice"])
+            selected_hud_columns.clear()
+            selected_hud_columns.extend(snap["hud_columns"])
+            hud_cols_btn.config(
+                text=format_hud_cols_btn_label(selected_hud_columns)
+            )
+            for k in dollar_keys:
+                if tamper_lk and k in (
+                    "consec_loss_min_dollars",
+                    "consec_win_reset_dollars",
+                ):
+                    continue
+                dollar_vars[k].set(snap["dollars"][k][0])
+        finally:
+            _ignore_prepos_guard["suppress"] = False
+            _opt_waiver_guard["suppress"] = False
+            _tilt_cd_popup_guard["suppress"] = False
+            _pf_undo_busy["suppress"] = False
+
+        for _, _, widget_ref, _ in _pf_numeric_field_specs:
+            if isinstance(widget_ref, tk.Entry) and widget_ref.winfo_exists():
+                try:
+                    widget_ref.config(
+                        highlightbackground=getattr(
+                            widget_ref, "_orig_rim", "#2e526e"
+                        )
+                    )
+                except Exception:
+                    pass
+        _sync_prev_toggle_state()
+        _refresh_dynamic_stop_box_colors()
+        refresh_preset_buttons_highlight()
+        refresh_smart_dimming()
+        _refresh_undo_edits_btn()
+        if default_status_lbl is not None:
+            default_status_lbl.config(
+                text="✓ Back to where you started — nothing was changed.",
+                fg="#58d68d",
+            )
 
     def restore_factory_defaults():
         if is_in_trade_tamper_locked():
@@ -28907,17 +30637,24 @@ def show_preflight_window(
         )
         apply_dollar_preset(src)
         refresh_smart_dimming()
+        _refresh_undo_edits_btn()
         if default_status_lbl is not None:
             lk_note = (
                 " (🔒 Active Loss Streak settings stayed locked)"
                 if tamper_lk
                 else ""
             )
-            msg = (
-                f"↺ Restored your saved defaults{lk_note}."
+            tpl_name = (
+                "Your Defaults"
                 if config.get("user_defaults")
-                else f"↺ Restored factory defaults{lk_note}."
+                else "Factory Defaults"
             )
+            undo_hint = (
+                " · ↺ Undo Edits to go back"
+                if _has_unsaved_pf_edits()
+                else ""
+            )
+            msg = f"{tpl_name} loaded — not saved yet{undo_hint}{lk_note}."
             default_status_lbl.config(text=msg, fg="#5dade2")
 
     _pf_numeric_field_specs = []
@@ -29042,8 +30779,8 @@ def show_preflight_window(
     def save_and_launch():
         global settings_win_open, triggered_alarms, first_poll_of_launch
         global force_reanchor, is_locked_down, active_breach_source
-        global last_breach_trigger_net_pnl
-        global current_is_flat, active_adapter, _launch_fee_drift_checked
+        global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
+        global current_is_flat, active_adapter, _launch_fee_drift_checked, _launch_live_sync_deferred
         global active_preflight_close_fn, active_preflight_win
         global daily_breach_settings_prompted, breach_visual_sim_active
         global consecutive_loop_exceptions
@@ -29067,7 +30804,15 @@ def show_preflight_window(
 
         if _pf_initial_shown.get("needs_bg_sync"):
             _pf_initial_shown["needs_bg_sync"] = False
-            refresh_baseline_preview()
+            chosen_b_pre = str(var_broker.get() or "")
+            chosen_id_pre = account_label_to_id.get(
+                var_account_label.get(), getattr(active_adapter, "account_id", "")
+            )
+            if (chosen_b_pre, chosen_id_pre) != (
+                _preexisting_state.get("broker"),
+                _preexisting_state.get("acct_id"),
+            ):
+                refresh_baseline_preview()
 
         if is_in_trade_tamper_locked():
             try:
@@ -29374,16 +31119,24 @@ def show_preflight_window(
             first_poll_of_launch = True
             if parent is None:
                 _launch_fee_drift_checked = False
+                _launch_live_sync_deferred = False
                 if active_adapter is not None and hasattr(
                     active_adapter, "_filled_since_cache"
                 ) and isinstance(active_adapter._filled_since_cache, dict):
                     active_adapter._filled_since_cache.clear()
+                if active_adapter is not None and hasattr(
+                    active_adapter, "_filled_today_cache"
+                ) and isinstance(active_adapter._filled_today_cache, dict):
+                    active_adapter._filled_today_cache.clear()
 
             if var_reanchor.get() and not is_tilt_streak_tamper_locked():
                 force_reanchor = True
                 is_locked_down = False
                 active_breach_source = ""
                 last_breach_trigger_net_pnl = None
+                _breach_pin_rt_pending = False
+                _breach_pin_retired = False
+                _lock_from_presync_save = False
                 _launch_grace_syms.clear()
                 breach_visual_sim_active = False
                 daily_breach_settings_prompted = False
@@ -29479,10 +31232,21 @@ def show_preflight_window(
                     or (
                         was_ld
                         and last_breach_trigger_net_pnl is None
+                        and not _breach_pin_retired
+                        and not _lock_from_presync_save
                         and old_floor is not None
                         and new_floor is not None
                         and new_floor >= (old_floor - 0.005)
                     )
+                )
+                presync_save = bool(
+                    parent is None
+                    and not _off_session_reconciled
+                    and max(
+                        float(_restored_session_saved_epoch or 0.0),
+                        float(_reconciled_through_epoch or 0.0),
+                    ) > 0.0
+                    and not is_demo_mode_active(active_adapter)
                 )
                 if keep_locked:
                     is_locked_down = True
@@ -29491,13 +31255,20 @@ def show_preflight_window(
                             "OFF_SESSION" if parent is None else "LIVE"
                         )
                     if (
-                        last_breach_trigger_net_pnl is None
+                        (not was_ld)
+                        and (not presync_save)
+                        and last_breach_trigger_net_pnl is None
                         and ref_eq is not None
                         and start_equity is not None
                     ):
                         last_breach_trigger_net_pnl = round(
                             float(ref_eq) - float(start_equity), 2
                         )
+                        _breach_pin_rt_pending = False
+                        _breach_pin_retired = False
+                    _lock_from_presync_save = bool(
+                        presync_save and (not was_ld or _lock_from_presync_save)
+                    )
                     shown_net_chk = (
                         last_breach_trigger_net_pnl
                         if (
@@ -29517,11 +31288,25 @@ def show_preflight_window(
                         if (new_floor is not None and start_equity is not None)
                         else "$0.00"
                     )
+                    presync_sfx = (
+                        " (pre-sync)"
+                        if presync_save
+                        else (
+                            " [prior bounce-fill lockout — widen stop or Re-Zero]"
+                            if (
+                                last_breach_trigger_net_pnl is None
+                                and ref_eq is not None
+                                and new_floor is not None
+                                and ref_eq > new_floor
+                            )
+                            else ""
+                        )
+                    )
                     log_event(
                         "GUARDRAIL",
                         f"Daily Stop remains BREACHED after Settings save "
                         f"(Breach Net PnL {format_dollar(shown_net_chk)} vs "
-                        f"Daily Stop {stop_rel_str} [{new_tier_short}]). "
+                        f"Daily Stop {stop_rel_str} [{new_tier_short}]{presync_sfx}). "
                         f"New positions will be force-flattened until Daily Stop is raised or Re-Zeroed."
                         if (
                             not new_cfg.get("alarms_only_mode", False)
@@ -29529,13 +31314,16 @@ def show_preflight_window(
                         )
                         else f"Daily Stop remains BREACHED / DISARMED after Settings save "
                         f"(Breach Net PnL {format_dollar(shown_net_chk)} vs "
-                        f"Daily Stop {stop_rel_str} [{new_tier_short}]). "
+                        f"Daily Stop {stop_rel_str} [{new_tier_short}]{presync_sfx}). "
                         f"Card 1 Trade/Tilt Stops remain active.",
                     )
                 else:
                     is_locked_down = False
                     active_breach_source = ""
                     last_breach_trigger_net_pnl = None
+                    _breach_pin_rt_pending = False
+                    _breach_pin_retired = False
+                    _lock_from_presync_save = False
                     if parent is not None:
                         _launch_grace_syms.clear()
                     daily_breach_settings_prompted = False
@@ -29566,6 +31354,19 @@ def show_preflight_window(
                         round(float(last_breach_trigger_net_pnl), 2)
                         if (is_locked_down and last_breach_trigger_net_pnl is not None)
                         else None
+                    )
+                    s_entry["breach_pin_rt_pending"] = bool(
+                        _breach_pin_rt_pending
+                        and is_locked_down
+                        and last_breach_trigger_net_pnl is not None
+                    )
+                    s_entry["breach_pin_retired"] = bool(
+                        _breach_pin_retired
+                        and is_locked_down
+                        and last_breach_trigger_net_pnl is None
+                    )
+                    s_entry["lock_from_presync_save"] = bool(
+                        _lock_from_presync_save and is_locked_down
                     )
                     s_entry["done_for_today"] = bool(done_for_today)
                     s_entry["done_for_today_date"] = (
@@ -29612,6 +31413,10 @@ def show_preflight_window(
             active_preflight_win = None
             settings_win_open = False
             _cancel_pf_timers()
+            if parent is None:
+                bg_p_sl = pf_timer_state.pop("bg_auth_pending", None)
+                if isinstance(bg_p_sl, tuple):
+                    _enqueue_postlaunch_preflight_auth(*bg_p_sl)
             pf.destroy()
             if parent is not None:
                 _flush_deferred_alarms(default_ui_button=mute_btn)
@@ -32549,6 +34354,8 @@ def show_preflight_window(
         activate_commit_for_today()
         _refresh_commit_today_pill()
         refresh_smart_dimming()
+        _capture_pf_undo_snapshot()
+        _refresh_undo_edits_btn()
         _render_card3_telemetry_live(force=True)
         if default_status_lbl is not None:
             default_status_lbl.config(
@@ -36082,6 +37889,7 @@ def show_preflight_window(
                 lbl_arrow.config(fg="#3b4756")
                 lbl_fl.config(fg="#526070")
                 ent_fl.config(state="disabled")
+        _schedule_undo_btn_refresh()
 
     var_open_flat.trace_add("write", _on_toggle_open_flat)
     var_tilt_cd.trace_add("write", _on_toggle_tilt_cd)
@@ -36094,6 +37902,23 @@ def show_preflight_window(
         var_t1_w1_on, var_t1_w2_on, var_t2_on, var_t3_on, var_t4_on
     ):
         trace_var.trace_add("write", refresh_smart_dimming)
+    for _uv_tr in (
+        var_tilt_count,
+        var_tilt_window,
+        var_cd_mins,
+        var_daily_lock_mins,
+        var_poll,
+        var_tts_voice,
+        var_reanchor,
+        var_voice_cues,
+        var_upside_chime,
+        var_ignore_preexisting,
+        var_reset925,
+        var_kill_tos,
+        var_kill_wb,
+        var_flatten_options,
+    ):
+        _uv_tr.trace_add("write", _schedule_undo_btn_refresh)
     refresh_smart_dimming()
 
     _pf_streak_prev_locked = {
@@ -36220,6 +38045,31 @@ def show_preflight_window(
         btn_save_def,
         "Saves every setting and dollar threshold currently on this screen as your personal\n"
         "Default profile (used by 'Restore Defaults', 'Standard Full Risk', and '50% Low Energy')."
+    )
+
+    btn_undo_edits = make_stadium_button(
+        btn_frame,
+        text="↺ Undo Edits",
+        font=("Arial", 10, "bold"),
+        fill_color="#141820",
+        fill_top_color="#1c212b",
+        border_color="#7dd3fc",
+        hover_fill="#162231",
+        hover_fill_top="#1e2f44",
+        hover_border="#bae6fd",
+        fg="#bae6fd",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        width=128,
+        height=38,
+        pad_x=20,
+        auto_width=False,
+        command=undo_preflight_edits,
+    )
+    attach_tooltip(
+        btn_undo_edits,
+        "Puts every unsaved box and setting on this screen back to how it was when you opened Settings.\n"
+        "Nothing is saved or applied until you click SAVE."
     )
 
     def _on_toggle_alarms_only():
@@ -36398,6 +38248,8 @@ def show_preflight_window(
     default_status_lbl.pack(side="left")
 
     refresh_smart_dimming()
+    _capture_pf_undo_snapshot()
+    _refresh_undo_edits_btn()
 
     tk.Label(
         ver_frame,
@@ -37797,29 +39649,51 @@ def show_preflight_window(
                             resolved_acct_id = saved_id
                         elif valid_ids:
                             resolved_acct_id = valid_ids[0]
-                        if resolved_acct_id and get_adapter_epoch() == _bg_sync_epoch:
-                            ad.account_id = resolved_acct_id
+                    if verified_accts:
+                        pf_timer_state["bg_auth_pending"] = (
+                            ad,
+                            _bg_sync_epoch,
+                            verified_accts,
+                            resolved_acct_id,
+                        )
                 snap = None
                 bg_prefetched_fills = None
                 bg_prefetched_closing = None
+                bg_prefetched_win = None
                 acct_changed_from_init = bool(
                     _bg_init_acct_id and resolved_acct_id and resolved_acct_id != _bg_init_acct_id
                 )
+                if pf_timer_state.get("closing") or launched["status"]:
+                    if launched["status"] and verified_accts:
+                        pf_timer_state.pop("bg_auth_pending", None)
+                        _enqueue_postlaunch_preflight_auth(
+                            ad, _bg_sync_epoch, verified_accts, resolved_acct_id
+                        )
+                    return
                 if (
                     _pf_initial_shown.get("needs_bg_sync")
-                    and ad.account_id
+                    and resolved_acct_id
                     and not acct_changed_from_init
                     and get_adapter_epoch() == _bg_sync_epoch
                 ):
                     try:
                         snap = ad.fetch_account_data()
+                        if pf_timer_state.get("closing") or launched["status"]:
+                            if launched["status"] and verified_accts:
+                                pf_timer_state.pop("bg_auth_pending", None)
+                                _enqueue_postlaunch_preflight_auth(
+                                    ad, _bg_sync_epoch, verified_accts, resolved_acct_id
+                                )
+                            return
                         if (
                             snap
                             and snap[0] is not None
                             and snap[0] > 0
                             and get_adapter_epoch() == _bg_sync_epoch
                         ):
-                            if snap[1] and hasattr(ad, "has_any_filled_orders_today"):
+                            if _is_untouched_fee_drift_candidate(
+                                snap[0], snap[1], adapter_override=ad
+                            ) and hasattr(ad, "has_any_filled_orders_today"):
                                 ad.has_any_filled_orders_today()
                             eff_bg_since = (
                                 float(_reconciled_through_epoch)
@@ -37829,9 +39703,31 @@ def show_preflight_window(
                             if eff_bg_since > 0.0 and hasattr(
                                 ad, "fetch_filled_orders_since"
                             ):
-                                bg_prefetched_fills = ad.fetch_filled_orders_since(
-                                    eff_bg_since
+                                bg_ref_flat = (
+                                    last_flat_equity
+                                    if last_flat_equity is not None and float(last_flat_equity) > 0.0
+                                    else start_equity
                                 )
+                                bg_use_fast = bool(
+                                    snap[1]
+                                    and _restored_session_was_flat
+                                    and bg_ref_flat is not None
+                                    and float(bg_ref_flat) > 0.0
+                                    and abs(round(float(snap[0]) - float(bg_ref_flat), 2)) < 0.01
+                                    and (time.time() - eff_bg_since) < (30.0 * 3600.0)
+                                )
+                                bg_prefetched_win = "36h" if bg_use_fast else "58d"
+                                bg_prefetched_fills = _call_fetch_filled_orders_since(
+                                    ad, eff_bg_since, fast_recent_only=bg_use_fast
+                                )
+                                if bg_use_fast and (
+                                    bg_prefetched_fills is None
+                                    or len(bg_prefetched_fills) > 0
+                                ):
+                                    bg_prefetched_win = "58d"
+                                    bg_prefetched_fills = _call_fetch_filled_orders_since(
+                                        ad, eff_bg_since, fast_recent_only=False
+                                    )
                                 if (
                                     bg_prefetched_fills is None
                                     and snap[1]
@@ -37850,12 +39746,25 @@ def show_preflight_window(
                         snap = None
                         bg_prefetched_fills = None
                         bg_prefetched_closing = None
+                        bg_prefetched_win = None
+
+                if launched["status"] and verified_accts:
+                    pf_timer_state.pop("bg_auth_pending", None)
+                    _enqueue_postlaunch_preflight_auth(
+                        ad, _bg_sync_epoch, verified_accts, resolved_acct_id
+                    )
+                    return
 
                 def _finish_bg_sync_on_ui():
                     global start_equity, last_flat_equity, prev_flat_realized_pnl
                     global settled_realized_pnl, anchor_cash_flow, force_reanchor
                     global _initial_positions_verified, current_is_flat
-                    if pf_timer_state.get("closing"):
+                    if pf_timer_state.get("closing") or launched["status"]:
+                        if launched["status"] and verified_accts:
+                            pf_timer_state.pop("bg_auth_pending", None)
+                            _enqueue_postlaunch_preflight_auth(
+                                ad, _bg_sync_epoch, verified_accts, resolved_acct_id
+                            )
                         return
                     try:
                         if not pf.winfo_exists():
@@ -37867,6 +39776,7 @@ def show_preflight_window(
                     if resolved_acct_id:
                         ad.account_id = resolved_acct_id
                     if verified_accts and ad.accounts:
+                        pf_timer_state.pop("bg_auth_pending", None)
                         b_n = ad.name
                         if (
                             config.get("brokers", {})
@@ -37921,6 +39831,7 @@ def show_preflight_window(
                                         prefetched_fills=bg_prefetched_fills,
                                         prefetched_closing_confirmed=bg_prefetched_closing,
                                         allow_network=False,
+                                        prefetched_window=bg_prefetched_win,
                                     )
                             else:
                                 _reconcile_off_session_activity(
@@ -37931,6 +39842,7 @@ def show_preflight_window(
                                     prefetched_fills=bg_prefetched_fills,
                                     prefetched_closing_confirmed=bg_prefetched_closing,
                                     allow_network=False,
+                                    prefetched_window=bg_prefetched_win,
                                 )
                         _card3_base_cache["eq_str"] = (
                             f"${start_equity:,.2f} (Saved)"
@@ -37970,7 +39882,10 @@ def show_preflight_window(
                 try:
                     pf.after(0, _finish_bg_sync_on_ui)
                 except Exception:
-                    pass
+                    if launched["status"] and verified_accts:
+                        bg_p_fb = pf_timer_state.pop("bg_auth_pending", None)
+                        if isinstance(bg_p_fb, tuple):
+                            _enqueue_postlaunch_preflight_auth(*bg_p_fb)
 
             threading.Thread(
                 target=_bg_preflight_broker_sync, daemon=True
@@ -38978,18 +40893,38 @@ def _sync_hud_bottom_bar_layout():
                 hud_root.update_idletasks()
                 m_w = int(hud_mute_btn.winfo_width() or 0)
                 if m_w > 10:
+                    pill_f = getattr(
+                        hud_mute_btn, "_font", ("Arial", 8, "bold")
+                    )
                     p_id = hud_mute_btn.create_text(
                         0,
                         0,
                         text="🔔 DISMISS ALARM",
-                        font=getattr(
-                            hud_mute_btn, "_font", ("Arial", 8, "bold")
-                        ),
+                        font=pill_f,
                         anchor="nw",
                     )
                     bb = hud_mute_btn.bbox(p_id)
                     hud_mute_btn.delete(p_id)
-                    req_m_w = ((bb[2] - bb[0]) if bb else 98) + 14
+                    w_alarm = (bb[2] - bb[0]) if bb else 98
+                    cur_pill_t = str(getattr(hud_mute_btn, "_text", "") or "")
+                    if getattr(hud_mute_btn, "_show_status_led", False) and cur_pill_t:
+                        if cur_pill_t.startswith("● "):
+                            cur_pill_t = cur_pill_t[2:]
+                        elif cur_pill_t.startswith("🔇 ● "):
+                            cur_pill_t = "🔇 " + cur_pill_t[4:]
+                    w_cur = 0
+                    if cur_pill_t:
+                        p_id2 = hud_mute_btn.create_text(
+                            0, 0, text=cur_pill_t, font=pill_f, anchor="nw"
+                        )
+                        bb2 = hud_mute_btn.bbox(p_id2)
+                        hud_mute_btn.delete(p_id2)
+                        w_cur = (bb2[2] - bb2[0]) if bb2 else 0
+                    max_txt_w = max(w_alarm, w_cur)
+                    led_extra_w = (
+                        16 if getattr(hud_mute_btn, "_show_status_led", False) else 0
+                    )
+                    req_m_w = max_txt_w + 14 + led_extra_w
                     if m_w < req_m_w:
                         acct_badge_lbl.config(pad_x=8)
                         refresh_acct_badge(ultra_compact=True)
@@ -39195,7 +41130,131 @@ def rebuild_hud_columns():
             w_px, h_px, fallback_widget=hud_root
         )
         hud_root.geometry(f"{w_px}x{h_px}+{int(cur_x)}+{int(cur_y)}")
+    _seed_hud_columns_from_known_state()
     _sync_hud_bottom_bar_layout()
+
+
+def _seed_hud_columns_from_known_state():
+    """Populates HUD column tiles immediately at `0ms` on rebuild/launch using
+    ONLY read-only cached live metrics (Settings column resize) or pure
+    restored session math beneath calm neutral `#262a2e` tiles and Option C's
+    hollow `SYNCING` ring (`○`). Never mutates locks, W/L, or stop state."""
+    global hud_last_leash_pct, hud_last_leash_bg
+    if not hud_ui_labels or hud_root is None or active_adapter is None:
+        return
+    if force_reanchor or is_demo_mode_active(active_adapter):
+        return
+    active_cols = get_active_hud_columns(config)
+    cur_ep = get_adapter_epoch()
+    cur_b = str(getattr(active_adapter, "name", "") or "")
+    cur_a = str(getattr(active_adapter, "account_id", "") or "")
+
+    live_snap = _last_live_hud_snapshot
+    if (
+        _initial_positions_verified
+        and isinstance(live_snap, dict)
+        and live_snap.get("epoch") == cur_ep
+        and live_snap.get("broker") == cur_b
+        and live_snap.get("acct_id") == cur_a
+        and isinstance(live_snap.get("cols"), dict)
+    ):
+        col_map = dict(live_snap["cols"])
+        leash_to_draw = live_snap.get("leash_pct")
+        use_neutral = False
+    else:
+        today_s = get_today_str()
+        s_key = get_session_key(cur_b, cur_a)
+        s_ent = (
+            config.get("account_sessions", {}).get(s_key, {})
+            if s_key and isinstance(config.get("account_sessions"), dict)
+            else {}
+        )
+        if (
+            active_session_date != today_s
+            or start_equity is None
+            or float(start_equity) <= 0.0
+            or last_flat_equity is None
+            or float(last_flat_equity) <= 0.0
+            or not isinstance(s_ent, dict)
+            or s_ent.get("session_date") != today_s
+            or round(float(s_ent.get("start_equity") or 0.0), 2)
+            != round(float(start_equity), 2)
+        ):
+            return
+        rth_s = is_rth()
+        st_f = float(start_equity)
+        lf_f = float(last_flat_equity)
+        hwm_f = float(max_equity) if max_equity is not None else st_f
+        dmax_f = float(daily_max_equity) if daily_max_equity is not None else max(st_f, hwm_f)
+        fl_eq_s, st_pnl_s, _, _, _, _ = describe_active_floor(config, rth_mode=rth_s)
+        base_leash_s = abs(
+            float(
+                config.get("t1_max_loss", 2000.0)
+                if rth_s
+                else config.get("pm_max_loss", 1500.0)
+            )
+        )
+        realized_s = _round_cents(lf_f - st_f)
+        session_high_s = _round_cents(dmax_f - st_f)
+        dist_s = max(0.0, _round_cents(lf_f - float(fl_eq_s))) if fl_eq_s is not None else 0.0
+        eff_headroom_s = round(
+            max(1.0, (hwm_f - float(fl_eq_s)) if fl_eq_s is not None else base_leash_s),
+            2,
+        )
+        hud_breach_s = bool(is_locked_down or breach_visual_sim_active)
+        leash_pct_s = (
+            0.0
+            if hud_breach_s
+            else max(0.0, min(1.0, dist_s / max(1.0, eff_headroom_s)))
+        )
+        col_map = _build_hud_column_display_data(
+            realized_pnl=realized_s,
+            open_pnl=0.0,
+            net_pnl=realized_s,
+            terminate_pnl_level=st_pnl_s,
+            distance_to_terminate=dist_s,
+            session_high_pnl=session_high_s,
+            leash_pct=leash_pct_s,
+            base_leash=base_leash_s,
+            hud_breach_active=hud_breach_s,
+            eff_start_eq=st_f,
+            eff_last_flat_eq=lf_f,
+            eff_daily_min_eq=daily_min_equity,
+            neutral_pending=True,
+        )
+        can_seed_open = bool(
+            _restored_session_was_flat
+            or (_off_session_reconciled and current_is_flat)
+        )
+        if not can_seed_open:
+            for k_open in ("open_pnl", "net_pnl", "dist_to_term", "from_high"):
+                col_map[k_open] = ("---", "#262a2e")
+            leash_to_draw = None
+        else:
+            leash_to_draw = leash_pct_s
+        use_neutral = True
+
+    for i, cid in enumerate(active_cols):
+        if i >= len(hud_ui_labels):
+            break
+        text_v, bg_c = col_map.get(cid, ("---", "#262a2e"))
+        if cid == "loss_streak":
+            text_v, ls_c = format_loss_streak_multiline()
+            bg_c = "#262a2e" if use_neutral else ls_c
+        disp_bg = "#262a2e" if bg_c in ("#2c3e50", "#1f538d") else bg_c
+        target_font = (
+            ("Arial", 9, "bold") if "\n" in str(text_v) else ("Arial", 12, "bold")
+        )
+        try:
+            hud_ui_labels[i].config(text=text_v, bg=disp_bg, font=target_font)
+            hud_ui_labels[i]._target_font_key = target_font
+            if i == hud_leash_idx:
+                hud_last_leash_bg = disp_bg
+        except Exception:
+            pass
+    if hud_leash_bar is not None and leash_to_draw is not None:
+        hud_last_leash_pct = max(0.0, min(1.0, float(leash_to_draw)))
+        _redraw_hud_leash_canvas()
 
 
 def update_gui(
@@ -39351,7 +41410,7 @@ def attach_hud_mute_tooltip(widget, hud_win):
     """Attaches a live dark-slate hover tooltip to the HUD's middle Armed/Alarm
     capsule pill so users in Small/Compact HUD mode (or Standard mode) can
     hover to inspect the full armed configuration and active alarm details."""
-    tip_state = {"win": None, "after_id": None}
+    tip_state = {"win": None, "after_id": None, "feed_lbl": None}
 
     def show_tip():
         tip_state["after_id"] = None
@@ -39372,6 +41431,19 @@ def attach_hud_mute_tooltip(widget, hud_win):
             )
             inner = tk.Frame(card_wrap, bg="#0f1722", padx=14, pady=10)
             inner.pack(side="left", fill="both", expand=True)
+
+            fh_tip = _get_feed_health_state()
+            feed_lbl = tk.Label(
+                inner,
+                text=fh_tip["tooltip_line"],
+                font=("Segoe UI", 9, "bold"),
+                fg=fh_tip["tooltip_fg"],
+                bg="#0f1722",
+                justify="left",
+                anchor="w",
+            )
+            feed_lbl.pack(fill="x", pady=(0, 5))
+            tip_state["feed_lbl"] = feed_lbl
 
             if consecutive_api_failures > 0 or api_disconnect_alerted:
                 err_snip = str(
@@ -39601,12 +41673,39 @@ def attach_hud_mute_tooltip(widget, hud_win):
             except Exception:
                 pass
             tip_state["after_id"] = None
+        tip_state["feed_lbl"] = None
         if tip_state["win"] is not None:
             try:
                 tip_state["win"].destroy()
             except Exception:
                 pass
             tip_state["win"] = None
+
+    def _refresh_open_tip_feed():
+        tw_cur = tip_state.get("win")
+        lbl_cur = tip_state.get("feed_lbl")
+        if tw_cur is None or lbl_cur is None:
+            return
+        try:
+            if (
+                not widget.winfo_exists()
+                or not tw_cur.winfo_exists()
+                or not lbl_cur.winfo_exists()
+            ):
+                return
+            if widget.grab_current() is not None:
+                hide_tip()
+                return
+            fh_now = _get_feed_health_state()
+            if (
+                lbl_cur.cget("text") != fh_now["tooltip_line"]
+                or lbl_cur.cget("fg") != fh_now["tooltip_fg"]
+            ):
+                lbl_cur.config(
+                    text=fh_now["tooltip_line"], fg=fh_now["tooltip_fg"]
+                )
+        except Exception:
+            pass
 
     def schedule_tip(_event=None):
         hide_tip()
@@ -39616,6 +41715,7 @@ def attach_hud_mute_tooltip(widget, hud_win):
             pass
 
     widget._hide_tooltip_fn = hide_tip
+    widget._refresh_tooltip_feed_fn = _refresh_open_tip_feed
     if hide_tip not in _hud_tooltip_hide_fns:
         _hud_tooltip_hide_fns.append(hide_tip)
     widget.bind("<Enter>", schedule_tip, add="+")
@@ -39712,14 +41812,15 @@ def reset_demo_sandbox_state(on_done=None):
     global _last_round_trip_close_ts, _pending_subpoll_consec_reason
     global settled_realized_pnl, max_equity, daily_max_equity, daily_min_equity
     global win_trades, loss_trades, is_locked_down, active_breach_source
-    global last_breach_trigger_net_pnl, done_for_today
+    global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
+    global done_for_today
     global committed_for_today, cooldown_active, cooldown_end_time
     global dry_run_lock_active, penalty_box_until, pending_halt_breach
     global active_non_breach_halted_syms, _notified_non_breach_halt_syms
     global alarm_active, last_alarm_reason, breach_visual_sim_active
     global current_is_flat, prev_pos_snapshot, _active_penalty_box_overlay
     global flat_desync_streak, in_trade_desync_streak, pending_scale_out_tol
-    global first_poll_of_launch, _launch_grace_pending, _launch_grace_syms
+    global first_poll_of_launch, _launch_live_sync_deferred, _launch_grace_pending, _launch_grace_syms
     global _off_session_peak_reconstructed
     global current_upside_tier, _cooldown_seq_id
     global daily_breach_settings_prompted
@@ -39739,6 +41840,7 @@ def reset_demo_sandbox_state(on_done=None):
         in_trade_desync_streak = 0
         pending_scale_out_tol = 0.0
         first_poll_of_launch = False
+        _launch_live_sync_deferred = False
         _launch_grace_pending = False
         _off_session_peak_reconstructed = False
         current_upside_tier = compute_upside_tier(is_rth(), 0.0, config)
@@ -39759,6 +41861,9 @@ def reset_demo_sandbox_state(on_done=None):
         is_locked_down = False
         active_breach_source = ""
         last_breach_trigger_net_pnl = None
+        _breach_pin_rt_pending = False
+        _breach_pin_retired = False
+        _lock_from_presync_save = False
         done_for_today = False
         daily_breach_settings_prompted = False
         cooldown_active = False
@@ -41352,6 +43457,7 @@ def start_gui():
     grid_frame.bind("<ButtonRelease-1>", end_move)
     hud_grid_frame = grid_frame
 
+    _flush_pending_postlaunch_auth()
     rebuild_hud_columns()
     ui_labels = hud_ui_labels
 
@@ -41397,6 +43503,7 @@ def start_gui():
     hud_close_btn = close_btn
 
     init_bg, init_fg, init_rim, init_glow = get_idle_button_style()
+    init_fh = _get_feed_health_state(advance_streak=False)
     mute_btn = HudCapsulePill(
         bottom_bar,
         text=get_idle_button_text(),
@@ -41408,7 +43515,10 @@ def start_gui():
         width=80,
         height=24,
         state="disabled",
-        command=lambda: mute_alarm(mute_btn)
+        command=lambda: mute_alarm(mute_btn),
+        show_status_led=True,
+        led_hex=init_fh["led_hex"],
+        led_style=init_fh["led_style"],
     )
 
     init_set_st = _get_hud_settings_idle_style(config)
@@ -41518,12 +43628,16 @@ def start_gui():
 
     mute_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
     attach_hud_mute_tooltip(mute_btn, root)
+    _apply_hud_status_pill_state(mute_btn, advance_streak=False)
     _sync_hud_bottom_bar_layout()
+
+    _feed_tick_state = {"last_mono": 0.0}
 
     def _tick_loss_streak_hud():
         """Updates the live Loss Streak countdown timer on the HUD at 200ms
-        resolution when a streak is active (eliminating 1s phase-drift jitter)
-        and saves session state if a loss timestamp ages out."""
+        resolution when a streak is active (eliminating 1s phase-drift jitter),
+        refreshes Option C feed-freshness LED/age at ~1s cadence, and saves
+        session state if a loss timestamp ages out."""
         try:
             if not root.winfo_exists():
                 return
@@ -41559,22 +43673,15 @@ def start_gui():
                         refresh_acct_badge()
                     if len(recent_loss_timestamps) != prev_cnt:
                         save_session_state()
-                if not alarm_active and not cooldown_active:
-                    new_idle = get_idle_button_text()
-                    new_bg, new_fg, new_rim, new_glow = get_idle_button_style()
-                    if (
-                        getattr(mute_btn, "_text", "") != new_idle
-                        or getattr(mute_btn, "_bg", "") != new_bg
-                        or getattr(mute_btn, "_rim", "") != new_rim
-                    ):
-                        mute_btn.config(
-                            text=new_idle,
-                            bg=new_bg,
-                            fg=new_fg,
-                            disabledforeground=new_fg,
-                            rim=new_rim,
-                            glow=new_glow,
-                        )
+            now_tick_m = time.monotonic()
+            adv_feed = (now_tick_m - _feed_tick_state["last_mono"]) >= 0.90
+            if adv_feed:
+                _feed_tick_state["last_mono"] = now_tick_m
+            _apply_hud_status_pill_state(mute_btn, advance_streak=adv_feed)
+            if adv_feed:
+                refresh_tip_fn = getattr(mute_btn, "_refresh_tooltip_feed_fn", None)
+                if callable(refresh_tip_fn):
+                    refresh_tip_fn()
         except Exception:
             pass
         try:
@@ -41599,36 +43706,24 @@ def start_gui():
         try:
             if not root.winfo_exists():
                 return
-            if last_data_loop_heartbeat > 0:
-                age = time.time() - last_data_loop_heartbeat
-                if age > 45.0:
-                    if not hb_state["warned"]:
-                        hb_state["warned"] = True
-                        log_event(
-                            "WARN",
-                            f"Data loop heartbeat stalled ({age:.1f}s since last poll iteration).",
-                        )
-                    if not cooldown_active and not alarm_active:
-                        st_txt = (
-                            "⚠️ POLL STALLED"
-                            if is_compact_hud()
-                            else "⚠️ DATA LOOP STALLED (>45s) — CHECK NETWORK OR RESTART"
-                        )
-                        mute_btn.config(
-                            text=st_txt,
-                            bg="#78350f",
-                            fg="#fde68a",
-                            disabledforeground="#fde68a",
-                            state="disabled",
-                        )
-                elif hb_state["warned"]:
-                    hb_state["warned"] = False
+            fh_hb = _get_feed_health_state(advance_streak=False)
+            if fh_hb["is_stalled"]:
+                if not hb_state["warned"]:
+                    hb_state["warned"] = True
                     log_event(
-                        "SESSION",
-                        "Data loop heartbeat recovered and resumed polling.",
+                        "WARN",
+                        f"Data loop heartbeat stalled ({fh_hb['hb_age']:.1f}s since last poll iteration).",
                     )
-                    if not cooldown_active and not alarm_active:
-                        apply_idle_button_config(mute_btn)
+                if not cooldown_active and not alarm_active:
+                    _apply_hud_status_pill_state(mute_btn, advance_streak=False)
+            elif hb_state["warned"]:
+                hb_state["warned"] = False
+                log_event(
+                    "SESSION",
+                    "Data loop heartbeat recovered and resumed polling.",
+                )
+                if not cooldown_active and not alarm_active:
+                    _apply_hud_status_pill_state(mute_btn, advance_streak=False)
         except Exception:
             pass
         try:
