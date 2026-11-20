@@ -4,9 +4,26 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.78] — 2026-11-19
+### ⚡ Quick Summary
+- **Live HUD Data-Freshness LED & Hover Feed Status (Schwab, Webull & Demo):** Added a subtle real-time freshness dot directly inside the HUD center status pill (**`● GREEN`** when live, **`○ SYNCING`** hollow ring on startup or wake-from-sleep resync, **`● AMBER`** with compact age timer on Retry #1 or aging feed, and **`● RED`** on disconnects/stalls) plus live-ticking hover tooltip status (`Broker Feed LIVE · synced X.Xs ago · Poll: Ns`).
+- **Faster Pre-Flight Launch & Instant `0ms` Cold HUD Metrics:** Eliminated duplicate blocking broker `/orders` queries across Pre-Flight sync, fee-drift checks, and `data_loop()` Poll #1 using a shared single-flight `/orders` cache (`8s` TTL), a conservative `36h -> 58d` GTC escalation fast-path for untouched `$0.00`-drift launches, and pure-math `0ms` HUD column seeding under calm neutral `#262a2e` tiles while Poll #1 finishes live verification.
+- **Post-Breach Recovery Pin Retirement & Pre-Sync Lock Cleanup (`InvWithRed` Follow-Up):** Retiring an intraday bounce-fill trigger pin after a later flat round-trip close now cleanly allows Daily Stop re-arming even when keeping the same floor, and speculative pre-sync Daily Stop locks clear reliably once genuine live Poll #1 off-session catch-up settles above the active floor.
+
+### 🔍 Detailed Breakdown
+- **HUD Freshness LED, Sleep/Wake Detection & Compact Bottom-Bar Sizing (`_get_capsule_led_photo`, `HudCapsulePill`, `_get_feed_health_state`, `_apply_hud_status_pill_state`, `_refresh_open_tip_feed`, `_sync_hud_bottom_bar_layout`):**
+  - Renders crisp anti-aliased status LEDs (`GREEN` `#22c55e`, `AMBER` `#f59e0b`, `RED` `#ef4444`, hollow `SYNCING` `#7dd3fc`, `DEMO` `#38bdf8`) inside `HudCapsulePill` with live wall-vs-monotonic wake-from-sleep detection (`|dw - dm| > 5.0s`), `2`-poll degrade hysteresis, dynamic tooltip color/text refreshes, and pill width measurements including active compact age suffixes (`<= 3` cols).
+- **Single-Flight `/orders` Window Cache, `36h -> 58d` GTC Escalation & Deferred Auth Queue (`_compute_orders_cache_inv_sig`, `SchwabAdapter`, `WebullAdapter`, `_reconcile_off_session_activity`, `_is_untouched_fee_drift_candidate`, `_apply_postlaunch_preflight_auth`, `_seed_hud_columns_from_known_state`):**
+  - Coalesces concurrent `/orders` fetches across both `SchwabAdapter` (`max_results=3000` with `3,000`-order `[WARN]` & `[PERF]` telemetry) and `WebullAdapter` behind `_orders_fetch_lock` (`6.0s` timeout), keyed by `(account_id, _snapshot_gen, window)` plus active SDK client identity, cache-dict identity, snapshot epoch delta, and `_compute_orders_cache_inv_sig()` (covering both open holdings and settled equity changes while holding ignored swing positions), and isolates `reconnect_session()` / mid-launch trades cleanly across `_raw_orders_window_cache`, `_filled_since_cache`, and `_filled_today_cache`.
+  - Gates `has_any_filled_orders_today()` prefetches behind `_is_untouched_fee_drift_candidate()`, escalates any `$0.01+` delta, open position, older save, or non-empty `36h` fill set cleanly to `58d` on both background workers and Poll #1 (`allow_network=False` returns `False` instead of advancing `_reconciled_through_epoch` on incomplete `36h` batches), hands off deferred `verify_accounts_live()` auth atomically across `pf.destroy()` via `_enqueue_postlaunch_preflight_auth()`, and populates flat HUD tiles at `0ms` beneath neutral `#262a2e` backgrounds without touching lock or W/L state.
+- **Post-Breach Trigger Pin Retirement & Pre-Sync Lock Deferral (`_retire_stale_breach_trigger_pin`, `_breach_pin_retired`, `_recheck_presync_save_lock_after_sync`, `_stabilize_mid_fill_realized_and_equity`, `save_and_launch`):**
+  - Persists `breach_pin_retired` and `lock_from_presync_save` inside `config["account_sessions"]`, excludes explicitly retired recovery pins and speculative pre-sync locks from `save_and_launch()`'s fallback unchanged-floor lock clause, and defers Poll #1 off-session/pre-sync evaluation via `_launch_live_sync_deferred` whenever Poll #1 receives a rate-limited cached snapshot (`is_reverify=True`).
+
+---
+
 ## [v0.9.77] — 2026-11-19
 ### ⚡ Quick Summary
-- **One-Click `↺ Undo Edits` in Pre-Flight & Settings (`beta` Preview):** Clicked **`Standard Full Risk`**, **`50% Low Energy`**, or **`Restore Defaults`** while dialing in custom today settings? A clean contextual **`↺ Undo Edits`** button now appears right beside **`Save as Default`** whenever anything on screen differs from when you opened the window — snapping every checkbox, dollar threshold, HUD column, and preference back in one click without saving a thing.
+- **One-Click `↺ Undo Edits` in Pre-Flight & Settings:** Clicked **`Standard Full Risk`**, **`50% Low Energy`**, or **`Restore Defaults`** while dialing in custom today settings? A clean contextual **`↺ Undo Edits`** button now appears right beside **`Save as Default`** whenever anything on screen differs from when you opened the window — snapping every checkbox, dollar threshold, HUD column, and preference back in one click without saving a thing.
 - **Clearer `"Loaded — Not Saved Yet"` Preset & Defaults Status Copy:** Clicking **`Standard Full Risk`**, **`50% Low Energy`**, or **`Restore Defaults`** now explicitly confirms the preset is **loaded, not saved yet** (with a calm hint pointing to **`↺ Undo Edits`** whenever changes exist), removing any guesswork before you hit `SAVE`.
 
 ### 🔍 Detailed Breakdown
