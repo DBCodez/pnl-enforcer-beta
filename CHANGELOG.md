@@ -4,6 +4,17 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.82] — 2026-11-23
+### ⚡ Quick Summary
+- **Rock-Steady Pre-Flight Columns When Toggling `HUD Breach Mode`:** Fixed Card 3's settings summary line pushing the center divider rightward whenever **`🚨 Breach Sim: ON`** is enabled (and prevented mid-word clipping like `Breach Si`), keeping all 5 Pre-Flight cards pixel-locked across toggles, `Post-Breach Popup` preview actions, and HUD banner dismissals.
+
+### 🔍 Detailed Breakdown
+- **Fixed-Geometry Card 3 Summary & Priority-Ordered Fit (`prefs_summary_frame`, `_refresh_card3_prefs_summary`, `_dismiss_hud_breach_preview`, `show_daily_breach_return_notice`):**
+  - Wrapped `lbl_prefs_summary` inside `prefs_summary_frame` (`pack_propagate(False)` with worst-case emoji height measured before freezing, plus `<Configure>` width tracking) and applied `uniform="pf_cols"` on `body_frame` columns **after** outer Pre-Flight geometry locks (preventing layout shifts on wide windows without inflating compact laptop width).
+  - Replaced blind right-edge truncation with priority-ordered full-word stepping (`Tier 0 -> Tier 1 -> Tier 2 -> Tier 3` keeping **`🚨 Breach Sim`** and **`🔇 MUTED`** visible longest) and synced Card 3 immediately across `Preferences & Audio`, `Post-Breach Popup` (`on_close_keep_as_is` / `on_arm_rezero`), and `_dismiss_hud_breach_preview()` via `_pf_prefs_summary_refresh_cb` (cleared cleanly in `_cancel_pf_timers()`).
+
+---
+
 ## [v0.9.81] — 2026-11-23
 ### ⚡ Quick Summary
 - **Live Card 5 Ratchet Ladder Preview (`RTH` & `Ext-Hours`):** Added a sleek interactive step-and-trailing chart directly inside Card 5 that redraws as you type Tier 1–4 stops, highlights tightened/green floors & clamped steps cleanly, switches automatically between `Card 5 (RTH)` and `Card 4 (Ext-Hours)`, tracks your live `Rulebook High`, and collapses anytime with one click (`▾ Hide`).

@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.81"
+APP_VERSION = "0.9.82"
 
 import os
 import sys
@@ -2754,6 +2754,7 @@ _alarm_loop_lock = threading.Lock()
 cooldown_active = False
 dry_run_lock_active = False
 breach_visual_sim_active = False
+_pf_prefs_summary_refresh_cb = None
 _manual_flatten_in_flight = False
 _manual_flatten_state_lock = threading.Lock()
 PANIC_FLATTEN_HOLD_SEC = 2.0
@@ -26739,6 +26740,7 @@ def show_preflight_window(
     global force_reanchor, is_locked_down, current_is_flat
     global active_adapter, start_equity, daily_breach_settings_prompted
     global _demo_sim_pad_win, alarm_active, last_alarm_reason
+    global _pf_prefs_summary_refresh_cb
 
     eff_startup_boot = bool(
         IS_WINDOWS_BOOT_STARTUP if startup_boot is None else startup_boot
@@ -26948,6 +26950,8 @@ def show_preflight_window(
     pf.bind("<Configure>", _on_pf_configure, add="+")
 
     def _cancel_pf_timers():
+        global _pf_prefs_summary_refresh_cb
+        _pf_prefs_summary_refresh_cb = None
         pf_timer_state["closing"] = True
         if parent is not None:
             try:
@@ -37688,16 +37692,25 @@ def show_preflight_window(
         dlg.focus_set()
         pf.wait_window(dlg)
 
+    prefs_sum_font = tkfont.Font(root=pf, family="Arial", size=9, weight="bold")
+    prefs_summary_frame = tk.Frame(c3, bg="#131922")
     lbl_prefs_summary = tk.Label(
-        c3,
-        text="",
-        font=("Arial", 9, "bold"),
+        prefs_summary_frame,
+        text="9:30/4:00 Ratchets: Reset · Swings: Ignored · 🔇 Audio: MUTED · Poll: 10s · Safe Logs: OFF · Win Boot: ON · 🚨 Breach Sim: ON",
+        font=prefs_sum_font,
         fg="#94a3b8",
         bg="#131922",
         anchor="w",
+        width=1,
         cursor="hand2",
     )
-    lbl_prefs_summary.pack(fill="x", pady=(0, 4))
+    lbl_prefs_summary.update_idletasks()
+    prefs_row_h = max(19, int(lbl_prefs_summary.winfo_reqheight()))
+    lbl_prefs_summary.config(text="")
+    prefs_summary_frame.config(height=prefs_row_h)
+    prefs_summary_frame.pack(fill="x", pady=(0, 4))
+    prefs_summary_frame.pack_propagate(False)
+    lbl_prefs_summary.pack(fill="both", expand=True)
     lbl_prefs_summary.bind(
         "<Enter>", lambda _e: lbl_prefs_summary.config(fg="#cbd5e1")
     )
@@ -37715,11 +37728,17 @@ def show_preflight_window(
         "<Button-1>", lambda _e: open_preferences_audio_dialog()
     )
 
+    _ps_cfg_state = {"last_w": 0}
+
     def _refresh_card3_prefs_summary(*_):
         if pf_timer_state.get("closing"):
             return
         try:
-            if not pf.winfo_exists() or not lbl_prefs_summary.winfo_exists():
+            if (
+                not pf.winfo_exists()
+                or not prefs_summary_frame.winfo_exists()
+                or not lbl_prefs_summary.winfo_exists()
+            ):
                 return
         except Exception:
             return
@@ -37737,12 +37756,44 @@ def show_preflight_window(
         log_txt = "ON" if var_auto_share_logs.get() else "OFF"
         wb_sfx = " · Win Boot: ON" if var_start_with_windows.get() else ""
         sim_sfx = " · 🚨 Breach Sim: ON" if breach_visual_sim_active else ""
+        wb_short = " · Boot: ON" if var_start_with_windows.get() else ""
+        sim_short = " · 🚨 Breach Sim" if breach_visual_sim_active else ""
+        audio_short = "🔇 MUTED" if var_mute_all_audio.get() else audio_txt
+
+        tier0 = (
+            f"9:30/4:00 Ratchets: {sw_txt} · Swings: {pos_txt} · "
+            f"{audio_txt} · Poll: {p_sec}s · Safe Logs: {log_txt}{wb_sfx}{sim_sfx}"
+        )
+        tier1 = (
+            f"Ratchets: {sw_txt} · Swings: {pos_txt} · "
+            f"{audio_txt} · Poll: {p_sec}s · Logs: {log_txt}{wb_short}{sim_short}"
+        )
+        tier2 = (
+            f"Ratchets: {sw_txt} · Swings: {pos_txt} · "
+            f"{audio_txt} · Poll: {p_sec}s · Logs: {log_txt}{sim_short}"
+        )
+        tier3 = f"Ratchets: {sw_txt} · Swings: {pos_txt} · {audio_short}{sim_short}"
+
+        try:
+            fw = int(prefs_summary_frame.winfo_width() or 0)
+        except Exception:
+            fw = 0
+        avail_w = (fw - 8) if fw > 80 else 585
+
+        chosen_txt = tier3
+        for cand in (tier0, tier1, tier2, tier3):
+            if prefs_sum_font.measure(cand) <= avail_w:
+                chosen_txt = cand
+                break
+        else:
+            toks = [t for t in tier3.split(" · ") if t]
+            while len(toks) > 1 and prefs_sum_font.measure(" · ".join(toks)) > avail_w:
+                toks.pop(0)
+            chosen_txt = "… " + " · ".join(toks) if len(toks) < 3 else " · ".join(toks)
+
         try:
             lbl_prefs_summary.config(
-                text=(
-                    f"9:30/4:00 Ratchets: {sw_txt} · Swings: {pos_txt} · "
-                    f"{audio_txt} · Poll: {p_sec}s · Safe Logs: {log_txt}{wb_sfx}{sim_sfx}"
-                ),
+                text=chosen_txt,
                 fg=(
                     "#f87171"
                     if breach_visual_sim_active
@@ -37751,6 +37802,19 @@ def show_preflight_window(
             )
         except Exception:
             pass
+
+    _pf_prefs_summary_refresh_cb = _refresh_card3_prefs_summary
+
+    def _on_prefs_summary_configure(ev=None):
+        if ev is None or pf_timer_state.get("closing"):
+            return
+        w_ev = int(getattr(ev, "width", 0) or 0)
+        if w_ev <= 80 or abs(w_ev - _ps_cfg_state["last_w"]) < 2:
+            return
+        _ps_cfg_state["last_w"] = w_ev
+        _refresh_card3_prefs_summary()
+
+    prefs_summary_frame.bind("<Configure>", _on_prefs_summary_configure)
 
     for _pv in (
         var_reset925,
@@ -42136,6 +42200,10 @@ def show_preflight_window(
             if is_sim:
                 breach_visual_sim_active = True
                 _sync_hud_breach_banner(current_is_flat)
+                try:
+                    _refresh_card3_prefs_summary()
+                except Exception:
+                    pass
                 if mute_btn is not None and not alarm_active and not cooldown_active:
                     apply_idle_button_config(mute_btn)
             _restore_pf_modal_focus(dlg)
@@ -42152,6 +42220,10 @@ def show_preflight_window(
             if is_sim:
                 breach_visual_sim_active = False
                 _sync_hud_breach_banner(current_is_flat)
+                try:
+                    _refresh_card3_prefs_summary()
+                except Exception:
+                    pass
                 if mute_btn is not None and not alarm_active and not cooldown_active:
                     apply_idle_button_config(mute_btn)
             if not is_tilt_streak_tamper_locked() and not is_in_trade_tamper_locked():
@@ -42533,10 +42605,14 @@ def show_preflight_window(
         )
         if px is not None and py is not None:
             pf.geometry(f"{pf_w}x{pf_h}+{int(px)}+{int(py)}")
+            body_frame.columnconfigure(0, uniform="pf_cols")
+            body_frame.columnconfigure(1, uniform="pf_cols")
             apply_dark_title_bar(pf)
             pf.deiconify()
             pf.lift()
         else:
+            body_frame.columnconfigure(0, uniform="pf_cols")
+            body_frame.columnconfigure(1, uniform="pf_cols")
             center_dialog_over_parent(
                 pf, parent=parent, width=pf_w, height=pf_h, grab=False
             )
@@ -43114,6 +43190,11 @@ def _dismiss_hud_breach_preview():
         "User exited HUD Breach Mode visual simulation via HUD banner click (0 orders).",
     )
     _sync_hud_breach_banner(current_is_flat)
+    if callable(_pf_prefs_summary_refresh_cb):
+        try:
+            _pf_prefs_summary_refresh_cb()
+        except Exception:
+            pass
     _wake_data_loop()
 
 
