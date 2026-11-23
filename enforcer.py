@@ -1607,7 +1607,8 @@ def center_dialog_over_parent(
 
 def _safe_unbind(widget, seq, funcid):
     """Removes a single Tcl binding (`funcid`) from `widget` for `seq` without
-    wiping sibling `add='+'` bindings on Python < 3.13 (CPython gh-75666)."""
+    wiping sibling `add='+'` bindings on Python < 3.13 (CPython gh-75666), and
+    defers `deletecommand` to `after_idle` so in-flight bind scripts finish."""
     if widget is None or not funcid:
         return
     try:
@@ -1615,19 +1616,27 @@ def _safe_unbind(widget, seq, funcid):
     except Exception:
         return
     if existing:
+        match_tok = "[" + str(funcid) + " "
         kept = [
             ln
             for ln in existing.splitlines()
-            if ln.strip() and (funcid not in ln)
+            if ln.strip() and (match_tok not in ln)
         ]
         try:
             widget.bind(seq, "\n".join(kept) if kept else "")
         except Exception:
             pass
+
+    def _deferred_del(w=widget, fid=funcid):
+        try:
+            w.deletecommand(fid)
+        except Exception:
+            pass
+
     try:
-        widget.deletecommand(funcid)
+        widget.after_idle(_deferred_del)
     except Exception:
-        pass
+        _deferred_del()
 
 
 class DarkDropdownMenu:
@@ -1927,9 +1936,13 @@ class DarkDropdownMenu:
             tw.bind("<FocusOut>", _on_tw_focus_out)
 
             def _on_top_button1(ev=None):
+                if self._win is not tw:
+                    return
                 try:
                     w_ev = getattr(ev, "widget", None)
-                    if w_ev is not None and str(w_ev).startswith(str(tw)):
+                    w_s = str(w_ev or "")
+                    tw_s = str(tw)
+                    if w_ev is not None and (w_s == tw_s or w_s.startswith(tw_s + ".")):
                         return
                 except Exception:
                     pass
@@ -16459,6 +16472,19 @@ def is_disconnect_alarm_reason(reason):
     )
 
 
+def _purge_disconnect_alarm_dedup():
+    """Clears transient disconnect/token dedup keys from triggered_alarms and
+    _deferred_alarms once broker connectivity is restored so future connection
+    drops in the same session always trigger the 2-note disconnect tone and
+    yellow HUD alert banner."""
+    for k in list(triggered_alarms.keys()):
+        if is_disconnect_alarm_reason(k):
+            triggered_alarms.pop(k, None)
+    for k in list(_deferred_alarms.keys()):
+        if is_disconnect_alarm_reason(k):
+            _deferred_alarms.pop(k, None)
+
+
 def play_disconnect_tone_once(force=False):
     """Plays a calm, non-startling 2-note descending telemetry tone
     (660 Hz E5 -> 440 Hz A4) so API connection drops never sound like an
@@ -16581,6 +16607,7 @@ def sound_alarm_loop(my_gen=None):
 def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
     global alarm_active, triggered_alarms, last_alarm_reason, _alarm_loop_gen
     r_up = str(reason or "").upper()
+    is_disc = is_disconnect_alarm_reason(reason)
     is_repeatable_unfilled = (not alarm_active) and any(
         k in r_up
         for k in (
@@ -16593,12 +16620,14 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
             "FORCE-FLATTEN UNFILLED",
         )
     )
+    is_repeatable_disconnect = (not alarm_active) and is_disc
     if (
         not force_repeat
         and not is_repeatable_unfilled
+        and not is_repeatable_disconnect
         and reason in triggered_alarms
     ):
-        return
+        return False
 
     extra = f" | {context_str}" if context_str else ""
 
@@ -16616,7 +16645,7 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
                 "ALARM",
                 f"Suppressed siren during OS Cool-Down Lock: {reason}{extra}",
             )
-        return
+        return False
 
     if _settings_suppresses_alarms():
         already_deferred = reason in _deferred_alarms
@@ -16632,7 +16661,7 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
             if "INTERNAL POLL ERROR" not in r_up and not config.get("mute_all_audio", False):
                 def _one_shot_modal_alert():
                     try:
-                        if is_disconnect_alarm_reason(reason):
+                        if is_disc:
                             play_disconnect_tone_once()
                         else:
                             winsound.Beep(2600, 180)
@@ -16642,15 +16671,31 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
                         pass
                 threading.Thread(target=_one_shot_modal_alert, daemon=True).start()
                 speak_async(f"Alert: {_humanize_alarm_reason(reason, for_tts=True)}")
-        return
+        return False
 
-    _deferred_alarms.pop(reason, None)
-    triggered_alarms[reason] = time.time()
-    last_alarm_reason = reason
+    preempted_by_reason = None
+    gen_now = None
+    with _alarm_loop_lock:
+        if is_disc and alarm_active and not is_disconnect_alarm_reason(last_alarm_reason):
+            preempted_by_reason = last_alarm_reason
+        else:
+            _deferred_alarms.pop(reason, None)
+            triggered_alarms[reason] = time.time()
+            last_alarm_reason = reason
+            alarm_active = True
+            _alarm_loop_gen += 1
+            gen_now = _alarm_loop_gen
+
+    if preempted_by_reason is not None:
+        log_event(
+            "ALARM",
+            f"Connection-loss alert noted while higher-priority risk siren remains active ({preempted_by_reason}): {reason}{extra}",
+        )
+        return False
+
     hum_ui = _humanize_alarm_reason(reason, for_tts=False)
     disp_sfx = f" [{hum_ui}]" if hum_ui and hum_ui != str(reason).strip() else ""
     log_event("ALARM", f"Triggered: {reason}{disp_sfx}{extra}")
-    alarm_active = True
     btn_txt = format_alarm_button_text(reason)
     if ui_button is not None:
         try:
@@ -16668,13 +16713,11 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
             pass
     loop_fn = (
         sound_disconnect_alert_loop
-        if is_disconnect_alarm_reason(reason)
+        if is_disc
         else sound_alarm_loop
     )
-    with _alarm_loop_lock:
-        _alarm_loop_gen += 1
-        gen_now = _alarm_loop_gen
     threading.Thread(target=loop_fn, args=(gen_now,), daemon=True).start()
+    return True
 
 
 def _flush_deferred_alarms(default_ui_button=None):
@@ -16683,10 +16726,19 @@ def _flush_deferred_alarms(default_ui_button=None):
     burning the one-shot dedup token."""
     if cooldown_active or _settings_suppresses_alarms() or not _deferred_alarms:
         return
-    pending = list(_deferred_alarms.items())
-    _deferred_alarms.clear()
+    pending = []
+    while _deferred_alarms:
+        try:
+            pending.append(_deferred_alarms.popitem())
+        except Exception:
+            break
     now_t = time.time()
-    for r_key, (btn_ref, ctx_def, ts_def) in reversed(pending):
+    # Try higher-priority risk alarms before transient disconnect alarms
+    ordered = sorted(
+        reversed(pending),
+        key=lambda kv: 1 if is_disconnect_alarm_reason(kv[0]) else 0,
+    )
+    for r_key, (btn_ref, ctx_def, ts_def) in ordered:
         if (now_t - float(ts_def or 0.0)) > 900.0:
             continue
         r_up = str(r_key or "").upper()
@@ -16701,8 +16753,8 @@ def _flush_deferred_alarms(default_ui_button=None):
         ):
             continue
         target_btn = btn_ref if btn_ref is not None else default_ui_button
-        trigger_alarm(r_key, target_btn, ctx_def)
-        break
+        if trigger_alarm(r_key, target_btn, ctx_def):
+            break
 
 
 def check_alarm_rearm(reason, current_val, threshold_val):
@@ -25100,17 +25152,14 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     was_alerted = api_disconnect_alerted
                     consecutive_api_failures = 0
                     api_disconnect_alerted = False
+                    _purge_disconnect_alarm_dedup()
                     if was_alerted:
-                        if alarm_active and any(
-                            k in last_alarm_reason.upper()
-                            for k in (
-                                "CONNECTION LOST",
-                                "DISCONNECTED",
-                                "TOKEN EXPIRED",
-                            )
-                        ):
-                            alarm_active = False
-                            last_alarm_reason = ""
+                        with _alarm_loop_lock:
+                            if alarm_active and is_disconnect_alarm_reason(
+                                last_alarm_reason
+                            ):
+                                alarm_active = False
+                                last_alarm_reason = ""
                         speak_async("Connection restored. Enforcer is back online.")
                         if config.get("enable_upside_chime", True):
                             trigger_upside_tier_glow(
@@ -26288,10 +26337,19 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                     f"({_clip_log_detail(raw_err, 140)})...",
                                 )
                             if not is_tok_exp:
-                                if alarm_active:
-                                    last_alarm_reason = (
-                                        f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})"
+                                with _alarm_loop_lock:
+                                    disc_alarm_live = bool(
+                                        alarm_active
+                                        and is_disconnect_alarm_reason(
+                                            last_alarm_reason
+                                        )
                                     )
+                                    any_alarm_live = bool(alarm_active)
+                                    if disc_alarm_live:
+                                        last_alarm_reason = (
+                                            f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})"
+                                        )
+                                if disc_alarm_live:
                                     al_btn_txt = (
                                         f"🔔 RECONNECTING (#{att}) (MUTE)"
                                         if is_compact_hud()
@@ -26313,7 +26371,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                             **kw,
                                         ),
                                     )
-                                elif not cooldown_active:
+                                elif not any_alarm_live and not cooldown_active:
                                     if getattr(mute_btn, "_show_status_led", False):
                                         mute_btn.after(
                                             0,
@@ -48116,10 +48174,17 @@ def _build_changelog_nav_bar(parent_card, txt_box, nav_ctrl):
             lb.bind("<Escape>", _close_ver_popup)
 
             def _on_top_click(evt):
+                if nav_state.get("popup") is not pop:
+                    return
                 try:
                     w_obj = getattr(evt, "widget", None)
                     w_str = str(w_obj or "")
-                    if w_str.startswith(str(pop)) or w_obj is ver_pick_btn:
+                    pop_s = str(pop)
+                    if (
+                        w_str == pop_s
+                        or w_str.startswith(pop_s + ".")
+                        or w_obj is ver_pick_btn
+                    ):
                         return
                 except Exception:
                     pass

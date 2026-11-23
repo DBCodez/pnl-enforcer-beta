@@ -6,12 +6,16 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ## [v0.9.83] — 2026-11-23
 ### ⚡ Quick Summary
-- **Cleaner Anti-Wick & API Timeout Diagnostics:** Fixed transient warning-only anti-wick checks inaccurately saying `"No flatten triggered."` (now clearly logs `"No warning alarm triggered."` with the exact `0.2s`/`0.35s` delay) and kept full `(read timeout=...)` details unclipped in disconnect/retry logs while keeping immediate Attempt #2 disconnect alerts unchanged.
+- **Reliable Repeat Disconnect Alerts (Even Across Multiple Brownouts):** Fixed an old `triggered_alarms` dedup entry from your first `CONNECTION LOST` recovery silently blocking the 2-note disconnect tone and yellow HUD alarm banner on later disconnects in the same session, and protected active high-priority risk sirens from ever being overwritten by a mid-siren API blip.
+- **Zero-Glitch Dropdown Unbinds & Cleaner Log Diagnostics:** Fixed a rare background `[TCL_ERR]` (`invalid command name "..._on_top_button1"`) when clicking top-bar controls while a dropdown menu is open, fixed warning-only anti-wick checks to say `"No warning alarm triggered."`, and kept full `(read timeout=...)` details unclipped in disconnect logs.
 
 ### 🔍 Detailed Breakdown
-- **Accurate Anti-Wick Delay & Warning-Only Copy + Unclipped Word-Boundary Error Formatting (`_clip_log_detail`, `data_loop`):**
-  - Parameterized `wick_delay_s` (`0.2s` vs `0.35s`) in `data_loop()`'s anti-wick re-verify log copy and distinguished `"No warning alarm triggered."` when only a warning threshold flickered vs `"No flatten triggered."` when a stop candidate flickered.
-  - Added `_clip_log_detail(msg, max_len=140)` for `Attempt #1`, `Connection lost`, `Still offline`, and loop-error diagnostic entries so Webull/Schwab HTTP timeout details like `(read timeout=3.5)` are preserved whole instead of sliced mid-token at 80–90 chars.
+- **Disconnect Dedup Reset, Atomic Priority Guard & Safe Deferred Replay (`_purge_disconnect_alarm_dedup`, `trigger_alarm`, `_flush_deferred_alarms`, `data_loop`):**
+  - Added `_purge_disconnect_alarm_dedup()` on every live API recovery (alongside `is_repeatable_disconnect` re-arming when idle) so repeat disconnects in the same session always play `sound_disconnect_alert_loop` and illuminate the HUD alert button.
+  - Serialized `trigger_alarm()`'s priority check and state transition under a single non-nested `_alarm_loop_lock` (and guarded `data_loop()`'s Attempt #3+ progress update with `is_disconnect_alarm_reason(last_alarm_reason)`) so transient disconnect/retry updates never silence or clear an active Stop / Manual-Options risk siren, and updated `_flush_deferred_alarms()` to prioritize risk alarms and skip only on `trigger_alarm()` `False`.
+- **Event-Safe Tcl Unbind & Stale Popup Guards (`_safe_unbind`, `DarkDropdownMenu._on_top_button1`, `show_release_notes_dialog._on_top_click`, `_clip_log_detail`):**
+  - Updated `_safe_unbind()` to match exact `"[funcid "` binding tokens and defer `widget.deletecommand(funcid)` via `after_idle` so in-flight `<Button-1>` event evaluation never throws `invalid command name`, plus stale-popup (`self._win is not tw` / `nav_state["popup"] is not pop`) and exact widget-path prefix (`w == p or w.startswith(p + ".")`) guards.
+  - Parameterized `wick_delay_s` (`0.2s` vs `0.35s`) in anti-wick guardrail logs with `"No warning alarm triggered."` for warning-only flickers, and added `_clip_log_detail(msg, max_len=140)` for word-boundary error formatting while keeping immediate Attempt #2 disconnect alerts intact.
 
 ---
 
