@@ -6,40 +6,22 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ## [v0.9.83] — 2026-11-23
 ### ⚡ Quick Summary
-- **Reliable Repeat Disconnect Alerts (Even Across Multiple Brownouts):** Fixed an old `triggered_alarms` dedup entry from your first `CONNECTION LOST` recovery silently blocking the 2-note disconnect tone and yellow HUD alarm banner on later disconnects in the same session, and protected active high-priority risk sirens from ever being overwritten by a mid-siren API blip.
-- **Zero-Glitch Dropdown Unbinds & Cleaner Log Diagnostics:** Fixed a rare background `[TCL_ERR]` (`invalid command name "..._on_top_button1"`) when clicking top-bar controls while a dropdown menu is open, fixed warning-only anti-wick checks to say `"No warning alarm triggered."`, and kept full `(read timeout=...)` details unclipped in disconnect logs.
-
-### 🔍 Detailed Breakdown
-- **Disconnect Dedup Reset, Atomic Priority Guard & Safe Deferred Replay (`_purge_disconnect_alarm_dedup`, `trigger_alarm`, `_flush_deferred_alarms`, `data_loop`):**
-  - Added `_purge_disconnect_alarm_dedup()` on every live API recovery (alongside `is_repeatable_disconnect` re-arming when idle) so repeat disconnects in the same session always play `sound_disconnect_alert_loop` and illuminate the HUD alert button.
-  - Serialized `trigger_alarm()`'s priority check and state transition under a single non-nested `_alarm_loop_lock` (and guarded `data_loop()`'s Attempt #3+ progress update with `is_disconnect_alarm_reason(last_alarm_reason)`) so transient disconnect/retry updates never silence or clear an active Stop / Manual-Options risk siren, and updated `_flush_deferred_alarms()` to prioritize risk alarms and skip only on `trigger_alarm()` `False`.
-- **Event-Safe Tcl Unbind & Stale Popup Guards (`_safe_unbind`, `DarkDropdownMenu._on_top_button1`, `show_release_notes_dialog._on_top_click`, `_clip_log_detail`):**
-  - Updated `_safe_unbind()` to match exact `"[funcid "` binding tokens and defer `widget.deletecommand(funcid)` via `after_idle` so in-flight `<Button-1>` event evaluation never throws `invalid command name`, plus stale-popup (`self._win is not tw` / `nav_state["popup"] is not pop`) and exact widget-path prefix (`w == p or w.startswith(p + ".")`) guards.
-  - Parameterized `wick_delay_s` (`0.2s` vs `0.35s`) in anti-wick guardrail logs with `"No warning alarm triggered."` for warning-only flickers, and added `_clip_log_detail(msg, max_len=140)` for word-boundary error formatting while keeping immediate Attempt #2 disconnect alerts intact.
-
----
-
-## [v0.9.82] — 2026-11-23
-### ⚡ Quick Summary
-- **Rock-Steady Pre-Flight Columns When Toggling `HUD Breach Mode`:** Fixed Card 3's settings summary line pushing the center divider rightward whenever **`🚨 Breach Sim: ON`** is enabled (and prevented mid-word clipping like `Breach Si`), keeping all 5 Pre-Flight cards pixel-locked across toggles, `Post-Breach Popup` preview actions, and HUD banner dismissals.
-
-### 🔍 Detailed Breakdown
-- **Fixed-Geometry Card 3 Summary & Priority-Ordered Fit (`prefs_summary_frame`, `_refresh_card3_prefs_summary`, `_dismiss_hud_breach_preview`, `show_daily_breach_return_notice`):**
-  - Wrapped `lbl_prefs_summary` inside `prefs_summary_frame` (`pack_propagate(False)` with worst-case emoji height measured before freezing, plus `<Configure>` width tracking) and applied `uniform="pf_cols"` on `body_frame` columns **after** outer Pre-Flight geometry locks (preventing layout shifts on wide windows without inflating compact laptop width).
-  - Replaced blind right-edge truncation with priority-ordered full-word stepping (`Tier 0 -> Tier 1 -> Tier 2 -> Tier 3` keeping **`🚨 Breach Sim`** and **`🔇 MUTED`** visible longest) and synced Card 3 immediately across `Preferences & Audio`, `Post-Breach Popup` (`on_close_keep_as_is` / `on_arm_rezero`), and `_dismiss_hud_breach_preview()` via `_pf_prefs_summary_refresh_cb` (cleared cleanly in `_cancel_pf_timers()`).
-
----
-
-## [v0.9.81] — 2026-11-23
-### ⚡ Quick Summary
-- **Live Card 5 Ratchet Ladder Preview (`RTH` & `Ext-Hours`):** Added a sleek interactive step-and-trailing chart directly inside Card 5 that redraws as you type Tier 1–4 stops, highlights tightened/green floors & clamped steps cleanly, switches automatically between `Card 5 (RTH)` and `Card 4 (Ext-Hours)`, tracks your live `Rulebook High`, and collapses anytime with one click (`▾ Hide`).
+- **Live Card 5 Ratchet Ladder Preview (`RTH` & `Ext-Hours`):** Added an interactive step-and-trailing chart directly inside Card 5 that redraws as you type Tier 1–4 stops, highlights tightened/green floors & clamped steps cleanly, switches automatically between `Card 5 (RTH)` and `Card 4 (Ext-Hours)`, tracks your live `Rulebook High`, and collapses anytime with one click (`▾ Hide`).
 - **Opt-In HUD `PnL CURVE` Sparkline Column:** Added **`PnL CURVE`** to `📊 HUD Columns` so you can monitor your intraday Net PnL curve with `$0` breakeven, `Session High`, and smart Anti-Pancake Stop scaling (pinning a subtle bottom marker when your Daily Stop is far away and revealing the true-scale Stop line as you approach or trail profit), persisting cleanly across mid-day restarts.
+- **Reliable Repeat Disconnect Alerts & Risk-Siren Priority Protection:** Fixed an old `triggered_alarms` dedup entry from your first `CONNECTION LOST` recovery silently blocking the 2-note disconnect tone and yellow HUD alarm banner on later disconnects in the same session, and protected active high-priority Stop / Manual-Options risk sirens from ever being overwritten by a mid-siren API blip.
+- **Rock-Steady Pre-Flight Columns, Zero-Glitch Dropdown Unbinds & Cleaner Logs:** Fixed Card 3's settings summary line nudging Pre-Flight columns when toggling **`🚨 Breach Sim: ON`** (preventing mid-word clipping like `Breach Si`), fixed a rare background `[TCL_ERR]` when clicking top-bar buttons while a dropdown is open, clarified warning-only anti-wick checks (`"No warning alarm triggered."`), and preserved full `(read timeout=...)` details in disconnect logs.
 
 ### 🔍 Detailed Breakdown
 - **Card 5 Single-Canvas Ratchet Preview (`_preview_stop_at_peak`, `compute_ratchet_preview_model`, `ENABLE_RATCHET_PREVIEW`):**
   - Evaluates the exact piecewise `describe_active_floor()` / `_get_effective_rth_tier_stops()` step & T4/Ext trailing logic inside a screen-aware `96px` chart (`52px` compact fallback on `< 860px` screens, keeping Pre-Flight within `<= 785px` logical height on full displays and `<= 740px` on compact laptops), with tactile `RTH` / `EXT` / `▾ Hide` pills, zone-aware cursor switching (`hand2` / arrow / `crosshair`), step dollar callouts, bottom profit ticks, per-field last-valid keystroke memory, `[Clamped]` & `Alarms Only` tags, and an isolated `ratchet_prev_after_id` debounce.
 - **Thread-Safe Intraday HUD Sparkline Column (`_record_pnl_curve_point`, `compute_sparkline_scale`, `_redraw_hud_sparkline_canvas`, `update_gui`, `"pnl_sparkline"`):**
   - Stores up to `160` min/max-and-boundary-preserving points per `(broker, account_id)` session under strict `_config_io_lock -> _pnl_curve_lock` ordering, renders calm slate `#94a3b8` pre-trade `$0.00` flatlines before green/red PnL develops, passes immutable `spark_snap` snapshots to Tkinter, mirrors Demo flash colors, and automatically hides the canvas whenever `"OFFLINE"` / `"RETRY #N"` / `"TOKEN EXPIRED"` alert text needs the cell.
+- **Disconnect Dedup Reset, Atomic Priority Guard & Safe Deferred Replay (`_purge_disconnect_alarm_dedup`, `trigger_alarm`, `_flush_deferred_alarms`, `data_loop`):**
+  - Added `_purge_disconnect_alarm_dedup()` on every live API recovery (alongside `is_repeatable_disconnect` re-arming when idle) so repeat disconnects in the same session always play `sound_disconnect_alert_loop` and illuminate the HUD alert button.
+  - Serialized `trigger_alarm()`'s priority check and state transition under a single non-nested `_alarm_loop_lock` (and guarded `data_loop()`'s Attempt #3+ progress update with `is_disconnect_alarm_reason(last_alarm_reason)`) so transient disconnect/retry updates never silence or clear an active Stop / Manual-Options risk siren, and updated `_flush_deferred_alarms()` to prioritize risk alarms and stop only once `trigger_alarm()` returns `True`.
+- **Fixed-Geometry Card 3 Summary, Event-Safe Tcl Unbind & Cleaner Diagnostics (`prefs_summary_frame`, `_refresh_card3_prefs_summary`, `_safe_unbind`, `_clip_log_detail`):**
+  - Wrapped `lbl_prefs_summary` inside `prefs_summary_frame` (`pack_propagate(False)` with worst-case emoji height measured before freezing + `<Configure>` tracking), applied `uniform="pf_cols"` on `body_frame` columns after outer geometry locks, stepped down priority-ordered unclipped shorthand keeping **`🚨 Breach Sim`** and **`🔇 MUTED`** visible longest, and synced Card 3 across `Preferences & Audio`, `Post-Breach Popup`, and `_dismiss_hud_breach_preview()` via `_pf_prefs_summary_refresh_cb`.
+  - Updated `_safe_unbind()` to match exact `"[funcid "` tokens and defer `widget.deletecommand(funcid)` via `after_idle`, added stale-popup (`self._win is not tw` / `nav_state["popup"] is not pop`) and exact widget-path prefix (`w == p or w.startswith(p + ".")`) guards, parameterized `wick_delay_s` (`0.2s`/`0.35s`) with `"No warning alarm triggered."` on warning-only flickers, and added `_clip_log_detail(msg, max_len=140)` for word-boundary error formatting.
 
 ---
 
