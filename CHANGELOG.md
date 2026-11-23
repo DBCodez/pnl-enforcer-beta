@@ -4,6 +4,17 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.83] — 2026-11-23
+### ⚡ Quick Summary
+- **Cleaner Anti-Wick & API Timeout Diagnostics:** Fixed transient warning-only anti-wick checks inaccurately saying `"No flatten triggered."` (now clearly logs `"No warning alarm triggered."` with the exact `0.2s`/`0.35s` delay) and kept full `(read timeout=...)` details unclipped in disconnect/retry logs while keeping immediate Attempt #2 disconnect alerts unchanged.
+
+### 🔍 Detailed Breakdown
+- **Accurate Anti-Wick Delay & Warning-Only Copy + Unclipped Word-Boundary Error Formatting (`_clip_log_detail`, `data_loop`):**
+  - Parameterized `wick_delay_s` (`0.2s` vs `0.35s`) in `data_loop()`'s anti-wick re-verify log copy and distinguished `"No warning alarm triggered."` when only a warning threshold flickered vs `"No flatten triggered."` when a stop candidate flickered.
+  - Added `_clip_log_detail(msg, max_len=140)` for `Attempt #1`, `Connection lost`, `Still offline`, and loop-error diagnostic entries so Webull/Schwab HTTP timeout details like `(read timeout=3.5)` are preserved whole instead of sliced mid-token at 80–90 chars.
+
+---
+
 ## [v0.9.82] — 2026-11-23
 ### ⚡ Quick Summary
 - **Rock-Steady Pre-Flight Columns When Toggling `HUD Breach Mode`:** Fixed Card 3's settings summary line pushing the center divider rightward whenever **`🚨 Breach Sim: ON`** is enabled (and prevented mid-word clipping like `Breach Si`), keeping all 5 Pre-Flight cards pixel-locked across toggles, `Post-Breach Popup` preview actions, and HUD banner dismissals.

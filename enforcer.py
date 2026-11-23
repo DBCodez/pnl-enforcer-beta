@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.82"
+APP_VERSION = "0.9.83"
 
 import os
 import sys
@@ -16435,6 +16435,20 @@ def format_alarm_button_text(reason):
     return f"ACKNOWLEDGE ALARM ({_humanize_alarm_reason(reason, for_tts=False)})"
 
 
+def _clip_log_detail(msg, max_len=140):
+    """Normalizes single-line diagnostic text and trims cleanly on a word
+    boundary with '...' only when exceeding max_len so timeout/HTTP errors
+    never get sliced mid-token."""
+    s = " ".join(str(msg or "").split())
+    if len(s) <= max_len:
+        return s
+    cut = s[: max(12, max_len - 3)]
+    sp = cut.rfind(" ")
+    if sp >= max(12, max_len - 32):
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:-(") + "..."
+
+
 def is_disconnect_alarm_reason(reason):
     """Returns True when an alarm reason represents a broker API connection
     drop or token expiration rather than a position/loss threshold breach."""
@@ -25702,9 +25716,8 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 f"account snapshot (0s delay | {spike_ctx})."
                             )
                     else:
-                        time.sleep(
-                            0.35 if (qty_just_changed or is_flat) else 0.2
-                        )
+                        wick_delay_s = 0.35 if (qty_just_changed or is_flat) else 0.2
+                        time.sleep(wick_delay_s)
                         if not _poll_still_valid():
                             continue
                         v_eq, v_flat, v_open, v_pos, v_opt = (
@@ -25769,16 +25782,21 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 and not still_open
                                 and not still_warn
                             ):
+                                wick_no_op = (
+                                    "No flatten triggered."
+                                    if (floor_breach_cand or open_breach_cand)
+                                    else "No warning alarm triggered."
+                                )
                                 log_event(
                                     "GUARDRAIL",
                                     f"Filtered transient single-order wick "
-                                    f"(Spike: {spike_ctx} -> Re-verified 0.2s later: "
-                                    f"{v_ctx}). No flatten triggered."
+                                    f"(Spike: {spike_ctx} -> Re-verified {wick_delay_s:g}s later: "
+                                    f"{v_ctx}). {wick_no_op}"
                                 )
                             elif floor_breach_cand or open_breach_cand:
                                 log_event(
                                     "GUARDRAIL",
-                                    f"Breach confirmed after 0.2s anti-wick check "
+                                    f"Breach confirmed after {wick_delay_s:g}s anti-wick check "
                                     f"(Initial: {spike_ctx} -> Verified: {v_ctx})."
                                 )
 
@@ -26179,7 +26197,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 pass
                         log_event(
                             "WARN",
-                            f"Broker API poll failed (Attempt #1: {raw_err[:90]}) — "
+                            f"Broker API poll failed (Attempt #1: {_clip_log_detail(raw_err, 140)}) — "
                             f"refreshed HTTP session & retrying automatically...",
                         )
                         if not alarm_active and not cooldown_active:
@@ -26252,14 +26270,14 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
                             log_event(
                                 "WARN",
-                                f"Connection lost ({poll_ad.name}: {raw_err[:90]}). "
+                                f"Connection lost ({poll_ad.name}: {_clip_log_detail(raw_err, 140)}). "
                                 f"Auto-reconnecting (Attempt #{consecutive_api_failures})...",
                             )
                             speak_async(v_msg)
                             trigger_alarm(
                                 r_msg,
                                 mute_btn,
-                                raw_err[:80],
+                                _clip_log_detail(raw_err, 140),
                             )
                         else:
                             att = consecutive_api_failures
@@ -26267,7 +26285,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 log_event(
                                     "WARN",
                                     f"Still offline — auto-reconnect attempt #{att} "
-                                    f"({raw_err[:80]})...",
+                                    f"({_clip_log_detail(raw_err, 140)})...",
                                 )
                             if not is_tok_exp:
                                 if alarm_active:
@@ -26331,7 +26349,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 trigger_alarm(
                     "INTERNAL POLL ERROR — CHECK LOGS!",
                     mute_btn,
-                    str(e)[:80],
+                    _clip_log_detail(e, 140),
                     force_repeat=(consecutive_loop_exceptions == 3),
                 )
 
