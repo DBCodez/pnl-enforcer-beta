@@ -4,6 +4,19 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.81] — 2026-11-23
+### ⚡ Quick Summary
+- **Live Card 5 Ratchet Ladder Preview (`RTH` & `Ext-Hours`):** Added a sleek interactive step-and-trailing chart directly inside Card 5 that redraws as you type Tier 1–4 stops, highlights tightened/green floors & clamped steps cleanly, switches automatically between `Card 5 (RTH)` and `Card 4 (Ext-Hours)`, tracks your live `Rulebook High`, and collapses anytime with one click (`▾ Hide`).
+- **Opt-In HUD `PnL CURVE` Sparkline Column:** Added **`PnL CURVE`** to `📊 HUD Columns` so you can monitor your intraday Net PnL curve with `$0` breakeven, `Session High`, and smart Anti-Pancake Stop scaling (pinning a subtle bottom marker when your Daily Stop is far away and revealing the true-scale Stop line as you approach or trail profit), persisting cleanly across mid-day restarts.
+
+### 🔍 Detailed Breakdown
+- **Card 5 Single-Canvas Ratchet Preview (`_preview_stop_at_peak`, `compute_ratchet_preview_model`, `ENABLE_RATCHET_PREVIEW`):**
+  - Evaluates the exact piecewise `describe_active_floor()` / `_get_effective_rth_tier_stops()` step & T4/Ext trailing logic inside a screen-aware `96px` chart (`52px` compact fallback on `< 860px` screens, keeping Pre-Flight within `<= 785px` logical height on full displays and `<= 740px` on compact laptops), with tactile `RTH` / `EXT` / `▾ Hide` pills, zone-aware cursor switching (`hand2` / arrow / `crosshair`), step dollar callouts, bottom profit ticks, per-field last-valid keystroke memory, `[Clamped]` & `Alarms Only` tags, and an isolated `ratchet_prev_after_id` debounce.
+- **Thread-Safe Intraday HUD Sparkline Column (`_record_pnl_curve_point`, `compute_sparkline_scale`, `_redraw_hud_sparkline_canvas`, `update_gui`, `"pnl_sparkline"`):**
+  - Stores up to `160` min/max-and-boundary-preserving points per `(broker, account_id)` session under strict `_config_io_lock -> _pnl_curve_lock` ordering, renders calm slate `#94a3b8` pre-trade `$0.00` flatlines before green/red PnL develops, passes immutable `spark_snap` snapshots to Tkinter, mirrors Demo flash colors, and automatically hides the canvas whenever `"OFFLINE"` / `"RETRY #N"` / `"TOKEN EXPIRED"` alert text needs the cell.
+
+---
+
 ## [v0.9.80] — 2026-11-20
 ### ⚡ Quick Summary
 - **Smart Recovery & Bounce-Close Protection on Manual Options (`Options Auto-Flatten: OFF`, Shoutout to `T$MAC`!):** When an option trade dips past your Single-Trade Stop with Options Auto-Flatten OFF and then recovers cleanly back above your stop threshold (above `-$425` on a `-$500` stop) without averaging down, Enforcer now automatically clears the manual-options watch, silences repeat sirens, and skips the Penalty Box OS lock if you close for a win or small scratch — while still enforcing the lockout if you close near/past your stop or average down during the watch.

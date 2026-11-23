@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.80"
+APP_VERSION = "0.9.81"
 
 import os
 import sys
@@ -2542,6 +2542,7 @@ DEFAULT_CONFIG = {
     "hud_y": None,
     "preflight_x": None,
     "preflight_y": None,
+    "show_ratchet_preview": True,
     "reset_at_925": True,
     "ignore_preexisting_positions": True,
     "poll_interval": 2,
@@ -2649,10 +2650,14 @@ TTS_VOICE_CATALOG = _discover_windows_tts_voices()
 TTS_LABEL_TO_ID = {lbl: vid for lbl, vid in TTS_VOICE_CATALOG}
 TTS_ID_TO_LABEL = {vid: lbl for lbl, vid in TTS_VOICE_CATALOG}
 
+ENABLE_RATCHET_PREVIEW = True
+ENABLE_HUD_SPARKLINE = True
+
 HUD_COLUMN_CATALOG = [
     ("realized_pnl", "REALIZED PnL", "Closed (flat) PnL for the day"),
     ("open_pnl", "OPEN PnL", "Live unrealized PnL on open positions"),
     ("net_pnl", "NET PnL", "Total daily PnL (Realized + Open)"),
+    ("pnl_sparkline", "PnL CURVE", "Live intraday Net PnL curve with Daily Stop & Session High"),
     ("terminate_lvl", "DAILY STOP", "Active Rulebook stop (Starting Max Loss, Ratcheted Tier, or Trailing Profit Lock)"),
     ("dist_to_term", "$ TO STOP", "Remaining dollar cushion before hitting your active Daily Stop"),
     ("session_high", "SESSION HIGH", "Highest flat realized PnL of the day"),
@@ -3465,6 +3470,180 @@ def describe_active_floor(cfg=None, rth_mode=None):
         f"RTH Tier 1 Starting Max Loss (-${t1_max:,.0f})",
         "Card 5 'Starting Max Loss ($)'",
     )
+
+
+# === RATCHET PREVIEW ENGINE ===
+def _preview_stop_at_peak(peak_pnl, params, mode="rth"):
+    """Pure piecewise stop evaluator matching `describe_active_floor()` to the cent.
+    Returns `(stop_pnl, tier_tag)` for a given realized peak (`max_realized_profit`)."""
+    pk = round(float(peak_pnl), 2)
+    p = params or {}
+    if str(mode).lower() == "ext":
+        pm_max = float(p.get("pm_max_loss", 1500.0))
+        pm_lock_on = bool(p.get("enable_pm_lock", True))
+        pm_trig = float(p.get("pm_lock_trigger", 500.0))
+        pm_trail = float(p.get("pm_trail_cushion", 500.0))
+        if pm_lock_on and pk >= pm_trig:
+            return (round(max(-pm_max, pk - pm_trail), 2), "EXT LOCK")
+        return (round(-pm_max, 2), "EXT")
+
+    t1_max = float(p.get("t1_max_loss", 2000.0))
+    t2_on = bool(p.get("enable_t2", True))
+    t3_on = bool(p.get("enable_t3", True))
+    t4_on = bool(p.get("enable_t4", True))
+    t2_trig = float(p.get("t2_trigger", 250.0))
+    t2_max = float(p.get("t2_max_loss", -1000.0))
+    t3_trig = float(p.get("t3_trigger", 500.0))
+    t3_max = float(p.get("t3_max_loss", -500.0))
+    t4_trig = float(p.get("t4_trigger", 1000.0))
+    t4_trail = float(p.get("t4_trail", 500.0))
+    base_t1_stop, eff_t2_max, eff_t3_max = _get_effective_rth_tier_stops(
+        t1_max, t2_on, t2_max, t3_on, t3_max
+    )
+    if t4_on and pk >= t4_trig:
+        prior_stop_pnl = (
+            eff_t3_max
+            if (t3_on and pk >= t3_trig)
+            else (
+                eff_t2_max
+                if (t2_on and pk >= t2_trig)
+                else base_t1_stop
+            )
+        )
+        return (round(max(prior_stop_pnl, pk - t4_trail), 2), "T4")
+    if t3_on and pk >= t3_trig:
+        return (round(eff_t3_max, 2), "T3")
+    if t2_on and pk >= t2_trig:
+        return (round(eff_t2_max, 2), "T2")
+    return (round(base_t1_stop, 2), "T1")
+
+
+def compute_ratchet_preview_model(
+    params, mode="rth", rulebook_hwm=None, alarms_only=False
+):
+    """Builds the plotting bounds, step markers, clamp detection, and rich
+    two-column tooltip text for Card 5's embedded Ratchet Preview canvas."""
+    p = params or {}
+    m = "ext" if str(mode).lower() == "ext" else "rth"
+    steps = []
+    trigs = [0.0]
+    clamped = False
+    trail_trig = None
+    trail_val = 0.0
+
+    if m == "ext":
+        pm_max = float(p.get("pm_max_loss", 1500.0))
+        pm_lock_on = bool(p.get("enable_pm_lock", True))
+        pm_trig = float(p.get("pm_lock_trigger", 500.0))
+        pm_trail = float(p.get("pm_trail_cushion", 500.0))
+        base_stop = round(-pm_max, 2)
+        if pm_lock_on:
+            trigs.append(pm_trig)
+            trail_trig = pm_trig
+            trail_val = pm_trail
+            st0, _ = _preview_stop_at_peak(pm_trig, p, "ext")
+            steps.append((pm_trig, st0, "EXT LOCK"))
+            if (pm_trig - pm_trail) < -pm_max:
+                clamped = True
+    else:
+        t1_max = float(p.get("t1_max_loss", 2000.0))
+        t2_on = bool(p.get("enable_t2", True))
+        t3_on = bool(p.get("enable_t3", True))
+        t4_on = bool(p.get("enable_t4", True))
+        t2_trig = float(p.get("t2_trigger", 250.0))
+        t2_max = float(p.get("t2_max_loss", -1000.0))
+        t3_trig = float(p.get("t3_trigger", 500.0))
+        t3_max = float(p.get("t3_max_loss", -500.0))
+        t4_trig = float(p.get("t4_trigger", 1000.0))
+        t4_trail = float(p.get("t4_trail", 500.0))
+        base_stop, eff_t2, eff_t3 = _get_effective_rth_tier_stops(
+            t1_max, t2_on, t2_max, t3_on, t3_max
+        )
+        base_stop = round(base_stop, 2)
+        if t2_on:
+            trigs.append(t2_trig)
+            st2, _ = _preview_stop_at_peak(t2_trig, p, "rth")
+            steps.append((t2_trig, st2, "T2"))
+            if t2_max < base_stop:
+                clamped = True
+        if t3_on:
+            trigs.append(t3_trig)
+            st3, _ = _preview_stop_at_peak(t3_trig, p, "rth")
+            steps.append((t3_trig, st3, "T3"))
+            if t3_max < eff_t2 or (t2_on and t3_trig < t2_trig):
+                clamped = True
+        if t4_on:
+            trigs.append(t4_trig)
+            trail_trig = t4_trig
+            trail_val = t4_trail
+            prior_at_t4 = (
+                eff_t3
+                if (t3_on and t4_trig >= t3_trig)
+                else (eff_t2 if (t2_on and t4_trig >= t2_trig) else base_stop)
+            )
+            st4, _ = _preview_stop_at_peak(t4_trig, p, "rth")
+            steps.append((t4_trig, st4, "T4"))
+            if (
+                (t4_trig - t4_trail) < prior_at_t4
+                or (t3_on and t4_trig < t3_trig)
+                or (t2_on and t4_trig < t2_trig)
+            ):
+                clamped = True
+
+    x_min = min([0.0] + trigs)
+    max_trig = max([0.0] + trigs)
+    hwm_f = float(rulebook_hwm) if rulebook_hwm is not None else None
+    x_max = max(
+        1200.0,
+        max_trig * 1.75 if max_trig > 0 else 1200.0,
+        (trail_trig + abs(trail_val) + 300.0) if trail_trig is not None else 1200.0,
+        (hwm_f * 1.2) if (hwm_f is not None and hwm_f > 0) else 0.0,
+    )
+    end_stop, end_tag = _preview_stop_at_peak(x_max, p, m)
+
+    rows = [
+        f"PROFIT RATCHET LADDER ({'EXT-HOURS CARD 4' if m == 'ext' else 'RTH CARD 5'}):",
+        "---",
+        f"• Base Stop | {format_dollar(base_stop)}",
+    ]
+    for tx, sy, slbl in steps:
+        rows.append(
+            f"• At {format_dollar(tx)} Peak | Stop -> {format_dollar(sy)} ({slbl})"
+        )
+    if trail_trig is not None:
+        rows.append(
+            f"• At {format_dollar(x_max)} Peak | Trail Stop -> {format_dollar(end_stop)} ({end_tag})"
+        )
+    if hwm_f is not None:
+        cur_st, cur_tg = _preview_stop_at_peak(hwm_f, p, m)
+        rows.append(
+            f"• Rulebook High (Now) | {format_dollar(hwm_f)} -> {format_dollar(cur_st)} ({cur_tg})"
+        )
+    rows.append("---")
+    if clamped:
+        rows.append(
+            "• Clamp Active | Out-of-order or looser steps are clamped so your Daily Stop never loosens"
+        )
+    if alarms_only:
+        rows.append(
+            "• Alarms Only Mode | Sirens fire at these levels with zero auto-flatten orders or OS locks"
+        )
+    rows.append(
+        "• Single-Trade Stop | Card 1 Max Open Loss operates independently"
+    )
+    return {
+        "mode": m,
+        "base_stop": base_stop,
+        "x_min": x_min,
+        "x_max": x_max,
+        "end_stop": end_stop,
+        "end_tag": end_tag,
+        "steps": steps,
+        "clamped": clamped,
+        "alarms_only": bool(alarms_only),
+        "rulebook_hwm": hwm_f,
+        "tooltip": "\n".join(rows),
+    }
 
 
 def compute_active_floor_equity(cfg=None, rth_mode=None):
@@ -5451,6 +5630,204 @@ def format_config_summary(cfg):
     )
 
 
+# === HUD PNL SPARKLINE ENGINE (STATE & SCALE) ===
+MAX_PNL_CURVE_POINTS = 160
+_pnl_curve_lock = threading.Lock()
+_pnl_curves = {}  # {session_key: {"date": str, "pts": [(ts, pnl, is_boundary), ...], "last_flat": Optional[bool]}}
+
+
+def _clear_pnl_curve(s_key=None):
+    """Clears stored curve points for `s_key` (or all sessions if None).
+    Lock rule: NEVER acquires `_config_io_lock` or logs inside `_pnl_curve_lock`."""
+    with _pnl_curve_lock:
+        if s_key is None:
+            _pnl_curves.clear()
+        else:
+            _pnl_curves.pop(str(s_key), None)
+
+
+def _decimate_pnl_curve_pts(pts, max_pts=MAX_PNL_CURVE_POINTS):
+    """Reduces `pts` [(ts, pnl, is_boundary), ...] to <= `max_pts` while
+    preserving index 0, newest 40 points, global extrema, flat-close
+    boundaries, and local bucket min/max peaks."""
+    if len(pts) <= max_pts:
+        return list(pts)
+    tail_keep = min(40, max(8, max_pts // 4))
+    head = list(pts[:-tail_keep])
+    tail = list(pts[-tail_keep:])
+    head_budget = max(8, max_pts - len(tail))
+    if len(head) <= head_budget:
+        return head + tail
+
+    min_i = min(range(len(head)), key=lambda idx: head[idx][1])
+    max_i = max(range(len(head)), key=lambda idx: head[idx][1])
+    pinned_idx = {0, min_i, max_i}
+    boundary_idx = [i for i, it in enumerate(head) if it[2] and i not in pinned_idx]
+    b_cap = max(0, head_budget - len(pinned_idx) - 8)
+    if len(boundary_idx) > b_cap and b_cap > 0:
+        step_b = len(boundary_idx) / float(b_cap)
+        boundary_idx = [boundary_idx[int(j * step_b)] for j in range(b_cap)]
+    elif b_cap == 0:
+        boundary_idx = []
+    pinned_idx.update(boundary_idx)
+
+    rem_slots = max(0, head_budget - len(pinned_idx))
+    kept = set(pinned_idx)
+    if rem_slots >= 2:
+        n_buckets = max(1, rem_slots // 2)
+        for b_i in range(n_buckets):
+            lo = int((b_i * len(head)) / n_buckets)
+            hi = int(((b_i + 1) * len(head)) / n_buckets)
+            if hi <= lo:
+                continue
+            lo_idx = min(range(lo, hi), key=lambda idx: head[idx][1])
+            hi_idx = max(range(lo, hi), key=lambda idx: head[idx][1])
+            if len(kept) < head_budget:
+                kept.add(lo_idx)
+            if len(kept) < head_budget:
+                kept.add(hi_idx)
+    out = [head[idx] for idx in sorted(kept)]
+    if len(out) > head_budget:
+        out = out[:head_budget]
+    return out + tail
+
+
+def _load_pnl_curve_for_session(s_key, today_str, raw_list):
+    if not s_key or not today_str or not isinstance(raw_list, list):
+        return
+    cleaned = []
+    for item in raw_list:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            try:
+                ts_v = round(float(item[0]), 1)
+                pnl_v = round(float(item[1]), 2)
+                if math.isfinite(ts_v) and math.isfinite(pnl_v):
+                    cleaned.append((ts_v, pnl_v, False))
+            except Exception:
+                continue
+    cleaned.sort(key=lambda it: it[0])
+    if len(cleaned) > MAX_PNL_CURVE_POINTS:
+        cleaned = _decimate_pnl_curve_pts(cleaned, MAX_PNL_CURVE_POINTS)
+    with _pnl_curve_lock:
+        _pnl_curves[str(s_key)] = {
+            "date": str(today_str),
+            "pts": cleaned,
+            "last_flat": None,
+        }
+
+
+def _export_pnl_curve_for_session(s_key, today_str):
+    if not s_key or not today_str:
+        return []
+    with _pnl_curve_lock:
+        ent = _pnl_curves.get(str(s_key))
+        if not ent or ent.get("date") != str(today_str):
+            return []
+        return [[round(t, 1), round(p, 2)] for t, p, _ in ent.get("pts", ())]
+
+
+def _record_pnl_curve_point(
+    s_key,
+    poll_epoch,
+    today_str,
+    net_pnl,
+    is_flat_now=True,
+    base_leash=1500.0,
+    force=False,
+    now_ts=None,
+):
+    """Appends significant Net PnL checkpoints per session & returns an immutable
+    tuple of float PnL values including the live `net_pnl` tip."""
+    if not s_key or not today_str:
+        return (round(float(net_pnl), 2),)
+    ts = round(float(now_ts if now_ts is not None else time.time()), 1)
+    pnl = round(float(net_pnl), 2)
+    delta_thresh = max(5.0, min(25.0, 0.015 * abs(float(base_leash or 1500.0))))
+    k = str(s_key)
+    with _pnl_curve_lock:
+        if poll_epoch is not None and poll_epoch != _adapter_epoch:
+            return None
+        ent = _pnl_curves.get(k)
+        if ent is None or ent.get("date") != str(today_str):
+            ent = {"date": str(today_str), "pts": [], "last_flat": None}
+            _pnl_curves[k] = ent
+        pts = ent["pts"]
+        prev_flat = ent.get("last_flat")
+        flat_changed = prev_flat is not None and bool(prev_flat) != bool(is_flat_now)
+        ent["last_flat"] = bool(is_flat_now)
+        is_boundary = bool(force or flat_changed)
+        should_commit = is_boundary or not pts
+        if not should_commit and pts:
+            last_ts, last_pnl, _ = pts[-1]
+            cur_max = max(p for _, p, _ in pts)
+            cur_min = min(p for _, p, _ in pts)
+            if (
+                (ts - last_ts) >= 45.0
+                or abs(pnl - last_pnl) >= delta_thresh
+                or pnl > cur_max
+                or pnl < cur_min
+            ):
+                should_commit = True
+        if should_commit:
+            if pts and abs(ts - pts[-1][0]) < 0.05:
+                pts[-1] = (ts, pnl, bool(pts[-1][2] or is_boundary))
+            else:
+                pts.append((ts, pnl, is_boundary))
+            if len(pts) > MAX_PNL_CURVE_POINTS:
+                ent["pts"] = _decimate_pnl_curve_pts(
+                    pts, max(80, int(MAX_PNL_CURVE_POINTS * 0.75))
+                )
+                pts = ent["pts"]
+        out_vals = [p for _, p, _ in pts]
+        if not out_vals or abs(out_vals[-1] - pnl) > 0.005:
+            out_vals.append(pnl)
+        return tuple(out_vals)
+
+
+def _peek_pnl_curve_points(s_key, today_str, live_tip=None):
+    if not s_key or not today_str:
+        return (round(float(live_tip), 2),) if live_tip is not None else ()
+    with _pnl_curve_lock:
+        ent = _pnl_curves.get(str(s_key))
+        if not ent or ent.get("date") != str(today_str):
+            vals = []
+        else:
+            vals = [p for _, p, _ in ent.get("pts", ())]
+    if live_tip is not None:
+        lt = round(float(live_tip), 2)
+        if not vals or abs(vals[-1] - lt) > 0.005:
+            vals.append(lt)
+    return tuple(vals)
+
+
+def compute_sparkline_scale(
+    pts, stop_pnl, session_high_pnl, breach_active=False
+):
+    """Computes `(y_min, y_max, stop_in_window)` for `PnL CURVE`.
+    Returns `stop_in_window=False` (Anti-Pancake bottom pin) when `stop_pnl`
+    sits far below the intraday curve so morning price action is not squashed."""
+    vals = [0.0] + [float(v) for v in (pts or ())]
+    if session_high_pnl is not None:
+        vals.append(max(0.0, float(session_high_pnl)))
+    c_min = min(vals)
+    c_max = max(vals)
+    raw_span = max(25.0, c_max - c_min)
+    stop_f = float(stop_pnl if stop_pnl is not None else -1500.0)
+    stop_in_window = bool(
+        breach_active
+        or (
+            (stop_f >= (c_min - 1.5 * raw_span))
+            and (stop_f <= (c_max + 0.5 * raw_span))
+        )
+    )
+    if stop_in_window:
+        lo = min(c_min, stop_f)
+        hi = max(c_max, stop_f)
+        span = max(25.0, hi - lo)
+        return (lo - 0.14 * span, hi + 0.14 * span, True)
+    return (c_min - 0.16 * raw_span, c_max + 0.14 * raw_span, False)
+
+
 def restore_account_session(broker_name, account_id, log_restore=False):
     """Restores today's saved baseline for a specific broker + account_id.
     Returns True if a valid baseline for today was found, False otherwise."""
@@ -5515,6 +5892,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     today_str = get_today_str()
     active_session_date = today_str
     s_key = get_session_key(broker_name, account_id)
+    _clear_pnl_curve(s_key)
     acct_sessions = (
         _demo_memory_session
         if str(broker_name).upper() == "DEMO"
@@ -5654,6 +6032,9 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             saved_ig = s_data.get("ignored_positions")
             if isinstance(saved_ig, dict):
                 ignored_positions.update(json.loads(json.dumps(saved_ig)))
+            _load_pnl_curve_for_session(
+                s_key, today_str, s_data.get("pnl_curve")
+            )
             prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
             settled_realized_pnl = prev_flat_realized_pnl
             _last_round_trip_close_ts = 0.0
@@ -6108,6 +6489,7 @@ def save_session_state(
             "ignored_positions": json.loads(json.dumps(ignored_positions)),
             "was_flat_at_save": bool(current_is_flat),
             "open_positions_at_save": open_pos_save_map,
+            "pnl_curve": _export_pnl_curve_for_session(s_key, today_str),
             "reconciled_through_epoch": eff_rec_ep,
             "reconciled_order_qty": roq_clean,
             "snapshot_epoch": eff_snap_ep,
@@ -24461,6 +24843,7 @@ def _build_hud_column_display_data(
         "realized_pnl": (format_dollar(realized_pnl), c1_bg),
         "open_pnl": (format_dollar(open_pnl), c2_bg),
         "net_pnl": (format_dollar(net_pnl), net_bg),
+        "pnl_sparkline": ("" if ENABLE_HUD_SPARKLINE else "---", "#262a2e"),
         "terminate_lvl": (format_dollar(terminate_pnl_level), c3_bg),
         "dist_to_term": (
             format_dist_to_stop_hud(
@@ -24830,6 +25213,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     recent_loss_timestamps.clear()
                     triggered_alarms.clear()
                     _deferred_alarms.clear()
+                    _clear_pnl_curve(get_session_key(poll_ad.name, poll_ad.account_id))
                     _uncloseable_fractional_syms.clear()
                     _launch_grace_syms.clear()
                     _reconciled_order_qty.clear()
@@ -24951,6 +25335,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     recent_loss_timestamps.clear()
                     triggered_alarms.clear()
                     _deferred_alarms.clear()
+                    _clear_pnl_curve(get_session_key(poll_ad.name, poll_ad.account_id))
                     _launch_grace_syms.clear()
                     _reconciled_order_qty.clear()
                     _reconciled_through_epoch = time.time()
@@ -25680,9 +26065,48 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 is_fresh_hud_snap = bool(
                     not snap_was_cached and not reverify_deferred_cached
                 )
+                spark_snap_arg = None
+                if is_fresh_hud_snap and ENABLE_HUD_SPARKLINE:
+                    try:
+                        poll_s_key = get_session_key(poll_broker, poll_acct)
+                        pts_tup = _record_pnl_curve_point(
+                            poll_s_key,
+                            poll_epoch,
+                            today_now,
+                            net_pnl,
+                            is_flat_now=bool(is_flat),
+                            base_leash=dec.get("base_leash", 1500.0),
+                            force=bool(was_poll_1_launch),
+                        )
+                        if pts_tup is not None:
+                            s_low_pnl = round(
+                                (
+                                    daily_min_equity
+                                    if daily_min_equity is not None
+                                    else min(start_equity, last_flat_equity)
+                                )
+                                - start_equity,
+                                2,
+                            )
+                            spark_snap_arg = {
+                                "epoch": poll_epoch,
+                                "s_key": poll_s_key,
+                                "pts": pts_tup,
+                                "net_pnl": round(float(net_pnl), 2),
+                                "stop_pnl": round(float(terminate_pnl_level), 2),
+                                "session_high": round(float(session_high_pnl), 2),
+                                "session_low": s_low_pnl,
+                                "dist": round(float(distance_to_terminate), 2),
+                                "breach": bool(hud_breach_active),
+                                "neutral": False,
+                            }
+                            if isinstance(_last_live_hud_snapshot, dict):
+                                _last_live_hud_snapshot["spark_snap"] = spark_snap_arg
+                    except Exception:
+                        spark_snap_arg = None
                 root.after(
                     0,
-                    lambda d=col_data, f=is_flat, lp=leash_pct, ep=poll_epoch, fr=is_fresh_hud_snap: (
+                    lambda d=col_data, f=is_flat, lp=leash_pct, ep=poll_epoch, fr=is_fresh_hud_snap, sp=spark_snap_arg: (
                         (
                             update_gui(
                                 ui_labels,
@@ -25691,6 +26115,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 settings_btn,
                                 close_btn,
                                 leash_pct=lp,
+                                spark_snap=sp,
                             ),
                             _apply_hud_status_pill_state(mute_btn, advance_streak=False)
                             if (
@@ -26389,6 +26814,7 @@ def show_preflight_window(
         "pulse_after_id": None,
         "undo_after_id": None,
         "flight_plan_after_id": None,
+        "ratchet_prev_after_id": None,
         "pulse_stop_fn": None,
         "card3_pulse_keys": (),
         "closing": False,
@@ -26543,6 +26969,7 @@ def show_preflight_window(
             "pulse_after_id",
             "undo_after_id",
             "flight_plan_after_id",
+            "ratchet_prev_after_id",
         ):
             aid = pf_timer_state.get(k_id)
             if aid is not None:
@@ -32690,6 +33117,7 @@ def show_preflight_window(
                 if active_adapter is not None:
                     active_adapter.invalidate_cached_snapshots()
                 s_key = get_session_key(chosen_b, active_adapter.account_id)
+                _clear_pnl_curve(s_key)
                 if s_key and s_key in new_cfg.get("account_sessions", {}):
                     del new_cfg["account_sessions"][s_key]
                 new_cfg["saved_start_equity"] = None
@@ -38115,7 +38543,7 @@ def show_preflight_window(
             "Uncheck if you only want a single warning alarm before your Starting Max Loss."
         )
     )
-    tk.Frame(c4, bg="#222d3d", height=1).pack(fill="x", pady=7)
+    tk.Frame(c4, bg="#222d3d", height=1).pack(fill="x", pady=3)
 
     tk.Label(
         c4,
@@ -38124,7 +38552,7 @@ def show_preflight_window(
         fg="#8ec5fc",
         bg="#131922",
         anchor="w",
-    ).pack(fill="x", pady=(0, 4))
+    ).pack(fill="x", pady=(0, 1))
 
     pm_tbl = tk.Frame(c4, bg="#131922")
     pm_tbl.pack(fill="x")
@@ -38143,7 +38571,7 @@ def show_preflight_window(
         bg="#131922",
         anchor="w",
     )
-    cb_pm_lock.grid(row=0, column=0, sticky="w", pady=3)
+    cb_pm_lock.grid(row=0, column=0, sticky="w", pady=1)
     lbl_pm_trig = tk.Label(
         pm_tbl,
         text="At Profit ($):",
@@ -38152,9 +38580,9 @@ def show_preflight_window(
         bg="#131922",
         anchor="e",
     )
-    lbl_pm_trig.grid(row=0, column=1, sticky="e", padx=(4, 6), pady=3)
+    lbl_pm_trig.grid(row=0, column=1, sticky="e", padx=(4, 6), pady=1)
     ent_pm_trig = make_entry(pm_tbl, dollar_vars["pm_lock_trigger"], width=8)
-    ent_pm_trig.grid(row=0, column=2, pady=3)
+    ent_pm_trig.grid(row=0, column=2, pady=1)
     lbl_pm_arrow = tk.Label(
         pm_tbl,
         text="→",
@@ -38162,10 +38590,10 @@ def show_preflight_window(
         fg="#64748b",
         bg="#131922",
     )
-    lbl_pm_arrow.grid(row=0, column=3, padx=4, pady=3)
+    lbl_pm_arrow.grid(row=0, column=3, padx=4, pady=1)
 
     pm_fl_cell = tk.Frame(pm_tbl, bg="#131922")
-    pm_fl_cell.grid(row=0, column=4, sticky="e", pady=3)
+    pm_fl_cell.grid(row=0, column=4, sticky="e", pady=1)
     lbl_pm_trail = tk.Label(
         pm_fl_cell,
         text="Trail Peak By ($):",
@@ -38263,7 +38691,7 @@ def show_preflight_window(
         fg="#8ec5fc",
         bg="#131922",
         anchor="w"
-    ).pack(fill="x", pady=(2, 4))
+    ).pack(fill="x", pady=(0, 2))
 
     lbl_t1_max, ent_t1_max, _, _ = make_dual_field_row(
         c5,
@@ -38300,7 +38728,7 @@ def show_preflight_window(
         )
     )
 
-    tk.Frame(c5, bg="#222d3d", height=1).pack(fill="x", pady=8)
+    tk.Frame(c5, bg="#222d3d", height=1).pack(fill="x", pady=3)
 
     tk.Label(
         c5,
@@ -38309,7 +38737,7 @@ def show_preflight_window(
         fg="#8ec5fc",
         bg="#131922",
         anchor="w",
-    ).pack(fill="x", pady=(0, 6))
+    ).pack(fill="x", pady=(0, 2))
 
     tbl = tk.Frame(c5, bg="#131922")
     tbl.pack(fill="x")
@@ -38436,6 +38864,613 @@ def show_preflight_window(
         tier_widget_refs.append(
             (t_cb_var, cb_t, lbl_trig, ent_trig, lbl_arrow, lbl_fl, ent_fl, cb_fg_col)
         )
+
+    if ENABLE_RATCHET_PREVIEW:
+        rp_hdr_font = tkfont.Font(root=pf, family="Arial", size=8, weight="bold")
+        rp_lbl_font = tkfont.Font(root=pf, family="Arial", size=7, weight="bold")
+        try:
+            _rp_scr_h = int(pf.winfo_screenheight() or 1080)
+        except Exception:
+            _rp_scr_h = 1080
+        rp_ls = max(12, int(rp_hdr_font.metrics("linespace")))
+        rp_box_h = (
+            max(96, rp_ls * 6 + 12)
+            if _rp_scr_h >= 860
+            else max(52, rp_ls * 3 + 12)
+        )
+        rp_hdr_h = rp_ls + 6
+
+        _rp_last_valid = {}
+        for _rpk in (
+            "pm_max_loss",
+            "pm_warn_1",
+            "pm_warn_2",
+            "pm_lock_trigger",
+            "pm_trail_cushion",
+            "t1_max_loss",
+            "t1_warn_1",
+            "t1_warn_2",
+            "t2_trigger",
+            "t2_max_loss",
+            "t3_trigger",
+            "t3_max_loss",
+            "t4_trigger",
+            "t4_trail",
+        ):
+            _v0 = float(config.get(_rpk, DEFAULT_CONFIG.get(_rpk, 0.0)))
+            _rp_last_valid[_rpk] = _v0 if _rpk in SIGNED_DOLLAR_KEYS else abs(_v0)
+
+        def _rp_read_key(k):
+            try:
+                raw_s = str(dollar_vars[k].get()).replace("$", "").replace(",", "").strip()
+                if raw_s and raw_s not in ("-", "+", ".", "-.", "+."):
+                    v = float(raw_s)
+                    norm_v = v if k in SIGNED_DOLLAR_KEYS else abs(v)
+                    _rp_last_valid[k] = norm_v
+                    return norm_v
+            except Exception:
+                pass
+            return _rp_last_valid.get(k, 0.0)
+
+        def _rp_fmt_short(v):
+            nv = float(v)
+            av = abs(nv)
+            if av >= 1000.0:
+                kv = av / 1000.0
+                s = f"{int(round(kv))}k" if abs(kv - round(kv)) < 0.05 else f"{kv:.1f}k"
+            else:
+                s = f"{int(round(av))}"
+            if abs(nv) < 0.005:
+                return "$0"
+            return f"-${s}" if nv < 0 else f"+${s}"
+
+        _rp_state = {
+            "mode": "rth" if is_rth() else "ext",
+            "visible": bool(config.get("show_ratchet_preview", True)),
+            "hover_x": None,
+            "hover_btn": None,
+            "cursor": "",
+            "pad_l": 46,
+            "pad_r": 10,
+            "last_w": 0,
+            "tooltip": "",
+            "hit_rth": None,
+            "hit_ext": None,
+            "hit_toggle": None,
+        }
+
+        rp_frame = tk.Frame(
+            c5,
+            bg="#0e131a",
+            height=rp_box_h,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#243040",
+        )
+        rp_frame.pack(fill="x", pady=(4, 0))
+        rp_frame.pack_propagate(False)
+
+        cv_ratchet_prev = tk.Canvas(
+            rp_frame,
+            bg="#0e131a",
+            bd=0,
+            highlightthickness=0,
+            cursor="",
+        )
+        cv_ratchet_prev._is_ratchet_prev = True
+        cv_ratchet_prev.pack(fill="both", expand=True)
+
+        def _collect_rp_params():
+            return {
+                "pm_max_loss": _rp_read_key("pm_max_loss"),
+                "enable_pm_lock": bool(var_pm_lock_on.get()),
+                "pm_lock_trigger": _rp_read_key("pm_lock_trigger"),
+                "pm_trail_cushion": _rp_read_key("pm_trail_cushion"),
+                "t1_max_loss": _rp_read_key("t1_max_loss"),
+                "enable_t2": bool(var_t2_on.get()),
+                "t2_trigger": _rp_read_key("t2_trigger"),
+                "t2_max_loss": _rp_read_key("t2_max_loss"),
+                "enable_t3": bool(var_t3_on.get()),
+                "t3_trigger": _rp_read_key("t3_trigger"),
+                "t3_max_loss": _rp_read_key("t3_max_loss"),
+                "enable_t4": bool(var_t4_on.get()),
+                "t4_trigger": _rp_read_key("t4_trigger"),
+                "t4_trail": _rp_read_key("t4_trail"),
+            }
+
+        def _redraw_ratchet_prev(width_px=None):
+            if pf_timer_state.get("closing"):
+                return
+            try:
+                if not pf.winfo_exists() or not cv_ratchet_prev.winfo_exists():
+                    return
+                cw = int(width_px or cv_ratchet_prev.winfo_width() or 0)
+                if cw < 60:
+                    cw = max(240, int(c5.winfo_width() or 560) - 28)
+                ch = max(48, int(cv_ratchet_prev.winfo_height() or rp_box_h))
+                cv_ratchet_prev.delete("all")
+
+                mode_now = _rp_state["mode"]
+                params_now = _collect_rp_params()
+                now_hwm_rp = None
+                if (
+                    active_session_date == get_today_str()
+                    and start_equity is not None
+                    and float(start_equity) > 0.0
+                    and max_equity is not None
+                    and ((mode_now == "rth") == is_rth())
+                ):
+                    now_hwm_rp = max(
+                        0.0, round(float(max_equity) - float(start_equity), 2)
+                    )
+                model = compute_ratchet_preview_model(
+                    params_now,
+                    mode=mode_now,
+                    rulebook_hwm=now_hwm_rp,
+                    alarms_only=bool(var_alarms_only.get()),
+                )
+                _rp_state["tooltip"] = model["tooltip"]
+
+                def _pill_colors(is_active, is_hovered):
+                    if is_active:
+                        return (
+                            "#123629" if is_hovered else "#0d281f",
+                            "#38bdf8" if is_hovered else "#1f5c43",
+                            "#86efac" if is_hovered else "#4ade80",
+                        )
+                    return (
+                        "#1e293b" if is_hovered else "#161e29",
+                        "#38bdf8" if is_hovered else "#2c3a4d",
+                        "#ffffff" if is_hovered else "#cbd5e1",
+                    )
+
+                # Header bar
+                h_btn = _rp_state.get("hover_btn")
+                cv_ratchet_prev.create_rectangle(
+                    0, 0, cw, rp_hdr_h, fill="#121923", outline=""
+                )
+                cv_ratchet_prev.create_line(
+                    0, rp_hdr_h, cw, rp_hdr_h, fill="#1e293b"
+                )
+                x_cur = 7
+                cv_ratchet_prev.create_text(
+                    x_cur,
+                    rp_hdr_h // 2,
+                    text="RATCHET",
+                    font=rp_hdr_font,
+                    fill="#7dd3fc",
+                    anchor="w",
+                )
+                x_cur += int(rp_hdr_font.measure("RATCHET")) + 8
+
+                rth_w = max(30, int(rp_hdr_font.measure("RTH")) + 12)
+                ext_w = max(30, int(rp_hdr_font.measure("EXT")) + 12)
+                pill_y0, pill_y1 = 2, max(13, rp_hdr_h - 2)
+                rth_on = (mode_now == "rth")
+
+                rth_bg, rth_rim, rth_fg = _pill_colors(rth_on, h_btn == "rth")
+                cv_ratchet_prev.create_rectangle(
+                    x_cur, pill_y0, x_cur + rth_w, pill_y1, fill=rth_bg, outline=rth_rim
+                )
+                cv_ratchet_prev.create_text(
+                    x_cur + rth_w // 2,
+                    rp_hdr_h // 2,
+                    text="RTH",
+                    font=rp_lbl_font,
+                    fill=rth_fg,
+                )
+                _rp_state["hit_rth"] = (x_cur, 0, x_cur + rth_w, rp_hdr_h + 2)
+                x_cur += rth_w + 3
+
+                ext_bg, ext_rim, ext_fg = _pill_colors(not rth_on, h_btn == "ext")
+                cv_ratchet_prev.create_rectangle(
+                    x_cur, pill_y0, x_cur + ext_w, pill_y1, fill=ext_bg, outline=ext_rim
+                )
+                cv_ratchet_prev.create_text(
+                    x_cur + ext_w // 2,
+                    rp_hdr_h // 2,
+                    text="EXT",
+                    font=rp_lbl_font,
+                    fill=ext_fg,
+                )
+                _rp_state["hit_ext"] = (x_cur, 0, x_cur + ext_w, rp_hdr_h + 2)
+                x_cur += ext_w + 8
+
+                tog_txt = "▾ Hide" if _rp_state["visible"] else "▸ Show"
+                tog_w = max(54, int(rp_hdr_font.measure(tog_txt)) + 14)
+                tog_x0, tog_x1 = cw - 6 - tog_w, cw - 6
+                tog_bg, tog_rim, tog_fg = _pill_colors(False, h_btn == "toggle")
+                cv_ratchet_prev.create_rectangle(
+                    tog_x0, pill_y0, tog_x1, pill_y1, fill=tog_bg, outline=tog_rim
+                )
+                cv_ratchet_prev.create_text(
+                    (tog_x0 + tog_x1) // 2,
+                    rp_hdr_h // 2,
+                    text=tog_txt,
+                    font=rp_lbl_font,
+                    fill=tog_fg,
+                )
+                _rp_state["hit_toggle"] = (tog_x0 - 2, 0, cw, rp_hdr_h + 2)
+
+                if not _rp_state["visible"]:
+                    cv_ratchet_prev.create_text(
+                        cw // 2,
+                        rp_hdr_h + max(12, (ch - rp_hdr_h) // 2),
+                        text="Ratchet preview hidden (rulebook math unchanged) — click ▸ Show to restore",
+                        font=rp_lbl_font,
+                        fill="#64748b",
+                    )
+                    return
+
+                pad_l = max(46, int(rp_lbl_font.measure("-99.9k")) + 10)
+                pad_r = 10
+                _rp_state["pad_l"] = pad_l
+                _rp_state["pad_r"] = pad_r
+                show_rich_axes = ch >= 74
+                axis_b_h = (rp_ls + 1) if show_rich_axes else 0
+                top_y = (rp_hdr_h + 13) if show_rich_axes else (rp_hdr_h + 4)
+                bot_y = max(top_y + 18, ch - axis_b_h - 4)
+                plot_w = max(40, cw - pad_l - pad_r)
+                plot_h = max(14, bot_y - top_y)
+                x_min = float(model["x_min"])
+                x_max = max(x_min + 100.0, float(model["x_max"]))
+                base_st = float(model["base_stop"])
+                end_st = float(model["end_stop"])
+
+                y_lo_raw = min(base_st, 0.0, end_st)
+                y_hi_raw = max(200.0, end_st, 50.0)
+                y_span = max(200.0, y_hi_raw - y_lo_raw)
+                y_min = y_lo_raw - 0.14 * y_span
+                y_max = y_hi_raw + 0.14 * y_span
+
+                def _x_px(xv):
+                    return pad_l + ((float(xv) - x_min) / (x_max - x_min)) * plot_w
+
+                def _y_px(yv):
+                    return top_y + (1.0 - (float(yv) - y_min) / max(1.0, y_max - y_min)) * plot_h
+
+                # $0 breakeven line & base-loss left label
+                y0_px = _y_px(0.0)
+                if top_y - 2 <= y0_px <= bot_y + 2:
+                    cv_ratchet_prev.create_line(
+                        pad_l, y0_px, cw - pad_r, y0_px, fill="#475569", dash=(3, 3)
+                    )
+                    cv_ratchet_prev.create_text(
+                        pad_l - 4, y0_px, text="$0", font=rp_lbl_font, fill="#94a3b8", anchor="e"
+                    )
+                y_base_px = min(bot_y - 2, max(top_y + 2, _y_px(base_st)))
+                cv_ratchet_prev.create_text(
+                    pad_l - 4,
+                    y_base_px,
+                    text=_rp_fmt_short(base_st),
+                    font=rp_lbl_font,
+                    fill="#f26d6d",
+                    anchor="e",
+                )
+
+                # X-axis profit ticks along bottom strip
+                if show_rich_axes:
+                    cv_ratchet_prev.create_line(
+                        pad_l, bot_y + 2, cw - pad_r, bot_y + 2, fill="#1e293b"
+                    )
+                    cand_ticks = [0.0] + [float(tx) for tx, _, _ in model["steps"]] + [x_max]
+                    cand_ticks = sorted({round(t, 2) for t in cand_ticks if x_min <= t <= x_max})
+                    drawn_tick_xs = []
+                    for tx_v in cand_ticks:
+                        px_t = _x_px(tx_v)
+                        if any(abs(px_t - ox) < 38 for ox in drawn_tick_xs):
+                            continue
+                        drawn_tick_xs.append(px_t)
+                        cv_ratchet_prev.create_line(
+                            px_t, bot_y + 1, px_t, bot_y + 4, fill="#475569"
+                        )
+                        anch_t = "w" if tx_v == cand_ticks[0] else ("e" if tx_v == cand_ticks[-1] else "center")
+                        cv_ratchet_prev.create_text(
+                            px_t,
+                            ch - 1,
+                            text=_rp_fmt_short(tx_v),
+                            font=rp_lbl_font,
+                            fill="#7f8fa3",
+                            anchor=f"s{anch_t}" if anch_t in ("w", "e") else "s",
+                        )
+
+                # Sample curve + exact step breakpoints
+                pts_x = [
+                    x_min + (float(px) / max(1, plot_w)) * (x_max - x_min)
+                    for px in range(0, int(plot_w) + 1, 2)
+                ]
+                if pts_x[-1] < x_max:
+                    pts_x.append(x_max)
+                for tx, _, _ in model["steps"]:
+                    if x_min < tx < x_max:
+                        pts_x.append(max(x_min, tx - 0.01))
+                        pts_x.append(tx)
+                pts_x.sort()
+                eval_pts = []
+                for xv in pts_x:
+                    sy, tg = _preview_stop_at_peak(xv, params_now, mode_now)
+                    eval_pts.append((xv, sy, tg))
+
+                # Subtle emerald profit-lock shading above $0
+                y0_clamped = max(top_y, min(bot_y, y0_px))
+                pos_poly = []
+                for xv, sy, _ in eval_pts:
+                    if sy > 0.0:
+                        px, py = _x_px(xv), _y_px(sy)
+                        if not pos_poly:
+                            pos_poly.extend([px, y0_clamped])
+                        pos_poly.extend([px, py])
+                if len(pos_poly) >= 6:
+                    pos_poly.extend([pos_poly[-2], y0_clamped])
+                    cv_ratchet_prev.create_polygon(
+                        *pos_poly, fill="#102a20", outline=""
+                    )
+
+                for idx_s in range(1, len(eval_pts)):
+                    x0, y0_s, _ = eval_pts[idx_s - 1]
+                    x1, y1_s, tg1 = eval_pts[idx_s]
+                    if y1_s >= 0.0 or tg1 in ("T4", "EXT LOCK"):
+                        seg_col = "#4ade80" if y1_s >= 0.0 else "#38bdf8"
+                    elif abs(y1_s - base_st) < 0.01:
+                        seg_col = "#f26d6d"
+                    else:
+                        seg_col = "#38bdf8"
+                    cv_ratchet_prev.create_line(
+                        _x_px(x0),
+                        _y_px(y0_s),
+                        _x_px(x1),
+                        _y_px(y1_s),
+                        fill=seg_col,
+                        width=2,
+                    )
+
+                # Tier unlock dots + step dollar callouts
+                last_lbl_px = -999
+                for tx, sy, slbl in model["steps"]:
+                    if x_min <= tx <= x_max:
+                        px, py = _x_px(tx), _y_px(sy)
+                        d_col = "#4ade80" if (sy >= 0.0 or slbl in ("T4", "EXT LOCK")) else "#38bdf8"
+                        cv_ratchet_prev.create_oval(
+                            px - 3, py - 3, px + 3, py + 3, fill=d_col, outline="#0e131a"
+                        )
+                        if show_rich_axes and (px - last_lbl_px) >= 46:
+                            last_lbl_px = px
+                            sfx_tr = "↗" if slbl in ("T4", "EXT LOCK") else ""
+                            c_txt = f"{slbl} {_rp_fmt_short(sy)}{sfx_tr}"
+                            c_col = "#4ade80" if (sy >= 0.0 or slbl in ("T4", "EXT LOCK")) else "#7dd3fc"
+                            lbl_x = min(cw - pad_r - 24, max(pad_l + 24, px))
+                            lbl_y = max(rp_hdr_h + 7, py - 8)
+                            cv_ratchet_prev.create_text(
+                                lbl_x, lbl_y, text=c_txt, font=rp_lbl_font, fill=c_col, anchor="center"
+                            )
+
+                # Live Rulebook High marker when opened from an active session
+                if now_hwm_rp is not None and x_min <= now_hwm_rp <= x_max:
+                    hx = _x_px(now_hwm_rp)
+                    cur_st, _ = _preview_stop_at_peak(now_hwm_rp, params_now, mode_now)
+                    hy = _y_px(cur_st)
+                    cv_ratchet_prev.create_line(
+                        hx, top_y, hx, bot_y, fill="#fbbf24", dash=(2, 2)
+                    )
+                    cv_ratchet_prev.create_oval(
+                        hx - 2.5, hy - 2.5, hx + 2.5, hy + 2.5, fill="#fbbf24", outline="#0e131a"
+                    )
+
+                # Hover crosshair or default header readout
+                hx_ev = _rp_state.get("hover_x")
+                avail_readout_x = tog_x0 - 10
+                if hx_ev is not None and pad_l <= hx_ev <= (cw - pad_r):
+                    pk_hv = round(x_min + ((hx_ev - pad_l) / plot_w) * (x_max - x_min), 2)
+                    st_hv, tg_hv = _preview_stop_at_peak(pk_hv, params_now, mode_now)
+                    cv_ratchet_prev.create_line(
+                        hx_ev, top_y, hx_ev, bot_y, fill="#94a3b8", dash=(2, 2)
+                    )
+                    h_col = "#4ade80" if st_hv >= 0.0 else ("#f26d6d" if abs(st_hv - base_st) < 0.01 else "#38bdf8")
+                    cv_ratchet_prev.create_oval(
+                        hx_ev - 3, _y_px(st_hv) - 3, hx_ev + 3, _y_px(st_hv) + 3, fill=h_col, outline="#0e131a"
+                    )
+                    readout_txt = f"Peak {format_dollar(pk_hv)} → {format_dollar(st_hv)} ({tg_hv})"
+                    readout_col = h_col
+                else:
+                    parts_r = [f"End {_rp_fmt_short(x_max)} → {_rp_fmt_short(end_st)} ({model['end_tag']})"]
+                    if model["clamped"]:
+                        parts_r.append("· Clamped")
+                    elif model["alarms_only"]:
+                        parts_r.append("· Alarms Only")
+                    elif now_hwm_rp is not None:
+                        parts_r.append(f"· Rulebook High {_rp_fmt_short(now_hwm_rp)}")
+                    readout_txt = " ".join(parts_r)
+                    readout_col = "#fbbf24" if (model["clamped"] or model["alarms_only"]) else "#cbd5e1"
+
+                max_r_w = max(40, avail_readout_x - x_cur)
+                while len(readout_txt) > 12 and rp_lbl_font.measure(readout_txt) > max_r_w:
+                    readout_txt = readout_txt[:-4].rstrip() + "..."
+                if rp_lbl_font.measure(readout_txt) <= max_r_w:
+                    cv_ratchet_prev.create_text(
+                        avail_readout_x,
+                        rp_hdr_h // 2,
+                        text=readout_txt,
+                        font=rp_lbl_font,
+                        fill=readout_col,
+                        anchor="e",
+                    )
+            except Exception:
+                pass
+
+        def _refresh_ratchet_prev(*_):
+            pf_timer_state["ratchet_prev_after_id"] = None
+            if pf_timer_state.get("closing"):
+                return
+            _redraw_ratchet_prev()
+
+        def _schedule_ratchet_prev_refresh(*_):
+            if pf_timer_state.get("closing"):
+                return
+            if pf_timer_state.get("ratchet_prev_after_id") is not None:
+                return
+            try:
+                if pf.winfo_exists():
+                    pf_timer_state["ratchet_prev_after_id"] = pf.after(
+                        35, _refresh_ratchet_prev
+                    )
+            except Exception:
+                pass
+
+        def _on_rp_configure(ev=None):
+            if ev is None or pf_timer_state.get("closing"):
+                return
+            w_ev = int(getattr(ev, "width", 0) or 0)
+            if w_ev < 50:
+                return
+            if abs(w_ev - int(_rp_state.get("last_w", 0) or 0)) < 2:
+                return
+            _rp_state["last_w"] = w_ev
+            _redraw_ratchet_prev(w_ev)
+
+        def _on_rp_motion(ev=None):
+            if ev is None:
+                return
+            cx, cy = int(getattr(ev, "x", -1)), int(getattr(ev, "y", -1))
+
+            def _in_box_m(box):
+                return bool(box and box[0] <= cx <= box[2] and box[1] <= cy <= box[3])
+
+            cw_cur = int(cv_ratchet_prev.winfo_width() or _rp_state.get("last_w") or 500)
+            new_hbtn = None
+            new_hx = None
+            target_cursor = ""
+            if _in_box_m(_rp_state.get("hit_toggle")):
+                new_hbtn = "toggle"
+                target_cursor = "hand2"
+            elif _in_box_m(_rp_state.get("hit_rth")):
+                new_hbtn = "rth"
+                target_cursor = "hand2"
+            elif _in_box_m(_rp_state.get("hit_ext")):
+                new_hbtn = "ext"
+                target_cursor = "hand2"
+            elif (
+                _rp_state["visible"]
+                and cy > rp_hdr_h
+                and _rp_state["pad_l"] <= cx <= (cw_cur - _rp_state["pad_r"])
+            ):
+                new_hx = float(cx)
+                target_cursor = "crosshair"
+
+            if _rp_state.get("cursor") != target_cursor:
+                _rp_state["cursor"] = target_cursor
+                try:
+                    cv_ratchet_prev.config(cursor=target_cursor)
+                except Exception:
+                    pass
+            changed = (new_hbtn != _rp_state.get("hover_btn")) or (
+                new_hx != _rp_state.get("hover_x")
+            )
+            if changed:
+                _rp_state["hover_btn"] = new_hbtn
+                _rp_state["hover_x"] = new_hx
+                _redraw_ratchet_prev()
+
+        def _on_rp_leave(_ev=None):
+            changed = (_rp_state.get("hover_x") is not None) or (
+                _rp_state.get("hover_btn") is not None
+            )
+            if _rp_state.get("cursor") != "":
+                _rp_state["cursor"] = ""
+                try:
+                    cv_ratchet_prev.config(cursor="")
+                except Exception:
+                    pass
+            if changed:
+                _rp_state["hover_x"] = None
+                _rp_state["hover_btn"] = None
+                _redraw_ratchet_prev()
+
+        def _on_rp_click(ev=None):
+            if ev is None:
+                return
+            cx, cy = int(getattr(ev, "x", -1)), int(getattr(ev, "y", -1))
+
+            def _in_box(box):
+                return bool(box and box[0] <= cx <= box[2] and box[1] <= cy <= box[3])
+
+            if _in_box(_rp_state.get("hit_toggle")):
+                _rp_state["visible"] = not _rp_state["visible"]
+                _rp_state["hover_x"] = None
+                config["show_ratchet_preview"] = bool(_rp_state["visible"])
+                save_config(config)
+                _redraw_ratchet_prev()
+                return
+            if _in_box(_rp_state.get("hit_rth")):
+                if _rp_state["mode"] != "rth":
+                    _rp_state["mode"] = "rth"
+                    _redraw_ratchet_prev()
+                return
+            if _in_box(_rp_state.get("hit_ext")):
+                if _rp_state["mode"] != "ext":
+                    _rp_state["mode"] = "ext"
+                    _redraw_ratchet_prev()
+
+        cv_ratchet_prev.bind("<Configure>", _on_rp_configure)
+        cv_ratchet_prev.bind("<Motion>", _on_rp_motion)
+        cv_ratchet_prev.bind("<Leave>", _on_rp_leave)
+        cv_ratchet_prev.bind("<ButtonRelease-1>", _on_rp_click)
+        attach_tooltip(
+            cv_ratchet_prev,
+            lambda: _rp_state.get("tooltip", ""),
+            max_wrap_px=520,
+        )
+
+        for _rp_dk in (
+            "pm_max_loss",
+            "pm_warn_1",
+            "pm_warn_2",
+            "pm_lock_trigger",
+            "pm_trail_cushion",
+            "t1_max_loss",
+            "t1_warn_1",
+            "t1_warn_2",
+            "t2_trigger",
+            "t2_max_loss",
+            "t3_trigger",
+            "t3_max_loss",
+            "t4_trigger",
+            "t4_trail",
+        ):
+            dollar_vars[_rp_dk].trace_add("write", _schedule_ratchet_prev_refresh)
+        for _rp_bv in (
+            var_t2_on,
+            var_t3_on,
+            var_t4_on,
+            var_pm_lock_on,
+            var_t1_w1_on,
+            var_t1_w2_on,
+            var_pm_w1_on,
+            var_pm_w2_on,
+            var_alarms_only,
+        ):
+            _rp_bv.trace_add("write", _schedule_ratchet_prev_refresh)
+
+        def _set_rp_mode(m_target):
+            if _rp_state["mode"] != m_target:
+                _rp_state["mode"] = m_target
+                _redraw_ratchet_prev()
+
+        for _c4w in (ent_pm_max, ent_pm_w1, ent_pm_w2, ent_pm_trig, ent_pm_trail):
+            _c4w.bind("<FocusIn>", lambda _e: _set_rp_mode("ext"), add="+")
+        cb_pm_lock.bind("<ButtonRelease-1>", lambda _e: _set_rp_mode("ext"), add="+")
+        for _c5w in (
+            ent_t1_max,
+            ent_t1_w1,
+            ent_t1_w2,
+            tier_widget_refs[0][3],
+            tier_widget_refs[0][6],
+            tier_widget_refs[1][3],
+            tier_widget_refs[1][6],
+            tier_widget_refs[2][3],
+            tier_widget_refs[2][6],
+        ):
+            _c5w.bind("<FocusIn>", lambda _e: _set_rp_mode("rth"), add="+")
+        pf.after(20, _redraw_ratchet_prev)
 
     _pf_numeric_field_specs.extend(
         [
@@ -42025,6 +43060,10 @@ hud_leash_col_frame = None
 hud_leash_idx = None
 hud_last_leash_pct = 1.0
 hud_last_leash_bg = "#262a2e"
+hud_sparkline_canvas = None
+hud_sparkline_col_frame = None
+hud_sparkline_idx = None
+_hud_last_spark_snap = None
 hud_start_move_fn = None
 hud_do_move_fn = None
 hud_end_move_fn = None
@@ -42664,6 +43703,191 @@ def toggle_acct_badge(event=None):
     refresh_acct_badge()
 
 
+# === HUD PNL SPARKLINE ENGINE (RENDER & TOOLTIP) ===
+def _format_sparkline_tooltip():
+    snap = _hud_last_spark_snap
+    if not isinstance(snap, dict):
+        return (
+            "PnL CURVE (Live Session Sparkline):\n"
+            "• Status | Waiting for first live broker snapshot\n"
+            "• Toggle | Open Settings -> 📊 HUD Columns to show/hide"
+        )
+    net_v = float(snap.get("net_pnl", 0.0))
+    hi_v = float(snap.get("session_high", 0.0))
+    lo_v = float(snap.get("session_low", 0.0))
+    st_v = float(snap.get("stop_pnl", -1500.0))
+    dist_v = float(snap.get("dist", max(0.0, net_v - st_v)))
+    pts = snap.get("pts") or (net_v,)
+    _, _, stop_in_win = compute_sparkline_scale(
+        pts, st_v, hi_v, breach_active=bool(snap.get("breach", False))
+    )
+    scale_desc = (
+        "True-Scale (Profit Lock visible)"
+        if (stop_in_win and st_v >= 0.0)
+        else (
+            "True-Scale (Daily Stop in frame)"
+            if stop_in_win
+            else "Anti-Pancake Pin (Daily Stop safely below)"
+        )
+    )
+    return "\n".join(
+        [
+            "PnL CURVE (Intraday Net PnL Sparkline):",
+            "---",
+            f"• Current Net PnL | {format_dollar(net_v)}",
+            f"• Session High | {format_dollar(hi_v)}",
+            f"• Session Low | {format_dollar(lo_v)}",
+            f"• Active Daily Stop | {format_dollar(st_v)}",
+            f"• $ Cushion to Stop | ${dist_v:,.2f}",
+            f"• Scale Mode | {scale_desc}",
+        ]
+    )
+
+
+def _redraw_hud_sparkline_canvas(event=None):
+    """Draws the HUD `PnL CURVE` column using `_hud_last_spark_snap` only
+    (never touches `_pnl_curve_lock`)."""
+    if hud_sparkline_canvas is None:
+        return
+    try:
+        if not hud_sparkline_canvas.winfo_exists():
+            return
+        hud_sparkline_canvas.delete("all")
+        w = int(hud_sparkline_canvas.winfo_width() or 0)
+        h = int(hud_sparkline_canvas.winfo_height() or 0)
+        if w <= 8:
+            w = 152
+        if h <= 8:
+            h = 40
+        snap = _hud_last_spark_snap
+        if not isinstance(snap, dict):
+            cy = h // 2
+            hud_sparkline_canvas.create_line(
+                6, cy, max(8, w - 6), cy, fill="#334155", dash=(3, 3)
+            )
+            hud_sparkline_canvas.create_oval(
+                max(8, w - 8) - 2, cy - 2, max(8, w - 8) + 2, cy + 2, fill="#64748b", outline=""
+            )
+            return
+
+        pts = list(snap.get("pts") or ())
+        net_v = float(snap.get("net_pnl", 0.0))
+        if not pts:
+            pts = [net_v]
+        stop_v = float(snap.get("stop_pnl", -1500.0))
+        hi_v = float(snap.get("session_high", 0.0))
+        breach_v = bool(snap.get("breach", False))
+        neutral_v = bool(snap.get("neutral", False))
+
+        pad_x, pad_t, pad_b = 5, 4, 5
+        plot_w = max(12, w - (pad_x * 2))
+        plot_h = max(10, h - pad_t - pad_b)
+        y_min, y_max, stop_in_win = compute_sparkline_scale(
+            pts, stop_v, hi_v, breach_active=breach_v
+        )
+
+        def _y_px(val):
+            return pad_t + (
+                1.0 - (float(val) - y_min) / max(1.0, y_max - y_min)
+            ) * plot_h
+
+        def _x_px(idx_p):
+            if len(pts) <= 1:
+                return pad_x + plot_w
+            return pad_x + (float(idx_p) / float(len(pts) - 1)) * plot_w
+
+        # 1. $0 breakeven reference line
+        if y_min <= 0.0 <= y_max:
+            y0_px = _y_px(0.0)
+            hud_sparkline_canvas.create_line(
+                pad_x, y0_px, w - pad_x, y0_px, fill="#475569", dash=(2, 3)
+            )
+
+        # 2. Session High reference line
+        if hi_v > 0.0 and y_min <= hi_v <= y_max:
+            yh_px = _y_px(hi_v)
+            hud_sparkline_canvas.create_line(
+                pad_x,
+                yh_px,
+                w - pad_x,
+                yh_px,
+                fill="#475569" if neutral_v else "#1f6f4c",
+                dash=(2, 2),
+            )
+
+        # 3. Stop indicator (true scale or Anti-Pancake bottom pin)
+        if stop_in_win:
+            yst_px = _y_px(stop_v)
+            st_col = (
+                "#64748b"
+                if neutral_v
+                else ("#10b981" if stop_v >= 0.0 else "#ef4444")
+            )
+            hud_sparkline_canvas.create_line(
+                pad_x, yst_px, w - pad_x, yst_px, fill=st_col, dash=(4, 3), width=1
+            )
+        else:
+            ypin = h - 2
+            pin_col = "#64748b" if neutral_v else "#ef4444"
+            hud_sparkline_canvas.create_line(
+                pad_x, ypin, w - pad_x, ypin, fill=pin_col, width=1
+            )
+            tx = w // 2
+            hud_sparkline_canvas.create_polygon(
+                tx - 3, ypin - 4, tx + 3, ypin - 4, tx, ypin, fill=pin_col, outline=""
+            )
+
+        # 4. Net PnL polyline & 5. Live tip dot
+        def _spark_pt_col(val):
+            if neutral_v:
+                return "#94a3b8"
+            fv = float(val)
+            if fv > 0.005:
+                return "#4ade80"
+            if fv < -0.005:
+                return "#f87171"
+            return "#94a3b8"
+
+        if len(pts) == 1:
+            yv = _y_px(pts[0])
+            c_seg = _spark_pt_col(pts[0])
+            hud_sparkline_canvas.create_line(
+                pad_x, yv, w - pad_x, yv, fill=c_seg, width=2
+            )
+        else:
+            for j in range(1, len(pts)):
+                p0, p1 = pts[j - 1], pts[j]
+                ref_v = p0 if (abs(p1) <= 0.005 and abs(p0) > 0.005) else p1
+                c_seg = _spark_pt_col(ref_v)
+                hud_sparkline_canvas.create_line(
+                    _x_px(j - 1),
+                    _y_px(p0),
+                    _x_px(j),
+                    _y_px(p1),
+                    fill=c_seg,
+                    width=2,
+                )
+            hi_idx = max(range(len(pts)), key=lambda idx_m: pts[idx_m])
+            if pts[hi_idx] > 0.0 and not neutral_v:
+                px_m, py_m = _x_px(hi_idx), _y_px(pts[hi_idx])
+                hud_sparkline_canvas.create_oval(
+                    px_m - 2, py_m - 2, px_m + 2, py_m + 2, fill="#86efac", outline=""
+                )
+
+        # 5. Live tip dot
+        lx, ly = _x_px(len(pts) - 1), _y_px(pts[-1])
+        tip_c = (
+            "#cbd5e1"
+            if (not neutral_v and abs(pts[-1]) <= 0.005)
+            else _spark_pt_col(pts[-1])
+        )
+        hud_sparkline_canvas.create_oval(
+            lx - 2.5, ly - 2.5, lx + 2.5, ly + 2.5, fill=tip_c, outline=""
+        )
+    except Exception:
+        pass
+
+
 def _redraw_hud_leash_canvas(event=None):
     """Draws the glowing neon '$ TO STOP' progress bar with an upward bloom."""
     if hud_leash_bar is None:
@@ -43037,6 +44261,7 @@ def rebuild_hud_columns():
     """Dynamically builds or rebuilds the HUD columns inside hud_grid_frame
     and adjusts the HUD window width while preserving screen position."""
     global hud_ui_labels, hud_leash_bar, hud_leash_col_frame, hud_leash_idx
+    global hud_sparkline_canvas, hud_sparkline_col_frame, hud_sparkline_idx
     global hud_breach_banner_frame, hud_breach_banner_title_lbl, hud_breach_banner_sub_lbl
     global _hud_built_for_demo
     if hud_grid_frame is None or hud_root is None:
@@ -43058,6 +44283,9 @@ def rebuild_hud_columns():
     hud_leash_bar = None
     hud_leash_col_frame = None
     hud_leash_idx = None
+    hud_sparkline_canvas = None
+    hud_sparkline_col_frame = None
+    hud_sparkline_idx = None
     hud_breach_banner_frame = None
     hud_breach_banner_title_lbl = None
     hud_breach_banner_sub_lbl = None
@@ -43128,10 +44356,30 @@ def rebuild_hud_columns():
             )
             hud_leash_bar.bind("<Configure>", _redraw_hud_leash_canvas)
 
+        if col_id == "pnl_sparkline" and ENABLE_HUD_SPARKLINE:
+            hud_sparkline_idx = i
+            hud_sparkline_col_frame = col_frame
+            hud_sparkline_canvas = tk.Canvas(
+                col_frame,
+                bg="#1e2227",
+                bd=0,
+                highlightthickness=0,
+            )
+            hud_sparkline_canvas.place(
+                in_=val_lbl, relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0
+            )
+            hud_sparkline_canvas.bind("<Configure>", _redraw_hud_sparkline_canvas)
+            for _spw in (col_frame, hdr_lbl, val_lbl, hud_sparkline_canvas):
+                attach_hud_widget_tooltip(
+                    _spw, hud_root, _format_sparkline_tooltip
+                )
+
         if hud_start_move_fn and hud_do_move_fn:
             bind_list = [col_frame, hdr_lbl, val_lbl]
             if col_id == "dist_to_term" and hud_leash_bar is not None:
                 bind_list.append(hud_leash_bar)
+            if col_id == "pnl_sparkline" and hud_sparkline_canvas is not None:
+                bind_list.append(hud_sparkline_canvas)
             for widget in bind_list:
                 widget.bind("<Button-1>", hud_start_move_fn)
                 widget.bind("<B1-Motion>", hud_do_move_fn)
@@ -43239,7 +44487,7 @@ def _seed_hud_columns_from_known_state():
     ONLY read-only cached live metrics (Settings column resize) or pure
     restored session math beneath calm neutral `#262a2e` tiles and Option C's
     hollow `SYNCING` ring (`○`). Never mutates locks, W/L, or stop state."""
-    global hud_last_leash_pct, hud_last_leash_bg
+    global hud_last_leash_pct, hud_last_leash_bg, _hud_last_spark_snap
     if not hud_ui_labels or hud_root is None or active_adapter is None:
         return
     if force_reanchor or is_demo_mode_active(active_adapter):
@@ -43260,6 +44508,7 @@ def _seed_hud_columns_from_known_state():
     ):
         col_map = dict(live_snap["cols"])
         leash_to_draw = live_snap.get("leash_pct")
+        seed_spark_snap = live_snap.get("spark_snap")
         use_neutral = False
     else:
         today_s = get_today_str()
@@ -43329,9 +44578,33 @@ def _seed_hud_columns_from_known_state():
         if not can_seed_open:
             for k_open in ("open_pnl", "net_pnl", "dist_to_term", "from_high"):
                 col_map[k_open] = ("---", "#262a2e")
+            if "pnl_sparkline" in col_map:
+                col_map["pnl_sparkline"] = ("---", "#262a2e")
             leash_to_draw = None
+            seed_spark_snap = None
         else:
             leash_to_draw = leash_pct_s
+            seed_pts = _peek_pnl_curve_points(s_key, today_s, live_tip=realized_s)
+            seed_spark_snap = (
+                {
+                    "epoch": cur_ep,
+                    "s_key": s_key,
+                    "pts": seed_pts,
+                    "net_pnl": realized_s,
+                    "stop_pnl": st_pnl_s,
+                    "session_high": session_high_s,
+                    "session_low": (
+                        round(float(daily_min_equity) - st_f, 2)
+                        if daily_min_equity is not None
+                        else min(0.0, realized_s)
+                    ),
+                    "dist": dist_s,
+                    "breach": hud_breach_s,
+                    "neutral": True,
+                }
+                if ENABLE_HUD_SPARKLINE
+                else None
+            )
         use_neutral = True
 
     for i, cid in enumerate(active_cols):
@@ -43350,17 +44623,43 @@ def _seed_hud_columns_from_known_state():
             hud_ui_labels[i]._target_font_key = target_font
             if i == hud_leash_idx:
                 hud_last_leash_bg = disp_bg
+            if i == hud_sparkline_idx and hud_sparkline_canvas is not None:
+                if text_v == "" and ENABLE_HUD_SPARKLINE:
+                    if not hud_sparkline_canvas.winfo_manager():
+                        hud_sparkline_canvas.place(
+                            in_=hud_ui_labels[i],
+                            relx=0.0,
+                            rely=0.0,
+                            relwidth=1.0,
+                            relheight=1.0,
+                        )
+                    hud_sparkline_canvas.config(
+                        bg="#1e2227" if disp_bg == "#262a2e" else disp_bg
+                    )
+                else:
+                    if hud_sparkline_canvas.winfo_manager():
+                        hud_sparkline_canvas.place_forget()
         except Exception:
             pass
+    if seed_spark_snap is not None:
+        _hud_last_spark_snap = seed_spark_snap
+    if hud_sparkline_canvas is not None and hud_sparkline_canvas.winfo_manager():
+        _redraw_hud_sparkline_canvas()
     if hud_leash_bar is not None and leash_to_draw is not None:
         hud_last_leash_pct = max(0.0, min(1.0, float(leash_to_draw)))
         _redraw_hud_leash_canvas()
 
 
 def update_gui(
-    ui_labels, col_data, is_flat, settings_btn, close_btn, leash_pct=None
+    ui_labels,
+    col_data,
+    is_flat,
+    settings_btn,
+    close_btn,
+    leash_pct=None,
+    spark_snap=None,
 ):
-    global hud_last_leash_pct, hud_last_leash_bg
+    global hud_last_leash_pct, hud_last_leash_bg, _hud_last_spark_snap
     if (
         _hud_built_for_demo is not None
         and _hud_built_for_demo != bool(is_demo_mode_active())
@@ -43403,6 +44702,30 @@ def update_gui(
                         hdr_w.config(text=new_hdr_txt, fg=new_hdr_fg)
         if i == hud_leash_idx:
             hud_last_leash_bg = disp_bg
+        if i == hud_sparkline_idx and hud_sparkline_canvas is not None:
+            try:
+                if text_val == "" and ENABLE_HUD_SPARKLINE:
+                    if not hud_sparkline_canvas.winfo_manager() and i < len(ui_labels):
+                        hud_sparkline_canvas.place(
+                            in_=ui_labels[i],
+                            relx=0.0,
+                            rely=0.0,
+                            relwidth=1.0,
+                            relheight=1.0,
+                        )
+                    hud_sparkline_canvas.config(
+                        bg="#1e2227" if disp_bg == "#262a2e" else disp_bg
+                    )
+                else:
+                    if hud_sparkline_canvas.winfo_manager():
+                        hud_sparkline_canvas.place_forget()
+            except Exception:
+                pass
+
+    if spark_snap is not None:
+        _hud_last_spark_snap = spark_snap
+    if hud_sparkline_canvas is not None and hud_sparkline_canvas.winfo_manager():
+        _redraw_hud_sparkline_canvas()
 
     if hud_leash_bar is not None and leash_pct is not None:
         hud_last_leash_pct = max(0.0, min(1.0, float(leash_pct)))
@@ -43411,6 +44734,14 @@ def update_gui(
     refresh_acct_badge()
     _sync_hud_demo_chrome()
     _sync_hud_breach_banner(is_flat)
+    if (
+        hud_breach_banner_frame is not None
+        and hud_breach_banner_frame.winfo_manager()
+    ):
+        try:
+            hud_breach_banner_frame.lift()
+        except Exception:
+            pass
 
     _sync_hud_settings_btn_state(settings_btn, is_flat_now=is_flat)
     if cooldown_active and not is_demo_mode_active():
@@ -43827,6 +45158,15 @@ def attach_hud_mute_tooltip(widget, hud_win):
     widget.bind("<Enter>", schedule_tip, add="+")
     widget.bind("<Leave>", hide_tip, add="+")
     widget.bind("<ButtonPress>", hide_tip, add="+")
+    widget.bind(
+        "<Destroy>",
+        lambda _e, fn=hide_tip: (
+            _hud_tooltip_hide_fns.remove(fn)
+            if fn in _hud_tooltip_hide_fns
+            else None
+        ),
+        add="+",
+    )
 
 
 def attach_hud_widget_tooltip(widget, hud_win, text):
@@ -43850,7 +45190,8 @@ def attach_hud_widget_tooltip(widget, hud_win, text):
             tw.withdraw()
             tw.wm_overrideredirect(True)
             tw.attributes("-topmost", True)
-            _populate_rich_tooltip_card(tw, text, max_wrap_px=430)
+            txt_resolved = text() if callable(text) else text
+            _populate_rich_tooltip_card(tw, txt_resolved, max_wrap_px=430)
             tw.update_idletasks()
             tip_w = int(tw.winfo_reqwidth())
             tip_h = int(tw.winfo_reqheight())
@@ -43901,6 +45242,15 @@ def attach_hud_widget_tooltip(widget, hud_win, text):
     widget.bind("<Enter>", schedule_tip, add="+")
     widget.bind("<Leave>", hide_tip, add="+")
     widget.bind("<ButtonPress>", hide_tip, add="+")
+    widget.bind(
+        "<Destroy>",
+        lambda _e, fn=hide_tip: (
+            _hud_tooltip_hide_fns.remove(fn)
+            if fn in _hud_tooltip_hide_fns
+            else None
+        ),
+        add="+",
+    )
 
 
 _demo_sim_pad_win = None
@@ -43940,6 +45290,16 @@ def reset_demo_sandbox_state(on_done=None):
         _bump_adapter_epoch()
         _cooldown_seq_id += 1
         ad.sim_reset_account(25000.0)
+        demo_s_key = get_session_key("DEMO", ad.account_id)
+        _clear_pnl_curve(demo_s_key)
+        demo_pts_reset = _record_pnl_curve_point(
+            demo_s_key,
+            _adapter_epoch,
+            get_today_str(),
+            0.0,
+            is_flat_now=True,
+            force=True,
+        )
         ignored_positions.clear()
         _launch_grace_syms.clear()
         flat_desync_streak = 0
@@ -44020,6 +45380,7 @@ def reset_demo_sandbox_state(on_done=None):
                     "realized_pnl": ("$0.00", "#2c3e50"),
                     "open_pnl": ("$0.00", "#2c3e50"),
                     "net_pnl": ("$0.00", "#2c3e50"),
+                    "pnl_sparkline": ("" if ENABLE_HUD_SPARKLINE else "---", "#262a2e"),
                     "terminate_lvl": (format_dollar(st_pnl_r), c3_bg_r),
                     "dist_to_term": (format_dist_to_stop_hud(dist_r, False), "#2c3e50"),
                     "session_high": ("$0.00", "#2c3e50"),
@@ -44032,6 +45393,22 @@ def reset_demo_sandbox_state(on_done=None):
                 col_data_r = [
                     col_map_r.get(cid, ("---", "#2c3e50")) for cid in act_cols_r
                 ]
+                reset_spark_r = (
+                    {
+                        "epoch": _adapter_epoch,
+                        "s_key": get_session_key("DEMO", active_adapter.account_id),
+                        "pts": demo_pts_reset or (0.0,),
+                        "net_pnl": 0.0,
+                        "stop_pnl": float(st_pnl_r or -1500.0),
+                        "session_high": 0.0,
+                        "session_low": 0.0,
+                        "dist": float(dist_r),
+                        "breach": False,
+                        "neutral": False,
+                    }
+                    if ENABLE_HUD_SPARKLINE
+                    else None
+                )
                 update_gui(
                     hud_ui_labels,
                     col_data_r,
@@ -44039,6 +45416,7 @@ def reset_demo_sandbox_state(on_done=None):
                     hud_settings_btn,
                     hud_close_btn,
                     leash_pct=1.0,
+                    spark_snap=reset_spark_r,
                 )
                 refresh_acct_badge()
         except Exception:
