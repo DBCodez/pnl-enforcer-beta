@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.85"
+APP_VERSION = "0.9.86"
 
 import os
 import sys
@@ -44576,7 +44576,7 @@ def show_preflight_window(
     )
     attach_tooltip(
         src_diff_lbl,
-        "Open the public GitHub Gist bundle in your browser to inspect or download the full source code."
+        "Open the public GitHub repository in your browser to inspect the full source code, release notes, and commit history."
     )
 
     def show_daily_breach_return_notice(is_preview=False):
@@ -49885,6 +49885,7 @@ MAIN_GIST_BUNDLE_ID = "6442a3ab2767aeb5ba0b13940d012634"
 BETA_GIST_BUNDLE_ID = "28088fe94e866e249b2c794c25eef6e9"
 MAIN_CHANGELOG_GIST_ID = "c91f71c6114caf3f2dee17cc8b60a757"
 
+GITHUB_REPO_WEB_URL = "https://github.com/DBCodez/pnl-enforcer-beta"
 GITHUB_RAW_BASE = (
     "https://raw.githubusercontent.com/DBCodez/pnl-enforcer-beta/main/"
 )
@@ -49899,18 +49900,10 @@ BETA_GIST_ENFORCER_RAW_URL = (
     f"https://gist.githubusercontent.com/DBCodez/"
     f"{BETA_GIST_BUNDLE_ID}/raw/enforcer.py"
 )
-CHANGELOG_WEB_URL = (
-    f"https://gist.github.com/DBCodez/{MAIN_CHANGELOG_GIST_ID}"
-)
-BETA_CHANGELOG_WEB_URL = (
-    f"https://gist.github.com/DBCodez/{BETA_GIST_BUNDLE_ID}#file-changelog-md"
-)
-SOURCE_DIFF_WEB_URL = (
-    f"https://gist.github.com/DBCodez/{MAIN_GIST_BUNDLE_ID}"
-)
-BETA_SOURCE_DIFF_WEB_URL = (
-    f"https://gist.github.com/DBCodez/{BETA_GIST_BUNDLE_ID}"
-)
+CHANGELOG_WEB_URL = f"{GITHUB_REPO_WEB_URL}/blob/main/CHANGELOG.md"
+BETA_CHANGELOG_WEB_URL = f"{GITHUB_REPO_WEB_URL}/blob/beta/CHANGELOG.md"
+SOURCE_DIFF_WEB_URL = GITHUB_REPO_WEB_URL
+BETA_SOURCE_DIFF_WEB_URL = f"{GITHUB_REPO_WEB_URL}/tree/beta"
 GIST_DOC_RAW_URLS = {
     "CHANGELOG.md": (
         f"https://gist.githubusercontent.com/DBCodez/"
@@ -49931,11 +49924,22 @@ GIST_DOC_RAW_URLS = {
 }
 
 
+def _is_bat_beta_channel_text(bat_txt):
+    s = str(bat_txt or "")
+    return (BETA_GIST_BUNDLE_ID in s) or (BETA_GITHUB_RAW_BASE in s)
+
+
+def _rewrite_bat_bytes_for_beta(raw_bytes):
+    txt = bytes(raw_bytes).decode("utf-8", errors="replace")
+    txt = txt.replace(GITHUB_RAW_BASE, BETA_GITHUB_RAW_BASE)
+    txt = txt.replace(MAIN_GIST_BUNDLE_ID, BETA_GIST_BUNDLE_ID)
+    return txt.encode("utf-8")
+
+
 def _is_beta_channel_build():
     """Returns True when running from the experimental 'beta' git branch or a
-    Beta Channel Gist bundle (28088fe94e866e249b2c794c25eef6e9), so web
-    changelog links, remote doc fetches, and update checks automatically use
-    the Beta Channel without manual URL switching on branch merges."""
+    Beta Channel launcher/bundle, so web changelog links, remote doc fetches,
+    and update checks automatically use the Beta Channel without manual edits."""
     try:
         git_head_path = os.path.join(SCRIPT_DIR, ".git", "HEAD")
         if os.path.exists(git_head_path):
@@ -49952,7 +49956,7 @@ def _is_beta_channel_build():
             with open(
                 bat_path, "r", encoding="utf-8", errors="replace"
             ) as bf:
-                if BETA_GIST_BUNDLE_ID in bf.read():
+                if _is_bat_beta_channel_text(bf.read()):
                     return True
     except Exception:
         pass
@@ -49960,8 +49964,8 @@ def _is_beta_channel_build():
 
 
 def get_changelog_web_url():
-    """Returns the Beta Channel Gist Changelog URL when running on the beta
-    branch/channel, or the Main Stable Changelog Gist URL on stable builds."""
+    """Returns the Beta branch GitHub Changelog URL when running on the beta
+    branch/channel, or the main branch GitHub Changelog URL on stable builds."""
     return (
         BETA_CHANGELOG_WEB_URL
         if _is_beta_channel_build()
@@ -49970,9 +49974,8 @@ def get_changelog_web_url():
 
 
 def get_source_diff_web_url():
-    """Returns the GitHub Gist '/revisions' source-diff URL for the active
-    channel so security-conscious users can inspect full source code and
-    line-by-line version diffs in their browser before or after updating."""
+    """Returns the public GitHub repository URL for the active channel so
+    traders can inspect full source code, release tags, and commit history."""
     return (
         BETA_SOURCE_DIFF_WEB_URL
         if _is_beta_channel_build()
@@ -49992,11 +49995,14 @@ def _fetch_remote_doc_bytes(doc_name, ts=None):
     is_beta = _is_beta_channel_build()
     if is_beta:
         doc_urls = [
-            f"https://gist.githubusercontent.com/DBCodez/{BETA_GIST_BUNDLE_ID}/raw/{doc_name}?t={ts}",
             f"{BETA_GITHUB_RAW_BASE}{doc_name}?t={ts}",
+            f"https://gist.githubusercontent.com/DBCodez/{BETA_GIST_BUNDLE_ID}/raw/{doc_name}?t={ts}",
         ]
     else:
-        doc_urls = [f"{GITHUB_RAW_BASE}{doc_name}?t={ts}"]
+        doc_urls = [
+            f"{GITHUB_RAW_BASE}{doc_name}?t={ts}",
+            f"https://gist.githubusercontent.com/DBCodez/{MAIN_GIST_BUNDLE_ID}/raw/{doc_name}?t={ts}",
+        ]
         if doc_name in GIST_DOC_RAW_URLS:
             doc_urls.append(f"{GIST_DOC_RAW_URLS[doc_name]}?t={ts}")
     for d_url in doc_urls:
@@ -50011,12 +50017,21 @@ def _fetch_remote_doc_bytes(doc_name, ts=None):
             with urllib.request.urlopen(d_req, timeout=3) as d_resp:
                 doc_bytes = d_resp.read()
             if doc_bytes:
+                if doc_name == "Launch_Enforcer.bat" and not _is_valid_launcher_bat_bytes(
+                    doc_bytes
+                ):
+                    continue
+                if doc_name == "enforcer.ico" and (
+                    len(doc_bytes) < 64
+                    or doc_bytes[:4] != b"\x00\x00\x01\x00"
+                ):
+                    continue
+                if doc_name == "CHANGELOG.md" and (
+                    b"[" not in doc_bytes or b"<html" in doc_bytes[:512].lower()
+                ):
+                    continue
                 if is_beta and doc_name == "Launch_Enforcer.bat":
-                    doc_bytes = (
-                        doc_bytes.decode("utf-8", errors="replace")
-                        .replace(MAIN_GIST_BUNDLE_ID, BETA_GIST_BUNDLE_ID)
-                        .encode("utf-8")
-                    )
+                    doc_bytes = _rewrite_bat_bytes_for_beta(doc_bytes)
                 return doc_bytes
         except Exception:
             continue
@@ -52208,7 +52223,11 @@ def relocate_desktop_install(
                     "BAT_READ_FAILED",
                     f"Could not read Launch_Enforcer.bat ({exc}). No files were moved.",
                 )
-            src_is_beta = BETA_GIST_BUNDLE_ID.encode("utf-8") in src_bat_bytes
+            src_is_beta = _is_bat_beta_channel_text(
+                src_bat_bytes.decode("utf-8", errors="replace")
+            )
+            if src_is_beta:
+                src_bat_bytes = _rewrite_bat_bytes_for_beta(src_bat_bytes)
         else:
             src_is_beta = (
                 _is_beta_channel_build() if src_dir is None else False
@@ -52224,15 +52243,8 @@ def relocate_desktop_install(
                 and b"enforcer.py" in fetched_bat
                 and b"PnL Enforcer" in fetched_bat
             ):
-                if (
-                    src_is_beta
-                    and BETA_GIST_BUNDLE_ID.encode("utf-8") not in fetched_bat
-                ):
-                    fetched_bat = (
-                        fetched_bat.decode("utf-8", errors="replace")
-                        .replace(MAIN_GIST_BUNDLE_ID, BETA_GIST_BUNDLE_ID)
-                        .encode("utf-8")
-                    )
+                if src_is_beta:
+                    fetched_bat = _rewrite_bat_bytes_for_beta(fetched_bat)
                 src_bat_bytes = fetched_bat
             else:
                 return (
@@ -52315,8 +52327,8 @@ def relocate_desktop_install(
                     try:
                         with open(dst_bat_path, "rb") as dbf:
                             d_bat_b = dbf.read()
-                        if (
-                            BETA_GIST_BUNDLE_ID.encode("utf-8") in d_bat_b
+                        if _is_bat_beta_channel_text(
+                            d_bat_b.decode("utf-8", errors="replace")
                         ) == src_is_beta:
                             need_bat_write = False
                             verified_dest_files.add("Launch_Enforcer.bat")
@@ -53223,98 +53235,54 @@ def _fetch_available_update_payload(skip_if_recent=False):
         import urllib.request
         ts = int(now_ts)
         is_beta = _is_beta_channel_build()
-        active_gist_id = (
-            BETA_GIST_BUNDLE_ID if is_beta else MAIN_GIST_BUNDLE_ID
-        )
         active_enforcer_raw = (
             BETA_GIST_ENFORCER_RAW_URL if is_beta else GIST_ENFORCER_RAW_URL
         )
         active_raw_base = (
             BETA_GITHUB_RAW_BASE if is_beta else GITHUB_RAW_BASE
         )
-        candidate_urls = []
-        g_meta = None
+        candidate_urls = [
+            f"{active_raw_base}enforcer.py?t={ts}",
+            f"{active_enforcer_raw}?t={ts}",
+        ]
         best_ver = None
         best_bytes = None
-        try:
-            api_req = urllib.request.Request(
-                f"https://api.github.com/gists/{active_gist_id}",
-                headers={
-                    "User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}",
-                    "Accept": "application/vnd.github+json",
-                },
-            )
-            with urllib.request.urlopen(api_req, timeout=3) as api_resp:
-                g_meta = json.loads(
-                    api_resp.read().decode("utf-8", errors="replace")
-                )
-            enf_meta = g_meta.get("files", {}).get("enforcer.py", {})
-            if not enf_meta.get("truncated") and enf_meta.get("content"):
-                c_bytes = enf_meta["content"].encode("utf-8")
-                ok_g, g_ver, _g_err = _validate_enforcer_source_bytes(c_bytes)
-                if ok_g and _parse_version_tuple(g_ver) > _parse_version_tuple(
-                    APP_VERSION
-                ):
-                    best_ver = g_ver
-                    best_bytes = c_bytes
-                elif ok_g:
-                    best_ver = g_ver
-            live_raw = enf_meta.get("raw_url")
-            if live_raw:
-                candidate_urls.append(live_raw)
-        except Exception:
-            pass
-        candidate_urls.extend([
-            f"{active_enforcer_raw}?t={ts}",
-            f"{active_raw_base}enforcer.py?t={ts}",
-        ])
 
-        if best_ver is None:
-            for url in candidate_urls:
-                try:
-                    req = urllib.request.Request(
-                        url,
-                        headers={
-                            "User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}",
-                            "Cache-Control": "no-cache",
-                        },
+        for url in candidate_urls:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": f"PnL-Enforcer-Updater/{APP_VERSION}",
+                        "Cache-Control": "no-cache",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    head_bytes = resp.read(4096)
+                    head_txt = head_bytes.decode("utf-8", errors="replace")
+                    m_rem = re.search(
+                        r'(?m)^APP_VERSION\s*=\s*["\']([^"\']+)["\']',
+                        head_txt,
                     )
-                    with urllib.request.urlopen(req, timeout=8) as resp:
-                        head_bytes = resp.read(4096)
-                        head_txt = head_bytes.decode("utf-8", errors="replace")
-                        m_rem = re.search(
-                            r'(?m)^APP_VERSION\s*=\s*["\']([^"\']+)["\']',
-                            head_txt,
-                        )
-                        v_cand = (
-                            m_rem.group(1).strip() if m_rem else APP_VERSION
-                        )
-                        if _parse_version_tuple(v_cand) <= _parse_version_tuple(
-                            APP_VERSION
-                        ):
-                            if best_ver is None:
-                                best_ver = v_cand
-                            continue
-                        rem_bytes = head_bytes + resp.read()
-                    rem_txt = rem_bytes.decode("utf-8", errors="replace")
-                    if (
-                        "def data_loop" not in rem_txt
-                        or 'if __name__ == "__main__":' not in rem_txt
-                    ):
+                    if not m_rem or not m_rem.group(1).strip():
                         continue
-                    try:
-                        compile(rem_txt, "enforcer.py", "exec")
-                    except SyntaxError:
-                        continue
-                    if (
-                        best_ver is None
-                        or _parse_version_tuple(v_cand)
-                        > _parse_version_tuple(best_ver)
+                    v_cand = m_rem.group(1).strip()
+                    if _parse_version_tuple(v_cand) <= _parse_version_tuple(
+                        APP_VERSION
                     ):
                         best_ver = v_cand
-                        best_bytes = rem_bytes
-                except Exception:
+                        break
+                    rem_bytes = head_bytes + resp.read()
+                ok_rem, parsed_v, _rem_err = _validate_enforcer_source_bytes(
+                    rem_bytes
+                )
+                if not ok_rem:
                     continue
+                best_ver = parsed_v or v_cand
+                best_bytes = rem_bytes
+                break
+            except Exception:
+                continue
 
         if (not _desktop_tidy_in_progress) and (not os.path.exists(ICON_PATH)):
             ico_bytes = _fetch_remote_doc_bytes("enforcer.ico", ts=ts)
@@ -53346,13 +53314,7 @@ def _fetch_available_update_payload(skip_if_recent=False):
             return None
 
         print(f"New update available: v{APP_VERSION} -> v{best_ver}")
-        cl_bytes = None
-        if isinstance(g_meta, dict):
-            cl_meta = g_meta.get("files", {}).get("CHANGELOG.md", {})
-            if not cl_meta.get("truncated") and cl_meta.get("content"):
-                cl_bytes = cl_meta["content"].encode("utf-8")
-        if not cl_bytes:
-            cl_bytes = _fetch_remote_doc_bytes("CHANGELOG.md", ts=ts)
+        cl_bytes = _fetch_remote_doc_bytes("CHANGELOG.md", ts=ts)
         cl_text = (
             cl_bytes.decode("utf-8", errors="replace") if cl_bytes else ""
         )
