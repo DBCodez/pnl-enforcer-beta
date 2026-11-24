@@ -4,6 +4,18 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.86] — 2026-11-24
+### ⚡ Quick Summary
+- **Public GitHub Repo as Primary Source (`main` & `beta`):** Switched **`Inspect Source ↗`**, web **`Open Full Changelog ↗`** links, `Launch_Enforcer.bat` fresh-install downloads (now including `enforcer.ico`), and background/manual update checks (`raw.githubusercontent.com`) to use the public **`DBCodez/pnl-enforcer-beta`** GitHub repository first—eliminating redundant Gist REST API lookups while keeping Secret Gists as automatic failover mirrors.
+
+### 🔍 Detailed Breakdown
+- **GitHub-First Web Links, Single-Request Update Check & Backup Gist Failover (`GITHUB_REPO_WEB_URL`, `get_changelog_web_url`, `get_source_diff_web_url`, `_fetch_remote_doc_bytes`, `_fetch_available_update_payload`, `_is_bat_beta_channel_text`, `_rewrite_bat_bytes_for_beta`, `Launch_Enforcer.bat`):**
+  - Updated `CHANGELOG_WEB_URL` / `BETA_CHANGELOG_WEB_URL` (`blob/main/CHANGELOG.md` / `blob/beta/CHANGELOG.md`), `SOURCE_DIFF_WEB_URL` / `BETA_SOURCE_DIFF_WEB_URL` (repo root / `tree/beta`), and `src_diff_lbl`'s tooltip to point directly to `https://github.com/DBCodez/pnl-enforcer-beta`.
+  - Updated `_fetch_available_update_payload()` to read the first `4 KB` of `raw.githubusercontent.com/.../enforcer.py` first (`1` lightweight request when up to date, ignoring HTML error pages missing `APP_VERSION`, and validating full downloads via `_validate_enforcer_source_bytes()` with automatic failover to the channel's Secret Gist mirror).
+  - Updated `_is_bat_beta_channel_text()`, `_rewrite_bat_bytes_for_beta()`, and `relocate_desktop_install()` so Beta-channel launchers pointing to either `BETA_GITHUB_RAW_BASE` or `BETA_GIST_BUNDLE_ID` retain Beta channel identity cleanly across updates and Desktop relocations, and updated `Launch_Enforcer.bat` bootstrap downloads to pull from `main` on GitHub first with automatic Gist failover.
+
+---
+
 ## [v0.9.85] — 2026-11-24
 ### ⚡ Quick Summary
 - **10x Faster Mid-Day Relaunch Sync (`~0.5s` vs. `12s`) + Instant `~0.4s` HUD PnL Paint:** Relaunching after a break where trades executed off-session now checks the fast `36h` order window first instead of downloading 58 days of broker order history (`~4.8 MB`) upfront—escalating to `58d` only if an older multi-day GTC order filled while you were away—and paints your live Realized/Open/Net PnL onto the HUD in `~0.4s` without waiting on order-history catch-up.
