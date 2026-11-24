@@ -4,6 +4,23 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.84] — 2026-11-24
+### ⚡ Quick Summary
+- **Smarter Webull `401` / Gateway Resilience (Shoutout to `T$MAC`!):** Fixed upstream Webull `401 UNAUTHORIZED` gateway wobbles falsely triggering `"BROKER TOKEN EXPIRED — RESTART APP TO RE-LOGIN"`, kept `WebullAdapter` client rebuilds tightly time-boxed so a pending 2FA check can never freeze stop monitoring, and added clear `"WEBULL KEYS REJECTED — CHECK KEYS / PC CLOCK"` guidance only if `401`s persist ~30 seconds.
+- **Calm Flap-Storm Audio Protection (Schwab & Webull):** When an unstable broker connection flaps repeatedly inside 60 seconds, Enforcer now speaks a single calm `"Broker connection is unstable. I'm watching it."` notice instead of repeating disconnect/restore voice prompts and chimes on every blip—while still keeping yellow HUD alerts live and breaking through with audio immediately if an outage stays down `>= 3` attempts (`~6s+`).
+- **No More Secret Startup Broker Switching:** Removed automatic cross-broker fallback during startup (`run_startup_broker_connect`) and added automatic retry backoff (`1.5s`, `3.0s` for Webull; `1.5s` for Schwab) on transient startup blips so Enforcer never overwrites your active broker to the secondary broker or pops an unrequested OAuth browser login.
+
+### 🔍 Detailed Breakdown
+- **Broker-Aware Poll Auth Classifier & Webull Token Guard (`_classify_poll_auth_error`, `_format_disconnect_alarm_copy`, `_validate_webull_token_file`, `WebullAdapter.reconnect_session`, `is_disconnect_alarm_reason`):**
+  - Classified Webull `401` / `unauthorized` / `invalid credentials` / `ERROR_CHECK_TOKEN_ENABLE` / `ERROR_INIT_TOKEN` / `sign` errors as `auth_transient` (never triggering Schwab OAuth `"BROKER TOKEN EXPIRED"`), while keeping Schwab `invalid_grant` / `unsupported_token_type` / `refresh_token` / `"token expired"` / `"token rejected"` / `"safety buffer"` immediately hard and giving bare Schwab `401` errors 1 silent `reconnect_session()` token-file reload before escalating at `>= 3` consecutive `401`s (removed bare `"expired"` substring matching).
+  - Updated `data_loop()` to skip unnecessary Attempt #1 full SDK rebuilds on Webull `401`s (running full reinit at `att == 3 or att % 6 == 0`), updated `WebullAdapter.reconnect_session()` to pass `token_check_duration_seconds=8` & `token_check_interval_seconds=2` (`TypeError`-guarded for mocks) without carrying stale `old_tok` across full reinits, validated `~/conf/token.txt` line 3 (`NORMAL`) + expiry before light-path injection via `_validate_webull_token_file()`, and added `"AUTH/GATEWAY"` / `"KEYS REJECTED"` to `is_disconnect_alarm_reason()` so all auth/gateway alerts route through the calm 2-note disconnect loop and preempt cleanly under real risk sirens.
+- **Paired Flap-Storm Audio Throttle (`_evaluate_disconnect_flap_start`, `_handle_disconnect_recovery`, `_maybe_expire_disconnect_flap_quiet`, `_is_disconnect_audio_suppressed`):**
+  - Added a 60s sliding flap window (`>= 3` drops/60s -> quiet mode until `>= 30s` continuous stability or `_bump_adapter_epoch()` reset), gated `sound_disconnect_alert_loop()`, Settings modal one-shot disconnect alerts, and restore speech/chimes behind paired `_disc_audio_announced` tracking so `"Connection restored"` is never spoken for an unannounced drop, and enforced an `att >= 3` prolongation breakthrough so multi-poll outages always alert audibly without touching risk sirens.
+- **Transient Startup Retry & Primary-Broker Preservation (`_is_transient_startup_auth_error`, `connect_broker_adapter`, `run_startup_broker_connect`):**
+  - Retries transient startup `authenticate()` failures with fresh adapter instances (`2` retries at `1.5s`, `3.0s` for Webull; `1` retry at `1.5s` for Schwab; never retrying `DeferredAuthRequired`, cancelled OAuth, or `force_wizard`), and removed silent cross-broker fallback in `run_startup_broker_connect()` so Pre-Flight always opens on the configured `active_broker` with zero unintended `save_config()` mutations.
+
+---
+
 ## [v0.9.83] — 2026-11-23
 ### ⚡ Quick Summary
 - **Live Card 5 Ratchet Ladder Preview (`RTH` & `Ext-Hours`):** Added an interactive step-and-trailing chart directly inside Card 5 that redraws as you type Tier 1–4 stops, highlights tightened/green floors & clamped steps cleanly, switches automatically between `Card 5 (RTH)` and `Card 4 (Ext-Hours)`, tracks your live `Rulebook High`, and collapses anytime with one click (`▾ Hide`).

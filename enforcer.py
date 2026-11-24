@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.83"
+APP_VERSION = "0.9.84"
 
 import os
 import sys
@@ -2775,6 +2775,39 @@ _last_real_broker = "SCHWAB"
 _demo_memory_session = {}
 consecutive_api_failures = 0
 api_disconnect_alerted = False
+_consecutive_auth_failures = 0
+_disc_flap_drop_monos = []
+_disc_flap_quiet_active = False
+_disc_flap_unstable_announced = False
+_disc_stable_since_mono = 0.0
+_disc_audio_announced = False
+_disc_audio_suppressed_for_outage = False
+_disc_active_reason_prefix = ""
+
+
+def _reset_disconnect_flap_state():
+    """Resets disconnect-flap audio throttling and auth failure streak state
+    when switching brokers/accounts or starting a fresh polling loop."""
+    global _consecutive_auth_failures, _disc_flap_drop_monos
+    global _disc_flap_quiet_active, _disc_flap_unstable_announced
+    global _disc_stable_since_mono, _disc_audio_announced
+    global _disc_audio_suppressed_for_outage, _disc_active_reason_prefix
+    _consecutive_auth_failures = 0
+    _disc_flap_drop_monos = []
+    _disc_flap_quiet_active = False
+    _disc_flap_unstable_announced = False
+    _disc_stable_since_mono = 0.0
+    _disc_audio_announced = False
+    _disc_audio_suppressed_for_outage = False
+    _disc_active_reason_prefix = ""
+
+
+def _is_disconnect_audio_suppressed():
+    """Returns True when the current outage is held inside the flap-storm
+    audio quiet window and has not yet escalated past the prolongation gate."""
+    return bool(_disc_audio_suppressed_for_outage and not _disc_audio_announced)
+
+
 cooldown_end_time = 0.0
 cooldown_label = "COOL-DOWN LOCK"
 cooldown_30s_announced = False
@@ -2933,6 +2966,7 @@ def _bump_adapter_epoch():
         _feed_clock_probe["wall"] = 0.0
         _feed_clock_probe["mono"] = 0.0
         _last_live_hud_snapshot = None
+        _reset_disconnect_flap_state()
         return _adapter_epoch
 
 
@@ -10503,6 +10537,41 @@ class SchwabAdapter:
 WEBULL_POS_MIN_INTERVAL_SEC = 1.15
 
 
+def _validate_webull_token_file(tok_file):
+    """Reads Webull SDK's 3-line ~/conf/token.txt (token, expires, status) and
+    returns the cached token ONLY when status == 'NORMAL' and it has not expired.
+    Prevents injecting PENDING/INVALID tokens written mid-2FA initialization."""
+    try:
+        if not tok_file or not os.path.exists(tok_file):
+            return None
+        with open(tok_file, "r", encoding="utf-8") as tf:
+            tok = tf.readline().strip()
+            exp_raw = tf.readline().strip()
+            status = tf.readline().strip().upper()
+        if not tok or status != "NORMAL":
+            return None
+        if not exp_raw:
+            return None
+        try:
+            exp_val = float(exp_raw)
+        except Exception:
+            return None
+        if exp_val <= 0.0:
+            return None
+        now_t = time.time()
+        if exp_val > 1e12:
+            # Epoch milliseconds
+            return tok if (exp_val / 1000.0) > now_t else None
+        if exp_val > 1e9:
+            # Epoch seconds
+            return tok if exp_val > now_t else None
+        # Relative TTL seconds measured from token file mtime
+        mtime = os.path.getmtime(tok_file)
+        return tok if (mtime + exp_val) > now_t else None
+    except Exception:
+        return None
+
+
 class WebullAdapter:
     name = "WEBULL"
 
@@ -10972,8 +11041,9 @@ class WebullAdapter:
 
     def reconnect_session(self):
         """Refreshes Webull client timeout state (or rebuilds ApiClient/TradeClient
-        atomically on auth/token errors) without clobbering the active in-memory
-        access token if a reconnect attempt times out mid-outage."""
+        atomically on auth/token errors) with bounded token-check polling so
+        pending 2FA checks never freeze data_loop, and without carrying stale
+        tokens across a full reinit."""
         try:
             err_l = str(getattr(self, "last_error", "") or "").lower()
             needs_full_reinit = (
@@ -10988,6 +11058,8 @@ class WebullAdapter:
                         "token",
                         "expired",
                         "sign",
+                        "error_check_token_enable",
+                        "error_init_token",
                     )
                 )
             )
@@ -10996,23 +11068,13 @@ class WebullAdapter:
                 self.api_client._read_timeout = 4.5
                 if not self.api_client.get_token():
                     tok_file = os.path.join(USER_HOME, "conf", "token.txt")
-                    if os.path.exists(tok_file):
-                        try:
-                            with open(tok_file, "r", encoding="utf-8") as tf:
-                                saved_tok = tf.readline().strip()
-                            if saved_tok:
-                                self.api_client.set_token(saved_tok)
-                        except Exception:
-                            pass
+                    saved_tok = _validate_webull_token_file(tok_file)
+                    if saved_tok:
+                        self.api_client.set_token(saved_tok)
                 return True
 
             from webull.core.client import ApiClient
             from webull.trade.trade_client import TradeClient
-            old_tok = (
-                self.api_client.get_token()
-                if self.api_client is not None
-                else None
-            )
             try:
                 new_api = ApiClient(
                     self.app_key,
@@ -11020,18 +11082,29 @@ class WebullAdapter:
                     "us",
                     connect_timeout=3.5,
                     timeout=4.5,
+                    token_check_duration_seconds=8,
+                    token_check_interval_seconds=2,
                 )
             except TypeError:
-                new_api = ApiClient(self.app_key, self.app_secret, "us")
-                new_api._connect_timeout = 3.5
-                new_api._read_timeout = 4.5
+                try:
+                    new_api = ApiClient(
+                        self.app_key,
+                        self.app_secret,
+                        "us",
+                        connect_timeout=3.5,
+                        timeout=4.5,
+                    )
+                except TypeError:
+                    new_api = ApiClient(self.app_key, self.app_secret, "us")
+                    new_api._connect_timeout = 3.5
+                    new_api._read_timeout = 4.5
+                new_api._token_check_duration_seconds = 8
+                new_api._token_check_interval_seconds = 2
             new_api._stream_logger_set = True
             new_api._file_logger_set = True
             if hasattr(new_api, "set_token_dir"):
                 new_api.set_token_dir(os.path.join(USER_HOME, "conf"))
             new_api.add_endpoint("us", "api.webull.com")
-            if old_tok and not new_api.get_token():
-                new_api.set_token(old_tok)
             new_trade = TradeClient(new_api)
             self.api_client = new_api
             self.trade_client = new_trade
@@ -15485,6 +15558,69 @@ def show_broker_setup_wizard(broker_name, parent=None):
     return saved_ok["status"]
 
 
+def _is_transient_startup_auth_error(broker_name, exc):
+    """Returns True when a startup broker authenticate() error represents a
+    transient HTTP 401/5xx/timeout/socket hiccup safe to retry automatically,
+    never retrying cancelled interactive OAuth or DeferredAuthRequired."""
+    if isinstance(exc, DeferredAuthRequired):
+        return False
+    b_up = str(broker_name or "").upper()
+    err_l = str(exc or "").lower()
+    if any(
+        k in err_l
+        for k in (
+            "cancelled",
+            "canceled",
+            "browser login",
+            "invalid_grant",
+            "unsupported_token_type",
+            "token rejected",
+            "safety buffer",
+        )
+    ):
+        return False
+    if b_up == "WEBULL":
+        return any(
+            k in err_l
+            for k in (
+                "401",
+                "unauthorized",
+                "invalid credentials",
+                "error_check_token_enable",
+                "error_init_token",
+                "500",
+                "502",
+                "503",
+                "504",
+                "timeout",
+                "timed out",
+                "connection",
+                "reset",
+                "sdk.httperror",
+                "unknownservererror",
+            )
+        )
+    if b_up == "SCHWAB":
+        if "network connection failed while reaching schwab api" in err_l:
+            return True
+        if isinstance(exc, ConnectionError):
+            return True
+        return any(
+            k in err_l
+            for k in (
+                "500",
+                "502",
+                "503",
+                "504",
+                "timeout",
+                "timed out",
+                "connection",
+                "reset",
+            )
+        )
+    return False
+
+
 def connect_broker_adapter(
     broker_name,
     parent=None,
@@ -15523,95 +15659,121 @@ def connect_broker_adapter(
         load_config()
         b_cfg = config["brokers"][broker_name]
 
-    try:
-        if broker_name == "SCHWAB":
-            adapter = SchwabAdapter(b_cfg["app_key"], b_cfg["app_secret"])
-        else:
-            adapter = WebullAdapter(b_cfg["app_key"], b_cfg["app_secret"])
-
-        cached_accts = (
-            b_cfg.get("cached_accounts")
-            if (fast_startup and not force_wizard)
-            else None
+    retry_delays = ()
+    if not force_wizard and not suppress_error_modal:
+        retry_delays = (
+            (1.5, 3.0) if str(broker_name or "").upper() == "WEBULL" else (1.5,)
         )
+
+    last_exc = None
+    max_attempts = 1 + len(retry_delays)
+    for attempt_idx in range(max_attempts):
         try:
-            adapter.authenticate(
-                fast_cached_accounts=cached_accts,
-                allow_interactive_oauth=allow_interactive_oauth,
+            if broker_name == "SCHWAB":
+                adapter = SchwabAdapter(b_cfg["app_key"], b_cfg["app_secret"])
+            else:
+                adapter = WebullAdapter(b_cfg["app_key"], b_cfg["app_secret"])
+
+            cached_accts = (
+                b_cfg.get("cached_accounts")
+                if (fast_startup and not force_wizard)
+                else None
             )
-        except TypeError:
-            if sys.exc_info()[2].tb_next is not None:
-                raise
             try:
-                adapter.authenticate(fast_cached_accounts=cached_accts)
+                adapter.authenticate(
+                    fast_cached_accounts=cached_accts,
+                    allow_interactive_oauth=allow_interactive_oauth,
+                )
             except TypeError:
                 if sys.exc_info()[2].tb_next is not None:
                     raise
-                adapter.authenticate()
+                try:
+                    adapter.authenticate(fast_cached_accounts=cached_accts)
+                except TypeError:
+                    if sys.exc_info()[2].tb_next is not None:
+                        raise
+                    adapter.authenticate()
 
-        saved_acct = b_cfg.get("selected_account_id", "")
-        valid_ids = [a["id"] for a in adapter.accounts]
-        cfg_dirty = False
-        if saved_acct in valid_ids:
-            adapter.account_id = saved_acct
-        elif valid_ids:
-            adapter.account_id = valid_ids[0]
-            config["brokers"][broker_name]["selected_account_id"] = valid_ids[0]
-            cfg_dirty = True
-
-        if (
-            not getattr(adapter, "_fast_auth_deferred", False)
-            and adapter.accounts
-        ):
-            if b_cfg.get("cached_accounts") != adapter.accounts:
-                config["brokers"][broker_name]["cached_accounts"] = [
-                    dict(a) for a in adapter.accounts
-                ]
+            saved_acct = b_cfg.get("selected_account_id", "")
+            valid_ids = [a["id"] for a in adapter.accounts]
+            cfg_dirty = False
+            if saved_acct in valid_ids:
+                adapter.account_id = saved_acct
+            elif valid_ids:
+                adapter.account_id = valid_ids[0]
+                config["brokers"][broker_name]["selected_account_id"] = valid_ids[0]
                 cfg_dirty = True
-            log_event(
-                "SESSION",
-                f"{broker_name} API authenticated ({len(adapter.accounts)} account(s) found)."
-            )
-        if cfg_dirty:
-            save_config(config)
-        return adapter
-    except Exception as e:
-        if isinstance(e, DeferredAuthRequired):
-            _last_boot_deferred_auth_msg = str(e)
-            if suppress_error_modal:
-                log_event("SESSION", f"{broker_name} OAuth refresh deferred: {e}")
-                return None
+
+            if (
+                not getattr(adapter, "_fast_auth_deferred", False)
+                and adapter.accounts
+            ):
+                if b_cfg.get("cached_accounts") != adapter.accounts:
+                    config["brokers"][broker_name]["cached_accounts"] = [
+                        dict(a) for a in adapter.accounts
+                    ]
+                    cfg_dirty = True
+                log_event(
+                    "SESSION",
+                    f"{broker_name} API authenticated ({len(adapter.accounts)} account(s) found)."
+                )
+            if cfg_dirty:
+                save_config(config)
+            return adapter
+        except Exception as e:
+            last_exc = e
+            if (
+                attempt_idx < len(retry_delays)
+                and _is_transient_startup_auth_error(broker_name, e)
+            ):
+                wait_s = retry_delays[attempt_idx]
+                log_event(
+                    "WARN",
+                    f"{broker_name} transient startup error ({_clip_log_detail(e, 140)}) — "
+                    f"retrying ({attempt_idx + 1}/{len(retry_delays)}) in {wait_s:.1f}s...",
+                )
+                time.sleep(wait_s)
+                continue
+            break
+
+    e = last_exc
+    if isinstance(e, DeferredAuthRequired):
+        _last_boot_deferred_auth_msg = str(e)
         if suppress_error_modal:
-            log_event(
-                "WARN",
-                f"{broker_name} startup connection deferred (network pending): {e}",
-            )
+            log_event("SESSION", f"{broker_name} OAuth refresh deferred: {e}")
             return None
-        log_event("ERROR", f"{broker_name} connection error: {e}")
-        extra_hint = (
-            "\n\n⚠️ NOTE FOR WEBULL USERS:\n"
-            "1. Check your Webull mobile app / SMS! Webull may send a 2FA code prompt "
-            "the first time your API keys are used.\n"
-            "2. Once you approve the 2FA code (or disable API 2FA in Webull portal), "
-            "click 'No' to open Pre-Flight settings or 'Yes' to re-enter keys."
-            if broker_name == "WEBULL" else ""
+    if suppress_error_modal:
+        log_event(
+            "WARN",
+            f"{broker_name} startup connection deferred (network pending): {e}",
         )
-        retry = messagebox.askyesno(
-            f"{broker_name} Connection Error",
-            f"Could not authenticate with {broker_name}:\n\n{e}{extra_hint}\n\n"
-            f"Would you like to re-enter your {broker_name} API keys?",
-            parent=parent
-        )
-        if retry:
-            return connect_broker_adapter(
-                broker_name, parent=parent, force_wizard=True
-            )
         return None
+    log_event("ERROR", f"{broker_name} connection error: {e}")
+    extra_hint = (
+        "\n\n⚠️ NOTE FOR WEBULL USERS:\n"
+        "1. Check your Webull mobile app / SMS! Webull may send a 2FA code prompt "
+        "the first time your API keys are used.\n"
+        "2. Once you approve the 2FA code (or disable API 2FA in Webull portal), "
+        "click 'No' to open Pre-Flight settings or 'Yes' to re-enter keys."
+        if broker_name == "WEBULL" else ""
+    )
+    retry = messagebox.askyesno(
+        f"{broker_name} Connection Error",
+        f"Could not authenticate with {broker_name}:\n\n{e}{extra_hint}\n\n"
+        f"Would you like to re-enter your {broker_name} API keys?",
+        parent=parent
+    )
+    if retry:
+        return connect_broker_adapter(
+            broker_name, parent=parent, force_wizard=True
+        )
+    return None
 
 
 def run_startup_broker_connect(startup_boot=False):
     """Connects initial broker at startup, suppressing fallback switches & blocking
-    error popups when booting with Windows (--startup) while network may be pending."""
+    error popups when booting with Windows (--startup) while network may be pending.
+    Never silently overwrites config['active_broker'] to a different broker."""
     init_b = config.get("active_broker", "SCHWAB")
     boot_ad = connect_broker_adapter(
         init_b,
@@ -15619,18 +15781,6 @@ def run_startup_broker_connect(startup_boot=False):
         suppress_error_modal=bool(startup_boot),
         allow_interactive_oauth=(not bool(startup_boot)),
     )
-    if boot_ad is None and not bool(startup_boot):
-        fb_b = "SCHWAB" if init_b == "WEBULL" else "WEBULL"
-        fb_cfg_d = config.get("brokers", {}).get(fb_b, {})
-        if fb_cfg_d.get("app_key") and fb_cfg_d.get("app_secret"):
-            log_event(
-                "SESSION",
-                f"{init_b} connection failed. "
-                f"Falling back to configured broker {fb_b}...",
-            )
-            config["active_broker"] = fb_b
-            save_config(config)
-            boot_ad = connect_broker_adapter(fb_b, fast_startup=True)
     return boot_ad
 
 
@@ -16309,11 +16459,31 @@ def _apply_hud_status_pill_state(ui_button, advance_streak=False):
         elif consecutive_api_failures >= 2 or api_disconnect_alerted:
             att = max(2, int(consecutive_api_failures))
             age_sfx = f" · {fh['age_tag']}" if fh["age_tag"] else ""
-            re_txt = (
-                f"🔄 RECONNECTING (#{att}){age_sfx}"
-                if compact_now
-                else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att}){age_sfx}..."
-            )
+            re_pfx = str(_disc_active_reason_prefix or "CONNECTION LOST — AUTO-RECONNECTING").strip()
+            if "TOKEN EXPIRED" in re_pfx.upper():
+                re_txt = (
+                    f"🔑 TOKEN EXPIRED{age_sfx}"
+                    if compact_now
+                    else f"🔑 BROKER TOKEN EXPIRED — RESTART APP{age_sfx}"
+                )
+            elif "KEYS REJECTED" in re_pfx.upper():
+                re_txt = (
+                    f"🔑 KEYS REJECTED (#{att}){age_sfx}"
+                    if compact_now
+                    else f"🔑 {re_pfx} (#{att}){age_sfx}"
+                )
+            elif "AUTH/GATEWAY" in re_pfx.upper():
+                re_txt = (
+                    f"🔄 AUTH RETRY (#{att}){age_sfx}"
+                    if compact_now
+                    else f"🔄 {re_pfx} (ATTEMPT #{att}){age_sfx}..."
+                )
+            else:
+                re_txt = (
+                    f"🔄 RECONNECTING (#{att}){age_sfx}"
+                    if compact_now
+                    else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att}){age_sfx}..."
+                )
             cfg_kw = {
                 "text": re_txt,
                 "bg": "#78350f",
@@ -16462,13 +16632,109 @@ def _clip_log_detail(msg, max_len=140):
     return cut.rstrip(" ,;:-(") + "..."
 
 
+def _classify_poll_auth_error(broker_name, err_lower):
+    """Classifies a polling API error for two-way Schwab/Webull parity into
+    'hard' (real OAuth re-login required), 'auth_transient' (401/HMAC gateway
+    or single stray 401 retryable without restart alarm), or 'net'."""
+    err_l = str(err_lower or "").lower()
+    b_up = str(broker_name or "").upper()
+    if b_up == "WEBULL":
+        if any(
+            k in err_l
+            for k in (
+                "http status: 401",
+                "http 401",
+                "status: 401",
+                "unauthorized",
+                "invalid credentials",
+                "error_check_token_enable",
+                "error_init_token",
+                "sign",
+            )
+        ):
+            return "auth_transient"
+        return "net"
+    if any(
+        k in err_l
+        for k in (
+            "invalid_grant",
+            "unsupported_token_type",
+            "refresh_token",
+            "token expired",
+            "token rejected",
+            "safety buffer",
+        )
+    ):
+        return "hard"
+    if any(
+        k in err_l
+        for k in ("http 401", "http status: 401", "status: 401", "unauthorized")
+    ):
+        return "auth_transient"
+    return "net"
+
+
+def _format_disconnect_alarm_copy(
+    is_tok_exp, is_wb_auth_err, auth_fail_count, total_fail_count
+):
+    """Returns (base_prefix, reason_msg, voice_msg, pill_lbl_1, pill_lbl_2, is_hard_keys)
+    so Attempt #2+ alerts, Attempt #N rewrites, and escalations stay uniform."""
+    att = max(1, int(total_fail_count))
+    if is_tok_exp:
+        pfx = "BROKER TOKEN EXPIRED — RESTART APP TO RE-LOGIN"
+        return (
+            pfx,
+            pfx,
+            "Warning. Broker token expired. Please restart Enforcer to log in.",
+            "TOKEN",
+            "EXPIRED",
+            True,
+        )
+    if is_wb_auth_err:
+        if int(auth_fail_count) >= 15:
+            pfx = "WEBULL KEYS REJECTED — CHECK KEYS / PC CLOCK"
+            return (
+                pfx,
+                f"{pfx} (ATTEMPT #{att})",
+                "Warning. Webull keeps rejecting credentials. Check your API keys or PC clock.",
+                "AUTH",
+                f"RETRY #{att}",
+                True,
+            )
+        pfx = "WEBULL AUTH/GATEWAY ERROR — RETRYING"
+        return (
+            pfx,
+            f"{pfx} (ATTEMPT #{att})",
+            "Warning. Webull authentication or gateway error. Attempting to reconnect automatically.",
+            "AUTH",
+            f"RETRY #{att}",
+            False,
+        )
+    pfx = "CONNECTION LOST — AUTO-RECONNECTING"
+    return (
+        pfx,
+        f"{pfx} (ATTEMPT #{att})",
+        "Warning. Connection lost. Attempting to reconnect automatically.",
+        "OFFLINE",
+        f"RETRY #{att}",
+        False,
+    )
+
+
 def is_disconnect_alarm_reason(reason):
     """Returns True when an alarm reason represents a broker API connection
-    drop or token expiration rather than a position/loss threshold breach."""
+    drop, Webull auth/gateway retry, or token expiration rather than a
+    position/loss threshold breach."""
     r_up = str(reason or "").upper()
     return any(
         k in r_up
-        for k in ("CONNECTION LOST", "DISCONNECTED", "TOKEN EXPIRED")
+        for k in (
+            "CONNECTION LOST",
+            "DISCONNECTED",
+            "TOKEN EXPIRED",
+            "AUTH/GATEWAY",
+            "KEYS REJECTED",
+        )
     )
 
 
@@ -16561,7 +16827,7 @@ def sound_disconnect_alert_loop(my_gen=None):
         if _settings_suppresses_alarms():
             time.sleep(0.20)
             continue
-        if not config.get("mute_all_audio", False):
+        if not config.get("mute_all_audio", False) and not _is_disconnect_audio_suppressed():
             play_disconnect_tone_once()
         # Wait 4.5s between gentle reminders in 0.15s slices for instant mute/recovery
         for _ in range(30):
@@ -16659,18 +16925,19 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
                 f"Suppressed background siren loop while Settings modal is open (bounded one-shot + deferred HUD queue): {reason}{extra}",
             )
             if "INTERNAL POLL ERROR" not in r_up and not config.get("mute_all_audio", False):
-                def _one_shot_modal_alert():
-                    try:
-                        if is_disc:
-                            play_disconnect_tone_once()
-                        else:
-                            winsound.Beep(2600, 180)
-                            time.sleep(0.05)
-                            winsound.Beep(2600, 180)
-                    except Exception:
-                        pass
-                threading.Thread(target=_one_shot_modal_alert, daemon=True).start()
-                speak_async(f"Alert: {_humanize_alarm_reason(reason, for_tts=True)}")
+                if not (is_disc and _is_disconnect_audio_suppressed()):
+                    def _one_shot_modal_alert():
+                        try:
+                            if is_disc:
+                                play_disconnect_tone_once()
+                            else:
+                                winsound.Beep(2600, 180)
+                                time.sleep(0.05)
+                                winsound.Beep(2600, 180)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_one_shot_modal_alert, daemon=True).start()
+                    speak_async(f"Alert: {_humanize_alarm_reason(reason, for_tts=True)}")
         return False
 
     preempted_by_reason = None
@@ -25033,6 +25300,117 @@ def _flush_pending_postlaunch_auth():
     return _apply_postlaunch_preflight_auth(*pending)
 
 
+def _maybe_expire_disconnect_flap_quiet(now_mono=None):
+    """Clears flap-storm audio suppression once the connection stays healthy
+    for >= 30s so a genuinely separate outage later gets full audio again."""
+    global _disc_flap_quiet_active, _disc_flap_unstable_announced
+    global _disc_flap_drop_monos
+    now_m = time.monotonic() if now_mono is None else float(now_mono)
+    _disc_flap_drop_monos = [
+        t for t in _disc_flap_drop_monos if (now_m - float(t)) <= 60.0
+    ]
+    if (
+        _disc_flap_quiet_active
+        and _disc_stable_since_mono > 0.0
+        and (now_m - _disc_stable_since_mono) >= 30.0
+    ):
+        _disc_flap_quiet_active = False
+        _disc_flap_unstable_announced = False
+
+
+def _evaluate_disconnect_flap_start(is_tok_exp, is_hard_keys, v_msg, now_mono=None):
+    """Records a new outage episode in the 60s sliding flap window and returns
+    whether initial disconnect speech should play immediately or be suppressed
+    until the outage proves sustained (att >= 3)."""
+    global _disc_flap_drop_monos, _disc_flap_quiet_active
+    global _disc_flap_unstable_announced, _disc_stable_since_mono
+    global _disc_audio_announced, _disc_audio_suppressed_for_outage
+    now_m = time.monotonic() if now_mono is None else float(now_mono)
+    _disc_stable_since_mono = 0.0
+    _disc_flap_drop_monos = [
+        t for t in _disc_flap_drop_monos if (now_m - float(t)) <= 60.0
+    ]
+    if not is_tok_exp and not is_hard_keys:
+        _disc_flap_drop_monos.append(now_m)
+        if len(_disc_flap_drop_monos) >= 3:
+            _disc_flap_quiet_active = True
+            if not _disc_flap_unstable_announced:
+                _disc_flap_unstable_announced = True
+                log_event(
+                    "WARN",
+                    f"Broker API connection unstable ({len(_disc_flap_drop_monos)} drops/60s) — "
+                    f"quieting rapid repeat audio until stable for 30s.",
+                )
+                speak_async("Broker connection is unstable. I'm watching it.")
+    suppress_audio = bool(
+        _disc_flap_quiet_active and not is_tok_exp and not is_hard_keys
+    )
+    _disc_audio_suppressed_for_outage = suppress_audio
+    _disc_audio_announced = not suppress_audio
+    if not suppress_audio:
+        speak_async(v_msg)
+    return not suppress_audio
+
+
+def _handle_disconnect_recovery(recovered_attempts, was_alerted, mute_btn, now_mono=None):
+    """Handles transition back to live API health: resets outage/auth streaks,
+    purges transient disconnect alarm dedup keys, pairs 'Connection restored'
+    speech/chime strictly with whether 'Connection lost' audio played, and stamps
+    the 30s flap-stability clock."""
+    global consecutive_api_failures, _consecutive_auth_failures
+    global api_disconnect_alerted, _disc_audio_announced
+    global _disc_audio_suppressed_for_outage, _disc_active_reason_prefix
+    global _disc_stable_since_mono, alarm_active, last_alarm_reason
+    now_m = time.monotonic() if now_mono is None else float(now_mono)
+    was_audio_announced = bool(_disc_audio_announced)
+    consecutive_api_failures = 0
+    _consecutive_auth_failures = 0
+    api_disconnect_alerted = False
+    _disc_audio_announced = False
+    _disc_audio_suppressed_for_outage = False
+    _disc_active_reason_prefix = ""
+    _disc_stable_since_mono = now_m
+    _purge_disconnect_alarm_dedup()
+    if was_alerted:
+        with _alarm_loop_lock:
+            if alarm_active and is_disconnect_alarm_reason(last_alarm_reason):
+                alarm_active = False
+                last_alarm_reason = ""
+        if was_audio_announced:
+            speak_async("Connection restored. Enforcer is back online.")
+        if (
+            was_audio_announced
+            and config.get("enable_upside_chime", True)
+            and mute_btn is not None
+        ):
+            trigger_upside_tier_glow(
+                mute_btn,
+                "✓ CONNECTION RESTORED — BACK ONLINE",
+                f"Broker API connection restored after {recovered_attempts} attempt(s).",
+                log_tag="SESSION",
+            )
+        else:
+            log_event(
+                "SESSION",
+                f"Broker API connection restored after {recovered_attempts} attempt(s).",
+            )
+            if not alarm_active and not cooldown_active and mute_btn is not None:
+                mute_btn.after(
+                    0,
+                    lambda: apply_idle_button_config(mute_btn),
+                )
+    else:
+        log_event(
+            "SESSION",
+            "Broker API poll recovered after 1 retry.",
+        )
+        if not alarm_active and not cooldown_active and mute_btn is not None:
+            mute_btn.after(
+                0,
+                lambda: apply_idle_button_config(mute_btn),
+            )
+
+
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global anchor_cash_flow, _last_logged_unanchored_cash_flow
@@ -25048,6 +25426,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
     global consecutive_api_failures, consecutive_loop_exceptions, api_disconnect_alerted
+    global _consecutive_auth_failures, _disc_flap_drop_monos
+    global _disc_flap_quiet_active, _disc_flap_unstable_announced
+    global _disc_stable_since_mono, _disc_audio_announced
+    global _disc_audio_suppressed_for_outage, _disc_active_reason_prefix
     global alarm_active, last_alarm_reason, daily_breach_settings_prompted
     global pending_halt_breach, active_session_date
     global _initial_positions_verified, last_data_loop_heartbeat
@@ -25058,6 +25440,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     consecutive_api_failures = 0
     consecutive_loop_exceptions = 0
     api_disconnect_alerted = False
+    _reset_disconnect_flap_state()
     rate_limit_hold_since = 0.0
     rate_limit_anchor_hold_logged = False
     _data_loop_wake_event.clear()
@@ -25148,46 +25531,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 if not snap_was_cached and (
                     consecutive_api_failures > 0 or api_disconnect_alerted
                 ):
-                    recovered_attempts = max(1, consecutive_api_failures)
-                    was_alerted = api_disconnect_alerted
-                    consecutive_api_failures = 0
-                    api_disconnect_alerted = False
-                    _purge_disconnect_alarm_dedup()
-                    if was_alerted:
-                        with _alarm_loop_lock:
-                            if alarm_active and is_disconnect_alarm_reason(
-                                last_alarm_reason
-                            ):
-                                alarm_active = False
-                                last_alarm_reason = ""
-                        speak_async("Connection restored. Enforcer is back online.")
-                        if config.get("enable_upside_chime", True):
-                            trigger_upside_tier_glow(
-                                mute_btn,
-                                "✓ CONNECTION RESTORED — BACK ONLINE",
-                                f"Broker API connection restored after {recovered_attempts} attempt(s).",
-                                log_tag="SESSION",
-                            )
-                        else:
-                            log_event(
-                                "SESSION",
-                                f"Broker API connection restored after {recovered_attempts} attempt(s).",
-                            )
-                            if not alarm_active and not cooldown_active:
-                                mute_btn.after(
-                                    0,
-                                    lambda: apply_idle_button_config(mute_btn),
-                                )
-                    else:
-                        log_event(
-                            "SESSION",
-                            "Broker API poll recovered after 1 retry.",
-                        )
-                        if not alarm_active and not cooldown_active:
-                            mute_btn.after(
-                                0,
-                                lambda: apply_idle_button_config(mute_btn),
-                            )
+                    _handle_disconnect_recovery(
+                        max(1, consecutive_api_failures),
+                        api_disconnect_alerted,
+                        mute_btn,
+                    )
+                elif not snap_was_cached and _disc_flap_quiet_active:
+                    _maybe_expire_disconnect_flap_quiet()
                 current_is_flat = is_flat
 
                 today_now = get_today_str()
@@ -26228,27 +26578,39 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 if not hold_429_active:
                     consecutive_api_failures += 1
-                    is_tok_exp = any(
-                        k in err_lower
-                        for k in (
-                            "invalid_grant",
-                            "unsupported_token_type",
-                            "expired",
-                            "unauthorized",
-                            "http 401",
-                        )
+                    poll_b_name = str(getattr(poll_ad, "name", "") or "").upper()
+                    auth_kind = _classify_poll_auth_error(poll_b_name, err_lower)
+                    if auth_kind in ("hard", "auth_transient"):
+                        _consecutive_auth_failures += 1
+                    else:
+                        _consecutive_auth_failures = 0
+                    is_webull_poll = poll_b_name == "WEBULL"
+                    is_tok_exp = (auth_kind == "hard") or (
+                        (not is_webull_poll)
+                        and auth_kind == "auth_transient"
+                        and _consecutive_auth_failures >= 3
+                    )
+                    is_wb_auth_err = is_webull_poll and (
+                        auth_kind == "auth_transient"
                     )
                     if consecutive_api_failures == 1 and not is_tok_exp:
-                        if hasattr(poll_ad, "reconnect_session"):
-                            try:
-                                poll_ad.reconnect_session()
-                            except Exception:
-                                pass
-                        log_event(
-                            "WARN",
-                            f"Broker API poll failed (Attempt #1: {_clip_log_detail(raw_err, 140)}) — "
-                            f"refreshed HTTP session & retrying automatically...",
-                        )
+                        if is_wb_auth_err:
+                            log_event(
+                                "WARN",
+                                f"Broker API poll failed (Attempt #1: {_clip_log_detail(raw_err, 140)}) — "
+                                f"retrying automatically...",
+                            )
+                        else:
+                            if hasattr(poll_ad, "reconnect_session"):
+                                try:
+                                    poll_ad.reconnect_session()
+                                except Exception:
+                                    pass
+                            log_event(
+                                "WARN",
+                                f"Broker API poll failed (Attempt #1: {_clip_log_detail(raw_err, 140)}) — "
+                                f"refreshed HTTP session & retrying automatically...",
+                            )
                         if not alarm_active and not cooldown_active:
                             if getattr(mute_btn, "_show_status_led", False):
                                 mute_btn.after(
@@ -26274,22 +26636,33 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                     ),
                                 )
                     elif is_tok_exp or consecutive_api_failures >= 2:
+                        att = consecutive_api_failures
                         if not is_tok_exp and hasattr(poll_ad, "reconnect_session"):
-                            if (
-                                consecutive_api_failures == 2
-                                or consecutive_api_failures % 3 == 0
-                            ):
+                            should_reinit_wb = is_wb_auth_err and (
+                                att == 3 or att % 6 == 0
+                            )
+                            should_reinit_std = (not is_wb_auth_err) and (
+                                att == 2 or att % 3 == 0
+                            )
+                            if should_reinit_wb or should_reinit_std:
                                 try:
                                     poll_ad.reconnect_session()
                                 except Exception:
                                     pass
-                        lbl_1 = "TOKEN" if is_tok_exp else "OFFLINE"
-                        lbl_2 = (
-                            "EXPIRED"
-                            if is_tok_exp
-                            else f"RETRY #{consecutive_api_failures}"
+                        (
+                            base_prefix,
+                            r_msg,
+                            v_msg,
+                            lbl_1,
+                            lbl_2,
+                            is_hard_keys,
+                        ) = _format_disconnect_alarm_copy(
+                            is_tok_exp,
+                            is_wb_auth_err,
+                            _consecutive_auth_failures,
+                            att,
                         )
-                        col_2_bg = "#7b241c" if is_tok_exp else "#92400e"
+                        col_2_bg = "#7b241c" if is_hard_keys else "#92400e"
                         n_cols = max(1, len(get_active_hud_columns(config)))
                         err_cols = []
                         for idx in range(n_cols):
@@ -26307,35 +26680,49 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         )
                         if not api_disconnect_alerted:
                             api_disconnect_alerted = True
-                            r_msg = (
-                                "BROKER TOKEN EXPIRED — RESTART APP TO RE-LOGIN"
-                                if is_tok_exp
-                                else f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{consecutive_api_failures})"
-                            )
-                            v_msg = (
-                                "Warning. Broker token expired. Please restart Enforcer to log in."
-                                if is_tok_exp
-                                else "Warning. Connection lost. Attempting to reconnect automatically."
-                            )
+                            _disc_active_reason_prefix = base_prefix
                             log_event(
                                 "WARN",
                                 f"Connection lost ({poll_ad.name}: {_clip_log_detail(raw_err, 140)}). "
-                                f"Auto-reconnecting (Attempt #{consecutive_api_failures})...",
+                                f"Auto-reconnecting (Attempt #{att})...",
                             )
-                            speak_async(v_msg)
+                            _evaluate_disconnect_flap_start(
+                                is_tok_exp, is_hard_keys, v_msg
+                            )
                             trigger_alarm(
                                 r_msg,
                                 mute_btn,
                                 _clip_log_detail(raw_err, 140),
                             )
                         else:
-                            att = consecutive_api_failures
-                            if att % 5 == 0:
+                            promoted_hard = (
+                                base_prefix != _disc_active_reason_prefix
+                                and (is_tok_exp or is_hard_keys)
+                            )
+                            _disc_active_reason_prefix = base_prefix
+                            if promoted_hard or att % 5 == 0:
                                 log_event(
                                     "WARN",
                                     f"Still offline — auto-reconnect attempt #{att} "
-                                    f"({_clip_log_detail(raw_err, 140)})...",
+                                    f"({base_prefix}: {_clip_log_detail(raw_err, 140)})...",
                                 )
+                            if promoted_hard:
+                                _disc_audio_suppressed_for_outage = False
+                                _disc_audio_announced = True
+                                speak_async(v_msg)
+                                trigger_alarm(
+                                    r_msg,
+                                    mute_btn,
+                                    _clip_log_detail(raw_err, 140),
+                                )
+                            elif (
+                                _disc_audio_suppressed_for_outage
+                                and not _disc_audio_announced
+                                and att >= 3
+                            ):
+                                _disc_audio_suppressed_for_outage = False
+                                _disc_audio_announced = True
+                                speak_async(v_msg)
                             if not is_tok_exp:
                                 with _alarm_loop_lock:
                                     disc_alarm_live = bool(
@@ -26346,15 +26733,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                     )
                                     any_alarm_live = bool(alarm_active)
                                     if disc_alarm_live:
-                                        last_alarm_reason = (
-                                            f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})"
-                                        )
+                                        last_alarm_reason = r_msg
                                 if disc_alarm_live:
-                                    al_btn_txt = (
-                                        f"🔔 RECONNECTING (#{att}) (MUTE)"
-                                        if is_compact_hud()
-                                        else f"🔔 CONNECTION LOST — RECONNECTING (ATTEMPT #{att}) (CLICK TO MUTE)"
-                                    )
+                                    al_btn_txt = format_alarm_button_text(r_msg)
                                     al_led_kw = (
                                         {"led_hex": "#ef4444", "led_style": "solid"}
                                         if getattr(mute_btn, "_show_status_led", False)
@@ -26381,9 +26762,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                         )
                                     else:
                                         re_btn_txt = (
-                                            f"🔄 RECONNECTING (#{att})..."
-                                            if is_compact_hud()
-                                            else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
+                                            f"🔄 AUTH RETRY (#{att})..."
+                                            if (is_wb_auth_err and is_compact_hud())
+                                            else (
+                                                f"🔄 RECONNECTING (#{att})..."
+                                                if is_compact_hud()
+                                                else f"🔄 {base_prefix} (ATTEMPT #{att})..."
+                                            )
                                         )
                                         mute_btn.after(
                                             0,
