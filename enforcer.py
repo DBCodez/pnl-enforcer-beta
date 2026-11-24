@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.84"
+APP_VERSION = "0.9.85"
 
 import os
 import sys
@@ -2403,8 +2403,7 @@ LOG_RETENTION_DAYS = 90
 CALLBACK_URL = "https://127.0.0.1"
 BUG_REPORT_FORM_URL = "https://tally.so/r/Z98y4V"
 BETA_TELEMETRY_WEBHOOK_URL = (
-    "https://script.google.com/macros/s/"
-    "AKfycbwNR51toSgE4izajaN1hvX0R84Z6m169JNTD-54CTzu9sAVvOz0Ripk3BU-u59bZJ_W/exec"
+    "https://pnl-enforcer-logs.dbcodez-logs.workers.dev/"
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -2506,6 +2505,7 @@ DEFAULT_CONFIG = {
     "show_debug_console": False,
     "check_updates_on_startup": True,
     "start_with_windows": False,
+    "desktop_tidy_dismissed": False,
     "skipped_update_version": "",
     "last_uploaded_sanitized_log": "",
     "anonymous_tester_id": "",
@@ -2762,6 +2762,11 @@ _reconciled_through_epoch = 0.0
 _reconciled_order_qty = {}
 _off_session_peak_reconstructed = False
 _off_session_reconciled = False
+_off_session_pending_boundary = None
+SCHWAB_ORDERS_58D_READ_TIMEOUT_SEC = 12.0
+ORDERS_FETCH_LOCK_WAIT_SEC = SCHWAB_ORDERS_58D_READ_TIMEOUT_SEC + 1.0
+ORDERS_WINDOW_FAIL_COOLDOWN_SEC = 2.0
+OFF_SESSION_DEFER_MAX_RETRIES = 5
 _cold_launch_ignored_qty_mutated = False
 _last_live_hud_snapshot = None
 _pending_postlaunch_auth = None
@@ -4036,6 +4041,48 @@ def _scrub_log_line(message):
     return msg
 
 
+SANITIZED_LOG_FORMAT_REV = "rev2"
+
+
+def _redact_balance_figures(line_str):
+    """Redacts total account equity/cash figures (including negative margin
+    debits formatted as '$-1,234.56' or '-$1,234.56') while preserving relative PnL."""
+    s = str(line_str or "")
+    amt_pat = r"-?\$-?[0-9][0-9,]*(?:\.[0-9]{1,4})?"
+    s = re.sub(rf"(Baseline anchored to:\s*){amt_pat}", r"\1$[REDACTED]", s)
+    s = re.sub(
+        rf"(starting baseline from\s*){amt_pat}(\s+to\s+){amt_pat}",
+        r"\1$[REDACTED]\2$[REDACTED]",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        rf"((?:Start|Baseline|LastFlat|TotalAccountValue|NetLiq|Cash|MarketVal)=){amt_pat}",
+        r"\1$[REDACTED]",
+        s,
+    )
+    s = re.sub(
+        rf"(session initialized at\s*){amt_pat}",
+        r"\1$[REDACTED]",
+        s,
+        flags=re.IGNORECASE,
+    )
+    return s
+
+
+def sanitize_user_report_text(raw_text, max_len=None):
+    """Scrubs user-entered bug report descriptions or contact strings against
+    accidental token, account-hash, Windows user-path, order-ID, or balance leaks."""
+    cleaned_lines = [
+        _redact_balance_figures(_scrub_log_line(ln))
+        for ln in str(raw_text or "").splitlines()
+    ]
+    out = "\n".join(cleaned_lines).strip()
+    if max_len is not None and max_len > 0 and len(out) > max_len:
+        out = out[:max_len].rstrip()
+    return out
+
+
 def sanitize_log_for_export(raw_log_text):
     """Produces a share-safe version of a session log with all total account
     balances/equities redacted ($[REDACTED]) while keeping all relative PnL
@@ -4045,34 +4092,11 @@ def sanitize_log_for_export(raw_log_text):
     inserted_notice = False
 
     for line in lines:
-        s = _scrub_log_line(line)
-        # Redact total account equity / balance figures while keeping relative PnL
-        s = re.sub(
-            r"(Baseline anchored to:\s*)\$[0-9,]+(?:\.[0-9]{2})?",
-            r"\1$[REDACTED]",
-            s,
-        )
-        s = re.sub(
-            r"(starting baseline from\s*)\$[0-9,]+(?:\.[0-9]{2})?(\s+to\s+)\$[0-9,]+(?:\.[0-9]{2})?",
-            r"\1$[REDACTED]\2$[REDACTED]",
-            s,
-            flags=re.IGNORECASE,
-        )
-        s = re.sub(
-            r"((?:Start|Baseline|LastFlat|TotalAccountValue|NetLiq|Cash|MarketVal)=)\$[0-9,]+(?:\.[0-9]{2})?",
-            r"\1$[REDACTED]",
-            s,
-        )
-        s = re.sub(
-            r"(session initialized at\s*)\$[0-9,]+(?:\.[0-9]{2})?",
-            r"\1$[REDACTED]",
-            s,
-            flags=re.IGNORECASE,
-        )
+        s = _redact_balance_figures(_scrub_log_line(line))
         out_lines.append(s)
         if not inserted_notice and s.startswith("==="):
             out_lines.append(
-                "[SANITIZED EXPORT: Total account balances, user paths, "
+                f"[SANITIZED EXPORT ({SANITIZED_LOG_FORMAT_REV}): Total account balances, user paths, "
                 "and full order IDs redacted for safe sharing]"
             )
             inserted_notice = True
@@ -4113,6 +4137,14 @@ def _sync_sanitized_log_archive():
                         needs_gen = True
                 except OSError:
                     pass
+            if not needs_gen:
+                try:
+                    with open(san_path, "r", encoding="utf-8", errors="replace") as shf:
+                        head_san = shf.read(512)
+                    if f"SANITIZED EXPORT ({SANITIZED_LOG_FORMAT_REV})" not in head_san:
+                        needs_gen = True
+                except OSError:
+                    needs_gen = True
             if needs_gen:
                 try:
                     with open(
@@ -4147,6 +4179,18 @@ def _sync_sanitized_log_archive():
 _telemetry_auto_upload_in_flight = False
 
 
+def _cap_sanitized_log_for_upload(sanitized_text, max_chars=2_200_000):
+    """Caps uploaded sanitized logs at max_chars while preserving the session
+    header, startup config, and most recent trading/error lines."""
+    txt = str(sanitized_text or "")
+    if max_chars is None or max_chars <= 0 or len(txt) <= max_chars:
+        return txt
+    head_len = min(3_500, max(0, max_chars // 4))
+    notice = "\n[...middle log lines trimmed cleanly for upload size limit...]\n"
+    tail_len = max(256, max_chars - head_len - len(notice))
+    return txt[:head_len] + notice + txt[-tail_len:]
+
+
 def _upload_sanitized_log_to_drive(
     filename, sanitized_text, active_broker, anonymous_id, extra_fields=None
 ) -> bool:
@@ -4157,12 +4201,13 @@ def _upload_sanitized_log_to_drive(
     import urllib.request
 
     try:
+        safe_content = _cap_sanitized_log_for_upload(sanitized_text)
         payload_dict = {
             "filename": str(filename),
             "version": APP_VERSION,
             "broker": str(active_broker or "SCHWAB"),
             "tester_id": str(anonymous_id or ""),
-            "content": str(sanitized_text or ""),
+            "content": safe_content,
         }
         if isinstance(extra_fields, dict):
             for ek, ev in extra_fields.items():
@@ -4172,7 +4217,10 @@ def _upload_sanitized_log_to_drive(
         req = urllib.request.Request(
             BETA_TELEMETRY_WEBHOOK_URL,
             data=payload_bytes,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"PnL-Enforcer/{APP_VERSION}",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -6183,7 +6231,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     global _restored_open_positions_at_save, _restored_has_open_pos_snapshot
     global _reconciled_through_epoch, _reconciled_order_qty
     global _off_session_peak_reconstructed
-    global _off_session_reconciled, _cold_launch_ignored_qty_mutated
+    global _off_session_reconciled, _off_session_pending_boundary, _cold_launch_ignored_qty_mutated
     global _last_live_hud_snapshot
     global recent_loss_timestamps, ignored_positions, pending_halt_breach
     global active_non_breach_halted_syms, _notified_non_breach_halt_syms
@@ -6209,6 +6257,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     _reconciled_order_qty.clear()
     _off_session_peak_reconstructed = False
     _off_session_reconciled = False
+    _off_session_pending_boundary = None
     _cold_launch_ignored_qty_mutated = False
     active_breach_source = ""
     _manual_reanchor_pending = False
@@ -6800,13 +6849,43 @@ def save_session_state(
         eff_rec_ep = round(
             max(float(_reconciled_through_epoch or 0.0), eff_snap_ep), 2
         )
+        disk_last_flat = last_flat_equity
+        disk_was_flat = bool(current_is_flat)
+        disk_open_pos = open_pos_save_map
+        disk_snap_ep = eff_snap_ep
+        if (
+            isinstance(_off_session_pending_boundary, dict)
+            and not _off_session_reconciled
+            and str(active_b).upper() != "DEMO"
+        ):
+            pb_s = _off_session_pending_boundary
+            pb_since = round(float(pb_s.get("eff_since", 0.0) or 0.0), 2)
+            eff_rec_ep = pb_since
+            if pb_since > 0.0:
+                disk_snap_ep = pb_since
+            pb_ref = float(pb_s.get("ref_flat", 0.0) or 0.0)
+            pb_set = float(pb_s.get("settled_flat_eq", 0.0) or 0.0)
+            if pb_ref > 0.0 and pb_set > 0.0:
+                if pb_s.get("live_advanced") and last_flat_equity is not None:
+                    live_shift = float(last_flat_equity) - pb_set
+                    disk_last_flat = _round_cents(pb_ref + live_shift)
+                else:
+                    disk_last_flat = _round_cents(pb_ref)
+                if (
+                    abs(float(last_flat_equity or pb_set) - pb_set) < 0.01
+                    and bool(current_is_flat) == bool(pb_s.get("is_flat", True))
+                ):
+                    disk_was_flat = bool(pb_s.get("was_flat_before", True))
+                    disk_open_pos = json.loads(
+                        json.dumps(pb_s.get("restored_pos") or {})
+                    )
         new_entry = {
             "session_date": today_str,
             "start_equity": start_equity,
             "max_equity": max_equity,
             "daily_max_equity": daily_max_equity,
             "daily_min_equity": daily_min_equity,
-            "last_flat_equity": last_flat_equity,
+            "last_flat_equity": disk_last_flat,
             "anchor_cash_flow": round(float(anchor_cash_flow or 0.0), 2),
             "has_reset_at_open": has_reset_at_open,
             "has_reset_at_close": has_reset_at_close,
@@ -6849,12 +6928,12 @@ def save_session_state(
                 )
                 else None
             ),
-            "was_flat_at_save": bool(current_is_flat),
-            "open_positions_at_save": open_pos_save_map,
+            "was_flat_at_save": disk_was_flat,
+            "open_positions_at_save": disk_open_pos,
             "pnl_curve": _export_pnl_curve_for_session(s_key, today_str),
             "reconciled_through_epoch": eff_rec_ep,
             "reconciled_order_qty": roq_clean,
-            "snapshot_epoch": eff_snap_ep,
+            "snapshot_epoch": disk_snap_ep,
             "last_saved_epoch": now_ep,
         }
 
@@ -8015,6 +8094,8 @@ class SchwabAdapter:
             self._filled_since_cache = {}
         if not isinstance(getattr(self, "_filled_today_cache", None), dict):
             self._filled_today_cache = {}
+        if not isinstance(getattr(self, "_orders_window_fail_ts", None), dict):
+            self._orders_window_fail_ts = {}
 
     def invalidate_cached_snapshots(self):
         self._ensure_orders_cache_infra()
@@ -8026,6 +8107,7 @@ class SchwabAdapter:
             self._filled_since_cache.clear()
             self._filled_today_cache.clear()
             self._raw_orders_window_cache.clear()
+            self._orders_window_fail_ts.clear()
 
     def _prune_pending_flatten_cids(self, acct_id, live_qty_map):
         if not acct_id or not self._pending_flatten_cids:
@@ -9072,7 +9154,13 @@ class SchwabAdapter:
         except Exception:
             return s[:10]
 
-    def _get_orders_window_cached(self, window_tag="58d", ttl_sec=8.0):
+    def _get_orders_window_cached(
+        self,
+        window_tag="58d",
+        ttl_sec=8.0,
+        lock_wait_sec=None,
+        respect_fail_cooldown=False,
+    ):
         """Coalesces concurrent Schwab order-history queries behind a timeout-
         bounded single-flight lock and caches the raw JSON list for `ttl_sec`
         seconds keyed by `(account_id, _snapshot_gen, window_tag)` so
@@ -9083,6 +9171,17 @@ class SchwabAdapter:
         if not self.client or not self.account_id:
             return None
         win_tag = "36h" if str(window_tag) == "36h" else "58d"
+
+        def _is_fail_cooldown_active(rec_val, now_m):
+            if rec_val is None:
+                return False
+            if isinstance(rec_val, tuple) and len(rec_val) >= 2:
+                f_m, f_ms = float(rec_val[0]), float(rec_val[1])
+            else:
+                f_m, f_ms = float(rec_val), 999.0
+            if (now_m - f_m) >= ORDERS_WINDOW_FAIL_COOLDOWN_SEC:
+                return False
+            return bool(respect_fail_cooldown or f_ms >= 200.0)
 
         def _lookup_cached_locked(
             acct_k, gen_k, cl_obj, inv_sig, cur_snap_ep, now_t
@@ -9110,6 +9209,7 @@ class SchwabAdapter:
         acct_cur = str(self.account_id)
         inv_sig_cur = _compute_orders_cache_inv_sig(self, acct_cur)
         snap_ep_cur = self.get_last_snapshot_epoch()
+        now_mono_pre = time.monotonic()
         with self._cache_lock:
             hit = _lookup_cached_locked(
                 acct_cur,
@@ -9119,10 +9219,31 @@ class SchwabAdapter:
                 snap_ep_cur,
                 time.time(),
             )
+            fail_m_pre = self._orders_window_fail_ts.get(
+                (acct_cur, self._snapshot_gen)
+            )
         if hit is not None:
             return hit
+        if _is_fail_cooldown_active(fail_m_pre, now_mono_pre):
+            return None
 
-        acquired = self._orders_fetch_lock.acquire(timeout=6.0)
+        eff_wait = float(
+            ORDERS_FETCH_LOCK_WAIT_SEC
+            if lock_wait_sec is None
+            else lock_wait_sec
+        )
+        acquired = self._orders_fetch_lock.acquire(timeout=max(0.05, eff_wait))
+        if not acquired:
+            log_event(
+                "WARN",
+                f"Schwab get_orders_for_account({win_tag}) single-flight lock wait "
+                f"({eff_wait:.1f}s) timed out; skipping duplicate request.",
+            )
+            return None
+        t0 = time.monotonic()
+        gen_before = 0
+        cl_before = None
+        acct_before = ""
         try:
             with self._cache_lock:
                 gen_before = self._snapshot_gen
@@ -9140,10 +9261,34 @@ class SchwabAdapter:
                     snap_ep_before,
                     time.time(),
                 )
+                fail_m2 = self._orders_window_fail_ts.get(
+                    (acct_before, gen_before)
+                )
             if hit2 is not None:
                 return hit2
+            if _is_fail_cooldown_active(fail_m2, time.monotonic()):
+                return None
             if not cl_before or not acct_before:
                 return None
+
+            def _record_sc_orders_fail(reason_txt):
+                dt_f_ms = (time.monotonic() - t0) * 1000.0
+                with self._cache_lock:
+                    if (
+                        self._snapshot_gen == gen_before
+                        and self.client is cl_before
+                        and str(self.account_id or "") == acct_before
+                    ):
+                        if len(self._orders_window_fail_ts) > 24:
+                            self._orders_window_fail_ts.clear()
+                        self._orders_window_fail_ts[
+                            (acct_before, gen_before)
+                        ] = (time.monotonic(), dt_f_ms)
+                log_event(
+                    "WARN",
+                    f"Schwab get_orders_for_account({win_tag}) failed in "
+                    f"{dt_f_ms:.0f}ms ({reason_txt}).",
+                )
 
             now_utc = datetime.now(timezone.utc)
             from_dt = (
@@ -9153,26 +9298,53 @@ class SchwabAdapter:
             )
             to_dt = now_utc + timedelta(hours=1)
             t0 = time.monotonic()
-            try:
-                resp = cl_before.get_orders_for_account(
-                    acct_before,
+            resp = None
+            if (
+                win_tag == "58d"
+                and hasattr(cl_before, "_make_order_query")
+                and hasattr(cl_before, "session")
+                and hasattr(getattr(cl_before, "session", None), "get")
+            ):
+                import httpx
+
+                q_params = cl_before._make_order_query(
+                    max_results=3000,
                     from_entered_datetime=from_dt,
                     to_entered_datetime=to_dt,
-                    max_results=3000,
+                    status=None,
                 )
-            except TypeError:
+                req_timeout = httpx.Timeout(
+                    4.5, read=float(SCHWAB_ORDERS_58D_READ_TIMEOUT_SEC)
+                )
+                resp = cl_before.session.get(
+                    f"https://api.schwabapi.com/trader/v1/accounts/{acct_before}/orders",
+                    params=q_params,
+                    timeout=req_timeout,
+                )
+            else:
                 try:
                     resp = cl_before.get_orders_for_account(
                         acct_before,
                         from_entered_datetime=from_dt,
                         to_entered_datetime=to_dt,
+                        max_results=3000,
                     )
                 except TypeError:
-                    resp = cl_before.get_orders_for_account(acct_before)
-            if resp is None or getattr(resp, "status_code", None) != 200:
+                    try:
+                        resp = cl_before.get_orders_for_account(
+                            acct_before,
+                            from_entered_datetime=from_dt,
+                            to_entered_datetime=to_dt,
+                        )
+                    except TypeError:
+                        resp = cl_before.get_orders_for_account(acct_before)
+            st_code = getattr(resp, "status_code", None) if resp is not None else None
+            if resp is None or st_code != 200:
+                _record_sc_orders_fail(f"HTTP {st_code}")
                 return None
             orders = resp.json()
             if not isinstance(orders, list):
+                _record_sc_orders_fail("non-list JSON payload")
                 return None
             dt_ms = (time.monotonic() - t0) * 1000.0
             try:
@@ -9201,6 +9373,9 @@ class SchwabAdapter:
                     and self.client is cl_before
                     and str(self.account_id or "") == acct_before
                 ):
+                    self._orders_window_fail_ts.pop(
+                        (acct_before, gen_before), None
+                    )
                     if len(self._raw_orders_window_cache) > 24:
                         self._raw_orders_window_cache.clear()
                     self._raw_orders_window_cache[(acct_before, gen_before, win_tag)] = (
@@ -9213,7 +9388,25 @@ class SchwabAdapter:
                         list(orders),
                     )
             return orders
-        except Exception:
+        except Exception as e:
+            if cl_before is not None and acct_before:
+                dt_exc_ms = (time.monotonic() - t0) * 1000.0
+                with self._cache_lock:
+                    if (
+                        self._snapshot_gen == gen_before
+                        and self.client is cl_before
+                        and str(self.account_id or "") == acct_before
+                    ):
+                        if len(self._orders_window_fail_ts) > 24:
+                            self._orders_window_fail_ts.clear()
+                        self._orders_window_fail_ts[
+                            (acct_before, gen_before)
+                        ] = (time.monotonic(), dt_exc_ms)
+                log_event(
+                    "WARN",
+                    f"Schwab get_orders_for_account({win_tag}) failed in "
+                    f"{dt_exc_ms:.0f}ms ({type(e).__name__}).",
+                )
             return None
         finally:
             if acquired:
@@ -9305,11 +9498,13 @@ class SchwabAdapter:
             return True
 
     def has_non_ignored_closing_fills_since(
-        self, since_epoch, was_flat_at_save=True
+        self, since_epoch, was_flat_at_save=True, until_epoch=None
     ):
-        """Returns True ONLY when the Schwab API confirms at least one non-ignored
-        closing order (or any non-ignored fill if the session saved while in a
-        trade) executed on today's ET date at or after `since_epoch`."""
+        """Tri-state check: returns True when the Schwab API confirms at least one
+        non-ignored closing order (or any non-ignored fill if saved while in a trade)
+        executed on today's ET date at or after `since_epoch` (and <= `until_epoch`
+        when provided), False when confirmed absent, or None when order history
+        could not be fetched."""
         if (
             not self.client
             or not self.account_id
@@ -9319,6 +9514,7 @@ class SchwabAdapter:
             return False
         today_str = get_today_str()
         cutoff = float(since_epoch) - 2.0
+        ceil_ep = float(until_epoch) if until_epoch is not None else None
         closing_instrs = {
             "SELL",
             "SELL_TO_CLOSE",
@@ -9326,9 +9522,11 @@ class SchwabAdapter:
             "BUY_TO_CLOSE",
         }
         try:
-            orders = self._get_orders_window_cached("58d")
+            orders = self._get_orders_window_cached(
+                "58d", respect_fail_cooldown=True
+            )
             if not isinstance(orders, list):
-                return False
+                return None
             for o in orders:
                 if not isinstance(o, dict):
                     continue
@@ -9362,6 +9560,8 @@ class SchwabAdapter:
                         fill_dates.add(d_s)
                 if today_str not in fill_dates:
                     continue
+                if ceil_ep is not None:
+                    fill_epochs = [ep for ep in fill_epochs if ep <= ceil_ep]
                 if not fill_epochs or max(fill_epochs) < cutoff:
                     continue
                 for lg in o.get("orderLegCollection") or []:
@@ -9381,7 +9581,7 @@ class SchwabAdapter:
                         return True
             return False
         except Exception:
-            return False
+            return None
 
     def fetch_filled_orders_since(self, since_epoch, fast_recent_only=False):
         """Fetches normalized execution fills on today's ET date at or after
@@ -10949,6 +11149,8 @@ class WebullAdapter:
             self._filled_since_cache = {}
         if not isinstance(getattr(self, "_filled_today_cache", None), dict):
             self._filled_today_cache = {}
+        if not isinstance(getattr(self, "_orders_window_fail_ts", None), dict):
+            self._orders_window_fail_ts = {}
 
     def invalidate_cached_snapshots(self):
         self._ensure_orders_cache_infra()
@@ -10960,6 +11162,7 @@ class WebullAdapter:
             self._filled_since_cache.clear()
             self._filled_today_cache.clear()
             self._raw_orders_window_cache.clear()
+            self._orders_window_fail_ts.clear()
 
     def _reserve_pos_slot(self, own_gap=None, owner="verify"):
         """Serializes Webull `/account/position` requests across `data_loop`
@@ -12139,7 +12342,9 @@ class WebullAdapter:
             log_event("ERROR", f"Webull cancel working orders exception: {e}")
         return False
 
-    def _get_orders_window_cached(self, ttl_sec=8.0):
+    def _get_orders_window_cached(
+        self, ttl_sec=8.0, lock_wait_sec=None, respect_fail_cooldown=False
+    ):
         """Coalesces concurrent Webull order-history queries behind a timeout-
         bounded single-flight lock and caches the raw today order list for
         `ttl_sec` seconds keyed by `(account_id, _snapshot_gen, today_str)`
@@ -12148,6 +12353,17 @@ class WebullAdapter:
         if not self.trade_client or not self.account_id:
             return None
         today_str = get_today_str()
+
+        def _is_wb_fail_cooldown_active(rec_val, now_m):
+            if rec_val is None:
+                return False
+            if isinstance(rec_val, tuple) and len(rec_val) >= 2:
+                f_m, f_ms = float(rec_val[0]), float(rec_val[1])
+            else:
+                f_m, f_ms = float(rec_val), 999.0
+            if (now_m - f_m) >= ORDERS_WINDOW_FAIL_COOLDOWN_SEC:
+                return False
+            return bool(respect_fail_cooldown or f_ms >= 200.0)
 
         def _lookup_wb_locked(
             acct_k, gen_k, tc_obj, inv_sig, cur_snap_ep, now_t
@@ -12173,6 +12389,7 @@ class WebullAdapter:
         acct_cur = str(self.account_id)
         inv_sig_cur = _compute_orders_cache_inv_sig(self, acct_cur)
         snap_ep_cur = self.get_last_snapshot_epoch()
+        now_mono_pre = time.monotonic()
         with self._cache_lock:
             hit = _lookup_wb_locked(
                 acct_cur,
@@ -12182,10 +12399,31 @@ class WebullAdapter:
                 snap_ep_cur,
                 time.time(),
             )
+            fail_m_pre = self._orders_window_fail_ts.get(
+                (acct_cur, self._snapshot_gen)
+            )
         if hit is not None:
             return hit
+        if _is_wb_fail_cooldown_active(fail_m_pre, now_mono_pre):
+            return None
 
-        acquired = self._orders_fetch_lock.acquire(timeout=6.0)
+        eff_wait = float(
+            ORDERS_FETCH_LOCK_WAIT_SEC
+            if lock_wait_sec is None
+            else lock_wait_sec
+        )
+        acquired = self._orders_fetch_lock.acquire(timeout=max(0.05, eff_wait))
+        if not acquired:
+            log_event(
+                "WARN",
+                f"Webull order_history single-flight lock wait ({eff_wait:.1f}s) "
+                f"timed out; skipping duplicate request.",
+            )
+            return None
+        t0 = time.monotonic()
+        gen_before = 0
+        tc_before = None
+        acct_before = ""
         try:
             with self._cache_lock:
                 gen_before = self._snapshot_gen
@@ -12203,8 +12441,13 @@ class WebullAdapter:
                     snap_ep_before,
                     time.time(),
                 )
+                fail_m2 = self._orders_window_fail_ts.get(
+                    (acct_before, gen_before)
+                )
             if hit2 is not None:
                 return hit2
+            if _is_wb_fail_cooldown_active(fail_m2, time.monotonic()):
+                return None
             if not tc_before or not acct_before:
                 return None
 
@@ -12415,6 +12658,22 @@ class WebullAdapter:
                     last_cid_td = next_cid
 
             if not wb_fetch_ok:
+                dt_f_ms = (time.monotonic() - t0) * 1000.0
+                with self._cache_lock:
+                    if (
+                        self._snapshot_gen == gen_before
+                        and self.trade_client is tc_before
+                        and str(self.account_id or "") == acct_before
+                    ):
+                        if len(self._orders_window_fail_ts) > 24:
+                            self._orders_window_fail_ts.clear()
+                        self._orders_window_fail_ts[
+                            (acct_before, gen_before)
+                        ] = (time.monotonic(), dt_f_ms)
+                log_event(
+                    "WARN",
+                    f"Webull order_history failed in {dt_f_ms:.0f}ms (non-200 response).",
+                )
                 return None
 
             dt_ms = (time.monotonic() - t0) * 1000.0
@@ -12433,6 +12692,9 @@ class WebullAdapter:
                     and self.trade_client is tc_before
                     and str(self.account_id or "") == acct_before
                 ):
+                    self._orders_window_fail_ts.pop(
+                        (acct_before, gen_before), None
+                    )
                     if len(self._raw_orders_window_cache) > 24:
                         self._raw_orders_window_cache.clear()
                     self._raw_orders_window_cache[(acct_before, gen_before, today_str)] = (
@@ -12445,7 +12707,24 @@ class WebullAdapter:
                         list(wb_raw_orders),
                     )
             return wb_raw_orders
-        except Exception:
+        except Exception as e:
+            if tc_before is not None and acct_before:
+                dt_exc_ms = (time.monotonic() - t0) * 1000.0
+                with self._cache_lock:
+                    if (
+                        self._snapshot_gen == gen_before
+                        and self.trade_client is tc_before
+                        and str(self.account_id or "") == acct_before
+                    ):
+                        if len(self._orders_window_fail_ts) > 24:
+                            self._orders_window_fail_ts.clear()
+                        self._orders_window_fail_ts[
+                            (acct_before, gen_before)
+                        ] = (time.monotonic(), dt_exc_ms)
+                log_event(
+                    "WARN",
+                    f"Webull order_history failed in {dt_exc_ms:.0f}ms ({type(e).__name__}).",
+                )
             return None
         finally:
             if acquired:
@@ -12571,11 +12850,13 @@ class WebullAdapter:
             return 0.0
 
     def has_non_ignored_closing_fills_since(
-        self, since_epoch, was_flat_at_save=True
+        self, since_epoch, was_flat_at_save=True, until_epoch=None
     ):
-        """Returns True ONLY when the Webull API confirms at least one non-ignored
-        closing order (or any non-ignored fill if the session saved while in a
-        trade) executed on today's ET date at or after `since_epoch`."""
+        """Tri-state check: returns True when the Webull API confirms at least one
+        non-ignored closing order (or any non-ignored fill if saved while in a trade)
+        executed on today's ET date at or after `since_epoch` (and <= `until_epoch`
+        when provided), False when confirmed absent, or None when order history
+        could not be fetched."""
         if (
             not self.trade_client
             or not self.account_id
@@ -12584,10 +12865,11 @@ class WebullAdapter:
         ):
             return False
         cutoff = float(since_epoch) - 2.0
+        ceil_ep = float(until_epoch) if until_epoch is not None else None
         try:
-            orders = self._get_orders_window_cached()
+            orders = self._get_orders_window_cached(respect_fail_cooldown=True)
             if not isinstance(orders, list):
-                return False
+                return None
             for o in orders:
                 if not isinstance(o, dict):
                     continue
@@ -12618,6 +12900,8 @@ class WebullAdapter:
                 )
                 ep = self._webull_ts_to_epoch(raw_t)
                 if ep <= 0.0 or ep < cutoff:
+                    continue
+                if ceil_ep is not None and ep > ceil_ep:
                     continue
                 o_itype = str(
                     o.get("instrument_type")
@@ -12653,7 +12937,7 @@ class WebullAdapter:
                     return True
             return False
         except Exception:
-            return False
+            return None
 
     def fetch_filled_orders_since(self, since_epoch, fast_recent_only=False):
         """Fetches normalized filled Webull orders on today's ET date at or after
@@ -14534,7 +14818,7 @@ class DemoBrokerAdapter:
             return len(self._filled_orders) > 0
 
     def has_non_ignored_closing_fills_since(
-        self, since_epoch, was_flat_at_save=True
+        self, since_epoch, was_flat_at_save=True, until_epoch=None
     ):
         return False
 
@@ -23300,6 +23584,7 @@ def _reconcile_off_session_activity(
     prefetched_closing_confirmed=None,
     allow_network=True,
     prefetched_window=None,
+    preserve_live_equity=False,
 ):
     """Incrementally reconciles off-session broker executions since
     `_reconciled_through_epoch` (whether resuming flat or holding an open trade):
@@ -23318,10 +23603,29 @@ def _reconcile_off_session_activity(
     global last_flat_equity, max_equity, daily_max_equity, daily_min_equity
     global prev_flat_realized_pnl, settled_realized_pnl
     global win_trades, loss_trades, recent_loss_timestamps
-    global _off_session_reconciled, _reconciled_through_epoch, _reconciled_order_qty
+    global _off_session_reconciled, _off_session_pending_boundary
+    global _reconciled_through_epoch, _reconciled_order_qty
     global _restored_session_was_flat, _restored_open_positions_at_save
     global _restored_has_open_pos_snapshot, _off_session_peak_reconstructed
     global last_breach_trigger_net_pnl, _breach_pin_rt_pending
+
+    pend_bnd = (
+        _off_session_pending_boundary
+        if (
+            isinstance(_off_session_pending_boundary, dict)
+            and not _off_session_reconciled
+        )
+        else None
+    )
+    if preserve_live_equity and pend_bnd is not None:
+        is_fl_now = bool(pend_bnd.get("is_flat", is_fl_now))
+        live_open_pnl = float(pend_bnd.get("live_open_pnl", live_open_pnl) or 0.0)
+        pos_details = pend_bnd.get("pos_details", pos_details)
+        eq_now = (
+            float(pend_bnd["settled_flat_eq"])
+            if is_fl_now
+            else float(pend_bnd["settled_flat_eq"]) + live_open_pnl
+        )
 
     if (
         eq_now is None
@@ -23331,7 +23635,21 @@ def _reconcile_off_session_activity(
     ):
         return False
 
-    was_flat_before_reconcile = bool(_restored_session_was_flat)
+    was_flat_before_reconcile = (
+        bool(pend_bnd["was_flat_before"])
+        if pend_bnd is not None and "was_flat_before" in pend_bnd
+        else bool(_restored_session_was_flat)
+    )
+    restored_pos_seed = (
+        pend_bnd["restored_pos"]
+        if pend_bnd is not None and isinstance(pend_bnd.get("restored_pos"), dict)
+        else (_restored_open_positions_at_save or {})
+    )
+    restored_has_pos_seed = (
+        bool(pend_bnd["restored_has_pos"])
+        if pend_bnd is not None and "restored_has_pos" in pend_bnd
+        else bool(_restored_has_open_pos_snapshot)
+    )
     live_pos_map = pos_details if isinstance(pos_details, dict) else {}
     settled_flat_eq_now = (
         _round_cents(float(eq_now))
@@ -23343,22 +23661,34 @@ def _reconcile_off_session_activity(
         if last_flat_equity is not None and float(last_flat_equity) > 0.0
         else _round_cents(float(start_equity))
     )
+    if pend_bnd is not None and float(pend_bnd.get("ref_flat", 0.0) or 0.0) > 0.0:
+        if preserve_live_equity or abs(settled_flat_eq_now - ref_flat) < 0.01:
+            ref_flat = _round_cents(float(pend_bnd["ref_flat"]))
     actual_off_delta = _round_cents(settled_flat_eq_now - ref_flat)
     eff_since = (
-        float(_reconciled_through_epoch)
-        if float(_reconciled_through_epoch or 0.0) > 0.0
-        else float(_restored_session_saved_epoch or 0.0)
+        float(pend_bnd["eff_since"])
+        if pend_bnd is not None and float(pend_bnd.get("eff_since", 0.0) or 0.0) > 0.0
+        else (
+            float(_reconciled_through_epoch)
+            if float(_reconciled_through_epoch or 0.0) > 0.0
+            else float(_restored_session_saved_epoch or 0.0)
+        )
     )
-    snap_ep_now = time.time()
-    if active_adapter is not None and hasattr(
-        active_adapter, "get_last_snapshot_epoch"
-    ):
-        try:
-            ad_sp = float(active_adapter.get_last_snapshot_epoch() or 0.0)
-            if ad_sp > 0.0:
-                snap_ep_now = ad_sp
-        except Exception:
-            pass
+    snap_ep_now = (
+        float(pend_bnd["snap_ep"])
+        if (preserve_live_equity and pend_bnd is not None and float(pend_bnd.get("snap_ep", 0.0) or 0.0) > 0.0)
+        else time.time()
+    )
+    if not (preserve_live_equity and pend_bnd is not None):
+        if active_adapter is not None and hasattr(
+            active_adapter, "get_last_snapshot_epoch"
+        ):
+            try:
+                ad_sp = float(active_adapter.get_last_snapshot_epoch() or 0.0)
+                if ad_sp > 0.0:
+                    snap_ep_now = ad_sp
+            except Exception:
+                pass
 
     def _build_pos_seed_from_live(p_map):
         out_seed = {}
@@ -23375,6 +23705,12 @@ def _reconcile_off_session_activity(
                 "asset_type": str(pv.get("asset_type") or "EQUITY").upper(),
             }
         return out_seed
+
+    until_ep_bound = (
+        (snap_ep_now + 0.25)
+        if (preserve_live_equity and pend_bnd is not None and snap_ep_now > 0.0)
+        else None
+    )
 
     def _filter_inc_fills(raw_list):
         out_inc = []
@@ -23398,11 +23734,13 @@ def _reconcile_off_session_activity(
                 if delta_q <= 1e-6:
                     continue
                 f_ep = float(f_rec.get("fill_epoch") or 0.0)
+                if until_ep_bound is not None and f_ep > until_ep_bound:
+                    continue
                 if (
                     o_key not in _reconciled_order_qty
                     and f_ep < (eff_since - 0.25)
                     and abs(actual_off_delta) < 0.05
-                    and is_fl_now == bool(_restored_session_was_flat)
+                    and is_fl_now == bool(was_flat_before_reconcile)
                 ):
                     out_roq[o_key] = tot_fq
                     continue
@@ -23417,70 +23755,34 @@ def _reconcile_off_session_activity(
                 out_inc.append(rec_copy)
         return out_inc, out_roq, out_max_ep
 
+    def _record_pending_deferral():
+        global _off_session_pending_boundary
+        if not isinstance(_off_session_pending_boundary, dict):
+            _off_session_pending_boundary = {
+                "ref_flat": ref_flat,
+                "settled_flat_eq": settled_flat_eq_now,
+                "is_flat": bool(is_fl_now),
+                "live_open_pnl": float(live_open_pnl or 0.0),
+                "pos_details": json.loads(json.dumps(live_pos_map)),
+                "snap_ep": snap_ep_now,
+                "was_flat_before": was_flat_before_reconcile,
+                "restored_pos": json.loads(json.dumps(restored_pos_seed or {})),
+                "restored_has_pos": bool(restored_has_pos_seed),
+                "eff_since": eff_since,
+                "retries": 1,
+                "live_advanced": False,
+            }
+            return 1
+        nxt_r = int(_off_session_pending_boundary.get("retries", 0) or 0) + 1
+        _off_session_pending_boundary["retries"] = nxt_r
+        return nxt_r
+
     if (
         eff_since > 0.0
         and not _cold_launch_ignored_qty_mutated
         and active_adapter is not None
         and not is_demo_mode_active(active_adapter)
     ):
-        # Strict Clause (F5 Case b): only allow the 36h fast-path when flat
-        # before AND now, |delta| < $0.01, save was <30h ago, and zero
-        # incremental fills appear; everything else escalates to full 58d.
-        eligible_36h_zero_delta = bool(
-            was_flat_before_reconcile
-            and is_fl_now
-            and abs(actual_off_delta) < 0.01
-            and (time.time() - eff_since) < (30.0 * 3600.0)
-        )
-        raw_fills = prefetched_fills
-        if (
-            raw_fills is None
-            and allow_network
-            and hasattr(active_adapter, "fetch_filled_orders_since")
-        ):
-            try:
-                if eligible_36h_zero_delta:
-                    cand_36h = _call_fetch_filled_orders_since(
-                        active_adapter, eff_since, fast_recent_only=True
-                    )
-                    if isinstance(cand_36h, list):
-                        chk_inc, _, _ = _filter_inc_fills(cand_36h)
-                        if len(chk_inc) == 0:
-                            raw_fills = cand_36h
-                        else:
-                            raw_fills = _call_fetch_filled_orders_since(
-                                active_adapter, eff_since, fast_recent_only=False
-                            )
-                    else:
-                        raw_fills = _call_fetch_filled_orders_since(
-                            active_adapter, eff_since, fast_recent_only=False
-                        )
-                else:
-                    raw_fills = _call_fetch_filled_orders_since(
-                        active_adapter, eff_since, fast_recent_only=False
-                    )
-            except Exception:
-                raw_fills = None
-        elif (
-            isinstance(raw_fills, list)
-            and prefetched_window == "36h"
-        ):
-            chk_inc, _, _ = _filter_inc_fills(raw_fills)
-            if (not eligible_36h_zero_delta) or len(chk_inc) > 0:
-                if allow_network and hasattr(
-                    active_adapter, "fetch_filled_orders_since"
-                ):
-                    try:
-                        raw_fills = _call_fetch_filled_orders_since(
-                            active_adapter, eff_since, fast_recent_only=False
-                        )
-                    except Exception:
-                        raw_fills = None
-                else:
-                    return False
-
-        inc_fills, new_roq_updates, max_fill_ep = _filter_inc_fills(raw_fills)
-
         ig_scratch_tol = (
             float(active_adapter.get_flat_rounding_tolerance())
             if (
@@ -23490,18 +23792,22 @@ def _reconcile_off_session_activity(
             else 0.0
         )
 
-        def _try_reconstruct(cand_fills):
+        def _try_reconstruct(
+            cand_fills, raw_list_ref, strict_36h_fees=False
+        ):
             c_rts = []
             c_ledger = {}
             c_tot_eq = 0.0
             c_tot_opt = 0.0
+            c_sold_eq_shares = 0.0
+            c_sell_notional = 0.0
             if not (
-                isinstance(raw_fills, list)
+                isinstance(raw_list_ref, list)
                 and len(cand_fills) > 0
-                and _restored_has_open_pos_snapshot
+                and restored_has_pos_seed
             ):
                 return False, c_rts, c_ledger
-            for sp_k, sp_v in (_restored_open_positions_at_save or {}).items():
+            for sp_k, sp_v in (restored_pos_seed or {}).items():
                 if not isinstance(sp_v, dict):
                     continue
                 sq = float(sp_v.get("qty", 0.0) or 0.0)
@@ -23541,6 +23847,9 @@ def _reconcile_off_session_activity(
                     c_tot_opt += dq
                 else:
                     c_tot_eq += dq
+                    if f_side == "SELL":
+                        c_sold_eq_shares += dq
+                        c_sell_notional += dq * f_px
 
                 st_ent = c_ledger.get(sym_tag)
                 if st_ent is None or abs(float(st_ent["qty"])) <= 1e-6:
@@ -23639,7 +23948,19 @@ def _reconcile_off_session_activity(
                 + 0.01 * c_tot_eq
                 + 0.75 * c_tot_opt,
             )
-            if abs(fee_res) > max_fee_tol:
+            if strict_36h_fees:
+                if fee_res > 0.02:
+                    return False, [], {}
+                strict_neg_tol = round(
+                    0.06
+                    + (0.000035 * c_sell_notional)
+                    + (0.00025 * c_sold_eq_shares)
+                    + (0.80 * c_tot_opt),
+                    2,
+                )
+                if abs(fee_res) > min(max_fee_tol, strict_neg_tol):
+                    return False, [], {}
+            elif abs(fee_res) > max_fee_tol:
                 return False, [], {}
             if c_rts and abs(fee_res) >= 0.01 and abs(open_partial_realized) <= 1e-6:
                 tot_w = sum(
@@ -23667,28 +23988,184 @@ def _reconcile_off_session_activity(
                     rt["pnl"] = ap
             return True, c_rts, c_ledger
 
-        full_reconstruct_ok, completed_rts, ledger = _try_reconstruct(inc_fills)
-        if not full_reconstruct_ok and inc_fills:
-            # Drop stray pre-save closing fills leaked by the cutoff=(eff_since-2.0) overlap window
-            trim_cands = [
-                [r for r in inc_fills if float(r.get("fill_epoch") or 0.0) >= eff_since]
-            ]
-            if was_flat_before_reconcile:
-                trim_cands.append(
+        def _attempt_reconstruct_with_trim(
+            inc_list, raw_list_ref, strict_36h_fees=False
+        ):
+            ok_r, rts_r, led_r = _try_reconstruct(
+                inc_list, raw_list_ref, strict_36h_fees=strict_36h_fees
+            )
+            if not ok_r and inc_list:
+                # Drop stray pre-save closing fills leaked by cutoff=(eff_since-2.0) overlap window
+                trim_cands = [
                     [
                         r
-                        for r in inc_fills
-                        if float(r.get("fill_epoch") or 0.0) > (eff_since + 0.5)
+                        for r in inc_list
+                        if float(r.get("fill_epoch") or 0.0) >= eff_since
                     ]
+                ]
+                if was_flat_before_reconcile:
+                    trim_cands.append(
+                        [
+                            r
+                            for r in inc_list
+                            if float(r.get("fill_epoch") or 0.0)
+                            > (eff_since + 0.5)
+                        ]
+                    )
+                for trimmed in trim_cands:
+                    if trimmed and len(trimmed) < len(inc_list):
+                        ok_tr, rts_tr, led_tr = _try_reconstruct(
+                            trimmed,
+                            raw_list_ref,
+                            strict_36h_fees=strict_36h_fees,
+                        )
+                        if ok_tr:
+                            return True, rts_tr, led_tr
+            return ok_r, rts_r, led_r
+
+        gap_under_30h = bool((time.time() - eff_since) < (30.0 * 3600.0))
+        eligible_36h_zero_delta = bool(
+            was_flat_before_reconcile
+            and is_fl_now
+            and abs(actual_off_delta) < 0.01
+            and gap_under_30h
+        )
+        raw_fills = prefetched_fills
+        inc_fills = []
+        new_roq_updates = {}
+        max_fill_ep = eff_since
+        full_reconstruct_ok = False
+        completed_rts = []
+        ledger = {}
+
+        if isinstance(raw_fills, list) and prefetched_window == "36h":
+            inc_36, roq_36, max_ep_36 = _filter_inc_fills(raw_fills)
+            if eligible_36h_zero_delta and len(inc_36) == 0:
+                inc_fills, new_roq_updates, max_fill_ep = (
+                    inc_36,
+                    roq_36,
+                    max_ep_36,
                 )
-            for trimmed in trim_cands:
-                if trimmed and len(trimmed) < len(inc_fills):
-                    ok_tr, rts_tr, led_tr = _try_reconstruct(trimmed)
-                    if ok_tr:
-                        full_reconstruct_ok = True
-                        completed_rts = rts_tr
-                        ledger = led_tr
-                        break
+            else:
+                ok_36, rts_36, led_36 = _attempt_reconstruct_with_trim(
+                    inc_36, raw_fills, strict_36h_fees=True
+                )
+                if ok_36:
+                    inc_fills, new_roq_updates, max_fill_ep = (
+                        inc_36,
+                        roq_36,
+                        max_ep_36,
+                    )
+                    full_reconstruct_ok = True
+                    completed_rts = rts_36
+                    ledger = led_36
+                elif allow_network and hasattr(
+                    active_adapter, "fetch_filled_orders_since"
+                ):
+                    try:
+                        raw_fills = _call_fetch_filled_orders_since(
+                            active_adapter, eff_since, fast_recent_only=False
+                        )
+                    except Exception:
+                        raw_fills = None
+                    inc_fills, new_roq_updates, max_fill_ep = _filter_inc_fills(
+                        raw_fills
+                    )
+                    (
+                        full_reconstruct_ok,
+                        completed_rts,
+                        ledger,
+                    ) = _attempt_reconstruct_with_trim(
+                        inc_fills, raw_fills, strict_36h_fees=False
+                    )
+                else:
+                    return False
+        elif (
+            raw_fills is None
+            and allow_network
+            and hasattr(active_adapter, "fetch_filled_orders_since")
+        ):
+            try:
+                if gap_under_30h:
+                    cand_36h = _call_fetch_filled_orders_since(
+                        active_adapter, eff_since, fast_recent_only=True
+                    )
+                    if isinstance(cand_36h, list):
+                        inc_36, roq_36, max_ep_36 = _filter_inc_fills(cand_36h)
+                        if eligible_36h_zero_delta and len(inc_36) == 0:
+                            raw_fills = cand_36h
+                            inc_fills, new_roq_updates, max_fill_ep = (
+                                inc_36,
+                                roq_36,
+                                max_ep_36,
+                            )
+                        else:
+                            ok_36, rts_36, led_36 = (
+                                _attempt_reconstruct_with_trim(
+                                    inc_36, cand_36h, strict_36h_fees=True
+                                )
+                            )
+                            if ok_36:
+                                raw_fills = cand_36h
+                                inc_fills, new_roq_updates, max_fill_ep = (
+                                    inc_36,
+                                    roq_36,
+                                    max_ep_36,
+                                )
+                                full_reconstruct_ok = True
+                                completed_rts = rts_36
+                                ledger = led_36
+                            else:
+                                raw_fills = _call_fetch_filled_orders_since(
+                                    active_adapter,
+                                    eff_since,
+                                    fast_recent_only=False,
+                                )
+                                (
+                                    inc_fills,
+                                    new_roq_updates,
+                                    max_fill_ep,
+                                ) = _filter_inc_fills(raw_fills)
+                                (
+                                    full_reconstruct_ok,
+                                    completed_rts,
+                                    ledger,
+                                ) = _attempt_reconstruct_with_trim(
+                                    inc_fills, raw_fills, strict_36h_fees=False
+                                )
+                    else:
+                        raw_fills = None
+                else:
+                    raw_fills = _call_fetch_filled_orders_since(
+                        active_adapter, eff_since, fast_recent_only=False
+                    )
+                    inc_fills, new_roq_updates, max_fill_ep = _filter_inc_fills(
+                        raw_fills
+                    )
+                    (
+                        full_reconstruct_ok,
+                        completed_rts,
+                        ledger,
+                    ) = _attempt_reconstruct_with_trim(
+                        inc_fills, raw_fills, strict_36h_fees=False
+                    )
+            except Exception:
+                raw_fills = None
+                inc_fills = []
+                new_roq_updates = {}
+                max_fill_ep = eff_since
+                full_reconstruct_ok = False
+        else:
+            inc_fills, new_roq_updates, max_fill_ep = _filter_inc_fills(
+                raw_fills
+            )
+            (
+                full_reconstruct_ok,
+                completed_rts,
+                ledger,
+            ) = _attempt_reconstruct_with_trim(
+                inc_fills, raw_fills, strict_36h_fees=False
+            )
 
         if full_reconstruct_ok:
             pre_high_eq = (
@@ -23792,20 +24269,24 @@ def _reconcile_off_session_activity(
                 _off_session_peak_reconstructed = True
             _reconciled_order_qty.update(new_roq_updates)
             _reconciled_through_epoch = max(eff_since, max_fill_ep, snap_ep_now)
-            _restored_session_was_flat = bool(is_fl_now)
-            _restored_open_positions_at_save.clear()
-            for sk, sv in ledger.items():
-                if abs(float(sv.get("qty", 0.0))) > 1e-6:
-                    _restored_open_positions_at_save[str(sk)] = {
-                        "symbol": str(sk),
-                        "qty": round(float(sv["qty"]), 6),
-                        "avg": round(float(sv["avg"]), 4),
-                        "asset_type": (
-                            "OPTION" if float(sv.get("mult", 1.0)) > 1.0 else "EQUITY"
-                        ),
-                    }
-            _restored_has_open_pos_snapshot = True
+            if not preserve_live_equity:
+                _restored_session_was_flat = bool(is_fl_now)
+                _restored_open_positions_at_save.clear()
+                for sk, sv in ledger.items():
+                    if abs(float(sv.get("qty", 0.0))) > 1e-6:
+                        _restored_open_positions_at_save[str(sk)] = {
+                            "symbol": str(sk),
+                            "qty": round(float(sv["qty"]), 6),
+                            "avg": round(float(sv["avg"]), 4),
+                            "asset_type": (
+                                "OPTION"
+                                if float(sv.get("mult", 1.0)) > 1.0
+                                else "EQUITY"
+                            ),
+                        }
+                _restored_has_open_pos_snapshot = True
             _off_session_reconciled = True
+            _off_session_pending_boundary = None
             if completed_rts:
                 log_event(
                     "SESSION",
@@ -23825,7 +24306,11 @@ def _reconcile_off_session_activity(
                         or "CLOSE" in f_instr
                         or "COVER" in f_instr
                     )
-                    if (not _restored_session_was_flat) or is_cl or f_rec.get("multi_leg_unknown"):
+                    if (
+                        (not was_flat_before_reconcile)
+                        or is_cl
+                        or f_rec.get("multi_leg_unknown")
+                    ):
                         closing_confirmed = True
                         break
             elif (
@@ -23846,19 +24331,45 @@ def _reconcile_off_session_activity(
                 and not _off_session_reconciled
                 and hasattr(active_adapter, "has_non_ignored_closing_fills_since")
             ):
-                closing_confirmed = bool(
-                    active_adapter.has_non_ignored_closing_fills_since(
+                if until_ep_bound is not None:
+                    try:
+                        closing_res = active_adapter.has_non_ignored_closing_fills_since(
+                            eff_since,
+                            was_flat_at_save=was_flat_before_reconcile,
+                            until_epoch=until_ep_bound,
+                        )
+                    except TypeError:
+                        closing_res = active_adapter.has_non_ignored_closing_fills_since(
+                            eff_since,
+                            was_flat_at_save=was_flat_before_reconcile,
+                        )
+                else:
+                    closing_res = active_adapter.has_non_ignored_closing_fills_since(
                         eff_since,
-                        was_flat_at_save=_restored_session_was_flat,
+                        was_flat_at_save=was_flat_before_reconcile,
                     )
-                )
+                if closing_res is None:
+                    cur_def_cnt = _record_pending_deferral()
+                    if cur_def_cnt <= OFF_SESSION_DEFER_MAX_RETRIES:
+                        return False
+                    log_event(
+                        "WARN",
+                        f"Off-session order history unavailable after {OFF_SESSION_DEFER_MAX_RETRIES} "
+                        f"retries — committing flat delta ({format_dollar(actual_off_delta)}) "
+                        f"without order-level W/L verification.",
+                    )
+                    closing_confirmed = False
+                else:
+                    closing_confirmed = bool(closing_res)
             _off_session_reconciled = True
+            _off_session_pending_boundary = None
             if new_roq_updates:
                 _reconciled_order_qty.update(new_roq_updates)
             _reconciled_through_epoch = max(eff_since, max_fill_ep, snap_ep_now)
-            _restored_session_was_flat = True
-            _restored_open_positions_at_save.clear()
-            _restored_has_open_pos_snapshot = True
+            if not preserve_live_equity:
+                _restored_session_was_flat = True
+                _restored_open_positions_at_save.clear()
+                _restored_has_open_pos_snapshot = True
             if closing_confirmed:
                 if actual_off_delta > 0.0:
                     win_trades += 1
@@ -23881,16 +24392,35 @@ def _reconcile_off_session_activity(
                     f"(no non-ignored closing fills since last save; W/L unchanged).",
                 )
         elif is_fl_now and not _off_session_reconciled:
+            if raw_fills is None and abs(actual_off_delta) >= 0.01:
+                if not allow_network:
+                    return False
+                cur_def_cnt = _record_pending_deferral()
+                if cur_def_cnt <= OFF_SESSION_DEFER_MAX_RETRIES:
+                    return False
             _off_session_reconciled = True
+            _off_session_pending_boundary = None
             if new_roq_updates and abs(actual_off_delta) < 1.00:
                 _reconciled_order_qty.update(new_roq_updates)
             _reconciled_through_epoch = max(eff_since, snap_ep_now)
-            _restored_session_was_flat = True
-            _restored_open_positions_at_save.clear()
-            _restored_has_open_pos_snapshot = True
+            if not preserve_live_equity:
+                _restored_session_was_flat = True
+                _restored_open_positions_at_save.clear()
+                _restored_has_open_pos_snapshot = True
         elif not is_fl_now:
             if raw_fills is None:
-                return False
+                if allow_network and not _off_session_reconciled:
+                    cur_def_cnt = _record_pending_deferral()
+                    if cur_def_cnt <= OFF_SESSION_DEFER_MAX_RETRIES:
+                        return False
+                    log_event(
+                        "WARN",
+                        f"Off-session order history unavailable after {OFF_SESSION_DEFER_MAX_RETRIES} "
+                        f"retries — syncing mid-trade delta ({format_dollar(actual_off_delta)}) "
+                        f"from live positions.",
+                    )
+                else:
+                    return False
             # Mid-trade fallback (open position still held): never increment W/L here
             # so partial scale-outs or option entry fees are not double-counted when
             # the remaining open shares later close flat via log_position_transitions().
@@ -23903,15 +24433,27 @@ def _reconcile_off_session_activity(
             if new_roq_updates:
                 _reconciled_order_qty.update(new_roq_updates)
             _reconciled_through_epoch = max(eff_since, max_fill_ep, snap_ep_now)
-            _restored_session_was_flat = False
-            _restored_open_positions_at_save.clear()
-            _restored_open_positions_at_save.update(
-                _build_pos_seed_from_live(live_pos_map)
-            )
-            _restored_has_open_pos_snapshot = True
+            if not preserve_live_equity:
+                _restored_session_was_flat = False
+                _restored_open_positions_at_save.clear()
+                _restored_open_positions_at_save.update(
+                    _build_pos_seed_from_live(live_pos_map)
+                )
+                _restored_has_open_pos_snapshot = True
             _off_session_reconciled = True
+            _off_session_pending_boundary = None
     elif is_fl_now and not _off_session_reconciled:
         _off_session_reconciled = True
+        _off_session_pending_boundary = None
+
+    if preserve_live_equity:
+        if is_fl_now:
+            if daily_max_equity is None or settled_flat_eq_now > daily_max_equity:
+                daily_max_equity = settled_flat_eq_now
+            if daily_min_equity is None or settled_flat_eq_now < daily_min_equity:
+                daily_min_equity = settled_flat_eq_now
+        save_session_state()
+        return True
 
     last_flat_equity = settled_flat_eq_now
     if is_fl_now:
@@ -24020,7 +24562,13 @@ def _stabilize_mid_fill_realized_and_equity(
             if not _launch_fee_drift_checked:
                 _launch_fee_drift_checked = True
                 if not _maybe_absorb_untouched_flat_fee_drift(current_eq, is_flat):
-                    _reconcile_off_session_activity(current_eq, True, 0.0, {})
+                    if (
+                        not _reconcile_off_session_activity(
+                            current_eq, True, 0.0, {}
+                        )
+                        and isinstance(_off_session_pending_boundary, dict)
+                    ):
+                        _off_session_pending_boundary["live_advanced"] = True
             _recheck_presync_save_lock_after_sync(current_eq)
             last_flat_equity = current_eq
             if current_eq > max_equity:
@@ -24040,12 +24588,16 @@ def _stabilize_mid_fill_realized_and_equity(
             open_pnl = live_open_pnl
             if not _launch_fee_drift_checked:
                 _launch_fee_drift_checked = True
-                _reconcile_off_session_activity(
-                    current_eq,
-                    False,
-                    live_open_pnl=open_pnl,
-                    pos_details=pos_details,
-                )
+                if (
+                    not _reconcile_off_session_activity(
+                        current_eq,
+                        False,
+                        live_open_pnl=open_pnl,
+                        pos_details=pos_details,
+                    )
+                    and isinstance(_off_session_pending_boundary, dict)
+                ):
+                    _off_session_pending_boundary["live_advanced"] = True
             realized_pnl = _round_cents((current_eq - start_equity) - open_pnl)
             last_flat_equity = _round_cents(start_equity + realized_pnl)
             _recheck_presync_save_lock_after_sync(last_flat_equity)
@@ -24055,6 +24607,21 @@ def _stabilize_mid_fill_realized_and_equity(
         in_trade_desync_streak = 0
         pending_scale_out_tol = 0.0
         return current_eq, realized_pnl, open_pnl
+
+    if (
+        not is_reverify
+        and isinstance(_off_session_pending_boundary, dict)
+        and not _off_session_reconciled
+    ):
+        _reconcile_off_session_activity(
+            current_eq,
+            is_flat,
+            live_open_pnl=live_open_pnl,
+            pos_details=pos_details,
+            preserve_live_equity=bool(
+                _off_session_pending_boundary.get("live_advanced", False)
+            ),
+        )
 
     if is_demo_mode_active(active_adapter):
         flat_desync_streak = 0
@@ -25919,6 +26486,7 @@ def _apply_pending_baseline_revert(
     global flat_desync_streak, in_trade_desync_streak, pending_scale_out_tol
     global current_upside_tier, first_poll_of_launch, _baseline_archive, _manual_reanchor_pending
     global pending_baseline_revert, pending_baseline_revert_done_today
+    global _off_session_pending_boundary
 
     req_s_key = pending_baseline_revert
     req_done_today = bool(pending_baseline_revert_done_today)
@@ -26066,6 +26634,7 @@ def _apply_pending_baseline_revert(
     in_trade_desync_streak = 0
     pending_scale_out_tol = 0.0
     first_poll_of_launch = True
+    _off_session_pending_boundary = None
     if req_done_today:
         done_for_today = True
 
@@ -26094,6 +26663,46 @@ def _apply_pending_baseline_revert(
     return True, new_eq, pos_details
 
 
+def _paint_poll1_preview_if_valid(
+    ui_labels,
+    col_data_p,
+    is_flat_p,
+    settings_btn,
+    close_btn,
+    leash_pct_p,
+    expected_epoch,
+    expected_broker,
+    expected_acct_id,
+    expected_session_key,
+):
+    """Applies the read-only Poll #1 live-balance preview paint only if the
+    active broker/account/epoch still match the poll that fetched `current_eq`."""
+    if (
+        broker_reconfig_in_progress
+        or active_adapter is None
+        or get_adapter_epoch() != expected_epoch
+    ):
+        return False
+    cur_b = str(getattr(active_adapter, "name", "") or "")
+    cur_a = str(getattr(active_adapter, "account_id", "") or "")
+    if (
+        cur_b != str(expected_broker or "")
+        or cur_a != str(expected_acct_id or "")
+        or get_session_key(cur_b, cur_a) != str(expected_session_key or "")
+    ):
+        return False
+    update_gui(
+        ui_labels,
+        col_data_p,
+        is_flat_p,
+        settings_btn,
+        close_btn,
+        leash_pct=leash_pct_p,
+        spark_snap=None,
+    )
+    return True
+
+
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global anchor_cash_flow, _last_logged_unanchored_cash_flow
@@ -26119,6 +26728,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global pending_halt_breach, active_session_date
     global _initial_positions_verified, last_data_loop_heartbeat
     global _launch_fee_drift_checked, _launch_live_sync_deferred, _off_session_reconciled
+    global _off_session_pending_boundary
     global _reconciled_through_epoch, _reconciled_order_qty, _off_session_peak_reconstructed
     global _last_live_hud_snapshot
 
@@ -26329,6 +26939,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     _launch_fee_drift_checked = True
                     _launch_live_sync_deferred = False
                     _off_session_reconciled = True
+                    _off_session_pending_boundary = None
                     save_session_state(
                         expected_epoch=poll_epoch, adapter_override=poll_ad
                     )
@@ -26479,6 +27090,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     _launch_fee_drift_checked = True
                     _launch_live_sync_deferred = False
                     _off_session_reconciled = True
+                    _off_session_pending_boundary = None
                     save_session_state(
                         expected_epoch=poll_epoch, adapter_override=poll_ad
                     )
@@ -26641,6 +27253,106 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         )
 
                 pre_poll_hwm_profit = round(max_equity - start_equity, 2)
+
+                if (
+                    was_poll_1_launch
+                    and not snap_was_cached
+                    and start_equity is not None
+                    and start_equity > 0.0
+                    and not _off_session_reconciled
+                    and not _is_untouched_fee_drift_candidate(
+                        current_eq, is_flat, adapter_override=poll_ad
+                    )
+                    and _poll_still_valid()
+                ):
+                    try:
+                        prev_open_p1 = (
+                            0.0
+                            if is_flat
+                            else round(float(live_open_pnl or 0.0), 2)
+                        )
+                        prev_real_p1 = _round_cents(
+                            (current_eq - start_equity) - prev_open_p1
+                        )
+                        prev_net_p1 = round(current_eq - start_equity, 2)
+                        prev_dec_p1 = evaluate_stop_decisions(
+                            current_eq=current_eq,
+                            pos_details=pos_details,
+                            cfg=config,
+                            rth_now=is_rth(),
+                            is_flat=is_flat,
+                            realized_pnl=prev_real_p1,
+                            open_pnl=prev_open_p1,
+                            has_options=has_options,
+                            pre_poll_hwm_profit=pre_poll_hwm_profit,
+                            on_before_stop_checks=None,
+                            suppress_mutations=True,
+                        )
+                        prev_breach_p1 = bool(
+                            is_locked_down or breach_visual_sim_active
+                        )
+                        prev_lp_p1 = (
+                            0.0
+                            if prev_breach_p1
+                            else prev_dec_p1["leash_pct"]
+                        )
+                        prev_sh_p1 = (
+                            max(prev_dec_p1["session_high_pnl"], prev_net_p1)
+                            if is_flat
+                            else prev_dec_p1["session_high_pnl"]
+                        )
+                        prev_dmin_p1 = (
+                            (
+                                min(daily_min_equity, current_eq)
+                                if daily_min_equity is not None
+                                else min(start_equity, current_eq)
+                            )
+                            if is_flat
+                            else daily_min_equity
+                        )
+                        prev_all_cols = _build_hud_column_display_data(
+                            realized_pnl=prev_real_p1,
+                            open_pnl=prev_open_p1,
+                            net_pnl=prev_net_p1,
+                            terminate_pnl_level=prev_dec_p1["terminate_pnl_level"],
+                            distance_to_terminate=prev_dec_p1[
+                                "distance_to_terminate"
+                            ],
+                            session_high_pnl=prev_sh_p1,
+                            leash_pct=prev_lp_p1,
+                            base_leash=prev_dec_p1.get("base_leash", 1500.0),
+                            hud_breach_active=prev_breach_p1,
+                            eff_start_eq=start_equity,
+                            eff_last_flat_eq=(
+                                current_eq if is_flat else last_flat_equity
+                            ),
+                            eff_daily_min_eq=prev_dmin_p1,
+                            neutral_pending=False,
+                        )
+                        prev_col_data = [
+                            prev_all_cols.get(cid, ("---", "#2c3e50"))
+                            for cid in get_active_hud_columns(config)
+                        ]
+                        prev_s_key = get_session_key(poll_broker, poll_acct)
+                        root.after(
+                            0,
+                            lambda d=prev_col_data, f=is_flat, lp=prev_lp_p1, ep=poll_epoch, br=poll_broker, ac=poll_acct, sk=prev_s_key: (
+                                _paint_poll1_preview_if_valid(
+                                    ui_labels,
+                                    d,
+                                    f,
+                                    settings_btn,
+                                    close_btn,
+                                    lp,
+                                    ep,
+                                    br,
+                                    ac,
+                                    sk,
+                                )
+                            ),
+                        )
+                    except Exception:
+                        pass
 
                 _pre_stab_streak_len = len(recent_loss_timestamps)
                 current_eq, realized_pnl, open_pnl = (
@@ -29813,12 +30525,14 @@ def show_preflight_window(
                                             else start_equity
                                         )
                                         sw_use_fast = bool(
+                                            (time.time() - eff_sw_since) < (30.0 * 3600.0)
+                                        )
+                                        sw_zero_delta_flat = bool(
                                             sw_snap[1]
                                             and _restored_session_was_flat
                                             and sw_ref_flat is not None
                                             and float(sw_ref_flat) > 0.0
                                             and abs(round(float(sw_snap[0]) - float(sw_ref_flat), 2)) < 0.01
-                                            and (time.time() - eff_sw_since) < (30.0 * 3600.0)
                                         )
                                         sw_prefetched_win = "36h" if sw_use_fast else "58d"
                                         sw_prefetched_fills = _call_fetch_filled_orders_since(
@@ -29826,9 +30540,14 @@ def show_preflight_window(
                                             eff_sw_since,
                                             fast_recent_only=sw_use_fast,
                                         )
-                                        if sw_use_fast and (
-                                            sw_prefetched_fills is None
-                                            or len(sw_prefetched_fills) > 0
+                                        if (
+                                            sw_use_fast
+                                            and isinstance(sw_prefetched_fills, list)
+                                            and len(sw_prefetched_fills) == 0
+                                            and not sw_zero_delta_flat
+                                            and not pf_timer_state.get("closing")
+                                            and active_adapter is _acct_sw_ad
+                                            and get_adapter_epoch() == _acct_sw_ep
                                         ):
                                             sw_prefetched_win = "58d"
                                             sw_prefetched_fills = _call_fetch_filled_orders_since(
@@ -29839,12 +30558,16 @@ def show_preflight_window(
                                         if (
                                             sw_prefetched_fills is None
                                             and sw_snap[1]
+                                            and not sw_use_fast
+                                            and not pf_timer_state.get("closing")
+                                            and active_adapter is _acct_sw_ad
+                                            and get_adapter_epoch() == _acct_sw_ep
                                             and hasattr(
                                                 _acct_sw_ad,
                                                 "has_non_ignored_closing_fills_since",
                                             )
                                         ):
-                                            sw_prefetched_closing = bool(
+                                            sw_prefetched_closing = (
                                                 _acct_sw_ad.has_non_ignored_closing_fills_since(
                                                     eff_sw_since,
                                                     was_flat_at_save=_restored_session_was_flat,
@@ -31788,7 +32511,7 @@ def show_preflight_window(
         ent_contact.pack(fill="x", ipady=5, pady=(0, 2))
         tk.Label(
             card_body,
-            text="Leave blank to send anonymously. Saved locally so you don't have to re-type it.",
+            text="Leave blank to send anonymously. Saved locally so you don't have to re-type it · Safe Log includes pseudonymous ID & PnL.",
             font=("Arial", 8, "bold"),
             fg="#64748b",
             bg="#131922",
@@ -31951,8 +32674,12 @@ def show_preflight_window(
             if sending_state["busy"]:
                 return
             try:
-                contact_s = str(var_contact.get() or "").strip()
-                desc_s = desc_txt.get("1.0", "end-1c").strip()
+                contact_s = sanitize_user_report_text(
+                    str(var_contact.get() or "").strip(), max_len=120
+                )
+                desc_s = sanitize_user_report_text(
+                    desc_txt.get("1.0", "end-1c").strip(), max_len=4000
+                )
                 p_block, _ = _get_selected_prior_block()
                 att_lbl = (
                     f"Today ({get_today_str()}) + Prior Day ({prior_fname})"
@@ -32021,6 +32748,9 @@ def show_preflight_window(
                 config["bug_report_contact"] = contact_str
                 save_config(config)
 
+            safe_contact_str = sanitize_user_report_text(contact_str, max_len=120)
+            safe_desc_str = sanitize_user_report_text(desc_str, max_len=4000)
+
             try:
                 if not os.path.exists(LOG_PATH):
                     init_daily_log()
@@ -32037,8 +32767,8 @@ def show_preflight_window(
                 report_hdr = _build_bug_report_header(
                     tester_id,
                     active_b,
-                    contact_str,
-                    desc_str,
+                    safe_contact_str,
+                    safe_desc_str,
                     attached_logs_label=att_lbl,
                 )
                 san_today_kept = san_today
@@ -32119,8 +32849,8 @@ def show_preflight_window(
                     tester_id,
                     extra_fields={
                         "report_type": "bug_report",
-                        "contact": contact_str,
-                        "description": desc_str,
+                        "contact": safe_contact_str,
+                        "description": safe_desc_str,
                     },
                 )
 
@@ -32978,6 +33708,14 @@ def show_preflight_window(
                 cancel_pf_fn=_cancel_pf_timers,
             ),
         )
+        if parent is None and is_running_directly_on_desktop(SCRIPT_DIR):
+            logs_dropdown.add_command(
+                label="📁 Move App off Desktop & Create Shortcut...",
+                command=lambda: prompt_desktop_tidy_dialog(
+                    parent_pf=pf,
+                    cancel_pf_fn=_cancel_pf_timers,
+                ),
+            )
 
     logs_dropdown._before_popup = rebuild_logs_dropdown
 
@@ -34266,6 +35004,9 @@ def show_preflight_window(
             new_cfg["seen_layout_tour_version"] = config.get(
                 "seen_layout_tour_version", ""
             )
+            new_cfg["desktop_tidy_dismissed"] = bool(
+                config.get("desktop_tidy_dismissed", False)
+            )
             new_cfg["mute_all_audio"] = bool(var_mute_all_audio.get())
             new_cfg["enable_voice_cues"] = bool(var_voice_cues.get())
             new_cfg["tts_voice"] = TTS_LABEL_TO_ID.get(
@@ -34428,7 +35169,35 @@ def show_preflight_window(
                     s_entry["max_equity"] = max_equity
                     s_entry["daily_max_equity"] = daily_max_equity
                     s_entry["daily_min_equity"] = daily_min_equity
-                    s_entry["last_flat_equity"] = last_flat_equity
+                    sl_last_flat = last_flat_equity
+                    sl_rec_ep = round(
+                        float(_reconciled_through_epoch or 0.0), 2
+                    )
+                    if (
+                        isinstance(_off_session_pending_boundary, dict)
+                        and not _off_session_reconciled
+                        and str(chosen_b).upper() != "DEMO"
+                    ):
+                        pb_sl = _off_session_pending_boundary
+                        pb_sl_ref = float(pb_sl.get("ref_flat", 0.0) or 0.0)
+                        pb_sl_set = float(
+                            pb_sl.get("settled_flat_eq", 0.0) or 0.0
+                        )
+                        sl_rec_ep = round(
+                            float(pb_sl.get("eff_since", 0.0) or 0.0), 2
+                        )
+                        if pb_sl_ref > 0.0 and pb_sl_set > 0.0:
+                            if (
+                                pb_sl.get("live_advanced")
+                                and last_flat_equity is not None
+                            ):
+                                sl_last_flat = _round_cents(
+                                    pb_sl_ref
+                                    + (float(last_flat_equity) - pb_sl_set)
+                                )
+                            else:
+                                sl_last_flat = _round_cents(pb_sl_ref)
+                    s_entry["last_flat_equity"] = sl_last_flat
                     s_entry["anchor_cash_flow"] = round(
                         float(anchor_cash_flow or 0.0), 2
                     )
@@ -34440,9 +35209,7 @@ def show_preflight_window(
                     s_entry["ignored_positions"] = json.loads(
                         json.dumps(ignored_positions)
                     )
-                    s_entry["reconciled_through_epoch"] = round(
-                        float(_reconciled_through_epoch or 0.0), 2
-                    )
+                    s_entry["reconciled_through_epoch"] = sl_rec_ep
                     s_entry["reconciled_order_qty"] = {
                         str(rk): round(float(rv), 6)
                         for rk, rv in list(_reconciled_order_qty.items())[-500:]
@@ -44418,6 +45185,11 @@ def show_preflight_window(
                             verified_accts,
                             resolved_acct_id,
                         )
+                def _flush_bg_auth_if_launched():
+                    bg_p = pf_timer_state.pop("bg_auth_pending", None)
+                    if launched["status"] and verified_accts and isinstance(bg_p, tuple):
+                        _enqueue_postlaunch_preflight_auth(*bg_p)
+
                 snap = None
                 bg_prefetched_fills = None
                 bg_prefetched_closing = None
@@ -44426,11 +45198,7 @@ def show_preflight_window(
                     _bg_init_acct_id and resolved_acct_id and resolved_acct_id != _bg_init_acct_id
                 )
                 if pf_timer_state.get("closing") or launched["status"]:
-                    if launched["status"] and verified_accts:
-                        pf_timer_state.pop("bg_auth_pending", None)
-                        _enqueue_postlaunch_preflight_auth(
-                            ad, _bg_sync_epoch, verified_accts, resolved_acct_id
-                        )
+                    _flush_bg_auth_if_launched()
                     return
                 if (
                     _pf_initial_shown.get("needs_bg_sync")
@@ -44441,15 +45209,12 @@ def show_preflight_window(
                     _max_s_tries = 6 if eff_startup_boot else 1
                     for _s_try in range(_max_s_tries):
                         if _bg_sync_abort():
+                            _flush_bg_auth_if_launched()
                             return
                         try:
                             snap = ad.fetch_account_data()
                             if pf_timer_state.get("closing") or launched["status"]:
-                                if launched["status"] and verified_accts:
-                                    pf_timer_state.pop("bg_auth_pending", None)
-                                    _enqueue_postlaunch_preflight_auth(
-                                        ad, _bg_sync_epoch, verified_accts, resolved_acct_id
-                                    )
+                                _flush_bg_auth_if_launched()
                                 return
                             if (
                                 snap
@@ -44461,6 +45226,9 @@ def show_preflight_window(
                                     snap[0], snap[1], adapter_override=ad
                                 ) and hasattr(ad, "has_any_filled_orders_today"):
                                     ad.has_any_filled_orders_today()
+                                if _bg_sync_abort():
+                                    _flush_bg_auth_if_launched()
+                                    return
                                 eff_bg_since = (
                                     float(_reconciled_through_epoch)
                                     if float(_reconciled_through_epoch or 0.0) > 0.0
@@ -44475,20 +45243,25 @@ def show_preflight_window(
                                         else start_equity
                                     )
                                     bg_use_fast = bool(
+                                        (time.time() - eff_bg_since) < (30.0 * 3600.0)
+                                    )
+                                    bg_zero_delta_flat = bool(
                                         snap[1]
                                         and _restored_session_was_flat
                                         and bg_ref_flat is not None
                                         and float(bg_ref_flat) > 0.0
                                         and abs(round(float(snap[0]) - float(bg_ref_flat), 2)) < 0.01
-                                        and (time.time() - eff_bg_since) < (30.0 * 3600.0)
                                     )
                                     bg_prefetched_win = "36h" if bg_use_fast else "58d"
                                     bg_prefetched_fills = _call_fetch_filled_orders_since(
                                         ad, eff_bg_since, fast_recent_only=bg_use_fast
                                     )
-                                    if bg_use_fast and (
-                                        bg_prefetched_fills is None
-                                        or len(bg_prefetched_fills) > 0
+                                    if (
+                                        bg_use_fast
+                                        and isinstance(bg_prefetched_fills, list)
+                                        and len(bg_prefetched_fills) == 0
+                                        and not bg_zero_delta_flat
+                                        and not _bg_sync_abort()
                                     ):
                                         bg_prefetched_win = "58d"
                                         bg_prefetched_fills = _call_fetch_filled_orders_since(
@@ -44497,12 +45270,14 @@ def show_preflight_window(
                                     if (
                                         bg_prefetched_fills is None
                                         and snap[1]
+                                        and not bg_use_fast
+                                        and not _bg_sync_abort()
                                         and hasattr(
                                             ad,
                                             "has_non_ignored_closing_fills_since",
                                         )
                                     ):
-                                        bg_prefetched_closing = bool(
+                                        bg_prefetched_closing = (
                                             ad.has_non_ignored_closing_fills_since(
                                                 eff_bg_since,
                                                 was_flat_at_save=_restored_session_was_flat,
@@ -44517,13 +45292,11 @@ def show_preflight_window(
                         if _s_try + 1 < _max_s_tries:
                             boot_retried_net = True
                             if sleep_with_startup_abort(3.0, _bg_sync_abort):
+                                _flush_bg_auth_if_launched()
                                 return
 
                 if launched["status"] and verified_accts:
-                    pf_timer_state.pop("bg_auth_pending", None)
-                    _enqueue_postlaunch_preflight_auth(
-                        ad, _bg_sync_epoch, verified_accts, resolved_acct_id
-                    )
+                    _flush_bg_auth_if_launched()
                     return
 
                 def _finish_bg_sync_on_ui():
@@ -44531,11 +45304,7 @@ def show_preflight_window(
                     global settled_realized_pnl, anchor_cash_flow, force_reanchor
                     global _initial_positions_verified, current_is_flat
                     if pf_timer_state.get("closing") or launched["status"]:
-                        if launched["status"] and verified_accts:
-                            pf_timer_state.pop("bg_auth_pending", None)
-                            _enqueue_postlaunch_preflight_auth(
-                                ad, _bg_sync_epoch, verified_accts, resolved_acct_id
-                            )
+                        _flush_bg_auth_if_launched()
                         return
                     try:
                         if not pf.winfo_exists():
@@ -44824,6 +45593,49 @@ def show_preflight_window(
 
     if post_daily_breach_prompt:
         pf.after(150, show_daily_breach_return_notice)
+    elif parent is None and _should_auto_offer_desktop_tidy(
+        eff_startup_boot=eff_startup_boot
+    ):
+        def _auto_offer_desktop_tidy():
+            try:
+                if (
+                    pf_timer_state.get("closing")
+                    or launched["status"]
+                    or not pf.winfo_exists()
+                ):
+                    return
+                if pf.grab_current() is not None:
+                    pf.after(300, _auto_offer_desktop_tidy)
+                    return
+                if not _should_auto_offer_desktop_tidy(
+                    eff_startup_boot=eff_startup_boot
+                ):
+                    return
+                moved_ok = prompt_desktop_tidy_dialog(
+                    parent_pf=pf, cancel_pf_fn=_cancel_pf_timers
+                )
+                if (
+                    not moved_ok
+                    and not pf_timer_state.get("closing")
+                    and not launched["status"]
+                    and pf.winfo_exists()
+                    and config.get("seen_layout_tour_version")
+                    != LAYOUT_TOUR_VERSION
+                ):
+                    pf.after(
+                        150,
+                        lambda: (
+                            show_layout_tour_dialog()
+                            if (pf.winfo_exists() and pf.grab_current() is None)
+                            else None
+                        ),
+                    )
+            except SystemExit:
+                raise
+            except Exception:
+                pass
+
+        pf.after(150, _auto_offer_desktop_tidy)
     elif (
         parent is None
         and config.get("seen_layout_tour_version") != LAYOUT_TOUR_VERSION
@@ -46524,8 +47336,12 @@ def update_gui(
 
     if spark_snap is not None:
         _hud_last_spark_snap = spark_snap
-    if hud_sparkline_canvas is not None and hud_sparkline_canvas.winfo_manager():
-        _redraw_hud_sparkline_canvas()
+    if hud_sparkline_canvas is not None:
+        try:
+            if hud_sparkline_canvas.winfo_manager():
+                _redraw_hud_sparkline_canvas()
+        except Exception:
+            pass
 
     if hud_leash_bar is not None and leash_pct is not None:
         hud_last_leash_pct = max(0.0, min(1.0, float(leash_pct)))
@@ -46534,12 +47350,10 @@ def update_gui(
     refresh_acct_badge()
     _sync_hud_demo_chrome()
     _sync_hud_breach_banner(is_flat)
-    if (
-        hud_breach_banner_frame is not None
-        and hud_breach_banner_frame.winfo_manager()
-    ):
+    if hud_breach_banner_frame is not None:
         try:
-            hud_breach_banner_frame.lift()
+            if hud_breach_banner_frame.winfo_manager():
+                hud_breach_banner_frame.lift()
         except Exception:
             pass
 
@@ -46591,9 +47405,12 @@ def update_gui(
     ov_now = _active_penalty_box_overlay
     ov_open = bool(ov_now is not None and not getattr(ov_now, "closed", True))
     if not settings_win_open and not _hud_hidden_by_overlay and not ov_open and ui_labels:
-        top = ui_labels[0].winfo_toplevel()
-        top.attributes("-topmost", True)
-        top.lift()
+        try:
+            top = ui_labels[0].winfo_toplevel()
+            top.attributes("-topmost", True)
+            top.lift()
+        except Exception:
+            pass
     elif ov_open and hud_root is not None:
         try:
             if hud_root.winfo_exists() and hud_root.winfo_ismapped():
@@ -50829,6 +51646,1226 @@ def prompt_version_rollback_dialog(
     return ok_exec
 
 
+_desktop_tidy_in_progress = False
+ENFORCER_TIDY_KNOWN_FILES = (
+    "enforcer.py",
+    "Launch_Enforcer.bat",
+    "enforcer.ico",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE.txt",
+    "enforcer.py.prev",
+    "CHANGELOG.md.prev",
+    ".enforcer_boot_pending.json",
+)
+
+
+def _expand_win_env_vars_percent_only(raw_val, env_map=None):
+    """Expands Windows %VAR% tokens without Python os.path.expandvars's $VAR
+    expansion, preserving usernames/paths that contain literal '$' (e.g. T$MAC)."""
+    s = str(raw_val or "").strip()
+    if not s:
+        return ""
+    if env_map is None and sys.platform == "win32" and "%" in s:
+        try:
+            import winreg
+
+            return str(winreg.ExpandEnvironmentStrings(s))
+        except Exception:
+            pass
+    if "%" not in s:
+        return s
+    src_env = env_map if env_map is not None else os.environ
+    ci_env = {str(k).upper(): str(v) for k, v in src_env.items() if v is not None}
+
+    def _repl(m):
+        tok = m.group(1)
+        return ci_env.get(tok.upper(), m.group(0))
+
+    return re.sub(r"%([^%]+)%", _repl, s)
+
+
+def _norm_fs_dir(path_str):
+    return os.path.normcase(os.path.normpath(os.path.abspath(str(path_str))))
+
+
+def _collect_norm_dir_variants(path_str):
+    out = set()
+    if not path_str:
+        return out
+    try:
+        out.add(_norm_fs_dir(path_str))
+    except Exception:
+        pass
+    try:
+        out.add(_norm_fs_dir(os.path.realpath(str(path_str))))
+    except Exception:
+        pass
+    return out
+
+
+def _get_user_desktop_dirs(user_home=None, reg_desktop=None, env_map=None):
+    """Returns ordered candidate Desktop root directories (Registry Shell Folders,
+    OneDrive KFM Desktop, and <home>\\Desktop). Sandboxed when user_home/reg_desktop/
+    env_map are injected or outside _IS_MAIN_PROCESS."""
+    eff_home = os.path.normpath(
+        os.path.abspath(user_home if user_home else USER_HOME)
+    )
+    raw_cands = []
+    if reg_desktop is not None:
+        reg_items = (
+            [reg_desktop]
+            if isinstance(reg_desktop, str)
+            else list(reg_desktop or ())
+        )
+        for rv in reg_items:
+            exp_v = _expand_win_env_vars_percent_only(rv, env_map=env_map)
+            if exp_v:
+                raw_cands.append(exp_v)
+    elif user_home is None and env_map is None and _IS_MAIN_PROCESS and sys.platform == "win32":
+        try:
+            import winreg
+
+            for subkey in (
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+            ):
+                try:
+                    with winreg.OpenKey(
+                        winreg.HKEY_CURRENT_USER,
+                        subkey,
+                        0,
+                        winreg.KEY_QUERY_VALUE,
+                    ) as hk:
+                        val_d, _ = winreg.QueryValueEx(hk, "Desktop")
+                        exp_d = _expand_win_env_vars_percent_only(val_d)
+                        if exp_d:
+                            raw_cands.append(exp_d)
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+    eff_env = (
+        env_map
+        if env_map is not None
+        else (os.environ if user_home is None else {})
+    )
+    for od_key in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        od_root = str(eff_env.get(od_key, "") or "").strip()
+        if od_root:
+            raw_cands.append(os.path.join(od_root, "Desktop"))
+
+    raw_cands.append(os.path.join(eff_home, "Desktop"))
+
+    ordered = []
+    seen_norm = set()
+    for rc in raw_cands:
+        try:
+            np = os.path.normpath(os.path.abspath(rc))
+            nk = os.path.normcase(np)
+            if nk not in seen_norm:
+                seen_norm.add(nk)
+                ordered.append(np)
+        except Exception:
+            continue
+    return ordered
+
+
+def _build_desktop_norm_set(desktop_dirs):
+    norm_set = set()
+    for d in desktop_dirs or ():
+        norm_set.update(_collect_norm_dir_variants(d))
+    return norm_set
+
+
+def is_running_directly_on_desktop(
+    script_dir=None, user_home=None, reg_desktop=None, env_map=None
+):
+    """Returns True ONLY when script_dir itself is a root Desktop directory
+    (never True for subfolders on the Desktop like Desktop\\PnL_Enforcer)."""
+    chk_dir = script_dir if script_dir else SCRIPT_DIR
+    if not chk_dir:
+        return False
+    desk_set = _build_desktop_norm_set(
+        _get_user_desktop_dirs(
+            user_home=user_home, reg_desktop=reg_desktop, env_map=env_map
+        )
+    )
+    if not desk_set:
+        return False
+    return bool(_collect_norm_dir_variants(chk_dir) & desk_set)
+
+
+def _get_primary_desktop_dir(
+    src_dir=None, user_home=None, reg_desktop=None, env_map=None
+):
+    """Resolves the active Desktop directory where PnL Enforcer.lnk should live."""
+    chk_src = src_dir if src_dir else SCRIPT_DIR
+    if (
+        chk_src
+        and os.path.isdir(chk_src)
+        and is_running_directly_on_desktop(
+            chk_src,
+            user_home=user_home,
+            reg_desktop=reg_desktop,
+            env_map=env_map,
+        )
+    ):
+        return os.path.normpath(os.path.abspath(chk_src))
+    cands = _get_user_desktop_dirs(
+        user_home=user_home, reg_desktop=reg_desktop, env_map=env_map
+    )
+    for cd in cands:
+        if os.path.isdir(cd):
+            return cd
+    eff_home = os.path.normpath(
+        os.path.abspath(user_home if user_home else USER_HOME)
+    )
+    return cands[0] if cands else os.path.join(eff_home, "Desktop")
+
+
+def _peek_enforcer_file_version_fast(fpath):
+    """Fast <1ms structural + APP_VERSION marker check without compile(), safe
+    for Browse folder inspection on the UI thread."""
+    try:
+        if not os.path.isfile(fpath):
+            return False, ""
+        sz = os.path.getsize(fpath)
+        if sz < 512 or sz > 20 * 1024 * 1024:
+            return False, ""
+        with open(fpath, "rb") as f:
+            raw = f.read()
+        txt = raw.decode("utf-8")
+    except Exception:
+        return False, ""
+    if "def data_loop" not in txt or 'if __name__ == "__main__":' not in txt:
+        return False, ""
+    m = re.search(r'(?m)^APP_VERSION\s*=\s*["\']([^"\']+)["\']', txt[:4096])
+    ver = m.group(1).strip() if m else ""
+    if not ver:
+        return False, ""
+    return True, ver
+
+
+def _is_verified_enforcer_app_file(fpath, fname=None):
+    """Strict content-ownership check so unrelated files on a user's Desktop or
+    in a custom destination folder are NEVER overwritten or deleted."""
+    base = fname if fname is not None else os.path.basename(str(fpath))
+    if base not in ENFORCER_TIDY_KNOWN_FILES:
+        return False
+    try:
+        if not os.path.isfile(fpath) or os.path.islink(fpath):
+            return False
+        if base in ("enforcer.py", "enforcer.py.prev"):
+            return _peek_enforcer_file_version_fast(fpath)[0]
+        if base == "Launch_Enforcer.bat":
+            with open(fpath, "rb") as f:
+                txt = f.read(65536).decode("utf-8", errors="replace")
+            return ("enforcer.py" in txt) and ("PnL Enforcer" in txt)
+        if base in (
+            "README.md",
+            "CHANGELOG.md",
+            "CHANGELOG.md.prev",
+            "LICENSE.txt",
+        ):
+            with open(fpath, "rb") as f:
+                head = f.read(2048).decode("utf-8", errors="replace")
+            return "PnL Enforcer" in head
+        if base == "enforcer.ico":
+            sz = os.path.getsize(fpath)
+            if sz < 64 or sz > 2 * 1024 * 1024:
+                return False
+            with open(fpath, "rb") as f:
+                hdr = f.read(4)
+            return hdr == b"\x00\x00\x01\x00"
+        if base == ".enforcer_boot_pending.json":
+            with open(fpath, "rb") as f:
+                raw_bp = f.read(16384).decode("utf-8")
+            obj = json.loads(raw_bp)
+            return isinstance(obj, dict) and ("target_version" in obj)
+    except Exception:
+        return False
+    return False
+
+
+def _resolve_tidy_target_dir(
+    chosen_dir, src_dir=None, user_home=None, reg_desktop=None, env_map=None
+):
+    """Validates and normalizes a destination directory for Desktop relocation.
+    Automatically appends '\\PnL_Enforcer' if the user picks Desktop, USER_HOME,
+    a drive root, or an existing non-empty general parent directory."""
+    raw = str(chosen_dir or "").strip()
+    if not raw:
+        return False, "", "Please select a valid destination folder."
+    cand = os.path.normpath(os.path.abspath(raw))
+    eff_home = os.path.normpath(
+        os.path.abspath(user_home if user_home else USER_HOME)
+    )
+    eff_src = os.path.normpath(
+        os.path.abspath(src_dir if src_dir else SCRIPT_DIR)
+    )
+    desk_set = _build_desktop_norm_set(
+        _get_user_desktop_dirs(
+            user_home=user_home, reg_desktop=reg_desktop, env_map=env_map
+        )
+    )
+
+    cand_norms = _collect_norm_dir_variants(cand)
+    is_drive_root = os.path.dirname(cand) == cand
+    is_home_root = bool(cand_norms & _collect_norm_dir_variants(eff_home))
+    is_desk_root = bool(cand_norms & desk_set)
+
+    if is_drive_root or is_home_root or is_desk_root:
+        cand = os.path.normpath(os.path.join(cand, "PnL_Enforcer"))
+    elif os.path.exists(cand) and os.path.isdir(cand):
+        slug = re.sub(
+            r"[\s\-]+", "_", os.path.basename(cand).strip().lower()
+        )
+        has_enf_py = _peek_enforcer_file_version_fast(
+            os.path.join(cand, "enforcer.py")
+        )[0]
+        try:
+            is_empty_dir = len(os.listdir(cand)) == 0
+        except OSError:
+            is_empty_dir = False
+        if not (is_empty_dir or has_enf_py or slug.startswith("pnl_enforcer")):
+            cand = os.path.normpath(os.path.join(cand, "PnL_Enforcer"))
+
+    if os.path.exists(cand) and not os.path.isdir(cand):
+        return (
+            False,
+            "",
+            "A file with that name already exists at the destination path.",
+        )
+
+    final_norms = _collect_norm_dir_variants(cand)
+    if (
+        os.path.dirname(cand) == cand
+        or bool(final_norms & _collect_norm_dir_variants(eff_src))
+        or bool(final_norms & _collect_norm_dir_variants(eff_home))
+        or bool(final_norms & desk_set)
+    ):
+        return (
+            False,
+            "",
+            "Please choose a dedicated subfolder rather than your root Desktop or user folder.",
+        )
+    return True, cand, ""
+
+
+def _create_windows_lnk_shortcut(
+    lnk_path,
+    target_path,
+    work_dir,
+    icon_path="",
+    description="Launch PnL Enforcer",
+    window_style=7,
+    _allow_sandbox_test=False,
+):
+    """Creates a Windows .lnk shortcut atomically using child environment
+    variables (safe for paths containing '$' or apostrophes) with WindowStyle=7
+    (minimized so fast-path launcher skips console flash) and verifies non-zero
+    file size on disk."""
+    if sys.platform != "win32":
+        return False, "Windows shortcuts are only supported on Windows."
+    if not _IS_MAIN_PROCESS and not _allow_sandbox_test:
+        return False, "Shortcut creation skipped outside main process."
+
+    lnk_abs = os.path.normpath(os.path.abspath(lnk_path))
+    parent_d = os.path.dirname(lnk_abs)
+    if not os.path.isdir(parent_d):
+        return False, f"Desktop folder not found: {parent_d}"
+    tmp_lnk = os.path.join(
+        parent_d, f".pnl_enforcer_tmp_{os.getpid()}_{int(time.time() * 1000)}.lnk"
+    )
+    ico_spec = (
+        f"{os.path.abspath(icon_path)},0"
+        if (icon_path and os.path.isfile(icon_path))
+        else ""
+    )
+    child_env = {
+        **os.environ,
+        "_ENF_LNK_PATH": tmp_lnk,
+        "_ENF_TARGET": os.path.abspath(target_path),
+        "_ENF_WORKDIR": os.path.abspath(work_dir),
+        "_ENF_ICON": ico_spec,
+        "_ENF_DESC": str(description or "Launch PnL Enforcer"),
+        "_ENF_WINSTYLE": str(int(window_style)),
+    }
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    ps_cmd = (
+        "$ws = New-Object -ComObject WScript.Shell; "
+        "$s = $ws.CreateShortcut($env:_ENF_LNK_PATH); "
+        "$s.TargetPath = $env:_ENF_TARGET; "
+        "$s.WorkingDirectory = $env:_ENF_WORKDIR; "
+        "$s.Description = $env:_ENF_DESC; "
+        "$s.WindowStyle = [int]$env:_ENF_WINSTYLE; "
+        "if ($env:_ENF_ICON) { $s.IconLocation = $env:_ENF_ICON }; "
+        "$s.Save()"
+    )
+    last_err = ""
+    try:
+        try:
+            subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    ps_cmd,
+                ],
+                env=child_env,
+                creationflags=creation_flags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=8,
+                check=False,
+            )
+        except Exception as ps_exc:
+            last_err = f"{type(ps_exc).__name__}: {ps_exc}"
+
+        if not (os.path.isfile(tmp_lnk) and os.path.getsize(tmp_lnk) > 0):
+            import tempfile
+
+            vbs_fd, vbs_path = tempfile.mkstemp(
+                prefix="enf_lnk_", suffix=".vbs"
+            )
+            try:
+                vbs_src = (
+                    'Set ws = CreateObject("WScript.Shell")\r\n'
+                    'Set pe = ws.Environment("PROCESS")\r\n'
+                    'Set s = ws.CreateShortcut(pe("_ENF_LNK_PATH"))\r\n'
+                    's.TargetPath = pe("_ENF_TARGET")\r\n'
+                    's.WorkingDirectory = pe("_ENF_WORKDIR")\r\n'
+                    's.Description = pe("_ENF_DESC")\r\n'
+                    's.WindowStyle = CInt(pe("_ENF_WINSTYLE"))\r\n'
+                    'If Len(pe("_ENF_ICON")) > 0 Then s.IconLocation = pe("_ENF_ICON")\r\n'
+                    "s.Save\r\n"
+                )
+                with os.fdopen(vbs_fd, "w", encoding="utf-8") as vf:
+                    vf.write(vbs_src)
+                subprocess.run(
+                    ["cscript.exe", "//NoLogo", "//B", vbs_path],
+                    env=child_env,
+                    creationflags=creation_flags,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=8,
+                    check=False,
+                )
+            except Exception as vbs_exc:
+                if not last_err:
+                    last_err = f"{type(vbs_exc).__name__}: {vbs_exc}"
+            finally:
+                try:
+                    if os.path.exists(vbs_path):
+                        os.remove(vbs_path)
+                except OSError:
+                    pass
+
+        if os.path.isfile(tmp_lnk) and os.path.getsize(tmp_lnk) > 0:
+            os.replace(tmp_lnk, lnk_abs)
+            if os.path.isfile(lnk_abs) and os.path.getsize(lnk_abs) > 0:
+                return True, lnk_abs
+        return (
+            False,
+            last_err
+            or "Desktop write blocked (check Windows Controlled Folder Access or permissions).",
+        )
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            if os.path.exists(tmp_lnk):
+                os.remove(tmp_lnk)
+        except OSError:
+            pass
+
+
+def _atomic_write_verified_bytes(dst_path, data_bytes):
+    """Writes data_bytes atomically via .tmp + fsync + os.replace and verifies
+    exact SHA-256 parity on disk without re-running Python compile()."""
+    exp_sha = hashlib.sha256(data_bytes).digest()
+    tmp_p = f"{dst_path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_p, "wb") as wf:
+            wf.write(data_bytes)
+            wf.flush()
+            os.fsync(wf.fileno())
+        os.replace(tmp_p, dst_path)
+        with open(dst_path, "rb") as rf:
+            got_sha = hashlib.sha256(rf.read()).digest()
+        return got_sha == exp_sha
+    except Exception:
+        try:
+            if os.path.exists(tmp_p):
+                os.remove(tmp_p)
+        except OSError:
+            pass
+        return False
+
+
+def relocate_desktop_install(
+    dest_dir,
+    create_shortcut=True,
+    src_dir=None,
+    from_live_hud=False,
+    cancel_pf_fn=None,
+    close_wins=(),
+    spawn_relaunch=True,
+    shortcut_fn=None,
+    spawn_fn=None,
+    sync_reg_fn=None,
+    fetch_doc_fn=None,
+    user_home=None,
+    reg_desktop=None,
+    env_map=None,
+    delete_fn=None,
+):
+    """Safely relocates a loose Desktop PnL Enforcer install into dest_dir,
+    preserving Beta/Main channel identity via Launch_Enforcer.bat, adopting an
+    existing equal-or-newer destination install without downgrading, creating an
+    optional Desktop .lnk shortcut BEFORE removing any Desktop files, and
+    relaunching cleanly into dest_dir\\enforcer.py."""
+    global _desktop_tidy_in_progress
+    if not _IS_MAIN_PROCESS and user_home is None:
+        if (create_shortcut and shortcut_fn is None) or (
+            spawn_relaunch and spawn_fn is None
+        ):
+            return (
+                False,
+                "SANDBOX_BLOCKED",
+                "Desktop relocation is disabled outside the main process without test overrides.",
+            )
+
+    _desktop_tidy_in_progress = True
+    try:
+        ok_sw, sw_code, sw_msg = _check_version_switch_guardrails(
+            from_live_hud=from_live_hud,
+            action_label="Desktop folder move",
+            log_block=True,
+        )
+        if not ok_sw:
+            return False, sw_code, sw_msg
+
+        eff_src = os.path.normpath(
+            os.path.abspath(src_dir if src_dir else SCRIPT_DIR)
+        )
+        if not is_running_directly_on_desktop(
+            eff_src,
+            user_home=user_home,
+            reg_desktop=reg_desktop,
+            env_map=env_map,
+        ):
+            return (
+                False,
+                "NOT_ON_DESKTOP",
+                "PnL Enforcer is already inside its own folder.",
+            )
+
+        ok_t, target_dir, t_msg = _resolve_tidy_target_dir(
+            dest_dir,
+            src_dir=eff_src,
+            user_home=user_home,
+            reg_desktop=reg_desktop,
+            env_map=env_map,
+        )
+        if not ok_t:
+            return False, "INVALID_TARGET", t_msg
+
+        src_py_path = os.path.join(eff_src, "enforcer.py")
+        try:
+            with open(src_py_path, "rb") as spf:
+                src_py_bytes = spf.read()
+        except OSError as exc:
+            return (
+                False,
+                "INVALID_SOURCE",
+                f"Could not read source enforcer.py: {exc}",
+            )
+        ok_src_py, src_ver, src_py_err = _validate_enforcer_source_bytes(
+            src_py_bytes
+        )
+        if not ok_src_py:
+            return (
+                False,
+                "INVALID_SOURCE",
+                f"Could not verify running enforcer.py ({src_py_err}).",
+            )
+
+        src_bat_path = os.path.join(eff_src, "Launch_Enforcer.bat")
+        src_bat_bytes = None
+        if os.path.isfile(src_bat_path) and _is_verified_enforcer_app_file(
+            src_bat_path, "Launch_Enforcer.bat"
+        ):
+            try:
+                with open(src_bat_path, "rb") as sbf:
+                    src_bat_bytes = sbf.read()
+            except OSError as exc:
+                return (
+                    False,
+                    "BAT_READ_FAILED",
+                    f"Could not read Launch_Enforcer.bat ({exc}). No files were moved.",
+                )
+            src_is_beta = BETA_GIST_BUNDLE_ID.encode("utf-8") in src_bat_bytes
+        else:
+            src_is_beta = (
+                _is_beta_channel_build() if src_dir is None else False
+            )
+            eff_fetch_doc = (
+                fetch_doc_fn
+                if callable(fetch_doc_fn)
+                else _fetch_remote_doc_bytes
+            )
+            fetched_bat = eff_fetch_doc("Launch_Enforcer.bat")
+            if (
+                fetched_bat
+                and b"enforcer.py" in fetched_bat
+                and b"PnL Enforcer" in fetched_bat
+            ):
+                if (
+                    src_is_beta
+                    and BETA_GIST_BUNDLE_ID.encode("utf-8") not in fetched_bat
+                ):
+                    fetched_bat = (
+                        fetched_bat.decode("utf-8", errors="replace")
+                        .replace(MAIN_GIST_BUNDLE_ID, BETA_GIST_BUNDLE_ID)
+                        .encode("utf-8")
+                    )
+                src_bat_bytes = fetched_bat
+            else:
+                return (
+                    False,
+                    "MISSING_LAUNCHER_BAT",
+                    "Launch_Enforcer.bat was missing on Desktop and could not be downloaded while offline. No files were moved.",
+                )
+
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as exc:
+            return (
+                False,
+                "MKDIR_FAILED",
+                f"Could not create destination folder ({exc}).",
+            )
+
+        dst_py_path = os.path.join(target_dir, "enforcer.py")
+        dst_bat_path = os.path.join(target_dir, "Launch_Enforcer.bat")
+        dst_py_bytes = None
+        ok_dst_py = False
+        dst_ver = ""
+        if os.path.exists(dst_py_path):
+            if not os.path.isfile(dst_py_path):
+                return (
+                    False,
+                    "DEST_CONFLICT",
+                    "Destination enforcer.py path is not a regular file.",
+                )
+            try:
+                with open(dst_py_path, "rb") as dpf:
+                    dst_py_bytes = dpf.read()
+            except OSError as exc:
+                return (
+                    False,
+                    "DEST_CONFLICT",
+                    f"Could not inspect existing enforcer.py in destination ({exc}).",
+                )
+            ok_dst_py, dst_ver, _ = _validate_enforcer_source_bytes(
+                dst_py_bytes
+            )
+            if not ok_dst_py and b"PnL Enforcer" not in dst_py_bytes[:2048]:
+                return (
+                    False,
+                    "DEST_CONFLICT",
+                    "Destination folder contains an unrecognized enforcer.py file.",
+                )
+
+        if os.path.exists(dst_bat_path) and not _is_verified_enforcer_app_file(
+            dst_bat_path, "Launch_Enforcer.bat"
+        ):
+            return (
+                False,
+                "DEST_CONFLICT",
+                "Destination folder contains an unrecognized Launch_Enforcer.bat file.",
+            )
+
+        adopt_mode = False
+        if ok_dst_py:
+            dst_tup = _parse_version_tuple(dst_ver)
+            src_tup = _parse_version_tuple(src_ver)
+            if dst_tup > src_tup:
+                adopt_mode = True
+            elif dst_tup == src_tup:
+                adopt_mode = True
+
+        verified_dest_files = set()
+        if adopt_mode:
+            verified_dest_files.add("enforcer.py")
+            need_bat_write = True
+            if os.path.isfile(dst_bat_path) and _is_verified_enforcer_app_file(
+                dst_bat_path, "Launch_Enforcer.bat"
+            ):
+                if _parse_version_tuple(dst_ver) > _parse_version_tuple(
+                    src_ver
+                ):
+                    need_bat_write = False
+                    verified_dest_files.add("Launch_Enforcer.bat")
+                else:
+                    try:
+                        with open(dst_bat_path, "rb") as dbf:
+                            d_bat_b = dbf.read()
+                        if (
+                            BETA_GIST_BUNDLE_ID.encode("utf-8") in d_bat_b
+                        ) == src_is_beta:
+                            need_bat_write = False
+                            verified_dest_files.add("Launch_Enforcer.bat")
+                    except OSError:
+                        need_bat_write = True
+            if need_bat_write:
+                if not _atomic_write_verified_bytes(
+                    dst_bat_path, src_bat_bytes
+                ):
+                    return (
+                        False,
+                        "BAT_WRITE_FAILED",
+                        "Could not write Launch_Enforcer.bat to destination folder. No files were moved.",
+                    )
+                verified_dest_files.add("Launch_Enforcer.bat")
+            for opt_name in (
+                "enforcer.ico",
+                "CHANGELOG.md",
+                "README.md",
+                "LICENSE.txt",
+                "enforcer.py.prev",
+                "CHANGELOG.md.prev",
+            ):
+                src_opt_p = os.path.join(eff_src, opt_name)
+                dst_opt_p = os.path.join(target_dir, opt_name)
+                if os.path.exists(dst_opt_p):
+                    if _is_verified_enforcer_app_file(dst_opt_p, opt_name):
+                        verified_dest_files.add(opt_name)
+                    continue
+                if os.path.isfile(src_opt_p) and _is_verified_enforcer_app_file(
+                    src_opt_p, opt_name
+                ):
+                    try:
+                        with open(src_opt_p, "rb") as sof:
+                            opt_b = sof.read()
+                        if _atomic_write_verified_bytes(dst_opt_p, opt_b):
+                            verified_dest_files.add(opt_name)
+                    except OSError:
+                        pass
+        else:
+            rotated_dst_prev = False
+            if (
+                ok_dst_py
+                and dst_py_bytes
+                and _parse_version_tuple(dst_ver)
+                < _parse_version_tuple(src_ver)
+            ):
+                dst_prev_p = os.path.join(target_dir, "enforcer.py.prev")
+                dst_bp_p = os.path.join(
+                    target_dir, ".enforcer_boot_pending.json"
+                )
+                if (not os.path.exists(dst_bp_p)) or (
+                    not os.path.isfile(dst_prev_p)
+                ):
+                    if (not os.path.exists(dst_prev_p)) or _is_verified_enforcer_app_file(
+                        dst_prev_p, "enforcer.py.prev"
+                    ):
+                        if _atomic_write_verified_bytes(
+                            dst_prev_p, dst_py_bytes
+                        ):
+                            rotated_dst_prev = True
+
+            if not _atomic_write_verified_bytes(dst_py_path, src_py_bytes):
+                return (
+                    False,
+                    "PY_WRITE_FAILED",
+                    "Could not write enforcer.py to destination folder. No files were moved.",
+                )
+            verified_dest_files.add("enforcer.py")
+
+            if not _atomic_write_verified_bytes(dst_bat_path, src_bat_bytes):
+                return (
+                    False,
+                    "BAT_WRITE_FAILED",
+                    "Could not write Launch_Enforcer.bat to destination folder. No files were moved.",
+                )
+            verified_dest_files.add("Launch_Enforcer.bat")
+
+            for opt_name in (
+                "CHANGELOG.md",
+                "README.md",
+                "LICENSE.txt",
+                "enforcer.ico",
+                "enforcer.py.prev",
+                "CHANGELOG.md.prev",
+            ):
+                if opt_name == "enforcer.py.prev" and rotated_dst_prev:
+                    verified_dest_files.add("enforcer.py.prev")
+                    continue
+                src_opt_p = os.path.join(eff_src, opt_name)
+                if not (
+                    os.path.isfile(src_opt_p)
+                    and _is_verified_enforcer_app_file(src_opt_p, opt_name)
+                ):
+                    continue
+                dst_opt_p = os.path.join(target_dir, opt_name)
+                if os.path.exists(dst_opt_p) and not _is_verified_enforcer_app_file(
+                    dst_opt_p, opt_name
+                ):
+                    continue
+                try:
+                    with open(src_opt_p, "rb") as sof:
+                        opt_b = sof.read()
+                    if _atomic_write_verified_bytes(dst_opt_p, opt_b):
+                        verified_dest_files.add(opt_name)
+                except OSError:
+                    continue
+
+        if not (
+            os.path.isfile(dst_py_path)
+            and _peek_enforcer_file_version_fast(dst_py_path)[0]
+            and os.path.isfile(dst_bat_path)
+            and _is_verified_enforcer_app_file(
+                dst_bat_path, "Launch_Enforcer.bat"
+            )
+        ):
+            return (
+                False,
+                "VERIFY_FAILED",
+                "Destination files failed post-copy verification. No Desktop files were removed.",
+            )
+
+        lnk_created_path = ""
+        if create_shortcut:
+            desk_dir = _get_primary_desktop_dir(
+                src_dir=eff_src,
+                user_home=user_home,
+                reg_desktop=reg_desktop,
+                env_map=env_map,
+            )
+            lnk_target = os.path.join(desk_dir, "PnL Enforcer.lnk")
+            dst_ico_p = os.path.join(target_dir, "enforcer.ico")
+            eff_sc_fn = (
+                shortcut_fn
+                if callable(shortcut_fn)
+                else _create_windows_lnk_shortcut
+            )
+            ok_sc, sc_info = eff_sc_fn(
+                lnk_target,
+                dst_bat_path,
+                target_dir,
+                icon_path=(dst_ico_p if os.path.isfile(dst_ico_p) else ""),
+                description="Launch PnL Enforcer",
+                window_style=7,
+            )
+            if not (
+                ok_sc
+                and os.path.isfile(lnk_target)
+                and os.path.getsize(lnk_target) > 0
+            ):
+                return (
+                    False,
+                    "SHORTCUT_FAILED",
+                    f"Could not create 'PnL Enforcer' shortcut on your Desktop ({sc_info}).\n\n"
+                    "No Desktop files were removed.",
+                )
+            lnk_created_path = lnk_target
+
+        if not _config_load_corrupt:
+            config["desktop_tidy_dismissed"] = True
+            save_config(config)
+            if bool(config.get("start_with_windows", False)):
+                eff_reg_fn = (
+                    sync_reg_fn
+                    if callable(sync_reg_fn)
+                    else sync_windows_startup_registry
+                )
+                try:
+                    eff_reg_fn(True, script_path=dst_py_path)
+                except Exception as reg_exc:
+                    log_event(
+                        "WARN",
+                        f"Desktop tidy could not refresh Windows Startup path: {reg_exc}",
+                    )
+
+        sweep_order = (
+            "README.md",
+            "LICENSE.txt",
+            "CHANGELOG.md",
+            "CHANGELOG.md.prev",
+            "enforcer.py.prev",
+            ".enforcer_boot_pending.json",
+            "Launch_Enforcer.bat",
+            "enforcer.py",
+            "enforcer.ico",
+        )
+        eff_del = delete_fn if callable(delete_fn) else os.remove
+        locked_names = []
+        for s_name in sweep_order:
+            s_path = os.path.join(eff_src, s_name)
+            if not os.path.exists(s_path):
+                continue
+            if not _is_verified_enforcer_app_file(s_path, s_name):
+                continue
+            if (
+                s_name != ".enforcer_boot_pending.json"
+                and s_name not in verified_dest_files
+            ):
+                continue
+            removed_ok = False
+            last_del_err = None
+            for _att in range(3):
+                try:
+                    eff_del(s_path)
+                    removed_ok = True
+                    break
+                except OSError as d_exc:
+                    last_del_err = d_exc
+                    if _att < 2:
+                        time.sleep(0.08)
+            if not removed_ok and os.path.exists(s_path):
+                locked_names.append(s_name)
+                log_event(
+                    "WARN",
+                    f"Desktop tidy copied {s_name} to folder, but old Desktop copy was temporarily in use ({type(last_del_err).__name__}).",
+                )
+
+        mode_desc = (
+            f"adopted existing v{dst_ver}"
+            if adopt_mode
+            else f"relocated v{src_ver}"
+        )
+        sc_desc = "created" if lnk_created_path else "skipped"
+        leftover_desc = (
+            f"; locked_leftovers={','.join(locked_names)}"
+            if locked_names
+            else ""
+        )
+        log_event(
+            "SESSION",
+            f"Desktop tidy {mode_desc} into {target_dir} (Desktop shortcut={sc_desc}{leftover_desc}).",
+        )
+
+        if spawn_relaunch:
+            if callable(cancel_pf_fn):
+                try:
+                    cancel_pf_fn()
+                except Exception:
+                    pass
+            for w_obj in close_wins or ():
+                if w_obj is not None:
+                    try:
+                        if w_obj.winfo_exists():
+                            w_obj.destroy()
+                    except Exception:
+                        pass
+            _release_single_instance_mutex()
+            eff_sp = spawn_fn if callable(spawn_fn) else _spawn_updated_enforcer
+            eff_sp(dst_py_path)
+
+        return True, ("ADOPTED" if adopt_mode else "MOVED"), dst_py_path
+    finally:
+        _desktop_tidy_in_progress = False
+
+
+def _should_auto_offer_desktop_tidy(eff_startup_boot=False):
+    """Returns True when initial Pre-Flight should gently offer the one-time
+    optional Desktop tidy-up & shortcut prompt."""
+    if not _IS_MAIN_PROCESS or _desktop_tidy_in_progress:
+        return False
+    if eff_startup_boot or ("--console" in sys.argv):
+        return False
+    if _config_load_corrupt:
+        return False
+    if bool(config.get("desktop_tidy_dismissed", False)):
+        return False
+    if not is_running_directly_on_desktop(SCRIPT_DIR):
+        return False
+    ok_sw, _, _ = _check_version_switch_guardrails(
+        from_live_hud=False,
+        action_label="Desktop folder move",
+        log_block=False,
+    )
+    return bool(ok_sw)
+
+
+def prompt_desktop_tidy_dialog(parent_pf=None, cancel_pf_fn=None):
+    """Displays a warm, optional dark-glass modal offering to move loose Desktop
+    PnL Enforcer files into ~\\PnL_Enforcer (or a custom folder) and place a
+    single clean 'PnL Enforcer' shortcut icon on the Desktop."""
+    hide_all_tooltips()
+    if _desktop_tidy_in_progress:
+        return False
+    ok_sw, _sw_code, sw_msg = _check_version_switch_guardrails(
+        from_live_hud=False,
+        action_label="Desktop folder move",
+        log_block=True,
+    )
+    if not ok_sw:
+        messagebox.showwarning(
+            "Desktop Move Locked", sw_msg, parent=parent_pf
+        )
+        return False
+    if not is_running_directly_on_desktop(SCRIPT_DIR):
+        messagebox.showinfo(
+            "Already in a Folder",
+            f"PnL Enforcer is already running inside its own folder:\n{SCRIPT_DIR}",
+            parent=parent_pf,
+        )
+        return False
+
+    default_dest = os.path.normpath(os.path.join(USER_HOME, "PnL_Enforcer"))
+    chosen_state = {"dest": default_dest, "moved": False}
+
+    dlg = tk.Tk() if parent_pf is None else tk.Toplevel(parent_pf)
+    dlg.withdraw()
+    if parent_pf is not None:
+        dlg.transient(parent_pf)
+    if os.path.exists(ICON_PATH):
+        try:
+            dlg.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+    dlg.title("PnL Enforcer — Keep Your Desktop Tidy? (Optional)")
+    dlg.config(bg="#0d1117", padx=24, pady=18)
+    dlg.resizable(False, False)
+    dlg.attributes("-topmost", True)
+
+    tk.Label(
+        dlg,
+        text="▶ ✨ KEEP YOUR DESKTOP TIDY?  (100% OPTIONAL)",
+        font=("Arial", 11, "bold"),
+        fg="#7dd3fc",
+        bg="#0d1117",
+        anchor="w",
+    ).pack(fill="x", pady=(0, 10))
+
+    card_o = tk.Frame(
+        dlg,
+        bg="#131922",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#243040",
+    )
+    card_o.pack(fill="x", pady=(0, 14))
+    NeonBarCanvas(
+        card_o, core_color="#38bdf8", card_bg="#131922", glow_on=True
+    ).pack(side="left", fill="y")
+    body_f = tk.Frame(card_o, bg="#131922", padx=16, pady=12)
+    body_f.pack(side="left", fill="both", expand=True)
+
+    intro_txt = (
+        "PnL Enforcer is currently running loose on your Desktop, where updates and rollback backups "
+        "keep 5+ app files sitting alongside it.\n\n"
+        "• Moves all PnL Enforcer app files into a clean folder so they never re-appear on your Desktop.\n"
+        "• Leaves one crisp 'PnL Enforcer' shortcut icon on your Desktop (100% of your saved rules, "
+        "broker tokens, and today's baseline stay untouched)."
+    )
+    tk.Label(
+        body_f,
+        text=intro_txt,
+        font=("Arial", 9, "bold"),
+        fg="#cbd5e1",
+        bg="#131922",
+        justify="left",
+        wraplength=580,
+        anchor="w",
+    ).pack(fill="x", pady=(0, 12))
+
+    dest_box = tk.Frame(
+        body_f,
+        bg="#0d131b",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#243040",
+        padx=10,
+        pady=7,
+    )
+    dest_box.pack(fill="x", pady=(0, 10))
+
+    lbl_dest_val = tk.Label(
+        dest_box,
+        text=f"App Folder:  {default_dest}",
+        font=("Arial", 9, "bold"),
+        fg="#bae6fd",
+        bg="#0d131b",
+        anchor="w",
+    )
+    lbl_dest_val.pack(side="left", fill="x", expand=True)
+
+    def _on_browse_dest():
+        from tkinter import filedialog
+
+        init_d = os.path.dirname(chosen_state["dest"])
+        if not os.path.isdir(init_d):
+            init_d = USER_HOME
+        picked = filedialog.askdirectory(
+            parent=dlg,
+            initialdir=init_d,
+            title="Choose Folder for PnL Enforcer App Files",
+        )
+        if not picked:
+            return
+        ok_r, resolved_d, r_err = _resolve_tidy_target_dir(picked)
+        if not ok_r:
+            messagebox.showwarning(
+                "Invalid Folder", r_err, parent=dlg
+            )
+            return
+        chosen_state["dest"] = resolved_d
+        lbl_dest_val.config(text=f"App Folder:  {resolved_d}")
+
+    make_stadium_button(
+        dest_box,
+        text="Browse...",
+        font=("Arial", 8, "bold"),
+        fill_color="#182230",
+        border_color="#3b526b",
+        hover_fill="#223044",
+        hover_border="#7dd3fc",
+        fg="#cbd5e1",
+        hover_fg="#ffffff",
+        canvas_bg="#0d131b",
+        height=24,
+        pad_x=12,
+        command=_on_browse_dest,
+    ).pack(side="right", padx=(10, 0))
+
+    var_mk_shortcut = tk.BooleanVar(dlg, value=True)
+    cb_sc = make_glass_checkbutton(
+        body_f,
+        text="Create 'PnL Enforcer' shortcut icon on my Desktop",
+        variable=var_mk_shortcut,
+        font=("Arial", 9, "bold"),
+        fg="#7dd3fc",
+        bg="#131922",
+        accent_hex="#0284c7",
+        check_hex="#38bdf8",
+        anchor="w",
+    )
+    cb_sc.pack(anchor="w")
+
+    btn_keep = None
+    btn_move = None
+
+    def _on_keep_on_desktop():
+        if not _config_load_corrupt:
+            config["desktop_tidy_dismissed"] = True
+            save_config(config)
+            log_event(
+                "CONFIG",
+                "Dismissed optional Desktop tidy prompt (staying on Desktop).",
+            )
+        chosen_state["moved"] = False
+        dlg.destroy()
+
+    def _on_confirm_tidy():
+        if btn_move is not None:
+            btn_move.config(text="⏳ Moving Files...", state="disabled")
+        if btn_keep is not None:
+            btn_keep.config(state="disabled")
+        dlg.update_idletasks()
+        ok_rel, _rel_code, rel_msg = relocate_desktop_install(
+            chosen_state["dest"],
+            create_shortcut=bool(var_mk_shortcut.get()),
+            src_dir=SCRIPT_DIR,
+            from_live_hud=False,
+            cancel_pf_fn=cancel_pf_fn,
+            close_wins=(dlg, parent_pf),
+            spawn_relaunch=True,
+        )
+        if not ok_rel:
+            if btn_move is not None and btn_move.winfo_exists():
+                btn_move.config(
+                    text="✨ Move to Folder & Relaunch >>", state="normal"
+                )
+            if btn_keep is not None and btn_keep.winfo_exists():
+                btn_keep.config(state="normal")
+            dlg.update_idletasks()
+            messagebox.showerror(
+                "Desktop Move Cancelled", rel_msg, parent=dlg
+            )
+            return
+        chosen_state["moved"] = True
+
+    b_row = tk.Frame(dlg, bg="#0d1117")
+    b_row.pack(fill="x")
+    btn_keep = make_stadium_button(
+        b_row,
+        text="No Thanks — Keep on Desktop",
+        font=("Arial", 10, "bold"),
+        fill_color="#181e26",
+        border_color="#4a5568",
+        hover_fill="#232c38",
+        hover_border="#718096",
+        fg="#cbd5e1",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=34,
+        pad_x=20,
+        command=_on_keep_on_desktop,
+    )
+    btn_keep.pack(side="left")
+
+    btn_move = make_stadium_button(
+        b_row,
+        text="✨ Move to Folder & Relaunch >>",
+        font=("Arial", 10, "bold"),
+        fill_color="#0f293a",
+        fill_top_color="#163b52",
+        border_color="#38bdf8",
+        hover_fill="#15374d",
+        hover_fill_top="#1d4b68",
+        hover_border="#7dd3fc",
+        fg="#e0f2fe",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=34,
+        pad_x=24,
+        command=_on_confirm_tidy,
+    )
+    btn_move.pack(side="right")
+
+    prev_grab_win = None
+    if parent_pf is not None:
+        try:
+            prev_grab_win = parent_pf.grab_current()
+        except Exception:
+            prev_grab_win = None
+
+    dlg.protocol("WM_DELETE_WINDOW", _on_keep_on_desktop)
+    dlg.update_idletasks()
+    center_dialog_over_parent(dlg, parent=parent_pf)
+    if parent_pf is not None:
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        dlg.focus_set()
+        parent_pf.wait_window(dlg)
+    else:
+        dlg.mainloop()
+
+    if not chosen_state["moved"]:
+        if prev_grab_win is not None:
+            try:
+                if prev_grab_win.winfo_exists():
+                    prev_grab_win.grab_set()
+            except Exception:
+                pass
+        if parent_pf is not None and parent_pf.winfo_exists():
+            try:
+                parent_pf.lift()
+                parent_pf.focus_force()
+            except Exception:
+                pass
+    return bool(chosen_state["moved"])
+
+
 def show_release_notes_dialog(
     parent=None, from_live_hud=False, cancel_pf_fn=None
 ):
@@ -51279,14 +53316,23 @@ def _fetch_available_update_payload(skip_if_recent=False):
                 except Exception:
                     continue
 
-        if not os.path.exists(ICON_PATH):
+        if (not _desktop_tidy_in_progress) and (not os.path.exists(ICON_PATH)):
             ico_bytes = _fetch_remote_doc_bytes("enforcer.ico", ts=ts)
-            if ico_bytes:
+            if ico_bytes and not _desktop_tidy_in_progress:
+                tmp_ico = f"{ICON_PATH}.{os.getpid()}.tmp"
                 try:
-                    with open(ICON_PATH, "wb") as icf:
+                    with open(tmp_ico, "wb") as icf:
                         icf.write(ico_bytes)
+                    if not _desktop_tidy_in_progress:
+                        os.replace(tmp_ico, ICON_PATH)
+                    elif os.path.exists(tmp_ico):
+                        os.remove(tmp_ico)
                 except Exception:
-                    pass
+                    try:
+                        if os.path.exists(tmp_ico):
+                            os.remove(tmp_ico)
+                    except OSError:
+                        pass
 
         if best_ver is None:
             print(f"Version check: v{APP_VERSION} (Offline / skipped)")
@@ -51415,6 +53461,14 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
     for doc_name in doc_list:
         doc_bytes = _fetch_remote_doc_bytes(doc_name, ts=ts)
         if doc_bytes:
+            if doc_name == "Launch_Enforcer.bat" and not _is_valid_launcher_bat_bytes(
+                doc_bytes
+            ):
+                continue
+            if doc_name == "enforcer.ico" and (
+                len(doc_bytes) < 64 or doc_bytes[:4] != b"\x00\x00\x01\x00"
+            ):
+                continue
             try:
                 doc_dst = os.path.join(script_dir, doc_name)
                 doc_tmp = f"{doc_dst}.{os.getpid()}.tmp"
@@ -51444,6 +53498,31 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
     return target_py
 
 
+def _is_git_repo_checkout(script_dir=None):
+    """Returns True when running inside a Git clone (.git present) so automatic
+    startup update checks never overwrite a developer/contributor working tree."""
+    chk = script_dir if script_dir else SCRIPT_DIR
+    return bool(chk and os.path.exists(os.path.join(chk, ".git")))
+
+
+def _is_valid_launcher_bat_bytes(raw_bytes):
+    """Verifies candidate Launch_Enforcer.bat bytes before writing to disk."""
+    if (
+        not isinstance(raw_bytes, (bytes, bytearray))
+        or len(raw_bytes) < 64
+        or len(raw_bytes) > 512 * 1024
+    ):
+        return False
+    if b"\x00" in raw_bytes:
+        return False
+    txt = bytes(raw_bytes).decode("utf-8", errors="replace")
+    return (
+        ("@echo off" in txt.lower())
+        and ("enforcer.py" in txt)
+        and ("PnL Enforcer" in txt)
+    )
+
+
 def _is_update_version_skipped(cand_ver):
     skipped_v = _peek_saved_skipped_update_version()
     if not skipped_v or not cand_ver:
@@ -51470,6 +53549,8 @@ def check_for_updates_cli(restart_on_update=False, skip_if_recent=False):
     (with Changelog preview + link) to download and install the latest files."""
     try:
         if not _peek_saved_check_updates_pref():
+            return
+        if _is_git_repo_checkout():
             return
         if _is_another_instance_running():
             return
@@ -51508,7 +53589,7 @@ def check_for_updates_manual(parent_pf=None, from_live_hud=False, cancel_pf_fn=N
     enforces the same flat/unlocked guardrails."""
     global _manual_update_chk_busy
     hide_all_tooltips()
-    if _manual_update_chk_busy:
+    if _manual_update_chk_busy or _desktop_tidy_in_progress:
         return False
     ok_sw, _sw_code, sw_msg = _check_version_switch_guardrails(
         from_live_hud=from_live_hud, action_label="In-app update", log_block=True
@@ -51602,6 +53683,8 @@ def start_background_update_check(parent_pf, cancel_pf_fn=None):
     + Changelog modal over Pre-Flight only if a newer version is found."""
     if not _peek_saved_check_updates_pref():
         return
+    if _is_git_repo_checkout():
+        return
 
     def _worker():
         payload = _fetch_available_update_payload(skip_if_recent=True)
@@ -51617,7 +53700,7 @@ def start_background_update_check(parent_pf, cancel_pf_fn=None):
 
         def _prompt_on_ui():
             try:
-                if not parent_pf.winfo_exists():
+                if not parent_pf.winfo_exists() or _desktop_tidy_in_progress:
                     return
                 if parent_pf.grab_current() is not None:
                     parent_pf.after(300, _prompt_on_ui)
