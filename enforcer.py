@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.83"
+APP_VERSION = "0.9.84"
 
 import os
 import sys
@@ -1608,7 +1608,8 @@ def center_dialog_over_parent(
 def _safe_unbind(widget, seq, funcid):
     """Removes a single Tcl binding (`funcid`) from `widget` for `seq` without
     wiping sibling `add='+'` bindings on Python < 3.13 (CPython gh-75666), and
-    defers `deletecommand` to `after_idle` so in-flight bind scripts finish."""
+    defers `deletecommand` past any synchronous `update_idletasks()` flush so
+    already-snapshotted bindtag scripts finish cleanly."""
     if widget is None or not funcid:
         return
     try:
@@ -1634,7 +1635,7 @@ def _safe_unbind(widget, seq, funcid):
             pass
 
     try:
-        widget.after_idle(_deferred_del)
+        widget.after(500, _deferred_del)
     except Exception:
         _deferred_del()
 
@@ -2740,6 +2741,11 @@ _lock_from_presync_save = False
 done_for_today = False
 committed_for_today = False
 force_reanchor = False
+_manual_reanchor_pending = False
+_baseline_archive = None
+_pending_reanchor_curve_seed = None
+pending_baseline_revert = None
+pending_baseline_revert_done_today = False
 current_is_flat = True
 first_poll_of_launch = True
 _launch_grace_pending = False
@@ -2775,6 +2781,39 @@ _last_real_broker = "SCHWAB"
 _demo_memory_session = {}
 consecutive_api_failures = 0
 api_disconnect_alerted = False
+_consecutive_auth_failures = 0
+_disc_flap_drop_monos = []
+_disc_flap_quiet_active = False
+_disc_flap_unstable_announced = False
+_disc_stable_since_mono = 0.0
+_disc_audio_announced = False
+_disc_audio_suppressed_for_outage = False
+_disc_active_reason_prefix = ""
+
+
+def _reset_disconnect_flap_state():
+    """Resets disconnect-flap audio throttling and auth failure streak state
+    when switching brokers/accounts or starting a fresh polling loop."""
+    global _consecutive_auth_failures, _disc_flap_drop_monos
+    global _disc_flap_quiet_active, _disc_flap_unstable_announced
+    global _disc_stable_since_mono, _disc_audio_announced
+    global _disc_audio_suppressed_for_outage, _disc_active_reason_prefix
+    _consecutive_auth_failures = 0
+    _disc_flap_drop_monos = []
+    _disc_flap_quiet_active = False
+    _disc_flap_unstable_announced = False
+    _disc_stable_since_mono = 0.0
+    _disc_audio_announced = False
+    _disc_audio_suppressed_for_outage = False
+    _disc_active_reason_prefix = ""
+
+
+def _is_disconnect_audio_suppressed():
+    """Returns True when the current outage is held inside the flap-storm
+    audio quiet window and has not yet escalated past the prolongation gate."""
+    return bool(_disc_audio_suppressed_for_outage and not _disc_audio_announced)
+
+
 cooldown_end_time = 0.0
 cooldown_label = "COOL-DOWN LOCK"
 cooldown_30s_announced = False
@@ -2922,9 +2961,13 @@ def _bump_adapter_epoch():
     from the previous epoch aborts cleanly without mutating the new session."""
     global _adapter_epoch, _last_fresh_poll_info, _feed_degrade_streak
     global _feed_wake_resync_until_fresh, _last_live_hud_snapshot
-    global _pending_postlaunch_auth
+    global _pending_postlaunch_auth, pending_baseline_revert, pending_baseline_revert_done_today
+    global _manual_reanchor_pending
     with _postlaunch_auth_lock:
         _pending_postlaunch_auth = None
+    pending_baseline_revert = None
+    pending_baseline_revert_done_today = False
+    _manual_reanchor_pending = False
     with _adapter_epoch_lock:
         _adapter_epoch += 1
         _last_fresh_poll_info = None
@@ -2933,6 +2976,7 @@ def _bump_adapter_epoch():
         _feed_clock_probe["wall"] = 0.0
         _feed_clock_probe["mono"] = 0.0
         _last_live_hud_snapshot = None
+        _reset_disconnect_flap_state()
         return _adapter_epoch
 
 
@@ -3364,14 +3408,16 @@ def _get_effective_rth_tier_stops(t1_max, t2_on, t2_max, t3_on, t3_max):
     return base_t1_stop, eff_t2, eff_t3
 
 
-def describe_active_floor(cfg=None, rth_mode=None):
+def describe_active_floor(cfg=None, rth_mode=None, start_eq=None, hwm_eq=None):
     """Returns (floor_equity, stop_pnl, hud_hdr_tag, tier_short_label,
     tier_full_desc, setting_field_hint) for the currently active Daily Stop
-    tier so the HUD, Post-Breach Review dialog, and audit logs always state
-    explicitly WHICH rulebook & tier controls the active floor."""
+    tier (or a counterfactual `(start_eq, hwm_eq)` pair without mutating globals)
+    so the HUD, Post-Breach Review dialog, revert previews, and audit logs
+    always state explicitly WHICH rulebook & tier controls the active floor."""
     c = cfg or config
     rth_now = is_rth() if rth_mode is None else bool(rth_mode)
-    if start_equity is None or start_equity <= 0.0:
+    eff_start = start_equity if start_eq is None else float(start_eq)
+    if eff_start is None or eff_start <= 0.0:
         if not rth_now:
             pm_max = float(c.get("pm_max_loss", 1500.0))
             return (
@@ -3392,16 +3438,20 @@ def describe_active_floor(cfg=None, rth_mode=None):
             "Card 5 'Starting Max Loss ($)'",
         )
 
-    hwm_eq = max_equity if max_equity is not None else start_equity
-    max_realized_profit = round(hwm_eq - start_equity, 2)
+    eff_hwm = (
+        (max_equity if max_equity is not None else eff_start)
+        if hwm_eq is None
+        else float(hwm_eq)
+    )
+    max_realized_profit = round(eff_hwm - eff_start, 2)
     if not rth_now:
         pm_lock_on = bool(c.get("enable_pm_lock", True))
         pm_trig = float(c.get("pm_lock_trigger", 500.0))
         pm_trail = float(c.get("pm_trail_cushion", 500.0))
         pm_max = float(c.get("pm_max_loss", 1500.0))
         if pm_lock_on and max_realized_profit >= pm_trig:
-            fl_eq = max(start_equity - pm_max, hwm_eq - pm_trail)
-            st_pnl = round(fl_eq - start_equity, 2)
+            fl_eq = max(eff_start - pm_max, eff_hwm - pm_trail)
+            st_pnl = round(fl_eq - eff_start, 2)
             return (
                 fl_eq,
                 st_pnl,
@@ -3410,10 +3460,10 @@ def describe_active_floor(cfg=None, rth_mode=None):
                 f"Ext-Hours Profit Lock (Unlocked at High {format_dollar(max_realized_profit)} >= +${pm_trig:,.0f}, Trail ${pm_trail:,.0f})",
                 "Card 4 'Trail Peak By ($)' (or uncheck 'Profit Lock Trigger')",
             )
-        fl_eq = start_equity - pm_max
+        fl_eq = eff_start - pm_max
         return (
             fl_eq,
-            round(fl_eq - start_equity, 2),
+            round(fl_eq - eff_start, 2),
             "EXT",
             "Ext-Hours Base Stop",
             f"Ext-Hours Starting Max Loss (-${pm_max:,.0f})",
@@ -3443,8 +3493,8 @@ def describe_active_floor(cfg=None, rth_mode=None):
                 else base_t1_stop
             )
         )
-        fl_eq = max(start_equity + prior_stop_pnl, hwm_eq - t4_trail)
-        st_pnl = round(fl_eq - start_equity, 2)
+        fl_eq = max(eff_start + prior_stop_pnl, eff_hwm - t4_trail)
+        st_pnl = round(fl_eq - eff_start, 2)
         return (
             fl_eq,
             st_pnl,
@@ -3454,8 +3504,8 @@ def describe_active_floor(cfg=None, rth_mode=None):
             "Card 5 'Tier 4 — Trail Peak By ($)' (or uncheck Tier 4)",
         )
     if t3_on and max_realized_profit >= t3_trig:
-        fl_eq = start_equity + eff_t3_max
-        st_pnl = round(fl_eq - start_equity, 2)
+        fl_eq = eff_start + eff_t3_max
+        st_pnl = round(fl_eq - eff_start, 2)
         return (
             fl_eq,
             st_pnl,
@@ -3465,8 +3515,8 @@ def describe_active_floor(cfg=None, rth_mode=None):
             "Card 5 'Tier 3 — Stop Level ($)' (or uncheck Tier 3)",
         )
     if t2_on and max_realized_profit >= t2_trig:
-        fl_eq = start_equity + eff_t2_max
-        st_pnl = round(fl_eq - start_equity, 2)
+        fl_eq = eff_start + eff_t2_max
+        st_pnl = round(fl_eq - eff_start, 2)
         return (
             fl_eq,
             st_pnl,
@@ -3475,10 +3525,10 @@ def describe_active_floor(cfg=None, rth_mode=None):
             f"RTH Tier 2 Stop Ratchet (Unlocked at RTH High {format_dollar(max_realized_profit)} >= +${t2_trig:,.0f})",
             "Card 5 'Tier 2 — Stop Level ($)' (or uncheck Tier 2)",
         )
-    fl_eq = start_equity - t1_max
+    fl_eq = eff_start - t1_max
     return (
         fl_eq,
-        round(fl_eq - start_equity, 2),
+        round(fl_eq - eff_start, 2),
         "T1",
         "RTH Tier 1 Base",
         f"RTH Tier 1 Starting Max Loss (-${t1_max:,.0f})",
@@ -5706,6 +5756,39 @@ def _decimate_pnl_curve_pts(pts, max_pts=MAX_PNL_CURVE_POINTS):
     return out + tail
 
 
+def _compact_flat_pnl_curve_pts(pts):
+    """Collapses consecutive identical-PnL points (`abs(p - prev_p) <= 0.005`)
+    so flat-out idle gaps never squish active trading into a narrow column:
+    interior identical runs >= 3 collapse to (first, last); trailing identical
+    runs >= 2 collapse to a single final point (earliest ts + OR'd boundary)."""
+    if not pts or len(pts) <= 1:
+        return list(pts or ())
+    groups = []
+    cur_group = [pts[0]]
+    for it in pts[1:]:
+        if abs(float(it[1]) - float(cur_group[-1][1])) <= 0.005:
+            cur_group.append(it)
+        else:
+            groups.append(cur_group)
+            cur_group = [it]
+    groups.append(cur_group)
+
+    out = []
+    n_groups = len(groups)
+    for g_idx, g in enumerate(groups):
+        is_tail = g_idx == (n_groups - 1)
+        if len(g) == 1:
+            out.append(g[0])
+        elif is_tail:
+            any_b = any(bool(x[2]) for x in g)
+            out.append((g[0][0], g[0][1], any_b))
+        else:
+            any_b = any(bool(x[2]) for x in g)
+            out.append((g[0][0], g[0][1], bool(g[0][2] or any_b)))
+            out.append((g[-1][0], g[-1][1], bool(g[-1][2])))
+    return out
+
+
 def _load_pnl_curve_for_session(s_key, today_str, raw_list):
     if not s_key or not today_str or not isinstance(raw_list, list):
         return
@@ -5720,6 +5803,7 @@ def _load_pnl_curve_for_session(s_key, today_str, raw_list):
             except Exception:
                 continue
     cleaned.sort(key=lambda it: it[0])
+    cleaned = _compact_flat_pnl_curve_pts(cleaned)
     if len(cleaned) > MAX_PNL_CURVE_POINTS:
         cleaned = _decimate_pnl_curve_pts(cleaned, MAX_PNL_CURVE_POINTS)
     with _pnl_curve_lock:
@@ -5750,8 +5834,9 @@ def _record_pnl_curve_point(
     force=False,
     now_ts=None,
 ):
-    """Appends significant Net PnL checkpoints per session & returns an immutable
-    tuple of float PnL values including the live `net_pnl` tip."""
+    """Appends significant Net PnL checkpoints per session (pausing periodic
+    45s time ticks while flat so idle waits never squish prior trades) &
+    returns an immutable tuple of float PnL values including the live tip."""
     if not s_key or not today_str:
         return (round(float(net_pnl), 2),)
     ts = round(float(now_ts if now_ts is not None else time.time()), 1)
@@ -5776,12 +5861,15 @@ def _record_pnl_curve_point(
             cur_max = max(p for _, p, _ in pts)
             cur_min = min(p for _, p, _ in pts)
             if (
-                (ts - last_ts) >= 45.0
+                ((not is_flat_now) and (ts - last_ts) >= 45.0)
                 or abs(pnl - last_pnl) >= delta_thresh
                 or pnl > cur_max
                 or pnl < cur_min
             ):
                 should_commit = True
+        same_as_last = bool(pts and abs(pnl - pts[-1][1]) <= 0.005)
+        if is_flat_now and same_as_last and not flat_changed:
+            should_commit = False
         if should_commit:
             if pts and abs(ts - pts[-1][0]) < 0.05:
                 pts[-1] = (ts, pnl, bool(pts[-1][2] or is_boundary))
@@ -5842,6 +5930,240 @@ def compute_sparkline_scale(
     return (c_min - 0.16 * raw_span, c_max + 0.14 * raw_span, False)
 
 
+def _get_valid_baseline_archive(s_key=None, today_str=None):
+    """Returns `_baseline_archive` only when it belongs to today and `(s_key)`
+    on a live broker (never DEMO) with a positive `orig_start_equity`."""
+    arch = _baseline_archive
+    if not isinstance(arch, dict):
+        return None
+    eff_today = str(today_str or active_session_date or get_today_str())
+    if s_key is None:
+        if active_adapter is None or is_demo_mode_active(active_adapter):
+            return None
+        eff_key = get_session_key(active_adapter.name, active_adapter.account_id)
+    else:
+        eff_key = str(s_key)
+    if not eff_key or eff_key.upper().startswith("DEMO"):
+        return None
+    try:
+        orig_s = float(arch.get("orig_start_equity") or 0.0)
+    except Exception:
+        return None
+    if (
+        str(arch.get("session_date") or "") != eff_today
+        or str(arch.get("s_key") or "") != eff_key
+        or orig_s <= 0.0
+    ):
+        return None
+    return arch
+
+
+def _check_ignored_positions_revert_compatible(arch, live_ig=None):
+    """Ensures archived swing-position references match current ignored
+    positions cleanly (no swing adds/trims/closes after Re-Zero)."""
+    if not isinstance(arch, dict):
+        return False, "Missing baseline archive."
+    arch_ig = arch.get("orig_ignored_positions")
+    if not isinstance(arch_ig, dict):
+        arch_ig = {}
+    if live_ig is None:
+        with _ignored_positions_lock:
+            cur_ig = json.loads(json.dumps(ignored_positions or {}))
+    else:
+        cur_ig = dict(live_ig)
+    if set(arch_ig.keys()) != set(cur_ig.keys()):
+        return (
+            False,
+            "Ignored swing positions changed after Re-Zero, so baseline revert is blocked to prevent swing PnL leakage.",
+        )
+    for tag, a_entry in arch_ig.items():
+        c_entry = cur_ig.get(tag)
+        if not isinstance(a_entry, dict) or not isinstance(c_entry, dict):
+            return (
+                False,
+                "Ignored swing position metadata changed after Re-Zero.",
+            )
+        a_q = float(a_entry.get("ref_qty", a_entry.get("init_qty", 0.0)) or 0.0)
+        c_q = float(c_entry.get("ref_qty", c_entry.get("init_qty", 0.0)) or 0.0)
+        c_li = float(c_entry.get("locked_impact", 0.0) or 0.0)
+        if abs(a_q - c_q) > 1e-6 or abs(c_li) > 0.005:
+            return (
+                False,
+                f"Ignored position {tag} was modified or traded after Re-Zero, so baseline revert is blocked to prevent swing PnL leakage.",
+            )
+    return True, ""
+
+
+def _fold_segment_into_baseline_archive(arch, seg_state, reset_925=True):
+    """Pure fold merging a re-anchored segment (`seg_state`) back into `arch`'s
+    S0 frame for both 2nd+ Re-Anchor archiving and final Revert preview/apply."""
+    orig_start = round(float(arch["orig_start_equity"]), 2)
+    off_eq = round(float(arch.get("active_shift", 0.0) or 0.0), 2)
+    seg_start = float(seg_state.get("start_equity") or orig_start)
+    off_pnl = round(seg_start + off_eq - orig_start, 2)
+
+    seg_dmax = float(seg_state.get("daily_max_equity") or seg_start)
+    seg_dmin = float(seg_state.get("daily_min_equity") or seg_start)
+    seg_lflat = float(seg_state.get("last_flat_equity") or seg_start)
+    seg_max = float(seg_state.get("max_equity") or seg_start)
+
+    daily_max = max(
+        float(arch.get("orig_daily_max_equity") or orig_start),
+        _round_cents(seg_dmax + off_eq),
+    )
+    daily_min = min(
+        float(arch.get("orig_daily_min_equity") or orig_start),
+        _round_cents(seg_dmin + off_eq),
+    )
+    last_flat = _round_cents(seg_lflat + off_eq)
+    wins = int(arch.get("orig_win_trades", 0) or 0) + int(
+        seg_state.get("win_trades", 0) or 0
+    )
+    losses = int(arch.get("orig_loss_trades", 0) or 0) + int(
+        seg_state.get("loss_trades", 0) or 0
+    )
+    has_open = bool(
+        arch.get("orig_has_reset_at_open", False)
+        or seg_state.get("has_reset_at_open", False)
+    )
+    has_close = bool(
+        arch.get("orig_has_reset_at_close", False)
+        or seg_state.get("has_reset_at_close", False)
+    )
+
+    if (
+        reset_925
+        and arch.get("rb_reset_s0") is not None
+        and arch.get("rb_reset_seg_max") is not None
+    ):
+        rb_s0 = float(arch["rb_reset_s0"])
+        rb_seg = float(arch["rb_reset_seg_max"])
+        if seg_max > (rb_seg + 0.01):
+            restored_max = max(rb_s0, _round_cents(seg_max + off_eq))
+        else:
+            restored_max = rb_s0
+    else:
+        restored_max = max(
+            float(arch.get("orig_max_equity") or orig_start),
+            _round_cents(seg_max + off_eq),
+        )
+
+    base_pts = [
+        [round(float(t), 1), round(float(p), 2)]
+        for t, p in (arch.get("orig_pnl_curve") or [])
+    ]
+    last_t = max((pt[0] for pt in base_pts), default=None)
+    for item in seg_state.get("pnl_curve") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            t_v = round(float(item[0]), 1)
+            p_v = round(float(item[1]) + off_pnl, 2)
+            if last_t is None or t_v > last_t:
+                base_pts.append([t_v, p_v])
+                last_t = t_v
+    if base_pts:
+        tuples_3 = [(pt[0], pt[1], False) for pt in base_pts]
+        tuples_3 = _compact_flat_pnl_curve_pts(tuples_3)
+        if len(tuples_3) > MAX_PNL_CURVE_POINTS:
+            tuples_3 = _decimate_pnl_curve_pts(tuples_3, MAX_PNL_CURVE_POINTS)
+        merged_curve = [[round(t, 1), round(p, 2)] for t, p, _ in tuples_3]
+    else:
+        merged_curve = []
+
+    return {
+        "start_equity": orig_start,
+        "anchor_cash_flow": round(float(arch.get("orig_anchor_cash_flow", 0.0) or 0.0), 2),
+        "max_equity": _round_cents(restored_max),
+        "daily_max_equity": _round_cents(daily_max),
+        "daily_min_equity": _round_cents(daily_min),
+        "last_flat_equity": _round_cents(last_flat),
+        "win_trades": wins,
+        "loss_trades": losses,
+        "has_reset_at_open": has_open,
+        "has_reset_at_close": has_close,
+        "pnl_curve": merged_curve,
+        "pnl_offset": off_pnl,
+        "eq_offset": off_eq,
+    }
+
+
+def _get_baseline_revert_block_reason(
+    s_key=None, today_str=None, require_flat=True, live_flat_override=None
+):
+    """Enforces identical tamper/lock/flatness gates across Preferences UI,
+    save_and_launch(), and data_loop() before reverting a baseline."""
+    if is_demo_mode_active():
+        return "Not available in Demo Simulator mode."
+    arch = _get_valid_baseline_archive(s_key=s_key, today_str=today_str)
+    if arch is None:
+        return "No original baseline archive exists for today's active account."
+    if start_equity is None or abs(float(arch["orig_start_equity"]) - float(start_equity)) <= 0.01:
+        return "Active session is already on today's original baseline."
+    if force_reanchor:
+        return "A Force Re-Anchor reset is currently queued."
+    if is_locked_down or cooldown_active or dry_run_lock_active or pending_halt_breach is not None:
+        return "Blocked while an active breach, cooldown lock, or halt watch is active."
+    if done_for_today:
+        return "Locked while 'Done for Today' mode is active."
+    if is_committed_for_today() or committed_for_today:
+        return "Locked because 'Commit Today' is active until 00:00 Midnight ET."
+    cur_streak_v, _req_l_v, _next_s_v, _full_s_v, _is_en_v = get_loss_streak_status()
+    if cur_streak_v > 0 and config.get("enable_consec_loss_cooldown", False):
+        return "Blocked during an active Tilt Loss Streak."
+    eff_flat = current_is_flat if live_flat_override is None else bool(live_flat_override)
+    if require_flat and (not eff_flat or not _initial_positions_verified):
+        return "Close any open daytrade flat (with live positions verified) before reverting."
+    ok_ig, ig_msg = _check_ignored_positions_revert_compatible(arch)
+    if not ok_ig:
+        return ig_msg
+    return ""
+
+
+def _preseed_crossed_warning_alarms(restored_net_pnl, rth_now, cfg, hwm_profit):
+    """Marks early warning keys already crossed by restored_net_pnl so reverting
+    never fires stale warning sirens for thresholds already below current PnL."""
+    net_v = float(restored_net_pnl)
+    c = cfg or config
+    if not rth_now:
+        if c.get("enable_pm_w1", False):
+            w1 = float(c.get("pm_warn_1", 500.0))
+            if net_v <= -w1:
+                triggered_alarms[f"Ext-Hours -${w1:,.0f} Warn 1"] = time.time()
+        if c.get("enable_pm_w2", False):
+            w2 = float(c.get("pm_warn_2", 1000.0))
+            if net_v <= -w2:
+                triggered_alarms[f"Ext-Hours -${w2:,.0f} Warn 2"] = time.time()
+        return
+    t1_max = float(c.get("t1_max_loss", 2000.0))
+    t2_on = bool(c.get("enable_t2", True))
+    t3_on = bool(c.get("enable_t3", True))
+    t4_on = bool(c.get("enable_t4", True))
+    _, eff_t2_max, eff_t3_max = _get_effective_rth_tier_stops(
+        t1_max,
+        t2_on,
+        float(c.get("t2_max_loss", -1000.0)),
+        t3_on,
+        float(c.get("t3_max_loss", -500.0)),
+    )
+    if t4_on and hwm_profit >= float(c.get("t4_trigger", 1000.0)):
+        return
+    if t3_on and hwm_profit >= float(c.get("t3_trigger", 500.0)):
+        if eff_t3_max < 0 and net_v <= 0.0:
+            triggered_alarms["Hit $0 (Tier 3)"] = time.time()
+        return
+    if t2_on and hwm_profit >= float(c.get("t2_trigger", 250.0)):
+        if eff_t2_max < 0 and net_v <= 0.0:
+            triggered_alarms["Hit $0 (Tier 2)"] = time.time()
+        return
+    if c.get("enable_t1_w1", False):
+        w1 = float(c.get("t1_warn_1", 500.0))
+        if net_v <= -w1:
+            triggered_alarms[f"Hit -${w1:,.0f} (Tier 1)"] = time.time()
+    if c.get("enable_t1_w2", False):
+        w2 = float(c.get("t1_warn_2", 1000.0))
+        if net_v <= -w2:
+            triggered_alarms[f"Hit -${w2:,.0f} (Tier 1)"] = time.time()
+
+
 def restore_account_session(broker_name, account_id, log_restore=False):
     """Restores today's saved baseline for a specific broker + account_id.
     Returns True if a valid baseline for today was found, False otherwise."""
@@ -5866,7 +6188,13 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     global recent_loss_timestamps, ignored_positions, pending_halt_breach
     global active_non_breach_halted_syms, _notified_non_breach_halt_syms
     global active_session_date
+    global _baseline_archive, _pending_reanchor_curve_seed, _manual_reanchor_pending
+    global pending_baseline_revert, pending_baseline_revert_done_today
 
+    _baseline_archive = None
+    _pending_reanchor_curve_seed = None
+    pending_baseline_revert = None
+    pending_baseline_revert_done_today = False
     _launch_fee_drift_checked = False
     _launch_live_sync_deferred = False
     _launch_grace_pending = True
@@ -5883,6 +6211,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     _off_session_reconciled = False
     _cold_launch_ignored_qty_mutated = False
     active_breach_source = ""
+    _manual_reanchor_pending = False
     last_breach_trigger_net_pnl = None
     _breach_pin_rt_pending = False
     _breach_pin_retired = False
@@ -5990,7 +6319,9 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             if is_locked_down:
                 raw_bsrc = str(s_data.get("breach_source") or "").strip().upper()
                 active_breach_source = (
-                    raw_bsrc if raw_bsrc in ("LIVE", "OFF_SESSION") else "LIVE"
+                    raw_bsrc
+                    if raw_bsrc in ("LIVE", "OFF_SESSION", "DONE_RESTORE")
+                    else "LIVE"
                 )
                 raw_btrig = s_data.get("breach_trigger_net_pnl")
                 if raw_btrig is not None:
@@ -6046,6 +6377,15 @@ def restore_account_session(broker_name, account_id, log_restore=False):
             saved_ig = s_data.get("ignored_positions")
             if isinstance(saved_ig, dict):
                 ignored_positions.update(json.loads(json.dumps(saved_ig)))
+            raw_b_arch = s_data.get("baseline_archive")
+            if (
+                str(broker_name).upper() != "DEMO"
+                and isinstance(raw_b_arch, dict)
+                and str(raw_b_arch.get("session_date") or "") == today_str
+                and str(raw_b_arch.get("s_key") or "") == s_key
+                and float(raw_b_arch.get("orig_start_equity") or 0.0) > 0.0
+            ):
+                _baseline_archive = json.loads(json.dumps(raw_b_arch))
             _load_pnl_curve_for_session(
                 s_key, today_str, s_data.get("pnl_curve")
             )
@@ -6501,6 +6841,14 @@ def save_session_state(
             "loss_trades": loss_trades,
             "loss_timestamps": [round(float(t), 2) for t in recent_loss_timestamps],
             "ignored_positions": json.loads(json.dumps(ignored_positions)),
+            "baseline_archive": (
+                json.loads(json.dumps(_baseline_archive))
+                if (
+                    str(active_b).upper() != "DEMO"
+                    and _get_valid_baseline_archive(s_key, today_str) is not None
+                )
+                else None
+            ),
             "was_flat_at_save": bool(current_is_flat),
             "open_positions_at_save": open_pos_save_map,
             "pnl_curve": _export_pnl_curve_for_session(s_key, today_str),
@@ -10503,6 +10851,41 @@ class SchwabAdapter:
 WEBULL_POS_MIN_INTERVAL_SEC = 1.15
 
 
+def _validate_webull_token_file(tok_file):
+    """Reads Webull SDK's 3-line ~/conf/token.txt (token, expires, status) and
+    returns the cached token ONLY when status == 'NORMAL' and it has not expired.
+    Prevents injecting PENDING/INVALID tokens written mid-2FA initialization."""
+    try:
+        if not tok_file or not os.path.exists(tok_file):
+            return None
+        with open(tok_file, "r", encoding="utf-8") as tf:
+            tok = tf.readline().strip()
+            exp_raw = tf.readline().strip()
+            status = tf.readline().strip().upper()
+        if not tok or status != "NORMAL":
+            return None
+        if not exp_raw:
+            return None
+        try:
+            exp_val = float(exp_raw)
+        except Exception:
+            return None
+        if exp_val <= 0.0:
+            return None
+        now_t = time.time()
+        if exp_val > 1e12:
+            # Epoch milliseconds
+            return tok if (exp_val / 1000.0) > now_t else None
+        if exp_val > 1e9:
+            # Epoch seconds
+            return tok if exp_val > now_t else None
+        # Relative TTL seconds measured from token file mtime
+        mtime = os.path.getmtime(tok_file)
+        return tok if (mtime + exp_val) > now_t else None
+    except Exception:
+        return None
+
+
 class WebullAdapter:
     name = "WEBULL"
 
@@ -10972,8 +11355,9 @@ class WebullAdapter:
 
     def reconnect_session(self):
         """Refreshes Webull client timeout state (or rebuilds ApiClient/TradeClient
-        atomically on auth/token errors) without clobbering the active in-memory
-        access token if a reconnect attempt times out mid-outage."""
+        atomically on auth/token errors) with bounded token-check polling so
+        pending 2FA checks never freeze data_loop, and without carrying stale
+        tokens across a full reinit."""
         try:
             err_l = str(getattr(self, "last_error", "") or "").lower()
             needs_full_reinit = (
@@ -10988,6 +11372,8 @@ class WebullAdapter:
                         "token",
                         "expired",
                         "sign",
+                        "error_check_token_enable",
+                        "error_init_token",
                     )
                 )
             )
@@ -10996,23 +11382,13 @@ class WebullAdapter:
                 self.api_client._read_timeout = 4.5
                 if not self.api_client.get_token():
                     tok_file = os.path.join(USER_HOME, "conf", "token.txt")
-                    if os.path.exists(tok_file):
-                        try:
-                            with open(tok_file, "r", encoding="utf-8") as tf:
-                                saved_tok = tf.readline().strip()
-                            if saved_tok:
-                                self.api_client.set_token(saved_tok)
-                        except Exception:
-                            pass
+                    saved_tok = _validate_webull_token_file(tok_file)
+                    if saved_tok:
+                        self.api_client.set_token(saved_tok)
                 return True
 
             from webull.core.client import ApiClient
             from webull.trade.trade_client import TradeClient
-            old_tok = (
-                self.api_client.get_token()
-                if self.api_client is not None
-                else None
-            )
             try:
                 new_api = ApiClient(
                     self.app_key,
@@ -11020,18 +11396,29 @@ class WebullAdapter:
                     "us",
                     connect_timeout=3.5,
                     timeout=4.5,
+                    token_check_duration_seconds=8,
+                    token_check_interval_seconds=2,
                 )
             except TypeError:
-                new_api = ApiClient(self.app_key, self.app_secret, "us")
-                new_api._connect_timeout = 3.5
-                new_api._read_timeout = 4.5
+                try:
+                    new_api = ApiClient(
+                        self.app_key,
+                        self.app_secret,
+                        "us",
+                        connect_timeout=3.5,
+                        timeout=4.5,
+                    )
+                except TypeError:
+                    new_api = ApiClient(self.app_key, self.app_secret, "us")
+                    new_api._connect_timeout = 3.5
+                    new_api._read_timeout = 4.5
+                new_api._token_check_duration_seconds = 8
+                new_api._token_check_interval_seconds = 2
             new_api._stream_logger_set = True
             new_api._file_logger_set = True
             if hasattr(new_api, "set_token_dir"):
                 new_api.set_token_dir(os.path.join(USER_HOME, "conf"))
             new_api.add_endpoint("us", "api.webull.com")
-            if old_tok and not new_api.get_token():
-                new_api.set_token(old_tok)
             new_trade = TradeClient(new_api)
             self.api_client = new_api
             self.trade_client = new_trade
@@ -15485,6 +15872,69 @@ def show_broker_setup_wizard(broker_name, parent=None):
     return saved_ok["status"]
 
 
+def _is_transient_startup_auth_error(broker_name, exc):
+    """Returns True when a startup broker authenticate() error represents a
+    transient HTTP 401/5xx/timeout/socket hiccup safe to retry automatically,
+    never retrying cancelled interactive OAuth or DeferredAuthRequired."""
+    if isinstance(exc, DeferredAuthRequired):
+        return False
+    b_up = str(broker_name or "").upper()
+    err_l = str(exc or "").lower()
+    if any(
+        k in err_l
+        for k in (
+            "cancelled",
+            "canceled",
+            "browser login",
+            "invalid_grant",
+            "unsupported_token_type",
+            "token rejected",
+            "safety buffer",
+        )
+    ):
+        return False
+    if b_up == "WEBULL":
+        return any(
+            k in err_l
+            for k in (
+                "401",
+                "unauthorized",
+                "invalid credentials",
+                "error_check_token_enable",
+                "error_init_token",
+                "500",
+                "502",
+                "503",
+                "504",
+                "timeout",
+                "timed out",
+                "connection",
+                "reset",
+                "sdk.httperror",
+                "unknownservererror",
+            )
+        )
+    if b_up == "SCHWAB":
+        if "network connection failed while reaching schwab api" in err_l:
+            return True
+        if isinstance(exc, ConnectionError):
+            return True
+        return any(
+            k in err_l
+            for k in (
+                "500",
+                "502",
+                "503",
+                "504",
+                "timeout",
+                "timed out",
+                "connection",
+                "reset",
+            )
+        )
+    return False
+
+
 def connect_broker_adapter(
     broker_name,
     parent=None,
@@ -15523,95 +15973,121 @@ def connect_broker_adapter(
         load_config()
         b_cfg = config["brokers"][broker_name]
 
-    try:
-        if broker_name == "SCHWAB":
-            adapter = SchwabAdapter(b_cfg["app_key"], b_cfg["app_secret"])
-        else:
-            adapter = WebullAdapter(b_cfg["app_key"], b_cfg["app_secret"])
-
-        cached_accts = (
-            b_cfg.get("cached_accounts")
-            if (fast_startup and not force_wizard)
-            else None
+    retry_delays = ()
+    if not force_wizard and not suppress_error_modal:
+        retry_delays = (
+            (1.5, 3.0) if str(broker_name or "").upper() == "WEBULL" else (1.5,)
         )
+
+    last_exc = None
+    max_attempts = 1 + len(retry_delays)
+    for attempt_idx in range(max_attempts):
         try:
-            adapter.authenticate(
-                fast_cached_accounts=cached_accts,
-                allow_interactive_oauth=allow_interactive_oauth,
+            if broker_name == "SCHWAB":
+                adapter = SchwabAdapter(b_cfg["app_key"], b_cfg["app_secret"])
+            else:
+                adapter = WebullAdapter(b_cfg["app_key"], b_cfg["app_secret"])
+
+            cached_accts = (
+                b_cfg.get("cached_accounts")
+                if (fast_startup and not force_wizard)
+                else None
             )
-        except TypeError:
-            if sys.exc_info()[2].tb_next is not None:
-                raise
             try:
-                adapter.authenticate(fast_cached_accounts=cached_accts)
+                adapter.authenticate(
+                    fast_cached_accounts=cached_accts,
+                    allow_interactive_oauth=allow_interactive_oauth,
+                )
             except TypeError:
                 if sys.exc_info()[2].tb_next is not None:
                     raise
-                adapter.authenticate()
+                try:
+                    adapter.authenticate(fast_cached_accounts=cached_accts)
+                except TypeError:
+                    if sys.exc_info()[2].tb_next is not None:
+                        raise
+                    adapter.authenticate()
 
-        saved_acct = b_cfg.get("selected_account_id", "")
-        valid_ids = [a["id"] for a in adapter.accounts]
-        cfg_dirty = False
-        if saved_acct in valid_ids:
-            adapter.account_id = saved_acct
-        elif valid_ids:
-            adapter.account_id = valid_ids[0]
-            config["brokers"][broker_name]["selected_account_id"] = valid_ids[0]
-            cfg_dirty = True
-
-        if (
-            not getattr(adapter, "_fast_auth_deferred", False)
-            and adapter.accounts
-        ):
-            if b_cfg.get("cached_accounts") != adapter.accounts:
-                config["brokers"][broker_name]["cached_accounts"] = [
-                    dict(a) for a in adapter.accounts
-                ]
+            saved_acct = b_cfg.get("selected_account_id", "")
+            valid_ids = [a["id"] for a in adapter.accounts]
+            cfg_dirty = False
+            if saved_acct in valid_ids:
+                adapter.account_id = saved_acct
+            elif valid_ids:
+                adapter.account_id = valid_ids[0]
+                config["brokers"][broker_name]["selected_account_id"] = valid_ids[0]
                 cfg_dirty = True
-            log_event(
-                "SESSION",
-                f"{broker_name} API authenticated ({len(adapter.accounts)} account(s) found)."
-            )
-        if cfg_dirty:
-            save_config(config)
-        return adapter
-    except Exception as e:
-        if isinstance(e, DeferredAuthRequired):
-            _last_boot_deferred_auth_msg = str(e)
-            if suppress_error_modal:
-                log_event("SESSION", f"{broker_name} OAuth refresh deferred: {e}")
-                return None
+
+            if (
+                not getattr(adapter, "_fast_auth_deferred", False)
+                and adapter.accounts
+            ):
+                if b_cfg.get("cached_accounts") != adapter.accounts:
+                    config["brokers"][broker_name]["cached_accounts"] = [
+                        dict(a) for a in adapter.accounts
+                    ]
+                    cfg_dirty = True
+                log_event(
+                    "SESSION",
+                    f"{broker_name} API authenticated ({len(adapter.accounts)} account(s) found)."
+                )
+            if cfg_dirty:
+                save_config(config)
+            return adapter
+        except Exception as e:
+            last_exc = e
+            if (
+                attempt_idx < len(retry_delays)
+                and _is_transient_startup_auth_error(broker_name, e)
+            ):
+                wait_s = retry_delays[attempt_idx]
+                log_event(
+                    "WARN",
+                    f"{broker_name} transient startup error ({_clip_log_detail(e, 140)}) — "
+                    f"retrying ({attempt_idx + 1}/{len(retry_delays)}) in {wait_s:.1f}s...",
+                )
+                time.sleep(wait_s)
+                continue
+            break
+
+    e = last_exc
+    if isinstance(e, DeferredAuthRequired):
+        _last_boot_deferred_auth_msg = str(e)
         if suppress_error_modal:
-            log_event(
-                "WARN",
-                f"{broker_name} startup connection deferred (network pending): {e}",
-            )
+            log_event("SESSION", f"{broker_name} OAuth refresh deferred: {e}")
             return None
-        log_event("ERROR", f"{broker_name} connection error: {e}")
-        extra_hint = (
-            "\n\n⚠️ NOTE FOR WEBULL USERS:\n"
-            "1. Check your Webull mobile app / SMS! Webull may send a 2FA code prompt "
-            "the first time your API keys are used.\n"
-            "2. Once you approve the 2FA code (or disable API 2FA in Webull portal), "
-            "click 'No' to open Pre-Flight settings or 'Yes' to re-enter keys."
-            if broker_name == "WEBULL" else ""
+    if suppress_error_modal:
+        log_event(
+            "WARN",
+            f"{broker_name} startup connection deferred (network pending): {e}",
         )
-        retry = messagebox.askyesno(
-            f"{broker_name} Connection Error",
-            f"Could not authenticate with {broker_name}:\n\n{e}{extra_hint}\n\n"
-            f"Would you like to re-enter your {broker_name} API keys?",
-            parent=parent
-        )
-        if retry:
-            return connect_broker_adapter(
-                broker_name, parent=parent, force_wizard=True
-            )
         return None
+    log_event("ERROR", f"{broker_name} connection error: {e}")
+    extra_hint = (
+        "\n\n⚠️ NOTE FOR WEBULL USERS:\n"
+        "1. Check your Webull mobile app / SMS! Webull may send a 2FA code prompt "
+        "the first time your API keys are used.\n"
+        "2. Once you approve the 2FA code (or disable API 2FA in Webull portal), "
+        "click 'No' to open Pre-Flight settings or 'Yes' to re-enter keys."
+        if broker_name == "WEBULL" else ""
+    )
+    retry = messagebox.askyesno(
+        f"{broker_name} Connection Error",
+        f"Could not authenticate with {broker_name}:\n\n{e}{extra_hint}\n\n"
+        f"Would you like to re-enter your {broker_name} API keys?",
+        parent=parent
+    )
+    if retry:
+        return connect_broker_adapter(
+            broker_name, parent=parent, force_wizard=True
+        )
+    return None
 
 
 def run_startup_broker_connect(startup_boot=False):
     """Connects initial broker at startup, suppressing fallback switches & blocking
-    error popups when booting with Windows (--startup) while network may be pending."""
+    error popups when booting with Windows (--startup) while network may be pending.
+    Never silently overwrites config['active_broker'] to a different broker."""
     init_b = config.get("active_broker", "SCHWAB")
     boot_ad = connect_broker_adapter(
         init_b,
@@ -15619,18 +16095,6 @@ def run_startup_broker_connect(startup_boot=False):
         suppress_error_modal=bool(startup_boot),
         allow_interactive_oauth=(not bool(startup_boot)),
     )
-    if boot_ad is None and not bool(startup_boot):
-        fb_b = "SCHWAB" if init_b == "WEBULL" else "WEBULL"
-        fb_cfg_d = config.get("brokers", {}).get(fb_b, {})
-        if fb_cfg_d.get("app_key") and fb_cfg_d.get("app_secret"):
-            log_event(
-                "SESSION",
-                f"{init_b} connection failed. "
-                f"Falling back to configured broker {fb_b}...",
-            )
-            config["active_broker"] = fb_b
-            save_config(config)
-            boot_ad = connect_broker_adapter(fb_b, fast_startup=True)
     return boot_ad
 
 
@@ -15746,7 +16210,7 @@ def get_full_idle_button_text():
             f"⏸ HALT DETECTED ({nh_lbl}): MONITORING POSITION — "
             f"NO RISK RULES BREACHED"
         )
-    if done_for_today and not is_locked_down:
+    if _is_done_today_display_active():
         return _with_mute_idle_prefix(
             f"🔒 DONE FOR TODAY ({b_name}): SESSION LOCKED IN — "
             f"NEW TRADES AUTO-FLATTENED"
@@ -15867,7 +16331,7 @@ def get_medium_idle_button_text():
         return _with_mute_idle_prefix(
             f"⏸ HALT ({nh_lbl}) — MONITORING (NO STOP BREACHED)"
         )
-    if done_for_today and not is_locked_down:
+    if _is_done_today_display_active():
         return _with_mute_idle_prefix(
             "🔒 DONE FOR TODAY: NEW TRADES AUTO-FLATTENED"
         )
@@ -15961,7 +16425,7 @@ def get_idle_button_text():
             )
             nh_lbl = f"{h_syms} · {max(1, int(round(rem_nh)))}s" if rem_nh > 0.2 else h_syms
             return _with_mute_idle_prefix(f"⏸ HALT ({nh_lbl})", compact=True)
-        if done_for_today and not is_locked_down:
+        if _is_done_today_display_active():
             return _with_mute_idle_prefix("🔒 DONE TODAY", compact=True)
         if _launch_grace_syms and not current_is_flat:
             g_lbl = ", ".join(list(_launch_grace_syms.keys())[:1])
@@ -15988,7 +16452,7 @@ def get_idle_button_style():
         return ("#3b2f1e", "#fde68a", "#d97706", "#78350f")
     if active_non_breach_halted_syms:
         return ("#1e293b", "#fde68a", "#d97706", "#334155")
-    if done_for_today and not is_locked_down:
+    if _is_done_today_display_active():
         net_v = (
             round(float(last_flat_equity) - float(start_equity), 2)
             if (last_flat_equity is not None and start_equity is not None)
@@ -16309,11 +16773,31 @@ def _apply_hud_status_pill_state(ui_button, advance_streak=False):
         elif consecutive_api_failures >= 2 or api_disconnect_alerted:
             att = max(2, int(consecutive_api_failures))
             age_sfx = f" · {fh['age_tag']}" if fh["age_tag"] else ""
-            re_txt = (
-                f"🔄 RECONNECTING (#{att}){age_sfx}"
-                if compact_now
-                else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att}){age_sfx}..."
-            )
+            re_pfx = str(_disc_active_reason_prefix or "CONNECTION LOST — AUTO-RECONNECTING").strip()
+            if "TOKEN EXPIRED" in re_pfx.upper():
+                re_txt = (
+                    f"🔑 TOKEN EXPIRED{age_sfx}"
+                    if compact_now
+                    else f"🔑 BROKER TOKEN EXPIRED — RESTART APP{age_sfx}"
+                )
+            elif "KEYS REJECTED" in re_pfx.upper():
+                re_txt = (
+                    f"🔑 KEYS REJECTED (#{att}){age_sfx}"
+                    if compact_now
+                    else f"🔑 {re_pfx} (#{att}){age_sfx}"
+                )
+            elif "AUTH/GATEWAY" in re_pfx.upper():
+                re_txt = (
+                    f"🔄 AUTH RETRY (#{att}){age_sfx}"
+                    if compact_now
+                    else f"🔄 {re_pfx} (ATTEMPT #{att}){age_sfx}..."
+                )
+            else:
+                re_txt = (
+                    f"🔄 RECONNECTING (#{att}){age_sfx}"
+                    if compact_now
+                    else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att}){age_sfx}..."
+                )
             cfg_kw = {
                 "text": re_txt,
                 "bg": "#78350f",
@@ -16462,13 +16946,109 @@ def _clip_log_detail(msg, max_len=140):
     return cut.rstrip(" ,;:-(") + "..."
 
 
+def _classify_poll_auth_error(broker_name, err_lower):
+    """Classifies a polling API error for two-way Schwab/Webull parity into
+    'hard' (real OAuth re-login required), 'auth_transient' (401/HMAC gateway
+    or single stray 401 retryable without restart alarm), or 'net'."""
+    err_l = str(err_lower or "").lower()
+    b_up = str(broker_name or "").upper()
+    if b_up == "WEBULL":
+        if any(
+            k in err_l
+            for k in (
+                "http status: 401",
+                "http 401",
+                "status: 401",
+                "unauthorized",
+                "invalid credentials",
+                "error_check_token_enable",
+                "error_init_token",
+                "sign",
+            )
+        ):
+            return "auth_transient"
+        return "net"
+    if any(
+        k in err_l
+        for k in (
+            "invalid_grant",
+            "unsupported_token_type",
+            "refresh_token",
+            "token expired",
+            "token rejected",
+            "safety buffer",
+        )
+    ):
+        return "hard"
+    if any(
+        k in err_l
+        for k in ("http 401", "http status: 401", "status: 401", "unauthorized")
+    ):
+        return "auth_transient"
+    return "net"
+
+
+def _format_disconnect_alarm_copy(
+    is_tok_exp, is_wb_auth_err, auth_fail_count, total_fail_count
+):
+    """Returns (base_prefix, reason_msg, voice_msg, pill_lbl_1, pill_lbl_2, is_hard_keys)
+    so Attempt #2+ alerts, Attempt #N rewrites, and escalations stay uniform."""
+    att = max(1, int(total_fail_count))
+    if is_tok_exp:
+        pfx = "BROKER TOKEN EXPIRED — RESTART APP TO RE-LOGIN"
+        return (
+            pfx,
+            pfx,
+            "Warning. Broker token expired. Please restart Enforcer to log in.",
+            "TOKEN",
+            "EXPIRED",
+            True,
+        )
+    if is_wb_auth_err:
+        if int(auth_fail_count) >= 15:
+            pfx = "WEBULL KEYS REJECTED — CHECK KEYS / PC CLOCK"
+            return (
+                pfx,
+                f"{pfx} (ATTEMPT #{att})",
+                "Warning. Webull keeps rejecting credentials. Check your API keys or PC clock.",
+                "AUTH",
+                f"RETRY #{att}",
+                True,
+            )
+        pfx = "WEBULL AUTH/GATEWAY ERROR — RETRYING"
+        return (
+            pfx,
+            f"{pfx} (ATTEMPT #{att})",
+            "Warning. Webull authentication or gateway error. Attempting to reconnect automatically.",
+            "AUTH",
+            f"RETRY #{att}",
+            False,
+        )
+    pfx = "CONNECTION LOST — AUTO-RECONNECTING"
+    return (
+        pfx,
+        f"{pfx} (ATTEMPT #{att})",
+        "Warning. Connection lost. Attempting to reconnect automatically.",
+        "OFFLINE",
+        f"RETRY #{att}",
+        False,
+    )
+
+
 def is_disconnect_alarm_reason(reason):
     """Returns True when an alarm reason represents a broker API connection
-    drop or token expiration rather than a position/loss threshold breach."""
+    drop, Webull auth/gateway retry, or token expiration rather than a
+    position/loss threshold breach."""
     r_up = str(reason or "").upper()
     return any(
         k in r_up
-        for k in ("CONNECTION LOST", "DISCONNECTED", "TOKEN EXPIRED")
+        for k in (
+            "CONNECTION LOST",
+            "DISCONNECTED",
+            "TOKEN EXPIRED",
+            "AUTH/GATEWAY",
+            "KEYS REJECTED",
+        )
     )
 
 
@@ -16561,7 +17141,7 @@ def sound_disconnect_alert_loop(my_gen=None):
         if _settings_suppresses_alarms():
             time.sleep(0.20)
             continue
-        if not config.get("mute_all_audio", False):
+        if not config.get("mute_all_audio", False) and not _is_disconnect_audio_suppressed():
             play_disconnect_tone_once()
         # Wait 4.5s between gentle reminders in 0.15s slices for instant mute/recovery
         for _ in range(30):
@@ -16659,18 +17239,19 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
                 f"Suppressed background siren loop while Settings modal is open (bounded one-shot + deferred HUD queue): {reason}{extra}",
             )
             if "INTERNAL POLL ERROR" not in r_up and not config.get("mute_all_audio", False):
-                def _one_shot_modal_alert():
-                    try:
-                        if is_disc:
-                            play_disconnect_tone_once()
-                        else:
-                            winsound.Beep(2600, 180)
-                            time.sleep(0.05)
-                            winsound.Beep(2600, 180)
-                    except Exception:
-                        pass
-                threading.Thread(target=_one_shot_modal_alert, daemon=True).start()
-                speak_async(f"Alert: {_humanize_alarm_reason(reason, for_tts=True)}")
+                if not (is_disc and _is_disconnect_audio_suppressed()):
+                    def _one_shot_modal_alert():
+                        try:
+                            if is_disc:
+                                play_disconnect_tone_once()
+                            else:
+                                winsound.Beep(2600, 180)
+                                time.sleep(0.05)
+                                winsound.Beep(2600, 180)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_one_shot_modal_alert, daemon=True).start()
+                    speak_async(f"Alert: {_humanize_alarm_reason(reason, for_tts=True)}")
         return False
 
     preempted_by_reason = None
@@ -22065,6 +22646,16 @@ def terminate_selected_apps(adapter=None):
     return "KILLED"
 
 
+def _is_done_today_display_active():
+    """Returns True when Done-for-Today UX/copy should take precedence over
+    Daily Stop Breach UX — either normal Done-for-Today (not breached) or
+    a silent 'Restore & Call It a Day' lock (`active_breach_source == 'DONE_RESTORE'`)."""
+    return bool(
+        done_for_today
+        and (not is_locked_down or active_breach_source == "DONE_RESTORE")
+    )
+
+
 def is_post_breach_force_flatten_active(cfg=None):
     """Returns True when the Daily Stop has been breached today, Auto-Flatten
     is ON, and Alarms-Only Mode is OFF — or when voluntary 'Done for Today'
@@ -22726,7 +23317,7 @@ def _reconcile_off_session_activity(
         off-session losses into `recent_loss_timestamps`."""
     global last_flat_equity, max_equity, daily_max_equity, daily_min_equity
     global prev_flat_realized_pnl, settled_realized_pnl
-    global win_trades, loss_trades
+    global win_trades, loss_trades, recent_loss_timestamps
     global _off_session_reconciled, _reconciled_through_epoch, _reconciled_order_qty
     global _restored_session_was_flat, _restored_open_positions_at_save
     global _restored_has_open_pos_snapshot, _off_session_peak_reconstructed
@@ -22899,17 +23490,17 @@ def _reconcile_off_session_activity(
             else 0.0
         )
 
-        full_reconstruct_ok = False
-        completed_rts = []
-        ledger = {}
-        tot_eq_sh = 0.0
-        tot_opt_ct = 0.0
-        if (
-            isinstance(raw_fills, list)
-            and len(inc_fills) > 0
-            and _restored_has_open_pos_snapshot
-        ):
-            prices_all_valid = True
+        def _try_reconstruct(cand_fills):
+            c_rts = []
+            c_ledger = {}
+            c_tot_eq = 0.0
+            c_tot_opt = 0.0
+            if not (
+                isinstance(raw_fills, list)
+                and len(cand_fills) > 0
+                and _restored_has_open_pos_snapshot
+            ):
+                return False, c_rts, c_ledger
             for sp_k, sp_v in (_restored_open_positions_at_save or {}).items():
                 if not isinstance(sp_v, dict):
                     continue
@@ -22918,10 +23509,9 @@ def _reconcile_off_session_activity(
                 if abs(sq) <= 1e-6:
                     continue
                 if savg <= 0.0:
-                    prices_all_valid = False
-                    break
+                    return False, [], {}
                 satype = str(sp_v.get("asset_type") or "EQUITY").upper()
-                ledger[str(sp_k)] = {
+                c_ledger[str(sp_k)] = {
                     "qty": sq,
                     "avg": savg,
                     "rt_pnl": 0.0,
@@ -22929,170 +23519,176 @@ def _reconcile_off_session_activity(
                     "closed_qty": 0.0,
                     "order_ids": [],
                 }
-
-            for f_rec in inc_fills:
+            for f_rec in cand_fills:
                 if f_rec.get("multi_leg_unknown"):
-                    prices_all_valid = False
-                    break
+                    return False, [], {}
                 f_px = f_rec.get("price")
                 if f_px is None or float(f_px or 0.0) <= 0.0:
-                    prices_all_valid = False
-                    break
+                    return False, [], {}
+            sorted_fills = sorted(
+                cand_fills,
+                key=lambda r: (float(r.get("fill_epoch", 0.0)), int(r["_idx"])),
+            )
+            for f_rec in sorted_fills:
+                sym_tag = str(f_rec["symbol"])
+                dq = float(f_rec["delta_qty"])
+                f_px = float(f_rec["price"])
+                f_side = str(f_rec["side"]).upper()
+                signed_dq = dq if f_side == "BUY" else -dq
+                f_mult = float(f_rec.get("multiplier") or 1.0)
+                f_oid = str(f_rec.get("order_id") or "").strip()
+                if f_rec.get("asset_type") == "OPTION":
+                    c_tot_opt += dq
+                else:
+                    c_tot_eq += dq
 
-            if prices_all_valid:
-                inc_fills.sort(
-                    key=lambda r: (float(r.get("fill_epoch", 0.0)), int(r["_idx"]))
-                )
-                for f_rec in inc_fills:
-                    sym_tag = str(f_rec["symbol"])
-                    dq = float(f_rec["delta_qty"])
-                    f_px = float(f_rec["price"])
-                    f_side = str(f_rec["side"]).upper()
-                    signed_dq = dq if f_side == "BUY" else -dq
-                    f_mult = float(f_rec.get("multiplier") or 1.0)
-                    f_oid = str(f_rec.get("order_id") or "").strip()
-                    if f_rec.get("asset_type") == "OPTION":
-                        tot_opt_ct += dq
-                    else:
-                        tot_eq_sh += dq
-
-                    st_ent = ledger.get(sym_tag)
-                    if st_ent is None or abs(float(st_ent["qty"])) <= 1e-6:
-                        ledger[sym_tag] = {
-                            "qty": signed_dq,
-                            "avg": f_px,
-                            "rt_pnl": 0.0,
-                            "mult": f_mult,
-                            "closed_qty": 0.0,
-                            "order_ids": [f_oid] if f_oid else [],
-                        }
-                    elif float(st_ent["qty"]) * signed_dq > 0.0:
-                        old_abs = abs(float(st_ent["qty"]))
-                        new_abs = old_abs + dq
-                        st_ent["avg"] = (
-                            (old_abs * float(st_ent["avg"])) + (dq * f_px)
-                        ) / new_abs
-                        st_ent["qty"] = round(float(st_ent["qty"]) + signed_dq, 6)
-                        if f_oid and f_oid not in st_ent["order_ids"]:
-                            st_ent["order_ids"].append(f_oid)
-                    else:
-                        cur_q = float(st_ent["qty"])
-                        cur_avg = float(st_ent["avg"])
-                        closed_q = min(abs(cur_q), dq)
-                        leg_pnl = (
-                            (f_px - cur_avg) * closed_q * f_mult
-                            if cur_q > 0.0
-                            else (cur_avg - f_px) * closed_q * f_mult
+                st_ent = c_ledger.get(sym_tag)
+                if st_ent is None or abs(float(st_ent["qty"])) <= 1e-6:
+                    c_ledger[sym_tag] = {
+                        "qty": signed_dq,
+                        "avg": f_px,
+                        "rt_pnl": 0.0,
+                        "mult": f_mult,
+                        "closed_qty": 0.0,
+                        "order_ids": [f_oid] if f_oid else [],
+                    }
+                elif float(st_ent["qty"]) * signed_dq > 0.0:
+                    old_abs = abs(float(st_ent["qty"]))
+                    new_abs = old_abs + dq
+                    st_ent["avg"] = (
+                        (old_abs * float(st_ent["avg"])) + (dq * f_px)
+                    ) / new_abs
+                    st_ent["qty"] = round(float(st_ent["qty"]) + signed_dq, 6)
+                    if f_oid and f_oid not in st_ent["order_ids"]:
+                        st_ent["order_ids"].append(f_oid)
+                else:
+                    cur_q = float(st_ent["qty"])
+                    cur_avg = float(st_ent["avg"])
+                    closed_q = min(abs(cur_q), dq)
+                    leg_pnl = (
+                        (f_px - cur_avg) * closed_q * f_mult
+                        if cur_q > 0.0
+                        else (cur_avg - f_px) * closed_q * f_mult
+                    )
+                    st_ent["rt_pnl"] = float(st_ent["rt_pnl"]) + leg_pnl
+                    st_ent["closed_qty"] = float(st_ent["closed_qty"]) + closed_q
+                    if f_oid and f_oid not in st_ent["order_ids"]:
+                        st_ent["order_ids"].append(f_oid)
+                    rem_open = round(abs(cur_q) - closed_q, 6)
+                    flip_open = round(dq - closed_q, 6)
+                    if rem_open <= 1e-6:
+                        st_ent["qty"] = 0.0
+                        all_flat_now = (
+                            flip_open <= 1e-6
+                            and all(
+                                abs(float(lv["qty"])) <= 1e-6
+                                for lv in c_ledger.values()
+                            )
                         )
-                        st_ent["rt_pnl"] = float(st_ent["rt_pnl"]) + leg_pnl
-                        st_ent["closed_qty"] = float(st_ent["closed_qty"]) + closed_q
-                        if f_oid and f_oid not in st_ent["order_ids"]:
-                            st_ent["order_ids"].append(f_oid)
-                        rem_open = round(abs(cur_q) - closed_q, 6)
-                        flip_open = round(dq - closed_q, 6)
-                        if rem_open <= 1e-6:
-                            st_ent["qty"] = 0.0
-                            all_flat_now = (
-                                flip_open <= 1e-6
-                                and all(
-                                    abs(float(lv["qty"])) <= 1e-6
-                                    for lv in ledger.values()
-                                )
-                            )
-                            completed_rts.append(
-                                {
-                                    "symbol": sym_tag,
-                                    "pnl": float(st_ent["rt_pnl"]),
-                                    "closed_qty": float(st_ent["closed_qty"]),
-                                    "close_epoch": float(f_rec["fill_epoch"]),
-                                    "all_flat_after": bool(all_flat_now),
-                                    "order_ids": list(st_ent["order_ids"]),
-                                }
-                            )
-                            if flip_open > 1e-6:
-                                ledger[sym_tag] = {
-                                    "qty": (
-                                        flip_open
-                                        if signed_dq > 0.0
-                                        else -flip_open
-                                    ),
-                                    "avg": f_px,
-                                    "rt_pnl": 0.0,
-                                    "mult": f_mult,
-                                    "closed_qty": 0.0,
-                                    "order_ids": [f_oid] if f_oid else [],
-                                }
-                            else:
-                                ledger.pop(sym_tag, None)
+                        c_rts.append(
+                            {
+                                "symbol": sym_tag,
+                                "pnl": float(st_ent["rt_pnl"]),
+                                "closed_qty": float(st_ent["closed_qty"]),
+                                "close_epoch": float(f_rec["fill_epoch"]),
+                                "all_flat_after": bool(all_flat_now),
+                                "order_ids": list(st_ent["order_ids"]),
+                            }
+                        )
+                        if flip_open > 1e-6:
+                            c_ledger[sym_tag] = {
+                                "qty": (
+                                    flip_open if signed_dq > 0.0 else -flip_open
+                                ),
+                                "avg": f_px,
+                                "rt_pnl": 0.0,
+                                "mult": f_mult,
+                                "closed_qty": 0.0,
+                                "order_ids": [f_oid] if f_oid else [],
+                            }
                         else:
-                            st_ent["qty"] = (
-                                rem_open if cur_q > 0.0 else -rem_open
-                            )
+                            c_ledger.pop(sym_tag, None)
+                    else:
+                        st_ent["qty"] = rem_open if cur_q > 0.0 else -rem_open
 
-                end_ledger_map = {
-                    lk: round(float(lv["qty"]), 6)
-                    for lk, lv in ledger.items()
-                    if abs(float(lv["qty"])) > 1e-6
-                }
-                end_live_map = {
-                    pk: round(float(pv.get("qty", 0.0) or 0.0), 6)
-                    for pk, pv in live_pos_map.items()
-                    if isinstance(pv, dict)
-                    and abs(float(pv.get("qty", 0.0) or 0.0)) > 1e-6
-                }
-                if end_ledger_map == end_live_map:
-                    open_partial_realized = sum(
-                        float(lv.get("rt_pnl", 0.0))
-                        for lv in ledger.values()
-                        if abs(float(lv.get("qty", 0.0))) > 1e-6
-                    )
-                    gross_sum = _round_cents(
-                        sum(float(rt["pnl"]) for rt in completed_rts)
-                        + open_partial_realized
-                    )
-                    fee_res = _round_cents(actual_off_delta - gross_sum)
-                    max_fee_tol = max(
-                        2.00,
-                        1.00 * max(1, len(completed_rts))
-                        + 0.01 * tot_eq_sh
-                        + 0.75 * tot_opt_ct,
-                    )
-                    if abs(fee_res) <= max_fee_tol:
-                        sign_flip_bad = False
-                        if completed_rts and abs(fee_res) >= 0.01 and abs(open_partial_realized) <= 1e-6:
-                            tot_w = sum(
-                                max(1.0, float(rt["closed_qty"]))
-                                for rt in completed_rts
-                            )
-                            adj_pnls = []
-                            running_adj = 0.0
-                            for r_i, rt in enumerate(completed_rts):
-                                if r_i < len(completed_rts) - 1:
-                                    share_f = _round_cents(
-                                        fee_res
-                                        * (
-                                            max(1.0, float(rt["closed_qty"]))
-                                            / tot_w
-                                        )
-                                    )
-                                    running_adj = _round_cents(
-                                        running_adj + share_f
-                                    )
-                                else:
-                                    share_f = _round_cents(fee_res - running_adj)
-                                cand_p = _round_cents(float(rt["pnl"]) + share_f)
-                                orig_p = _round_cents(float(rt["pnl"]))
-                                if (orig_p > 0.01 and cand_p <= 0.0) or (
-                                    orig_p < -0.01 and cand_p >= 0.0
-                                ):
-                                    sign_flip_bad = True
-                                    break
-                                adj_pnls.append(cand_p)
-                            if not sign_flip_bad:
-                                for rt, ap in zip(completed_rts, adj_pnls):
-                                    rt["pnl"] = ap
-                        if not sign_flip_bad:
-                            full_reconstruct_ok = True
+            end_ledger_map = {
+                lk: round(float(lv["qty"]), 6)
+                for lk, lv in c_ledger.items()
+                if abs(float(lv["qty"])) > 1e-6
+            }
+            end_live_map = {
+                pk: round(float(pv.get("qty", 0.0) or 0.0), 6)
+                for pk, pv in live_pos_map.items()
+                if isinstance(pv, dict)
+                and abs(float(pv.get("qty", 0.0) or 0.0)) > 1e-6
+            }
+            if end_ledger_map != end_live_map:
+                return False, [], {}
+            open_partial_realized = sum(
+                float(lv.get("rt_pnl", 0.0))
+                for lv in c_ledger.values()
+                if abs(float(lv.get("qty", 0.0))) > 1e-6
+            )
+            gross_sum = _round_cents(
+                sum(float(rt["pnl"]) for rt in c_rts) + open_partial_realized
+            )
+            fee_res = _round_cents(actual_off_delta - gross_sum)
+            max_fee_tol = max(
+                2.00,
+                1.00 * max(1, len(c_rts))
+                + 0.01 * c_tot_eq
+                + 0.75 * c_tot_opt,
+            )
+            if abs(fee_res) > max_fee_tol:
+                return False, [], {}
+            if c_rts and abs(fee_res) >= 0.01 and abs(open_partial_realized) <= 1e-6:
+                tot_w = sum(
+                    max(1.0, float(rt["closed_qty"])) for rt in c_rts
+                )
+                adj_pnls = []
+                running_adj = 0.0
+                for r_i, rt in enumerate(c_rts):
+                    if r_i < len(c_rts) - 1:
+                        share_f = _round_cents(
+                            fee_res
+                            * (max(1.0, float(rt["closed_qty"])) / tot_w)
+                        )
+                        running_adj = _round_cents(running_adj + share_f)
+                    else:
+                        share_f = _round_cents(fee_res - running_adj)
+                    cand_p = _round_cents(float(rt["pnl"]) + share_f)
+                    orig_p = _round_cents(float(rt["pnl"]))
+                    if (orig_p > 0.01 and cand_p <= 0.0) or (
+                        orig_p < -0.01 and cand_p >= 0.0
+                    ):
+                        return False, [], {}
+                    adj_pnls.append(cand_p)
+                for rt, ap in zip(c_rts, adj_pnls):
+                    rt["pnl"] = ap
+            return True, c_rts, c_ledger
+
+        full_reconstruct_ok, completed_rts, ledger = _try_reconstruct(inc_fills)
+        if not full_reconstruct_ok and inc_fills:
+            # Drop stray pre-save closing fills leaked by the cutoff=(eff_since-2.0) overlap window
+            trim_cands = [
+                [r for r in inc_fills if float(r.get("fill_epoch") or 0.0) >= eff_since]
+            ]
+            if was_flat_before_reconcile:
+                trim_cands.append(
+                    [
+                        r
+                        for r in inc_fills
+                        if float(r.get("fill_epoch") or 0.0) > (eff_since + 0.5)
+                    ]
+                )
+            for trimmed in trim_cands:
+                if trimmed and len(trimmed) < len(inc_fills):
+                    ok_tr, rts_tr, led_tr = _try_reconstruct(trimmed)
+                    if ok_tr:
+                        full_reconstruct_ok = True
+                        completed_rts = rts_tr
+                        ledger = led_tr
+                        break
 
         if full_reconstruct_ok:
             pre_high_eq = (
@@ -23100,10 +23696,32 @@ def _reconcile_off_session_activity(
                 if daily_max_equity is not None
                 else max(float(start_equity), ref_flat)
             )
+            req_losses = max(
+                2, int(round(float(config.get("consec_loss_count", 3))))
+            )
+            min_loss_mag = abs(
+                float(config.get("consec_loss_min_dollars", 25.0))
+            )
+            win_mins = max(
+                0.5, float(config.get("consec_loss_window_mins", 15.0))
+            )
+            min_win_to_reset = abs(
+                float(config.get("consec_win_reset_dollars", 10.0))
+            )
+            if recent_loss_timestamps:
+                now_ts_r = time.time()
+                recent_loss_timestamps[:] = [
+                    ts
+                    for ts in recent_loss_timestamps
+                    if (now_ts_r - float(ts)) <= (win_mins * 60.0)
+                ]
+            last_qual_win_idx = -1
+            last_qual_win_pnl = 0.0
+            last_qual_loss_idx = -1
             running_flat_eq = ref_flat
             w_added = 0
             l_added = 0
-            for rt in completed_rts:
+            for rt_idx, rt in enumerate(completed_rts):
                 d_pnl = _round_cents(float(rt["pnl"]))
                 running_flat_eq = _round_cents(running_flat_eq + d_pnl)
                 if d_pnl > (ig_scratch_tol + 1e-9):
@@ -23112,6 +23730,20 @@ def _reconcile_off_session_activity(
                 elif d_pnl < -(ig_scratch_tol + 1e-9):
                     loss_trades += 1
                     l_added += 1
+                if float(rt.get("close_epoch") or 0.0) >= float(
+                    _restored_session_saved_epoch or 0.0
+                ):
+                    if (
+                        d_pnl > (ig_scratch_tol + 1e-9)
+                        and d_pnl >= min_win_to_reset
+                    ):
+                        last_qual_win_idx = rt_idx
+                        last_qual_win_pnl = d_pnl
+                    elif (
+                        d_pnl < -(ig_scratch_tol + 1e-9)
+                        and abs(d_pnl) >= min_loss_mag
+                    ):
+                        last_qual_loss_idx = rt_idx
                 if rt["all_flat_after"]:
                     if daily_max_equity is None or running_flat_eq > daily_max_equity:
                         daily_max_equity = running_flat_eq
@@ -23145,6 +23777,14 @@ def _reconcile_off_session_activity(
                         _breach_pin_rt_pending = False
                 elif is_locked_down and last_breach_trigger_net_pnl is not None:
                     _retire_stale_breach_trigger_pin("off-session round-trip")
+            off_streak_reset_note = ""
+            if recent_loss_timestamps and last_qual_win_idx > last_qual_loss_idx:
+                recent_loss_timestamps.clear()
+                if config.get("enable_consec_loss_cooldown", False):
+                    off_streak_reset_note = (
+                        f" | TiltStreak reset to 0/{req_losses} "
+                        f"by off-session qualifying win ({format_dollar(last_qual_win_pnl)})"
+                    )
             if (
                 daily_max_equity is not None
                 and daily_max_equity > max(pre_high_eq, settled_flat_eq_now) + 0.01
@@ -23172,7 +23812,7 @@ def _reconcile_off_session_activity(
                     f"Reconciled {len(completed_rts)} off-session round-trip trade(s) "
                     f"(+{w_added}W / +{l_added}L, NetDelta: {format_dollar(actual_off_delta)} -> "
                     f"{format_trades_wl_inline(win_trades, loss_trades)}; "
-                    f"Session High/Low reflect flat checkpoints).",
+                    f"Session High/Low reflect flat checkpoints){off_streak_reset_note}.",
                 )
         elif is_fl_now and abs(actual_off_delta) >= 1.00:
             closing_confirmed = False
@@ -24227,7 +24867,9 @@ def evaluate_stop_decisions(
                 _breach_pin_rt_pending = False
                 _breach_pin_retired = False
                 if not active_breach_source:
-                    active_breach_source = "OFF_SESSION"
+                    active_breach_source = (
+                        "DONE_RESTORE" if done_for_today else "OFF_SESSION"
+                    )
     elif first_poll_of_launch and _launch_grace_pending and not is_flat:
         _launch_grace_pending = False
         first_poll_of_launch = False
@@ -24375,7 +25017,7 @@ def evaluate_stop_decisions(
                         "action": "ALARM",
                         "reason": (
                             "DONE FOR TODAY LOCKOUT — CLOSE OPTIONS MANUALLY!"
-                            if (done_for_today and not is_locked_down)
+                            if _is_done_today_display_active()
                             else "DAILY STOP BREACHED — CLOSE OPTIONS MANUALLY!"
                         ),
                         "ctx": ctx,
@@ -25033,12 +25675,433 @@ def _flush_pending_postlaunch_auth():
     return _apply_postlaunch_preflight_auth(*pending)
 
 
+def _maybe_expire_disconnect_flap_quiet(now_mono=None):
+    """Clears flap-storm audio suppression (and drop history) once the
+    connection stays healthy for >= 30s so any separate outage later gets
+    full initial audio again."""
+    global _disc_flap_quiet_active, _disc_flap_unstable_announced
+    global _disc_flap_drop_monos
+    now_m = time.monotonic() if now_mono is None else float(now_mono)
+    _disc_flap_drop_monos = [
+        t for t in _disc_flap_drop_monos if (now_m - float(t)) <= 60.0
+    ]
+    if _disc_stable_since_mono > 0.0 and (now_m - _disc_stable_since_mono) >= 30.0:
+        _disc_flap_drop_monos = []
+        _disc_flap_quiet_active = False
+        _disc_flap_unstable_announced = False
+
+
+def _evaluate_disconnect_flap_start(is_tok_exp, is_hard_keys, v_msg, now_mono=None):
+    """Records a new outage episode in the 60s sliding flap window and returns
+    whether initial disconnect speech should play immediately or be suppressed
+    until the outage proves sustained (att >= 3)."""
+    global _disc_flap_drop_monos, _disc_flap_quiet_active
+    global _disc_flap_unstable_announced, _disc_stable_since_mono
+    global _disc_audio_announced, _disc_audio_suppressed_for_outage
+    now_m = time.monotonic() if now_mono is None else float(now_mono)
+    _disc_stable_since_mono = 0.0
+    _disc_flap_drop_monos = [
+        t for t in _disc_flap_drop_monos if (now_m - float(t)) <= 60.0
+    ]
+    if not is_tok_exp and not is_hard_keys:
+        _disc_flap_drop_monos.append(now_m)
+        if len(_disc_flap_drop_monos) >= 3:
+            _disc_flap_quiet_active = True
+            if not _disc_flap_unstable_announced:
+                _disc_flap_unstable_announced = True
+                log_event(
+                    "WARN",
+                    f"Broker API connection unstable ({len(_disc_flap_drop_monos)} drops/60s) — "
+                    f"quieting rapid repeat audio until stable for 30s.",
+                )
+                speak_async("Broker connection is unstable. I'm watching it.")
+    suppress_audio = bool(
+        _disc_flap_quiet_active and not is_tok_exp and not is_hard_keys
+    )
+    _disc_audio_suppressed_for_outage = suppress_audio
+    _disc_audio_announced = not suppress_audio
+    if not suppress_audio:
+        speak_async(v_msg)
+    return not suppress_audio
+
+
+def _handle_disconnect_recovery(recovered_attempts, was_alerted, mute_btn, now_mono=None):
+    """Handles transition back to live API health: resets outage/auth streaks,
+    purges transient disconnect alarm dedup keys, pairs 'Connection restored'
+    speech/chime strictly with whether 'Connection lost' audio played, and stamps
+    the 30s flap-stability clock."""
+    global consecutive_api_failures, _consecutive_auth_failures
+    global api_disconnect_alerted, _disc_audio_announced
+    global _disc_audio_suppressed_for_outage, _disc_active_reason_prefix
+    global _disc_stable_since_mono, alarm_active, last_alarm_reason
+    now_m = time.monotonic() if now_mono is None else float(now_mono)
+    was_audio_announced = bool(_disc_audio_announced)
+    consecutive_api_failures = 0
+    _consecutive_auth_failures = 0
+    api_disconnect_alerted = False
+    _disc_audio_announced = False
+    _disc_audio_suppressed_for_outage = False
+    _disc_active_reason_prefix = ""
+    _disc_stable_since_mono = now_m
+    _purge_disconnect_alarm_dedup()
+    if was_alerted:
+        with _alarm_loop_lock:
+            if alarm_active and is_disconnect_alarm_reason(last_alarm_reason):
+                alarm_active = False
+                last_alarm_reason = ""
+        if was_audio_announced:
+            speak_async("Connection restored. Enforcer is back online.")
+        if (
+            was_audio_announced
+            and config.get("enable_upside_chime", True)
+            and mute_btn is not None
+        ):
+            trigger_upside_tier_glow(
+                mute_btn,
+                "✓ CONNECTION RESTORED — BACK ONLINE",
+                f"Broker API connection restored after {recovered_attempts} attempt(s).",
+                log_tag="SESSION",
+            )
+        else:
+            log_event(
+                "SESSION",
+                f"Broker API connection restored after {recovered_attempts} attempt(s).",
+            )
+            if not alarm_active and not cooldown_active and mute_btn is not None:
+                mute_btn.after(
+                    0,
+                    lambda: apply_idle_button_config(mute_btn),
+                )
+    else:
+        log_event(
+            "SESSION",
+            "Broker API poll recovered after 1 retry.",
+        )
+        if not alarm_active and not cooldown_active and mute_btn is not None:
+            mute_btn.after(
+                0,
+                lambda: apply_idle_button_config(mute_btn),
+            )
+
+
+def _archive_baseline_before_reanchor(
+    s_key,
+    today_now,
+    new_anchor_eq,
+    new_acf,
+    pre_anchor_eq,
+    pre_anchor_acf,
+    pre_ig_copy,
+    is_flat_now,
+):
+    """Captures or folds the pre-reanchor daily baseline before Force Re-Anchor
+    overwrites start_equity so Preferences -> Revert to Original Daily Baseline
+    can faithfully restore S0, extremes, W/L, swung refs, and curves."""
+    global _baseline_archive, _pending_reanchor_curve_seed
+    if not s_key or str(s_key).upper().startswith("DEMO"):
+        _baseline_archive = None
+        _pending_reanchor_curve_seed = None
+        return
+    if not is_flat_now:
+        _baseline_archive = None
+        _pending_reanchor_curve_seed = None
+        log_event(
+            "SESSION",
+            "Original-baseline archive skipped (not flat at re-anchor).",
+        )
+        return
+    if (
+        start_equity is None
+        or float(start_equity) <= 0.0
+        or active_session_date != today_now
+    ):
+        _pending_reanchor_curve_seed = None
+        return
+
+    # pre_anchor_eq was fetched while force_reanchor=True suppressed unanchored CF
+    cf_delta = round(float(new_acf or 0.0) - float(pre_anchor_acf or 0.0), 2)
+    eq_in_old_frame = _round_cents(float(pre_anchor_eq) - cf_delta)
+    seed_curve = []
+    if (
+        isinstance(_pending_reanchor_curve_seed, tuple)
+        and len(_pending_reanchor_curve_seed) == 3
+        and str(_pending_reanchor_curve_seed[0]) == str(s_key)
+        and str(_pending_reanchor_curve_seed[1]) == str(today_now)
+    ):
+        seed_curve = list(_pending_reanchor_curve_seed[2] or [])
+    else:
+        seed_curve = _export_pnl_curve_for_session(s_key, today_now)
+    _pending_reanchor_curve_seed = None
+
+    existing = _get_valid_baseline_archive(s_key=s_key, today_str=today_now)
+    if existing is not None:
+        ok_ig, _ = _check_ignored_positions_revert_compatible(
+            existing, live_ig=pre_ig_copy
+        )
+        if not ok_ig:
+            _baseline_archive = None
+            log_event(
+                "SESSION",
+                "Original-baseline archive cleared on subsequent re-anchor (ignored swing positions changed).",
+            )
+            return
+        seg_state = {
+            "start_equity": float(start_equity),
+            "max_equity": float(max_equity or start_equity),
+            "daily_max_equity": float(daily_max_equity or start_equity),
+            "daily_min_equity": float(daily_min_equity or start_equity),
+            "last_flat_equity": float(last_flat_equity or eq_in_old_frame),
+            "win_trades": int(win_trades or 0),
+            "loss_trades": int(loss_trades or 0),
+            "has_reset_at_open": bool(has_reset_at_open),
+            "has_reset_at_close": bool(has_reset_at_close),
+            "pnl_curve": seed_curve,
+        }
+        folded = _fold_segment_into_baseline_archive(
+            existing, seg_state, reset_925=bool(config.get("reset_at_925", True))
+        )
+        old_shift = float(existing.get("active_shift", 0.0) or 0.0)
+        new_shift = round(
+            old_shift + (eq_in_old_frame - float(new_anchor_eq)), 2
+        )
+        new_arch = dict(existing)
+        new_arch["orig_max_equity"] = folded["max_equity"]
+        new_arch["orig_daily_max_equity"] = folded["daily_max_equity"]
+        new_arch["orig_daily_min_equity"] = folded["daily_min_equity"]
+        new_arch["orig_win_trades"] = folded["win_trades"]
+        new_arch["orig_loss_trades"] = folded["loss_trades"]
+        new_arch["orig_has_reset_at_open"] = folded["has_reset_at_open"]
+        new_arch["orig_has_reset_at_close"] = folded["has_reset_at_close"]
+        new_arch["orig_pnl_curve"] = folded["pnl_curve"]
+        new_arch["active_shift"] = new_shift
+        new_arch["rb_reset_s0"] = None
+        new_arch["rb_reset_seg_max"] = None
+        new_arch["reanchor_count"] = int(existing.get("reanchor_count", 1) or 1) + 1
+        _baseline_archive = new_arch
+        return
+
+    _baseline_archive = {
+        "session_date": str(today_now),
+        "s_key": str(s_key),
+        "orig_start_equity": round(float(start_equity), 2),
+        "orig_anchor_cash_flow": round(float(pre_anchor_acf or 0.0), 2),
+        "orig_max_equity": _round_cents(float(max_equity or start_equity)),
+        "orig_daily_max_equity": _round_cents(
+            float(daily_max_equity or start_equity)
+        ),
+        "orig_daily_min_equity": _round_cents(
+            float(daily_min_equity or start_equity)
+        ),
+        "orig_win_trades": int(win_trades or 0),
+        "orig_loss_trades": int(loss_trades or 0),
+        "orig_has_reset_at_open": bool(has_reset_at_open),
+        "orig_has_reset_at_close": bool(has_reset_at_close),
+        "orig_ignored_positions": json.loads(json.dumps(pre_ig_copy or {})),
+        "orig_pnl_curve": seed_curve,
+        "active_shift": round(eq_in_old_frame - float(new_anchor_eq), 2),
+        "rb_reset_s0": None,
+        "rb_reset_seg_max": None,
+        "reanchor_count": 1,
+    }
+
+
+def _apply_pending_baseline_revert(
+    poll_ad, poll_epoch, today_now, current_eq, is_flat, pos_details, mute_btn
+):
+    """Applies a staged baseline revert safely on a fresh live poll inside
+    data_loop before 9:30/4:00 transitions and breach checks."""
+    global start_equity, max_equity, daily_max_equity, daily_min_equity
+    global last_flat_equity, anchor_cash_flow, _last_logged_unanchored_cash_flow
+    global has_reset_at_open, has_reset_at_close, is_locked_down, active_breach_source
+    global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired
+    global _lock_from_presync_save, done_for_today, daily_breach_settings_prompted
+    global win_trades, loss_trades, prev_flat_realized_pnl, settled_realized_pnl
+    global flat_desync_streak, in_trade_desync_streak, pending_scale_out_tol
+    global current_upside_tier, first_poll_of_launch, _baseline_archive, _manual_reanchor_pending
+    global pending_baseline_revert, pending_baseline_revert_done_today
+
+    req_s_key = pending_baseline_revert
+    req_done_today = bool(pending_baseline_revert_done_today)
+    pending_baseline_revert = None
+    pending_baseline_revert_done_today = False
+    if not req_s_key or poll_ad is None:
+        return False, current_eq, pos_details
+
+    live_s_key = get_session_key(poll_ad.name, poll_ad.account_id)
+    if str(req_s_key) != str(live_s_key):
+        log_event(
+            "GUARDRAIL",
+            "Baseline revert declined: active broker/account changed before apply.",
+        )
+        return False, current_eq, pos_details
+
+    blk_reason = _get_baseline_revert_block_reason(
+        s_key=live_s_key,
+        today_str=today_now,
+        require_flat=True,
+        live_flat_override=bool(is_flat),
+    )
+    if blk_reason:
+        log_event("GUARDRAIL", f"Baseline revert declined: {blk_reason}")
+        return False, current_eq, pos_details
+
+    arch = _get_valid_baseline_archive(s_key=live_s_key, today_str=today_now)
+    if arch is None:
+        log_event("GUARDRAIL", "Baseline revert declined: archive missing.")
+        return False, current_eq, pos_details
+
+    seg_state = {
+        "start_equity": float(start_equity),
+        "max_equity": float(max_equity or start_equity),
+        "daily_max_equity": float(daily_max_equity or start_equity),
+        "daily_min_equity": float(daily_min_equity or start_equity),
+        "last_flat_equity": float(last_flat_equity or current_eq),
+        "win_trades": int(win_trades or 0),
+        "loss_trades": int(loss_trades or 0),
+        "has_reset_at_open": bool(has_reset_at_open),
+        "has_reset_at_close": bool(has_reset_at_close),
+        "pnl_curve": _export_pnl_curve_for_session(live_s_key, today_now),
+    }
+    merged = _fold_segment_into_baseline_archive(
+        arch, seg_state, reset_925=bool(config.get("reset_at_925", True))
+    )
+    expected_eq = _round_cents(float(current_eq) + merged["eq_offset"])
+    expected_net = round(expected_eq - merged["start_equity"], 2)
+    _, restored_stop_pnl, _, _, _, _ = describe_active_floor(
+        config,
+        start_eq=merged["start_equity"],
+        hwm_eq=merged["max_equity"],
+    )
+    if expected_net <= restored_stop_pnl and not req_done_today:
+        log_event(
+            "GUARDRAIL",
+            f"Baseline revert declined: Restored full-day Net PnL ({format_dollar(expected_net)}) "
+            f"is at or below active Daily Stop ({format_dollar(restored_stop_pnl)}).",
+        )
+        return False, current_eq, pos_details
+
+    r_cnt = int(arch.get("reanchor_count", 1) or 1)
+    # Transactional live-equity evaluation in restored (ignored_positions, anchor_cash_flow) frame
+    # BEFORE committing globals or clearing _baseline_archive, so any drift past stop rolls back cleanly.
+    new_eq = expected_eq
+    next_pos_details = pos_details
+    true_live_eq = (
+        poll_ad.get_last_true_live_eq()
+        if hasattr(poll_ad, "get_last_true_live_eq")
+        else None
+    )
+    orig_ig = arch.get("orig_ignored_positions")
+    with _ignored_positions_lock:
+        prev_ig_snap = json.loads(json.dumps(ignored_positions or {}))
+        prev_acf_snap = anchor_cash_flow
+        ignored_positions.clear()
+        if isinstance(orig_ig, dict):
+            ignored_positions.update(json.loads(json.dumps(orig_ig)))
+        anchor_cash_flow = merged["anchor_cash_flow"]
+        if true_live_eq is not None and float(true_live_eq) > 0.0:
+            live_acf = (
+                poll_ad.get_last_intraday_cash_flow()
+                if hasattr(poll_ad, "get_last_intraday_cash_flow")
+                else anchor_cash_flow
+            )
+            raw_adj = float(true_live_eq) - get_unanchored_cash_flow(live_acf)
+            raw_pos = (
+                poll_ad.get_last_raw_pos_details()
+                if hasattr(poll_ad, "get_last_raw_pos_details")
+                else {}
+            )
+            res_eq, _, _, res_pos, _, _, _ = _apply_ignored_positions_to_snapshot(
+                raw_adj, raw_pos, [], []
+            )
+            if res_eq is not None and float(res_eq) > 0.0:
+                new_eq = _round_cents(res_eq)
+                next_pos_details = res_pos
+
+        actual_net = round(new_eq - merged["start_equity"], 2)
+        if actual_net <= restored_stop_pnl and not req_done_today:
+            ignored_positions.clear()
+            ignored_positions.update(prev_ig_snap)
+            anchor_cash_flow = prev_acf_snap
+            log_event(
+                "GUARDRAIL",
+                f"Baseline revert declined: Live full-day Net PnL ({format_dollar(actual_net)}) "
+                f"is at or below active Daily Stop ({format_dollar(restored_stop_pnl)}).",
+            )
+            return False, current_eq, pos_details
+
+    pos_details = next_pos_details
+    start_equity = merged["start_equity"]
+    _last_logged_unanchored_cash_flow = 0.0
+    max_equity = merged["max_equity"]
+    daily_max_equity = merged["daily_max_equity"]
+    daily_min_equity = merged["daily_min_equity"]
+    last_flat_equity = merged["last_flat_equity"]
+    win_trades = merged["win_trades"]
+    loss_trades = merged["loss_trades"]
+    has_reset_at_open = merged["has_reset_at_open"]
+    has_reset_at_close = merged["has_reset_at_close"]
+
+    if abs(actual_net - expected_net) > 1.0:
+        log_event(
+            "WARN",
+            f"Baseline revert drift detected (Expected={format_dollar(expected_net)} vs "
+            f"Live={format_dollar(actual_net)} | Offset={format_dollar(merged['pnl_offset'])}).",
+        )
+
+    if is_flat:
+        last_flat_equity = _round_cents(new_eq)
+    daily_max_equity = max(daily_max_equity, new_eq)
+    daily_min_equity = min(daily_min_equity, start_equity, new_eq)
+    prev_flat_realized_pnl = round(last_flat_equity - start_equity, 2)
+    settled_realized_pnl = prev_flat_realized_pnl
+    is_locked_down = False
+    active_breach_source = ""
+    _manual_reanchor_pending = False
+    last_breach_trigger_net_pnl = None
+    _breach_pin_rt_pending = False
+    _breach_pin_retired = False
+    _lock_from_presync_save = False
+    daily_breach_settings_prompted = False
+    flat_desync_streak = 0
+    in_trade_desync_streak = 0
+    pending_scale_out_tol = 0.0
+    first_poll_of_launch = True
+    if req_done_today:
+        done_for_today = True
+
+    _load_pnl_curve_for_session(live_s_key, today_now, merged["pnl_curve"])
+    hwm_profit = round(max_equity - start_equity, 2)
+    current_upside_tier = compute_upside_tier(is_rth(), hwm_profit, config)
+    _preseed_crossed_warning_alarms(actual_net, is_rth(), config, hwm_profit)
+    _baseline_archive = None
+    save_session_state(expected_epoch=poll_epoch, adapter_override=poll_ad)
+    if mute_btn is not None and not alarm_active and not cooldown_active:
+        try:
+            mute_btn.after(0, lambda: apply_idle_button_config(mute_btn))
+        except Exception:
+            pass
+    done_sfx = " | DoneForToday=ON" if req_done_today else ""
+    log_event(
+        "SESSION",
+        f"Baseline reverted to original (reanchor_count={r_cnt}, "
+        f"PnLOffset={format_dollar(merged['pnl_offset'])}): "
+        f"Start=${start_equity:,.2f} | LastFlat=${last_flat_equity:,.2f} | "
+        f"RulebookHWM={format_dollar(hwm_profit)} | "
+        f"SessionHighPnL={format_dollar(daily_max_equity - start_equity)} | "
+        f"SessionLowPnL={format_dollar(daily_min_equity - start_equity)} | "
+        f"{format_trades_wl_inline(win_trades, loss_trades)}{done_sfx}",
+    )
+    return True, new_eq, pos_details
+
+
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close, is_locked_down, active_breach_source
     global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
-    global force_reanchor
+    global force_reanchor, _manual_reanchor_pending
+    global _baseline_archive, _pending_reanchor_curve_seed, _manual_reanchor_pending
+    global pending_baseline_revert, pending_baseline_revert_done_today
     global done_for_today, committed_for_today, breach_visual_sim_active
     global triggered_alarms, prev_pos_snapshot, current_is_flat
     global active_adapter, first_poll_of_launch, _launch_grace_pending, _launch_grace_syms
@@ -25048,6 +26111,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global settled_realized_pnl, flat_desync_streak
     global in_trade_desync_streak, pending_scale_out_tol
     global consecutive_api_failures, consecutive_loop_exceptions, api_disconnect_alerted
+    global _consecutive_auth_failures, _disc_flap_drop_monos
+    global _disc_flap_quiet_active, _disc_flap_unstable_announced
+    global _disc_stable_since_mono, _disc_audio_announced
+    global _disc_audio_suppressed_for_outage, _disc_active_reason_prefix
     global alarm_active, last_alarm_reason, daily_breach_settings_prompted
     global pending_halt_breach, active_session_date
     global _initial_positions_verified, last_data_loop_heartbeat
@@ -25058,6 +26125,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     consecutive_api_failures = 0
     consecutive_loop_exceptions = 0
     api_disconnect_alerted = False
+    _reset_disconnect_flap_state()
     rate_limit_hold_since = 0.0
     rate_limit_anchor_hold_logged = False
     _data_loop_wake_event.clear()
@@ -25148,46 +26216,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 if not snap_was_cached and (
                     consecutive_api_failures > 0 or api_disconnect_alerted
                 ):
-                    recovered_attempts = max(1, consecutive_api_failures)
-                    was_alerted = api_disconnect_alerted
-                    consecutive_api_failures = 0
-                    api_disconnect_alerted = False
-                    _purge_disconnect_alarm_dedup()
-                    if was_alerted:
-                        with _alarm_loop_lock:
-                            if alarm_active and is_disconnect_alarm_reason(
-                                last_alarm_reason
-                            ):
-                                alarm_active = False
-                                last_alarm_reason = ""
-                        speak_async("Connection restored. Enforcer is back online.")
-                        if config.get("enable_upside_chime", True):
-                            trigger_upside_tier_glow(
-                                mute_btn,
-                                "✓ CONNECTION RESTORED — BACK ONLINE",
-                                f"Broker API connection restored after {recovered_attempts} attempt(s).",
-                                log_tag="SESSION",
-                            )
-                        else:
-                            log_event(
-                                "SESSION",
-                                f"Broker API connection restored after {recovered_attempts} attempt(s).",
-                            )
-                            if not alarm_active and not cooldown_active:
-                                mute_btn.after(
-                                    0,
-                                    lambda: apply_idle_button_config(mute_btn),
-                                )
-                    else:
-                        log_event(
-                            "SESSION",
-                            "Broker API poll recovered after 1 retry.",
-                        )
-                        if not alarm_active and not cooldown_active:
-                            mute_btn.after(
-                                0,
-                                lambda: apply_idle_button_config(mute_btn),
-                            )
+                    _handle_disconnect_recovery(
+                        max(1, consecutive_api_failures),
+                        api_disconnect_alerted,
+                        mute_btn,
+                    )
+                elif not snap_was_cached and _disc_flap_quiet_active:
+                    _maybe_expire_disconnect_flap_quiet()
                 current_is_flat = is_flat
 
                 today_now = get_today_str()
@@ -25251,6 +26286,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     has_reset_at_open = is_rth() or is_after_hours()
                     has_reset_at_close = is_after_hours()
                     force_reanchor = False
+                    _manual_reanchor_pending = False
+                    _baseline_archive = None
+                    _pending_reanchor_curve_seed = None
+                    pending_baseline_revert = None
+                    pending_baseline_revert_done_today = False
                     is_locked_down = False
                     active_breach_source = ""
                     last_breach_trigger_net_pnl = None
@@ -25331,6 +26371,19 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 ):
                     if not _poll_still_valid():
                         continue
+                    re_s_key = get_session_key(poll_ad.name, poll_ad.account_id)
+                    was_manual_reanchor = bool(
+                        force_reanchor
+                        and _manual_reanchor_pending
+                        and not snap_was_cached
+                    )
+                    pre_reanchor_eq = current_eq
+                    pre_reanchor_acf = anchor_cash_flow
+                    pre_reanchor_flat = bool(is_flat)
+                    with _ignored_positions_lock:
+                        pre_reanchor_ig = json.loads(
+                            json.dumps(ignored_positions or {})
+                        )
                     active_session_date = today_now
                     anchor_cash_flow = (
                         poll_ad.get_last_intraday_cash_flow()
@@ -25371,6 +26424,19 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         )
                         current_is_flat = is_flat
                     anchor_eq = _round_cents(current_eq - live_open_pnl)
+                    if was_manual_reanchor:
+                        _archive_baseline_before_reanchor(
+                            re_s_key,
+                            today_now,
+                            anchor_eq,
+                            anchor_cash_flow,
+                            pre_reanchor_eq,
+                            pre_reanchor_acf,
+                            pre_reanchor_ig,
+                            pre_reanchor_flat,
+                        )
+                    else:
+                        _pending_reanchor_curve_seed = None
                     start_equity = anchor_eq
                     max_equity = anchor_eq
                     daily_max_equity = max(anchor_eq, current_eq)
@@ -25379,6 +26445,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     has_reset_at_open = is_rth() or is_after_hours()
                     has_reset_at_close = is_after_hours()
                     force_reanchor = False
+                    _manual_reanchor_pending = False
+                    pending_baseline_revert = None
+                    pending_baseline_revert_done_today = False
                     is_locked_down = False
                     active_breach_source = ""
                     last_breach_trigger_net_pnl = None
@@ -25436,6 +26505,23 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         else start_equity,
                     )
 
+                if (
+                    pending_baseline_revert
+                    and not snap_was_cached
+                    and _poll_still_valid()
+                ):
+                    _reverted_ok, current_eq, pos_details = (
+                        _apply_pending_baseline_revert(
+                            poll_ad,
+                            poll_epoch,
+                            today_now,
+                            current_eq,
+                            is_flat,
+                            pos_details,
+                            mute_btn,
+                        )
+                    )
+
                 reset_925 = config.get("reset_at_925", True)
                 if is_rth() and not has_reset_at_open:
                     has_reset_at_open = True
@@ -25452,6 +26538,17 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         old_hwm = max_equity - start_equity
                         max_equity = max(start_equity, last_flat_equity)
                         new_hwm = max_equity - start_equity
+                        arch_925 = _get_valid_baseline_archive(
+                            s_key=get_session_key(poll_ad.name, poll_ad.account_id),
+                            today_str=today_now,
+                        )
+                        if arch_925 is not None:
+                            off_925 = float(arch_925.get("active_shift", 0.0) or 0.0)
+                            arch_925["rb_reset_s0"] = max(
+                                float(arch_925["orig_start_equity"]),
+                                _round_cents(float(last_flat_equity) + off_925),
+                            )
+                            arch_925["rb_reset_seg_max"] = float(max_equity)
                         is_locked_down = False
                         active_breach_source = ""
                         last_breach_trigger_net_pnl = None
@@ -25500,6 +26597,17 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         old_hwm = max_equity - start_equity
                         max_equity = max(start_equity, last_flat_equity)
                         new_hwm = max_equity - start_equity
+                        arch_400 = _get_valid_baseline_archive(
+                            s_key=get_session_key(poll_ad.name, poll_ad.account_id),
+                            today_str=today_now,
+                        )
+                        if arch_400 is not None:
+                            off_400 = float(arch_400.get("active_shift", 0.0) or 0.0)
+                            arch_400["rb_reset_s0"] = max(
+                                float(arch_400["orig_start_equity"]),
+                                _round_cents(float(last_flat_equity) + off_400),
+                            )
+                            arch_400["rb_reset_seg_max"] = float(max_equity)
                         is_locked_down = False
                         active_breach_source = ""
                         last_breach_trigger_net_pnl = None
@@ -25534,6 +26642,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 pre_poll_hwm_profit = round(max_equity - start_equity, 2)
 
+                _pre_stab_streak_len = len(recent_loss_timestamps)
                 current_eq, realized_pnl, open_pnl = (
                     _stabilize_mid_fill_realized_and_equity(
                         current_eq,
@@ -25543,6 +26652,18 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         is_reverify=snap_was_cached,
                     )
                 )
+                if (
+                    len(recent_loss_timestamps) != _pre_stab_streak_len
+                    and mute_btn is not None
+                    and not alarm_active
+                    and not cooldown_active
+                ):
+                    try:
+                        mute_btn.after(
+                            0, lambda: apply_idle_button_config(mute_btn)
+                        )
+                    except Exception:
+                        pass
 
                 net_pnl = round(current_eq - start_equity, 2)
                 max_realized_profit = round(max_equity - start_equity, 2)
@@ -25935,7 +27056,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     elif act_type == "COOLDOWN_STRAGGLER_ALERT":
                         _sound_lock_straggler_alert_burst()
                     elif act_type == "POST_BREACH_FLATTEN":
-                        if done_for_today and not is_locked_down:
+                        if _is_done_today_display_active():
                             log_event(
                                 "GUARDRAIL",
                                 f"DONE FOR TODAY FORCE-FLATTEN: New position detected while 'Done for Today' "
@@ -25965,10 +27086,10 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         if not swept_pb and _poll_still_valid():
                             _enter_halt_breach_watch(
                                 "DONE_TODAY"
-                                if (done_for_today and not is_locked_down)
+                                if _is_done_today_display_active()
                                 else "DAILY",
                                 "Done for Today Force-Flatten Unfilled"
-                                if (done_for_today and not is_locked_down)
+                                if _is_done_today_display_active()
                                 else "Post-Breach Force-Flatten Unfilled",
                                 act["ctx"],
                                 act["has_options"],
@@ -26228,27 +27349,39 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
                 if not hold_429_active:
                     consecutive_api_failures += 1
-                    is_tok_exp = any(
-                        k in err_lower
-                        for k in (
-                            "invalid_grant",
-                            "unsupported_token_type",
-                            "expired",
-                            "unauthorized",
-                            "http 401",
-                        )
+                    poll_b_name = str(getattr(poll_ad, "name", "") or "").upper()
+                    auth_kind = _classify_poll_auth_error(poll_b_name, err_lower)
+                    if auth_kind in ("hard", "auth_transient"):
+                        _consecutive_auth_failures += 1
+                    else:
+                        _consecutive_auth_failures = 0
+                    is_webull_poll = poll_b_name == "WEBULL"
+                    is_tok_exp = (auth_kind == "hard") or (
+                        (not is_webull_poll)
+                        and auth_kind == "auth_transient"
+                        and _consecutive_auth_failures >= 3
+                    )
+                    is_wb_auth_err = is_webull_poll and (
+                        auth_kind == "auth_transient"
                     )
                     if consecutive_api_failures == 1 and not is_tok_exp:
-                        if hasattr(poll_ad, "reconnect_session"):
-                            try:
-                                poll_ad.reconnect_session()
-                            except Exception:
-                                pass
-                        log_event(
-                            "WARN",
-                            f"Broker API poll failed (Attempt #1: {_clip_log_detail(raw_err, 140)}) — "
-                            f"refreshed HTTP session & retrying automatically...",
-                        )
+                        if is_wb_auth_err:
+                            log_event(
+                                "WARN",
+                                f"Broker API poll failed (Attempt #1: {_clip_log_detail(raw_err, 140)}) — "
+                                f"retrying automatically...",
+                            )
+                        else:
+                            if hasattr(poll_ad, "reconnect_session"):
+                                try:
+                                    poll_ad.reconnect_session()
+                                except Exception:
+                                    pass
+                            log_event(
+                                "WARN",
+                                f"Broker API poll failed (Attempt #1: {_clip_log_detail(raw_err, 140)}) — "
+                                f"refreshed HTTP session & retrying automatically...",
+                            )
                         if not alarm_active and not cooldown_active:
                             if getattr(mute_btn, "_show_status_led", False):
                                 mute_btn.after(
@@ -26274,22 +27407,33 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                     ),
                                 )
                     elif is_tok_exp or consecutive_api_failures >= 2:
+                        att = consecutive_api_failures
                         if not is_tok_exp and hasattr(poll_ad, "reconnect_session"):
-                            if (
-                                consecutive_api_failures == 2
-                                or consecutive_api_failures % 3 == 0
-                            ):
+                            should_reinit_wb = is_wb_auth_err and (
+                                att == 3 or att % 6 == 0
+                            )
+                            should_reinit_std = (not is_wb_auth_err) and (
+                                att == 2 or att % 3 == 0
+                            )
+                            if should_reinit_wb or should_reinit_std:
                                 try:
                                     poll_ad.reconnect_session()
                                 except Exception:
                                     pass
-                        lbl_1 = "TOKEN" if is_tok_exp else "OFFLINE"
-                        lbl_2 = (
-                            "EXPIRED"
-                            if is_tok_exp
-                            else f"RETRY #{consecutive_api_failures}"
+                        (
+                            base_prefix,
+                            r_msg,
+                            v_msg,
+                            lbl_1,
+                            lbl_2,
+                            is_hard_keys,
+                        ) = _format_disconnect_alarm_copy(
+                            is_tok_exp,
+                            is_wb_auth_err,
+                            _consecutive_auth_failures,
+                            att,
                         )
-                        col_2_bg = "#7b241c" if is_tok_exp else "#92400e"
+                        col_2_bg = "#7b241c" if is_hard_keys else "#92400e"
                         n_cols = max(1, len(get_active_hud_columns(config)))
                         err_cols = []
                         for idx in range(n_cols):
@@ -26307,35 +27451,49 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         )
                         if not api_disconnect_alerted:
                             api_disconnect_alerted = True
-                            r_msg = (
-                                "BROKER TOKEN EXPIRED — RESTART APP TO RE-LOGIN"
-                                if is_tok_exp
-                                else f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{consecutive_api_failures})"
-                            )
-                            v_msg = (
-                                "Warning. Broker token expired. Please restart Enforcer to log in."
-                                if is_tok_exp
-                                else "Warning. Connection lost. Attempting to reconnect automatically."
-                            )
+                            _disc_active_reason_prefix = base_prefix
                             log_event(
                                 "WARN",
                                 f"Connection lost ({poll_ad.name}: {_clip_log_detail(raw_err, 140)}). "
-                                f"Auto-reconnecting (Attempt #{consecutive_api_failures})...",
+                                f"Auto-reconnecting (Attempt #{att})...",
                             )
-                            speak_async(v_msg)
+                            _evaluate_disconnect_flap_start(
+                                is_tok_exp, is_hard_keys, v_msg
+                            )
                             trigger_alarm(
                                 r_msg,
                                 mute_btn,
                                 _clip_log_detail(raw_err, 140),
                             )
                         else:
-                            att = consecutive_api_failures
-                            if att % 5 == 0:
+                            promoted_hard = (
+                                base_prefix != _disc_active_reason_prefix
+                                and (is_tok_exp or is_hard_keys)
+                            )
+                            _disc_active_reason_prefix = base_prefix
+                            if promoted_hard or att % 5 == 0:
                                 log_event(
                                     "WARN",
                                     f"Still offline — auto-reconnect attempt #{att} "
-                                    f"({_clip_log_detail(raw_err, 140)})...",
+                                    f"({base_prefix}: {_clip_log_detail(raw_err, 140)})...",
                                 )
+                            if promoted_hard:
+                                _disc_audio_suppressed_for_outage = False
+                                _disc_audio_announced = True
+                                speak_async(v_msg)
+                                trigger_alarm(
+                                    r_msg,
+                                    mute_btn,
+                                    _clip_log_detail(raw_err, 140),
+                                )
+                            elif (
+                                _disc_audio_suppressed_for_outage
+                                and not _disc_audio_announced
+                                and att >= 3
+                            ):
+                                _disc_audio_suppressed_for_outage = False
+                                _disc_audio_announced = True
+                                speak_async(v_msg)
                             if not is_tok_exp:
                                 with _alarm_loop_lock:
                                     disc_alarm_live = bool(
@@ -26346,15 +27504,9 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                     )
                                     any_alarm_live = bool(alarm_active)
                                     if disc_alarm_live:
-                                        last_alarm_reason = (
-                                            f"CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})"
-                                        )
+                                        last_alarm_reason = r_msg
                                 if disc_alarm_live:
-                                    al_btn_txt = (
-                                        f"🔔 RECONNECTING (#{att}) (MUTE)"
-                                        if is_compact_hud()
-                                        else f"🔔 CONNECTION LOST — RECONNECTING (ATTEMPT #{att}) (CLICK TO MUTE)"
-                                    )
+                                    al_btn_txt = format_alarm_button_text(r_msg)
                                     al_led_kw = (
                                         {"led_hex": "#ef4444", "led_style": "solid"}
                                         if getattr(mute_btn, "_show_status_led", False)
@@ -26381,9 +27533,13 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                         )
                                     else:
                                         re_btn_txt = (
-                                            f"🔄 RECONNECTING (#{att})..."
-                                            if is_compact_hud()
-                                            else f"🔄 CONNECTION LOST — AUTO-RECONNECTING (ATTEMPT #{att})..."
+                                            f"🔄 AUTH RETRY (#{att})..."
+                                            if (is_wb_auth_err and is_compact_hud())
+                                            else (
+                                                f"🔄 RECONNECTING (#{att})..."
+                                                if is_compact_hud()
+                                                else f"🔄 {base_prefix} (ATTEMPT #{att})..."
+                                            )
                                         )
                                         mute_btn.after(
                                             0,
@@ -27357,6 +28513,8 @@ def show_preflight_window(
     btn_commit_today_pill = None
     btn_done_today_pill = None
     var_reanchor = tk.BooleanVar(value=False)
+    var_revert_baseline = tk.BooleanVar(value=False)
+    var_revert_done_today = tk.BooleanVar(value=False)
     var_privacy_mode = tk.BooleanVar(
         value=bool(config.get("privacy_mode", False))
     )
@@ -28751,6 +29909,11 @@ def show_preflight_window(
                                         )
                                 _refresh_ignored_positions_pill()
                                 _render_card3_telemetry_live(force=True)
+                                try:
+                                    refresh_smart_dimming()
+                                    _sync_prefs_modal_state()
+                                except Exception:
+                                    pass
 
                             try:
                                 pf.after(0, _apply_acct_sw_on_ui)
@@ -29904,6 +31067,8 @@ def show_preflight_window(
                     with _in_flight_poll_lock:
                         _bump_adapter_epoch()
                         _deferred_alarms.clear()
+                        var_revert_baseline.set(False)
+                        var_revert_done_today.set(False)
                         _pf_initial_shown["needs_bg_sync"] = False
                         _initial_positions_verified = False
                         active_adapter.account_id = chosen_id
@@ -29986,6 +31151,8 @@ def show_preflight_window(
                         else:
                             _bump_adapter_epoch()
                             _deferred_alarms.clear()
+                        var_revert_baseline.set(False)
+                        var_revert_done_today.set(False)
                         _pf_initial_shown["needs_bg_sync"] = False
                         _initial_positions_verified = False
                         active_adapter = new_ad
@@ -32677,6 +33844,8 @@ def show_preflight_window(
             text=format_hud_cols_btn_label(selected_hud_columns)
         )
         var_reanchor.set(False)
+        var_revert_baseline.set(False)
+        var_revert_done_today.set(False)
         var_poll.set(
             str(int(src.get("poll_interval", DEFAULT_CONFIG["poll_interval"])))
         )
@@ -32823,7 +33992,8 @@ def show_preflight_window(
 
     def save_and_launch():
         global settings_win_open, triggered_alarms, first_poll_of_launch
-        global force_reanchor, is_locked_down, active_breach_source
+        global force_reanchor, _manual_reanchor_pending, is_locked_down, active_breach_source
+        global _pending_reanchor_curve_seed, pending_baseline_revert, pending_baseline_revert_done_today
         global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
         global current_is_flat, active_adapter, _launch_fee_drift_checked, _launch_live_sync_deferred
         global active_preflight_close_fn, active_preflight_win
@@ -33182,6 +34352,9 @@ def show_preflight_window(
 
             if var_reanchor.get() and not is_tilt_streak_tamper_locked():
                 force_reanchor = True
+                _manual_reanchor_pending = True
+                pending_baseline_revert = None
+                pending_baseline_revert_done_today = False
                 is_locked_down = False
                 active_breach_source = ""
                 last_breach_trigger_net_pnl = None
@@ -33197,6 +34370,11 @@ def show_preflight_window(
                 if active_adapter is not None:
                     active_adapter.invalidate_cached_snapshots()
                 s_key = get_session_key(chosen_b, active_adapter.account_id)
+                _pending_reanchor_curve_seed = (
+                    (s_key, get_today_str(), _export_pnl_curve_for_session(s_key, get_today_str()))
+                    if s_key
+                    else None
+                )
                 _clear_pnl_curve(s_key)
                 if s_key and s_key in new_cfg.get("account_sessions", {}):
                     del new_cfg["account_sessions"][s_key]
@@ -33204,6 +34382,28 @@ def show_preflight_window(
                 new_cfg["saved_daily_max_equity"] = None
                 log_event("CONFIG", "User checked Force Re-Anchor Baseline.")
             else:
+                s_key = get_session_key(chosen_b, active_adapter.account_id)
+                if var_revert_baseline.get():
+                    blk_r = _get_baseline_revert_block_reason(
+                        s_key=s_key, today_str=get_today_str(), require_flat=True
+                    )
+                    if blk_r:
+                        pending_baseline_revert = None
+                        pending_baseline_revert_done_today = False
+                        log_event(
+                            "GUARDRAIL",
+                            f"Staged baseline revert declined on launch/save: {blk_r}",
+                        )
+                    else:
+                        pending_baseline_revert = s_key
+                        pending_baseline_revert_done_today = bool(
+                            var_revert_done_today.get()
+                        )
+                        log_event(
+                            "CONFIG",
+                            "User queued Revert to Original Daily Baseline"
+                            + (" (Done for Today)." if pending_baseline_revert_done_today else "."),
+                        )
                 if breach_visual_sim_active:
                     old_st_pnl = describe_active_floor(config)[1]
                     new_st_pnl = describe_active_floor(new_cfg)[1]
@@ -36496,7 +37696,13 @@ def show_preflight_window(
                 state="normal",
             )
 
-    var_reanchor.trace_add("write", _refresh_reanchor_pill)
+    def _on_var_reanchor_changed(*_):
+        if var_reanchor.get() and var_revert_baseline.get():
+            var_revert_baseline.set(False)
+            var_revert_done_today.set(False)
+        _refresh_reanchor_pill()
+
+    var_reanchor.trace_add("write", _on_var_reanchor_changed)
 
     base_sub_lbl = tk.Frame(c3, bg="#131922", height=38)
     base_sub_lbl.pack(fill="x", pady=(2, 6))
@@ -36631,6 +37837,12 @@ def show_preflight_window(
                     if (dry_run_lock_active or cooldown_active)
                     else "normal"
                 )
+            except Exception:
+                pass
+        rf_rev = _prefs_modal_refs.get("refresh_revert_fn")
+        if callable(rf_rev):
+            try:
+                rf_rev()
             except Exception:
                 pass
 
@@ -37198,6 +38410,433 @@ def show_preflight_window(
         attach_tooltip(cb_ignore_prepos, prepos_tip)
         attach_tooltip(lbl_ig_hint, prepos_tip)
         _prefs_modal_refs["cb_ignore_prepos"] = cb_ignore_prepos
+
+        # Tucked-away Baseline Revert row (visible ONLY when today's session was Re-Zeroed)
+        _cur_s_key_prefs = (
+            get_session_key(active_adapter.name, active_adapter.account_id)
+            if active_adapter is not None and not is_demo_mode_active(active_adapter)
+            else ""
+        )
+        _arch_prefs = _get_valid_baseline_archive(
+            s_key=_cur_s_key_prefs, today_str=get_today_str()
+        )
+        if (
+            _arch_prefs is not None
+            and start_equity is not None
+            and abs(float(_arch_prefs["orig_start_equity"]) - float(start_equity)) > 0.01
+        ):
+            r_rev = tk.Frame(sec1, bg="#131922")
+            r_rev.pack(fill="x", pady=(8, 2))
+            tk.Label(
+                r_rev,
+                text="Re-Zeroed Session:",
+                font=("Arial", 9, "bold"),
+                fg="#97a7b9",
+                bg="#131922",
+                anchor="w",
+            ).pack(side="left", padx=(0, 8))
+
+            btn_revert_base = make_stadium_button(
+                r_rev,
+                text="↺ Revert to Original Daily Baseline...",
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#38bdf8",
+                fg="#7dd3fc",
+                canvas_bg="#131922",
+                width=278,
+                height=26,
+                pad_x=16,
+                auto_width=False,
+            )
+            btn_revert_base.pack(side="left")
+            _revert_tip_state = {"text": ""}
+            attach_tooltip(btn_revert_base, lambda: _revert_tip_state["text"])
+
+            def _refresh_revert_btn():
+                if not btn_revert_base.winfo_exists():
+                    return
+                blk_r = _get_baseline_revert_block_reason(
+                    s_key=_cur_s_key_prefs,
+                    today_str=get_today_str(),
+                    require_flat=True,
+                )
+                if blk_r:
+                    btn_revert_base.config(
+                        text="🔒 Revert to Original Daily Baseline",
+                        fill_color="#141820",
+                        fill_top_color="#181d26",
+                        border_color="#242c38",
+                        fg="#64748b",
+                        disabledforeground="#64748b",
+                        state="disabled",
+                    )
+                    _revert_tip_state["text"] = f"Revert Locked:\n{blk_r}"
+                elif var_revert_baseline.get():
+                    sfx_d = " (Done Today)" if var_revert_done_today.get() else ""
+                    btn_revert_base.config(
+                        text=f"✓ Baseline Revert Queued{sfx_d} — Click to Cancel",
+                        fill_color="#0f2942",
+                        fill_top_color="#163a5c",
+                        border_color="#38bdf8",
+                        hover_fill="#163a5c",
+                        hover_fill_top="#1e4b75",
+                        hover_border="#7dd3fc",
+                        fg="#e0f2fe",
+                        state="normal",
+                    )
+                    _revert_tip_state["text"] = (
+                        "Original daily baseline revert is queued and will apply when you click\n"
+                        "'SAVE & LAUNCH / SAVE CHANGES' on the Pre-Flight window (click again to cancel)."
+                    )
+                else:
+                    btn_revert_base.config(
+                        text="↺ Revert to Original Daily Baseline...",
+                        fill_color="#141820",
+                        fill_top_color="#1c212b",
+                        border_color="#2e3746",
+                        hover_fill="#181e28",
+                        hover_fill_top="#232a36",
+                        hover_border="#38bdf8",
+                        fg="#7dd3fc",
+                        state="normal",
+                    )
+                    _revert_tip_state["text"] = (
+                        "Restore today's original morning equity baseline, full-day high/low, W/L counter,\n"
+                        "and stitched intraday PnL curve (undoing Re-Zero Baseline on Save & Launch)."
+                    )
+
+            def _on_click_revert_baseline():
+                if var_revert_baseline.get():
+                    var_revert_baseline.set(False)
+                    var_revert_done_today.set(False)
+                    _refresh_revert_btn()
+                    return
+                blk_r = _get_baseline_revert_block_reason(
+                    s_key=_cur_s_key_prefs,
+                    today_str=get_today_str(),
+                    require_flat=True,
+                )
+                if blk_r:
+                    _refresh_revert_btn()
+                    return
+                arch_now = _get_valid_baseline_archive(
+                    s_key=_cur_s_key_prefs, today_str=get_today_str()
+                )
+                if arch_now is None:
+                    _refresh_revert_btn()
+                    return
+                seg_now = {
+                    "start_equity": float(start_equity),
+                    "max_equity": float(max_equity or start_equity),
+                    "daily_max_equity": float(daily_max_equity or start_equity),
+                    "daily_min_equity": float(daily_min_equity or start_equity),
+                    "last_flat_equity": float(last_flat_equity or start_equity),
+                    "win_trades": int(win_trades or 0),
+                    "loss_trades": int(loss_trades or 0),
+                    "has_reset_at_open": bool(has_reset_at_open),
+                    "has_reset_at_close": bool(has_reset_at_close),
+                    "pnl_curve": _export_pnl_curve_for_session(
+                        _cur_s_key_prefs, get_today_str()
+                    ),
+                }
+                folded_prev = _fold_segment_into_baseline_archive(
+                    arch_now,
+                    seg_now,
+                    reset_925=bool(var_reset925.get()),
+                )
+                # Build draft config from current PF controls without saving
+                prev_cfg = json.loads(json.dumps(config))
+                try:
+                    for _pk, _pv in dollar_vars.items():
+                        _raw_pv = float(_parse_ui_dollar_num(_pv, prev_cfg.get(_pk, 0.0)))
+                        prev_cfg[_pk] = (
+                            _raw_pv
+                            if _pk in SIGNED_DOLLAR_KEYS
+                            else abs(_raw_pv)
+                        )
+                    prev_cfg["enable_pm_lock"] = bool(var_pm_lock_on.get())
+                    prev_cfg["enable_t2"] = bool(var_t2_on.get())
+                    prev_cfg["enable_t3"] = bool(var_t3_on.get())
+                    prev_cfg["enable_t4"] = bool(var_t4_on.get())
+                except Exception:
+                    pass
+                cur_net = round(float(last_flat_equity or start_equity) - float(start_equity), 2)
+                cur_hi = round(float(daily_max_equity or start_equity) - float(start_equity), 2)
+                cur_lo = round(float(daily_min_equity or start_equity) - float(start_equity), 2)
+                _, cur_stop_pnl, _, cur_tier_s, _, _ = describe_active_floor(prev_cfg)
+
+                rest_start = folded_prev["start_equity"]
+                rest_net = round(folded_prev["last_flat_equity"] - rest_start, 2)
+                rest_hi = round(folded_prev["daily_max_equity"] - rest_start, 2)
+                rest_lo = round(folded_prev["daily_min_equity"] - rest_start, 2)
+                _, rest_stop_pnl, _, rest_tier_s, _, _ = describe_active_floor(
+                    prev_cfg, start_eq=rest_start, hwm_eq=folded_prev["max_equity"]
+                )
+                past_stop = rest_net <= rest_stop_pnl
+
+                hide_all_tooltips()
+                c_dlg = tk.Toplevel(dlg)
+                c_dlg.withdraw()
+                apply_dark_title_bar(c_dlg)
+                c_dlg.title("Revert to Original Daily Baseline")
+                c_dlg.config(bg="#0d1117", padx=22, pady=18)
+                c_dlg.resizable(False, False)
+                c_dlg.transient(dlg)
+                c_dlg.attributes("-topmost", True)
+
+                hdr_row = tk.Frame(c_dlg, bg="#0d1117")
+                hdr_row.pack(fill="x", pady=(0, 10))
+                tk.Label(
+                    hdr_row,
+                    text=(
+                        "⚠  RESTORED FULL-DAY PnL IS PAST YOUR DAILY STOP"
+                        if past_stop
+                        else "↺  CONFIRM REVERT TO ORIGINAL DAILY BASELINE"
+                    ),
+                    font=("Arial", 11, "bold"),
+                    fg="#fbbf24" if past_stop else "#7dd3fc",
+                    bg="#0d1117",
+                    anchor="w",
+                ).pack(side="left")
+                tk.Label(
+                    hdr_row,
+                    text=(
+                        "PAST DAILY STOP"
+                        if past_stop
+                        else f"RESTORED NET: {format_dollar(rest_net)}"
+                    ),
+                    font=("Arial", 8, "bold"),
+                    fg=(
+                        "#fde68a"
+                        if past_stop
+                        else ("#6ee7b7" if rest_net >= 0 else "#fca5a5")
+                    ),
+                    bg=(
+                        "#33220c"
+                        if past_stop
+                        else ("#112a20" if rest_net >= 0 else "#311820")
+                    ),
+                    padx=8,
+                    pady=3,
+                ).pack(side="right", padx=(16, 0))
+
+                cmp_outer = tk.Frame(
+                    c_dlg,
+                    bg="#131922",
+                    bd=0,
+                    highlightthickness=1,
+                    highlightbackground="#243040",
+                )
+                cmp_outer.pack(fill="x", pady=(0, 12))
+                NeonBarCanvas(
+                    cmp_outer,
+                    core_color="#f59e0b" if past_stop else "#38bdf8",
+                    card_bg="#131922",
+                    glow_on=True,
+                ).pack(side="left", fill="y")
+                cmp_body = tk.Frame(cmp_outer, bg="#131922", padx=14, pady=11)
+                cmp_body.pack(side="left", fill="both", expand=True)
+
+                _col_headers = ("VIEW", "START", "NET PnL", "HIGH / LOW", "W / L", "ACTIVE STOP")
+                _col_padxs = ((0, 18), (0, 16), (0, 16), (0, 16), (0, 16), (0, 0))
+                for _ci, (_ch_txt, _ch_px) in enumerate(zip(_col_headers, _col_padxs)):
+                    tk.Label(
+                        cmp_body,
+                        text=_ch_txt,
+                        font=("Arial", 8, "bold"),
+                        fg="#7b8ea3",
+                        bg="#131922",
+                        anchor="w",
+                    ).grid(row=0, column=_ci, sticky="w", padx=_ch_px)
+
+                tk.Frame(cmp_body, bg="#222d3d", height=1).grid(
+                    row=1, column=0, columnspan=6, sticky="ew", pady=(5, 7)
+                )
+
+                _cur_vals = (
+                    "Current (Re-Zeroed)",
+                    f"${float(start_equity):,.2f}",
+                    format_dollar(cur_net),
+                    f"{format_dollar(cur_hi)} / {format_dollar(cur_lo)}",
+                    f"W: {int(win_trades)} · L: {int(loss_trades)}",
+                    f"{format_dollar(cur_stop_pnl)} ({cur_tier_s})",
+                )
+                for _ci, (_cv_txt, _cv_px) in enumerate(zip(_cur_vals, _col_padxs)):
+                    tk.Label(
+                        cmp_body,
+                        text=_cv_txt,
+                        font=("Arial", 9, "bold"),
+                        fg="#94a3b8",
+                        bg="#131922",
+                        anchor="w",
+                    ).grid(row=2, column=_ci, sticky="w", padx=_cv_px, pady=(0, 6))
+
+                _rest_vals = (
+                    "Original Morning",
+                    f"${rest_start:,.2f}",
+                    format_dollar(rest_net),
+                    f"{format_dollar(rest_hi)} / {format_dollar(rest_lo)}",
+                    f"W: {folded_prev['win_trades']} · L: {folded_prev['loss_trades']}",
+                    f"{format_dollar(rest_stop_pnl)} ({rest_tier_s})",
+                )
+                _rest_fgs = (
+                    "#f1f5f9",
+                    "#e2e8f0",
+                    "#6ee7b7" if rest_net >= 0 else "#fca5a5",
+                    "#e2e8f0",
+                    "#e2e8f0",
+                    "#fbbf24" if past_stop else "#cbd5e1",
+                )
+                for _ci, (_rv_txt, _rv_fg, _rv_px) in enumerate(
+                    zip(_rest_vals, _rest_fgs, _col_padxs)
+                ):
+                    tk.Label(
+                        cmp_body,
+                        text=_rv_txt,
+                        font=("Arial", 9, "bold"),
+                        fg=_rv_fg,
+                        bg="#131922",
+                        anchor="w",
+                    ).grid(row=3, column=_ci, sticky="w", padx=_rv_px)
+
+                if past_stop:
+                    warn_card = tk.Frame(
+                        c_dlg,
+                        bg="#3b1d0c",
+                        bd=0,
+                        highlightthickness=1,
+                        highlightbackground="#f59e0b",
+                        padx=14,
+                        pady=10,
+                    )
+                    warn_card.pack(fill="x", pady=(0, 14))
+                    tk.Label(
+                        warn_card,
+                        text=(
+                            f"Full-day Net PnL ({format_dollar(rest_net)}) is already at or past "
+                            f"your {rest_tier_s} stop ({format_dollar(rest_stop_pnl)})."
+                        ),
+                        font=("Arial", 9, "bold"),
+                        fg="#fef3c7",
+                        bg="#3b1d0c",
+                        anchor="w",
+                    ).pack(fill="x")
+                    tk.Label(
+                        warn_card,
+                        text=(
+                            "• To keep trading with the full-day view, click Keep Current View and raise your Daily Stop below full-day Net PnL first (if not committed).\n"
+                            "• Or click Restore & Call It a Day to restore your true daily PnL and enable Done for Today (no surprise workstation lockout)."
+                        ),
+                        font=("Arial", 9, "bold"),
+                        fg="#fde68a",
+                        bg="#3b1d0c",
+                        justify="left",
+                        anchor="w",
+                    ).pack(fill="x", pady=(4, 0))
+                else:
+                    msg_box = tk.Frame(c_dlg, bg="#0d1117")
+                    msg_box.pack(fill="x", pady=(0, 14))
+                    tk.Label(
+                        msg_box,
+                        text="Stage reverting back to today's original morning baseline?",
+                        font=("Arial", 10, "bold"),
+                        fg="#f1f5f9",
+                        bg="#0d1117",
+                        anchor="w",
+                    ).pack(fill="x")
+                    tk.Label(
+                        msg_box,
+                        text=(
+                            "Your true Net PnL, High/Low, W/L count, and stitched intraday curve "
+                            "will apply when you click SAVE & LAUNCH / SAVE CHANGES."
+                        ),
+                        font=("Arial", 9, "bold"),
+                        fg="#9fb1c4",
+                        bg="#0d1117",
+                        justify="left",
+                        anchor="w",
+                    ).pack(fill="x", pady=(3, 0))
+
+                rev_res = {"ok": False, "done_today": False}
+
+                def _close_c_dlg(accepted=False, mark_done=False):
+                    rev_res["ok"] = accepted
+                    rev_res["done_today"] = mark_done
+                    try:
+                        c_dlg.grab_release()
+                    except Exception:
+                        pass
+                    c_dlg.destroy()
+
+                btn_c_row = tk.Frame(c_dlg, bg="#0d1117")
+                btn_c_row.pack(fill="x")
+                make_stadium_button(
+                    btn_c_row,
+                    text="Keep Current View" if past_stop else "Cancel",
+                    font=("Arial", 9, "bold"),
+                    fill_color="#141820",
+                    fill_top_color="#1c212b",
+                    border_color="#2e3746",
+                    hover_fill="#1e293b",
+                    hover_fill_top="#293548",
+                    hover_border="#64748b",
+                    fg="#e2e8f0",
+                    canvas_bg="#0d1117",
+                    width=148,
+                    height=34,
+                    auto_width=False,
+                    command=lambda: _close_c_dlg(False, False),
+                ).pack(side="left")
+
+                make_stadium_button(
+                    btn_c_row,
+                    text=(
+                        "Restore & Call It a Day"
+                        if past_stop
+                        else "Stage Revert ✓"
+                    ),
+                    font=("Arial", 9, "bold"),
+                    fill_color="#3b2608" if past_stop else "#0d3b20",
+                    fill_top_color="#52350b" if past_stop else "#14532d",
+                    border_color="#f59e0b" if past_stop else "#10b981",
+                    hover_fill="#52350b" if past_stop else "#114b29",
+                    hover_fill_top="#6b4610" if past_stop else "#196638",
+                    hover_border="#fbbf24" if past_stop else "#34d399",
+                    fg="#ffffff",
+                    canvas_bg="#0d1117",
+                    width=184 if past_stop else 148,
+                    height=34,
+                    auto_width=False,
+                    command=lambda: _close_c_dlg(True, bool(past_stop)),
+                ).pack(side="right")
+
+                c_dlg.protocol("WM_DELETE_WINDOW", lambda: _close_c_dlg(False, False))
+                c_dlg.bind("<Escape>", lambda _e: _close_c_dlg(False, False))
+                center_dialog_over_parent(c_dlg, parent=dlg)
+                c_dlg.grab_set()
+                c_dlg.focus_set()
+                dlg.wait_window(c_dlg)
+                try:
+                    if dlg.winfo_exists():
+                        dlg.lift()
+                        dlg.grab_set()
+                        dlg.focus_set()
+                except Exception:
+                    pass
+                if rev_res["ok"]:
+                    var_reanchor.set(False)
+                    var_revert_baseline.set(True)
+                    var_revert_done_today.set(bool(rev_res["done_today"]))
+                    _refresh_revert_btn()
+
+            btn_revert_base.config(command=_on_click_revert_baseline)
+            _prefs_modal_refs["refresh_revert_fn"] = _refresh_revert_btn
+            _refresh_revert_btn()
 
         # Section 2: Audio & Voice Cues
         sec2, sec2_hdr = _make_prefs_section("AUDIO & VOICE CUES", "#10b981")
@@ -43013,6 +44652,11 @@ def show_preflight_window(
                             )
                     _refresh_ignored_positions_pill()
                     _render_card3_telemetry_live(force=True)
+                    try:
+                        refresh_smart_dimming()
+                        _sync_prefs_modal_state()
+                    except Exception:
+                        pass
                     _trigger_trade_perm_probe(force_recheck=False)
 
                 try:
@@ -43282,7 +44926,7 @@ def _get_hud_breach_banner_text(n_cols=None):
         n_cols = len(get_active_hud_columns(config))
     comm_on = is_committed_for_today()
     demo_now = is_demo_mode_active()
-    if done_for_today and not is_locked_down and not breach_visual_sim_active:
+    if _is_done_today_display_active() and not breach_visual_sim_active:
         ref_eq = (
             last_flat_equity if last_flat_equity is not None else start_equity
         )
@@ -43532,8 +45176,7 @@ def _sync_hud_breach_banner(is_flat_now=None):
             else 0.0
         )
         is_green_done = bool(
-            done_for_today
-            and not is_locked_down
+            _is_done_today_display_active()
             and not breach_visual_sim_active
             and net_val >= 0.0
         )
@@ -43673,7 +45316,7 @@ def _sync_hud_settings_btn_state(btn_widget=None, is_flat_now=None):
                 fg="#fde68a",
                 state="normal",
             )
-        elif done_for_today and not is_locked_down and not breach_visual_sim_active:
+        elif _is_done_today_display_active() and not breach_visual_sim_active:
             s_txt = f"{s_ico} DONE" if compact_set else f"{s_ico} DONE TODAY"
             _apply_stadium_btn_memo(
                 target,
