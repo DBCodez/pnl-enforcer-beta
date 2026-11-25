@@ -4,6 +4,20 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.90] — 2026-11-24 (Experimental Beta Channel)
+### ⚡ Quick Summary
+- **Merged `v0.9.87.1` Holiday/Early-Close & Card 4 UI Fixes + Tightened `ntfy` Topic & Rate-Limit Protection (`🔔 Mobile Push Alerts (BETA)`):** Merged Thanksgiving/Black Friday `1:00 PM` RTH / `5:00 PM` Extended-Hours schedule labels and Card 4 `(Pre & After-Hours)` fit from `main`, raised the `ntfy` Secret Topic minimum length to `10` characters, and added a `90s` `HTTP 429` cooldown for non-urgent recaps/warnings while keeping `URGENT` stop and connection alerts unblocked.
+
+### 🔍 Detailed Breakdown
+- **Merged Upstream `main` Release (`v0.9.87.1`):**
+  - Includes dynamic Thanksgiving / Black Friday `1:00 PM ET` RTH and `5:00 PM ET` Extended-Hours Pre-Flight greetings, `FLIGHT PLAN` tooltips, Card 3/4/5 labels, HUD tooltips, Midnight ET overnight rollover refresh, `data_loop` transition logs, and Card 4 `(Pre & After-Hours)` header fit.
+- **10-Character `ntfy` Topic Floor & Legacy Short-Topic Notice (`MOBILE_NTFY_MIN_TOPIC_LEN = 10`, `_has_legacy_short_ntfy_topic`, `is_mobile_push_configured`, `load_config`):**
+  - Requires at least `10` characters on `ntfy` topics (eliminating weak short topics and ensuring 100% coverage by `_scrub_log_line` `>= 8` char secret scrubbing), logs a non-leaky startup `[WARN]` if an existing config holds a `1–9` char topic, and highlights the Preferences button in amber (`TOPIC <10 CHARS`).
+- **90s `HTTP 429` Low-Priority Backoff (`MOBILE_PUSH_429_COOLDOWN_SEC = 90.0`, `_is_mobile_push_429_held`, `enqueue_mobile_push`, `_mobile_push_worker_loop`, `_save_mdlg`):**
+  - Keys `HTTP 429` holds by `(provider, server)` and pauses non-urgent Trade Recaps and Warnings for `90s` (logged once cleanly, before stamping dedup keys) so `URGENT` stops/manual-exits and `mobile_push_connection` alerts always keep priority, clearing immediately when switching provider or server in settings.
+
+---
+
 ## [v0.9.89] — 2026-11-24 (Experimental Beta Channel)
 ### ⚡ Quick Summary
 - **Screenshot-Safe Privacy Eye Toggle & Alphanumeric Input Fix (`🔔 Mobile Push Alerts (BETA)`):** Mobile Push fields now open pre-masked (`*`) by default with synchronized **`👁 Show` / `👁 Hide`** toggles across `ntfy` and `Pushover`, fixed alphanumeric typing/pasting on all 4 Mobile Push fields, and cleaned up blank-rendering Tkinter phone glyphs.
@@ -26,6 +40,18 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
   - Publishes UTF-8 JSON to `ntfy` root endpoints (emoji-safe, with `/<topic>` fallback) and Pushover (`priority=1` for stops/manual-exit, `0` otherwise), sends zero total account equity/balances, and scrubs configured secrets (`>= 8` chars) & custom server URLs from `enforcer_log.txt` while keeping mobile settings editable anytime and preserved separately from Risk Presets.
 - **Event Hooks (`_enter_halt_breach_watch`, `trigger_open_pnl_flatten`, `trigger_consec_loss_cooldown`, `trigger_lockdown`, `trigger_alarm`, `trigger_upside_tier_glow`, `_maybe_dispatch_pending_flat_recap`, `_handle_disconnect_recovery`, `data_loop`):**
   - Sends `URGENT` pushes on Stops/Flattens/Lockouts and Urgent Manual-Exit notices (sending only the manual-exit alert when Options Auto-Flatten is OFF or outside RTH), deduplicates Warning Alarm pushes via `trigger_alarm()`, composes a 1-poll settled **Trade Closed Flat Recap** (`TradePnL`, `Day Net`, `W/L`, and exact remaining `Room to Stop` or `LOCKED FOR DAY` / `Alarms-Only Mode`), reports Disconnect/Reconnect transitions (honoring flap-storm quiet mode), offers an optional session-armed check-in, and stays inactive in Demo Simulator mode (outside manual `🔔 Send Test Push`).
+
+---
+
+## [v0.9.87.1] — 2026-11-24
+### ⚡ Quick Summary
+- **Thanksgiving / Black Friday Early-Close UI Polish (`1:00 PM` RTH / `5:00 PM` Extended Hours) & Card 4 Header Fix:** Updated Pre-Flight session greetings, `FLIGHT PLAN` tooltips, Card 3/4/5 session labels, HUD status tooltips, and transition log text to dynamically display **`1:00 PM ET`** RTH / **`5:00 PM ET`** Extended-Hours schedules on NYSE early-close days (including across Midnight ET overnight rollovers) and trimmed Card 4's title to `(Pre & After-Hours)` so it never clips.
+
+### 🔍 Detailed Breakdown
+- **Dynamic Early-Close & Holiday Schedule Copy (`format_preflight_session_greeting`, `build_preflight_card4_subtitle`, `build_preflight_card5_title`, `build_flight_plan_summary`, `refresh_active_rulebook_highlight`, `data_loop`):**
+  - Displays `"⏸ Market Closed (NYSE Holiday)"` on NYSE holidays like Thanksgiving (`2026-11-26`), reflects `1:00 PM Early Close` pre-market/RTH copy and `5:00 PM ET` extended-hours close + `"🌙 Market Closed for Evening"` on early-close dates like Black Friday (`2026-11-27`), dynamically switches `build_flight_plan_summary()` and HUD tooltips between `4:00 PM` and `1:00 PM`, refreshes Card 3/4/5 and idle footer copy automatically across Midnight ET / session boundaries, and logs `"1:00 PM Early-Close Extended-Hours Transition"` in `data_loop`.
+- **Card 4 Pre-Flight Title Fit (`make_card`):**
+  - Shortened Card 4's header to **`▶  4. EXTENDED HOURS RULEBOOK (Pre & After-Hours)`** so `"rs)"` no longer clips before the `STANDBY` / `• ACTIVE NOW` pill.
 
 ---
 

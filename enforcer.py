@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.89"
+APP_VERSION = "0.9.90"
 
 import os
 import sys
@@ -4321,6 +4321,8 @@ def _upload_sanitized_log_to_drive(
 MOBILE_PUSH_MAX_QUEUE = 48
 MOBILE_PUSH_STALE_SEC = 120.0
 MOBILE_PUSH_HTTP_TIMEOUT_SEC = 2.5
+MOBILE_NTFY_MIN_TOPIC_LEN = 10
+MOBILE_PUSH_429_COOLDOWN_SEC = 90.0
 
 _mobile_push_lock = threading.Lock()
 _mobile_push_queue = queue.PriorityQueue(maxsize=MOBILE_PUSH_MAX_QUEUE)
@@ -4330,6 +4332,8 @@ _mobile_push_in_flight = 0
 _mobile_push_idle_event = threading.Event()
 _mobile_push_idle_event.set()
 _mobile_push_dedup_ts = {}
+_mobile_push_rate_limited_until = 0.0
+_mobile_push_rate_limited_key = ("", "")
 _mobile_push_transport_override = None
 _mobile_push_allow_sandbox_net = False
 _pending_flat_recap = None
@@ -4391,6 +4395,19 @@ def _make_mobile_text_entry(parent_w, var_s, width_chars, secret=False):
     )
 
 
+def _has_legacy_short_ntfy_topic(cfg=None):
+    """Returns True when Mobile Push is enabled for ntfy with a saved 1-9 char
+    topic shorter than `MOBILE_NTFY_MIN_TOPIC_LEN`."""
+    c = cfg if isinstance(cfg, dict) else config
+    if not bool(c.get("enable_mobile_push", False)):
+        return False
+    prov = str(c.get("mobile_push_provider", "ntfy") or "ntfy").strip().lower()
+    if prov != "ntfy":
+        return False
+    topic = str(c.get("mobile_ntfy_topic", "") or "").strip()
+    return 0 < len(topic) < MOBILE_NTFY_MIN_TOPIC_LEN
+
+
 def is_mobile_push_configured(cfg=None):
     """Returns True when experimental Mobile Push Alerts are enabled and valid
     credentials for the selected provider are configured."""
@@ -4404,7 +4421,24 @@ def is_mobile_push_configured(cfg=None):
         return bool(len(u_key) >= 10 and len(a_tok) >= 10)
     srv = _normalize_mobile_ntfy_server(c.get("mobile_ntfy_server", "https://ntfy.sh"))
     topic = str(c.get("mobile_ntfy_topic", "") or "").strip()
-    return bool(srv and len(topic) >= 4)
+    return bool(srv and len(topic) >= MOBILE_NTFY_MIN_TOPIC_LEN)
+
+
+def _is_mobile_push_429_held(snap_cfg, prio_rank, category_key=""):
+    """Returns True when `(provider, server)` is inside an active HTTP 429
+    cooldown for non-urgent traffic. `prio_rank == 0` URGENT stop alerts and
+    connection status alerts are NEVER suppressed by a 429 hold."""
+    if int(prio_rank) == 0 or str(category_key or "") == "mobile_push_connection":
+        return False
+    key = (
+        str(snap_cfg.get("provider", "") or ""),
+        str(snap_cfg.get("server", "") or ""),
+    )
+    return bool(
+        _mobile_push_rate_limited_until > 0.0
+        and key == _mobile_push_rate_limited_key
+        and time.monotonic() < _mobile_push_rate_limited_until
+    )
 
 
 def _snapshot_mobile_push_cfg(cfg=None):
@@ -4532,22 +4566,51 @@ def _send_mobile_push_http(snap_cfg, title, body, prio_rank=1):
 
 
 def _mobile_push_worker_loop():
-    global _mobile_push_in_flight
+    global _mobile_push_in_flight, _mobile_push_rate_limited_until, _mobile_push_rate_limited_key
     while True:
         item = _mobile_push_queue.get()
         try:
-            prio_rank, _seq, enqueued_mono, snap_cfg, title, body = item
+            prio_rank, _seq, enqueued_mono, snap_cfg, title, body = item[:6]
+            cat_key = item[6] if len(item) > 6 else ""
             if (
                 int(prio_rank) >= 1
                 and (time.monotonic() - float(enqueued_mono)) > MOBILE_PUSH_STALE_SEC
             ):
                 continue
+            with _mobile_push_lock:
+                if _is_mobile_push_429_held(snap_cfg, prio_rank, cat_key):
+                    continue
             ok, detail = _send_mobile_push_http(snap_cfg, title, body, prio_rank=prio_rank)
             if not ok:
-                log_event(
-                    "WARN",
-                    f"Mobile push ({snap_cfg.get('provider', 'ntfy')}) failed: {detail}.",
-                )
+                prov_lbl_w = str(snap_cfg.get("provider", "ntfy") or "ntfy")
+                srv_lbl_w = str(snap_cfg.get("server", "") or "")
+                if detail == "HTTP 429":
+                    with _mobile_push_lock:
+                        now_429 = time.monotonic()
+                        hold_k = (prov_lbl_w, srv_lbl_w)
+                        already_held = bool(
+                            _mobile_push_rate_limited_key == hold_k
+                            and now_429 < _mobile_push_rate_limited_until
+                        )
+                        _mobile_push_rate_limited_key = hold_k
+                        _mobile_push_rate_limited_until = now_429 + MOBILE_PUSH_429_COOLDOWN_SEC
+                    if int(prio_rank) == 0 or str(cat_key) == "mobile_push_connection":
+                        log_event(
+                            "WARN",
+                            f"Mobile push ({prov_lbl_w}) high-priority alert rate-limited (HTTP 429); "
+                            f"non-urgent recaps/warnings paused for {int(MOBILE_PUSH_429_COOLDOWN_SEC)}s.",
+                        )
+                    elif not already_held:
+                        log_event(
+                            "WARN",
+                            f"Mobile push ({prov_lbl_w}) rate-limited (HTTP 429) — pausing non-urgent "
+                            f"recaps/warnings for {int(MOBILE_PUSH_429_COOLDOWN_SEC)}s so URGENT stop alerts keep priority.",
+                        )
+                else:
+                    log_event(
+                        "WARN",
+                        f"Mobile push ({prov_lbl_w}) failed: {detail}.",
+                    )
         except Exception as ex:
             try:
                 log_event("WARN", f"Mobile push worker error: {type(ex).__name__}.")
@@ -4596,6 +4659,8 @@ def enqueue_mobile_push(
     now_m = time.monotonic()
 
     with _mobile_push_lock:
+        if _is_mobile_push_429_held(snap_cfg, prio_rank, category_key):
+            return False
         if dedup_key:
             last_t = float(_mobile_push_dedup_ts.get(dedup_key, 0.0) or 0.0)
             if last_t > 0.0 and (now_m - last_t) < float(cooldown_s):
@@ -4606,7 +4671,15 @@ def enqueue_mobile_push(
 
         _ensure_mobile_push_worker_started()
         _mobile_push_seq += 1
-        pkt = (int(prio_rank), _mobile_push_seq, now_m, snap_cfg, str(title), stamped_body)
+        pkt = (
+            int(prio_rank),
+            _mobile_push_seq,
+            now_m,
+            snap_cfg,
+            str(title),
+            stamped_body,
+            str(category_key or ""),
+        )
         try:
             _mobile_push_queue.put_nowait(pkt)
             _mobile_push_in_flight += 1
@@ -4683,7 +4756,7 @@ def send_mobile_push_test_sync(cfg_override=None):
             False,
             "Enter both Pushover User Key & App Token first."
             if prov == "pushover"
-            else "Enter (or Generate) a private ntfy Topic Name (>= 4 chars) first.",
+            else f"Enter (or Generate) a private ntfy Topic Name (>= {MOBILE_NTFY_MIN_TOPIC_LEN} chars) first.",
         )
     snap_cfg = _snapshot_mobile_push_cfg(tmp_c)
     ts_str = datetime.now().strftime("%H:%M:%S")
@@ -5845,12 +5918,18 @@ def build_flight_plan_summary(fp_state):
     st_ao = bool(st_d.get("alarms_only_mode", False))
     muted = bool(st_d.get("mute_all_audio", False))
     mkt_closed = bool(st_d.get("market_closed_day", False))
+    early_close = bool(st_d.get("early_close_day", False)) and not mkt_closed
+    rth_end_m = 780 if early_close else 960
+    close_short_today = "1:00" if early_close else "4:00"
+    close_ampm_today = "1:00 PM" if early_close else "4:00 PM"
+    ec_hdr_sfx = " · EARLY CLOSE" if early_close else ""
     if "is_rth_now" in st_d:
         rth_live = bool(st_d["is_rth_now"]) and not mkt_closed
     else:
         et_chk = int(_fp_safe_num(st_d.get("et_mins", 600), 600))
-        rth_live = (570 <= et_chk < 960) and not mkt_closed
+        rth_live = (570 <= et_chk < rth_end_m) and not mkt_closed
     et_mins_v = int(_fp_safe_num(st_d.get("et_mins", 600 if rth_live else 500), 600))
+    next_opt_close_short = "1:00" if (early_close and et_mins_v < rth_end_m) else "4:00"
 
     flat_on = (not st_ao) and bool(st_d.get("enable_auto_flatten", False))
     kill_tos_on = (not st_ao) and bool(st_d.get("enable_kill_tos", False))
@@ -5880,7 +5959,7 @@ def build_flight_plan_summary(fp_state):
         w2_mag = abs(_fp_safe_num(st_d.get("t1_warn_2", 1500.0), 1500.0))
         stop_mag = abs(_fp_safe_num(st_d.get("t1_max_loss", 2000.0), 2000.0))
         sess_tag = "RTH"
-        sess_full = "Regular Hours (9:30 AM – 4:00 PM ET)"
+        sess_full = f"Regular Hours (9:30 AM – {close_ampm_today} ET)"
     else:
         w1_on = bool(st_d.get("enable_pm_warn_1", True))
         w2_on = bool(st_d.get("enable_pm_warn_2", True))
@@ -5944,9 +6023,9 @@ def build_flight_plan_summary(fp_state):
             opt_clause = "Options: auto-close RTH (Beta)"
         elif opt_done_armed:
             opt_clause = (
-                "Options: visual now · auto-close 9:30–4:00 ET"
+                f"Options: visual now · auto-close 9:30–{next_opt_close_short} ET"
                 if muted
-                else "Options: alert now · auto-close 9:30–4:00 ET"
+                else f"Options: alert now · auto-close 9:30–{next_opt_close_short} ET"
             )
         else:
             opt_clause = (
@@ -5958,9 +6037,9 @@ def build_flight_plan_summary(fp_state):
         opt_clause = "Options: auto-close RTH (Beta)"
     elif opt_armed:
         opt_clause = (
-            "Options: visual now · auto-close 9:30–4:00 ET"
+            f"Options: visual now · auto-close 9:30–{next_opt_close_short} ET"
             if muted
-            else "Options: alert now · auto-close 9:30–4:00 ET"
+            else f"Options: alert now · auto-close 9:30–{next_opt_close_short} ET"
         )
     elif flat_on and opt_checked and not opt_waived:
         opt_clause = (
@@ -6061,7 +6140,7 @@ def build_flight_plan_summary(fp_state):
         )
     else:
         if rth_live:
-            hdr_base = "FLIGHT PLAN — REGULAR HOURS (9:30 AM – 4:00 PM ET)"
+            hdr_base = f"FLIGHT PLAN — REGULAR HOURS (9:30 AM – {close_ampm_today} ET{ec_hdr_sfx})"
         elif mkt_closed:
             hdr_base = "FLIGHT PLAN — MARKET CLOSED (EXTENDED-HOURS PREVIEW)"
         elif et_mins_v < 570:
@@ -6083,7 +6162,7 @@ def build_flight_plan_summary(fp_state):
 
     stop_detail = stop_clause
     if flat_on and (not rth_live or (et_mins_v < 570)) and (not st_done):
-        stop_detail += " (outside 9:30–4:00 ET, stocks close via marketable limit orders)"
+        stop_detail += f" (outside 9:30–{close_short_today} ET, stocks close via marketable limit orders)"
     tt_lines.append(f"• Daily Stop | {stop_detail}")
 
     opt_val_s = (
@@ -7206,6 +7285,13 @@ def load_config(log_restore=False):
         )
         if (start_equity is None or log_restore) and sel_acct:
             restore_account_session(active_b, sel_acct, log_restore=log_restore)
+        if log_restore and _has_legacy_short_ntfy_topic(config):
+            log_event(
+                "WARN",
+                f"Mobile Push Alerts paused: saved ntfy Secret Topic is shorter than "
+                f"{MOBILE_NTFY_MIN_TOPIC_LEN} characters — open Preferences & Audio -> "
+                f"Mobile Push Alerts to Generate a private topic.",
+            )
 
 
 def save_config(new_cfg=None):
@@ -8025,6 +8111,84 @@ def is_after_hours():
 def is_market_hours():
     now_et = get_eastern_now()
     return dt_time(9, 30) <= now_et.time() < get_rth_close_time(now_et)
+
+
+def get_rth_close_minutes(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    return 780 if is_nyse_early_close_day(dt_et) else 960
+
+
+def format_rth_close_short_label(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    return "1:00" if is_nyse_early_close_day(dt_et) else "4:00"
+
+
+def format_rth_close_ampm_label(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    return "1:00 PM" if is_nyse_early_close_day(dt_et) else "4:00 PM"
+
+
+def format_preflight_session_greeting(now_et=None, broker_name=None):
+    """Returns the Pre-Flight bottom-left session greeting, honoring weekends,
+    NYSE full holidays (e.g. Thanksgiving), and NYSE 1:00 PM ET RTH / 5:00 PM ET
+    Extended-Hours early closes (e.g. Black Friday)."""
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    d_str = dt_et.strftime("%Y-%m-%d")
+    if d_str in NYSE_FULL_HOLIDAY_DATES and dt_et.weekday() < 5:
+        return "⏸ Market Closed (NYSE Holiday)"
+    if dt_et.weekday() >= 5:
+        return "⏸ Weekend — Market Closed"
+    et_m = (dt_et.hour * 60) + dt_et.minute
+    early_c = d_str in NYSE_EARLY_CLOSE_DATES
+    rth_end_m = 780 if early_c else 960
+    ext_end_m = 1020 if early_c else 1200
+    if et_m < 570:
+        return (
+            "☀️ Pre-market check-in (1:00 PM Early Close)"
+            if early_c
+            else "☀️ Pre-market check-in"
+        )
+    if et_m < rth_end_m:
+        return (
+            "🟢 Regular Hours active (1:00 PM Early Close)"
+            if early_c
+            else "🟢 Regular Hours active"
+        )
+    if et_m < ext_end_m:
+        return (
+            "🌙 After-Hours active (closes 5:00 PM ET)"
+            if early_c
+            else "🌙 After-Hours active"
+        )
+    return "🌙 Market Closed for Evening"
+
+
+def build_preflight_card4_subtitle(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    if (
+        is_nyse_early_close_day(dt_et)
+        and dt_et.weekday() < 5
+        and (dt_et.strftime("%Y-%m-%d") not in NYSE_FULL_HOLIDAY_DATES)
+    ):
+        return (
+            "Early Close: active before 9:30 AM & after 1:00 PM ET. "
+            "Max Loss / Profit Lock triggers Card 2."
+        )
+    return (
+        "Active before 9:30 AM and after 4:00 PM ET. Hitting your Max Loss "
+        "or Profit Lock triggers Card 2."
+    )
+
+
+def build_preflight_card5_title(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    if (
+        is_nyse_early_close_day(dt_et)
+        and dt_et.weekday() < 5
+        and (dt_et.strftime("%Y-%m-%d") not in NYSE_FULL_HOLIDAY_DATES)
+    ):
+        return "▶  5. REGULAR HOURS RULEBOOK (9:30 AM – 1:00 PM)"
+    return "▶  5. REGULAR HOURS RULEBOOK (9:30 AM – 4:00 PM)"
 
 
 def is_any_equity_session_open(broker_name=None):
@@ -27911,6 +28075,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     flat_desync_streak = 0
                     in_trade_desync_streak = 0
                     pending_scale_out_tol = 0.0
+                    _eh_trans_lbl = (
+                        "1:00 PM Early-Close Extended-Hours Transition"
+                        if is_nyse_early_close_day()
+                        else "4:00 PM Extended-Hours Transition"
+                    )
                     if reset_925:
                         old_hwm = max_equity - start_equity
                         max_equity = max(start_equity, last_flat_equity)
@@ -27943,7 +28112,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         )
                         log_event(
                             "SESSION",
-                            f"4:00 PM Extended-Hours Transition: Rulebook HWM "
+                            f"{_eh_trans_lbl}: Rulebook HWM "
                             f"recalibrated from {format_dollar(old_hwm)} to "
                             f"{format_dollar(new_hwm)} (Session High preserved at "
                             f"{format_dollar(daily_max_equity - start_equity)})."
@@ -27954,7 +28123,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         )
                         log_event(
                             "SESSION",
-                            "4:00 PM Extended-Hours Transition: Switched from RTH "
+                            f"{_eh_trans_lbl}: Switched from RTH "
                             "Rulebook to Extended-Hours Rulebook."
                         )
 
@@ -36574,15 +36743,18 @@ def show_preflight_window(
             anchor="w"
         )
         title_lbl.pack(side="left", fill="x", expand=True)
+        subtitle_lbl = None
         if subtitle:
-            tk.Label(
+            subtitle_lbl = tk.Label(
                 card,
                 text=subtitle,
                 font=("Arial", 9),
                 fg="#8b9bb0",
                 bg="#131922",
                 anchor="w"
-            ).pack(fill="x", pady=(1, 4))
+            )
+            subtitle_lbl.pack(fill="x", pady=(1, 4))
+        card._subtitle_lbl = subtitle_lbl
         tk.Frame(card, bg="#222d3d", height=1).pack(fill="x", pady=(0, 4))
         if return_parts:
             return (
@@ -40966,19 +41138,23 @@ def show_preflight_window(
             if is_mobile_push_configured(config):
                 pv = str(config.get("mobile_push_provider", "ntfy") or "ntfy").lower()
                 return f"🔔 Mobile Push Alerts (BETA): ON ({pv})"
+            if _has_legacy_short_ntfy_topic(config):
+                return "🔔 Mobile Push (BETA): TOPIC <10 CHARS"
             return "🔔 Mobile Push Alerts (BETA): OFF"
 
+        _mob_on0 = is_mobile_push_configured(config)
+        _mob_short0 = (not _mob_on0) and _has_legacy_short_ntfy_topic(config)
         btn_mobile_push = make_stadium_button(
             r_mob_push,
             text=_fmt_mobile_btn_txt(),
             font=("Arial", 9, "bold"),
-            fill_color="#102a20" if is_mobile_push_configured(config) else "#141820",
-            fill_top_color="#163a2c" if is_mobile_push_configured(config) else "#1c212b",
-            border_color="#1f6e4c" if is_mobile_push_configured(config) else "#2e3746",
-            hover_fill="#15392b" if is_mobile_push_configured(config) else "#181e28",
-            hover_fill_top="#1c4a38" if is_mobile_push_configured(config) else "#232a36",
-            hover_border="#34d399" if is_mobile_push_configured(config) else "#38bdf8",
-            fg="#bbf7d0" if is_mobile_push_configured(config) else "#cbd5e1",
+            fill_color="#102a20" if _mob_on0 else ("#2b1b08" if _mob_short0 else "#141820"),
+            fill_top_color="#163a2c" if _mob_on0 else ("#3b250b" if _mob_short0 else "#1c212b"),
+            border_color="#1f6e4c" if _mob_on0 else ("#d97706" if _mob_short0 else "#2e3746"),
+            hover_fill="#15392b" if _mob_on0 else ("#36220a" if _mob_short0 else "#181e28"),
+            hover_fill_top="#1c4a38" if _mob_on0 else ("#472d0e" if _mob_short0 else "#232a36"),
+            hover_border="#34d399" if _mob_on0 else ("#fbbf24" if _mob_short0 else "#38bdf8"),
+            fg="#bbf7d0" if _mob_on0 else ("#fde68a" if _mob_short0 else "#cbd5e1"),
             canvas_bg="#131922",
             width=268,
             height=26,
@@ -40993,15 +41169,16 @@ def show_preflight_window(
                 if not btn_mobile_push.winfo_exists():
                     return
                 is_on = is_mobile_push_configured(config)
+                is_short = (not is_on) and _has_legacy_short_ntfy_topic(config)
                 btn_mobile_push.config(
                     text=_fmt_mobile_btn_txt(),
-                    fill_color="#102a20" if is_on else "#141820",
-                    fill_top_color="#163a2c" if is_on else "#1c212b",
-                    border_color="#1f6e4c" if is_on else "#2e3746",
-                    hover_fill="#15392b" if is_on else "#181e28",
-                    hover_fill_top="#1c4a38" if is_on else "#232a36",
-                    hover_border="#34d399" if is_on else "#38bdf8",
-                    fg="#bbf7d0" if is_on else "#cbd5e1",
+                    fill_color="#102a20" if is_on else ("#2b1b08" if is_short else "#141820"),
+                    fill_top_color="#163a2c" if is_on else ("#3b250b" if is_short else "#1c212b"),
+                    border_color="#1f6e4c" if is_on else ("#d97706" if is_short else "#2e3746"),
+                    hover_fill="#15392b" if is_on else ("#36220a" if is_short else "#181e28"),
+                    hover_fill_top="#1c4a38" if is_on else ("#472d0e" if is_short else "#232a36"),
+                    hover_border="#34d399" if is_on else ("#fbbf24" if is_short else "#38bdf8"),
+                    fg="#bbf7d0" if is_on else ("#fde68a" if is_short else "#cbd5e1"),
                 )
             except Exception:
                 pass
@@ -41448,13 +41625,14 @@ def show_preflight_window(
                 _restore_pf_modal_focus(mdlg)
 
             def _save_mdlg():
+                global _mobile_push_rate_limited_until, _mobile_push_rate_limited_key
                 draft = _build_draft_mobile_cfg()
                 if draft["enable_mobile_push"] and not is_mobile_push_configured(draft):
                     lbl_m_status.config(
                         text=(
                             "⚠️ Enter a valid Pushover User Key & App Token (or uncheck Enable)."
                             if draft["mobile_push_provider"] == "pushover"
-                            else "⚠️ Enter/Generate an ntfy Secret Topic (>= 4 chars) & valid http(s) URL."
+                            else f"⚠️ Enter/Generate an ntfy Secret Topic (>= {MOBILE_NTFY_MIN_TOPIC_LEN} chars) & valid http(s) URL."
                         ),
                         fg="#fbbf24",
                     )
@@ -41473,6 +41651,14 @@ def show_preflight_window(
                     "mobile_push_armed_checkin",
                 ):
                     config[mk] = draft[mk]
+                _saved_snap_k = (
+                    _snapshot_mobile_push_cfg(config).get("provider", ""),
+                    _snapshot_mobile_push_cfg(config).get("server", ""),
+                )
+                with _mobile_push_lock:
+                    if _saved_snap_k != _mobile_push_rate_limited_key:
+                        _mobile_push_rate_limited_until = 0.0
+                        _mobile_push_rate_limited_key = ("", "")
                 save_config(config)
                 prov_lbl = draft["mobile_push_provider"]
                 log_event(
@@ -41913,7 +42099,7 @@ def show_preflight_window(
         audio_short = "🔇 MUTED" if var_mute_all_audio.get() else audio_txt
 
         tier0 = (
-            f"9:30/4:00 Ratchets: {sw_txt} · Swings: {pos_txt} · "
+            f"9:30/{format_rth_close_short_label()} Ratchets: {sw_txt} · Swings: {pos_txt} · "
             f"{audio_txt} · Poll: {p_sec}s · Safe Logs: {log_txt}{wb_sfx}{sim_sfx}"
         )
         tier1 = (
@@ -42716,9 +42902,8 @@ def show_preflight_window(
     # ==========================================================
     c4, c4_halos, c4_bar, c4_title_lbl, c4_badge_pill = make_card(
         right_col,
-        "▶  4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)",
-        "Active before 9:30 AM and after 4:00 PM ET. Hitting your Max Loss "
-        "or Profit Lock triggers Card 2.",
+        "▶  4. EXTENDED HOURS RULEBOOK (Pre & After-Hours)",
+        build_preflight_card4_subtitle(),
         accent="#5dade2",
         bar_color="#10b981",
         return_parts=True
@@ -42846,7 +43031,7 @@ def show_preflight_window(
 
     c5, c5_halos, c5_bar, c5_title_lbl, c5_badge_pill = make_card(
         right_col,
-        "▶  5. REGULAR HOURS RULEBOOK (9:30 AM – 4:00 PM)",
+        build_preflight_card5_title(),
         "Starts at Base Tier 1 and ratchets your stop upward "
         "as realized profit grows. Hitting your stop triggers Card 2.",
         accent="#5dade2",
@@ -42854,6 +43039,29 @@ def show_preflight_window(
         expand=True,
         return_parts=True
     )
+
+    _pf_sched_state = {"sig": None, "date": "", "last_idle_txt": ""}
+
+    def _compute_pf_idle_status(now_et_arg):
+        if is_in_trade_tamper_locked():
+            return (
+                "🔒 In Trade: Risk & Rulebook cards (1, 2, 4, 5) are locked. HUD Columns, Logs & Audio remain editable.",
+                "#fbbf24",
+            )
+        if done_for_today:
+            return (
+                "🔒 Session locked in for today — protected until Midnight ET.",
+                "#34d399",
+            )
+        if is_committed_for_today():
+            return (
+                "🔒 Rulebook committed until Midnight ET — rules set, trade your plan.",
+                "#7dd3fc",
+            )
+        _sg = format_preflight_session_greeting(now_et_arg, var_broker.get())
+        if config.get("user_defaults"):
+            return (f"{_sg} · Custom defaults loaded ✓", "#8b9bb0")
+        return (f"{_sg} — dial in your stops & launch when ready", "#8b9bb0")
 
     def _apply_rulebook_aura(halos, bar_cv, title_w, badge_w, is_active):
         h0, outer_w = halos
@@ -42889,6 +43097,47 @@ def show_preflight_window(
         _apply_rulebook_aura(
             c4_halos, c4_bar, c4_title_lbl, c4_badge_pill, is_active=(not rth_now)
         )
+        try:
+            _now_et_rh = get_eastern_now()
+            _d_rh = _now_et_rh.strftime("%Y-%m-%d")
+            _idle_t_rh, _idle_fg_rh = _compute_pf_idle_status(_now_et_rh)
+            _sig_rh = (
+                _d_rh,
+                is_nyse_early_close_day(_now_et_rh),
+                _idle_t_rh,
+                _idle_fg_rh,
+            )
+            if _sig_rh != _pf_sched_state["sig"]:
+                _date_rolled = bool(
+                    _pf_sched_state["date"] and _pf_sched_state["date"] != _d_rh
+                )
+                c5_title_lbl.config(text=build_preflight_card5_title(_now_et_rh))
+                _c4_sub = getattr(c4, "_subtitle_lbl", None)
+                if _c4_sub is not None:
+                    _c4_sub.config(text=build_preflight_card4_subtitle(_now_et_rh))
+                _refresh_card3_prefs_summary()
+                if (
+                    default_status_lbl is not None
+                    and default_status_lbl.winfo_exists()
+                    and (
+                        _date_rolled
+                        or not _pf_sched_state["last_idle_txt"]
+                        or str(default_status_lbl.cget("text"))
+                        == _pf_sched_state["last_idle_txt"]
+                    )
+                ):
+                    default_status_lbl.config(text=_idle_t_rh, fg=_idle_fg_rh)
+                    _pf_sched_state["last_idle_txt"] = _idle_t_rh
+                _pf_sched_state["sig"] = _sig_rh
+                _pf_sched_state["date"] = _d_rh
+        except Exception as _rh_ex:
+            try:
+                log_event(
+                    "WARN",
+                    f"Pre-Flight schedule label refresh error: {type(_rh_ex).__name__}",
+                )
+            except Exception:
+                pass
         _fp_hooks["schedule"]()
         if not pf_timer_state["closing"]:
             try:
@@ -44904,6 +45153,7 @@ def show_preflight_window(
             "is_rth_now": rth_live_fp,
             "et_mins": et_mins_fp,
             "market_closed_day": mkt_closed_fp,
+            "early_close_day": bool((not mkt_closed_fp) and is_nyse_early_close_day(now_et_fp)),
             "enable_open_flatten": bool(var_open_flat.get()),
             "open_max_loss": dollar_vars["open_max_loss"].get(),
             "enable_open_cooldown": bool(var_open_cd.get()),
@@ -45363,29 +45613,10 @@ def show_preflight_window(
     ver_frame = tk.Frame(ver_outer, bg="#0d1117")
     ver_frame.pack(side="right")
 
-    if is_in_trade_tamper_locked():
-        init_def_txt = "🔒 In Trade: Risk & Rulebook cards (1, 2, 4, 5) are locked. HUD Columns, Logs & Audio remain editable."
-        init_def_fg = "#fbbf24"
-    elif done_for_today:
-        init_def_txt = "🔒 Session locked in for today — protected until Midnight ET."
-        init_def_fg = "#34d399"
-    elif is_committed_for_today():
-        init_def_txt = "🔒 Rulebook committed until Midnight ET — rules set, trade your plan."
-        init_def_fg = "#7dd3fc"
-    else:
-        _et_now = get_eastern_now()
-        _et_mins = (_et_now.hour * 60) + _et_now.minute
-        if _et_mins < 570:
-            _sess_greet = "☀️ Pre-market check-in"
-        elif _et_mins < 960:
-            _sess_greet = "🟢 Regular Hours active"
-        else:
-            _sess_greet = "🌙 After-Hours active"
-        if config.get("user_defaults"):
-            init_def_txt = f"{_sess_greet} · Custom defaults loaded ✓"
-        else:
-            init_def_txt = f"{_sess_greet} — dial in your stops & launch when ready"
-        init_def_fg = "#8b9bb0"
+    _et_init_pf = get_eastern_now()
+    init_def_txt, init_def_fg = _compute_pf_idle_status(_et_init_pf)
+    _pf_sched_state["last_idle_txt"] = init_def_txt
+    _pf_sched_state["date"] = _et_init_pf.strftime("%Y-%m-%d")
     default_status_lbl = tk.Label(
         ver_outer,
         text=init_def_txt,
@@ -49348,7 +49579,8 @@ def attach_hud_mute_tooltip(widget, hud_win):
                 ).pack(fill="x", pady=(4, 0))
 
             r_mode = (
-                "Regular Hours (9:30 AM – 4:00 PM ET)"
+                f"Regular Hours (9:30 AM – {format_rth_close_ampm_label()} ET"
+                + (" · Early Close)" if is_nyse_early_close_day() else ")")
                 if is_rth()
                 else "Extended Hours (Pre-Market & After-Hours)"
             )
