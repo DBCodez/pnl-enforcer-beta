@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.86"
+APP_VERSION = "0.9.87"
 
 import os
 import sys
@@ -4191,12 +4191,14 @@ def _cap_sanitized_log_for_upload(sanitized_text, max_chars=2_200_000):
     return txt[:head_len] + notice + txt[-tail_len:]
 
 
-def _upload_sanitized_log_to_drive(
+def _upload_sanitized_log_to_drive_detailed(
     filename, sanitized_text, active_broker, anonymous_id, extra_fields=None
-) -> bool:
-    """Uploads a balance-redacted session log (or bug report + log) to the Google Apps Script Drive
-    webhook. Inspects the JSON response body so application-level errors
-    (e.g., {"status": 413}) are never mistaken for HTTP 200 success."""
+):
+    """Uploads a balance-redacted session log (or bug report + log) to the Google
+    Apps Script / Cloudflare relay webhook and returns `(ok: bool, err_kind: str)`
+    where `err_kind` is `''`, `'rate_limited'`, or `'unreachable'`. Inspects the
+    JSON response body so application-level errors (e.g., {"status": 413/429}) are
+    never mistaken for HTTP 200 success."""
     import urllib.error
     import urllib.request
 
@@ -4234,11 +4236,20 @@ def _upload_sanitized_log_to_drive(
                 try:
                     body_json = json.loads(body_raw)
                     app_status = int(body_json.get("status", 200) or 200)
+                    err_msg = str(body_json.get("message", "") or body_json.get("error", "")).lower()
+                    if app_status == 429 or (
+                        app_status >= 400 and ("limit" in err_msg or "rate" in err_msg)
+                    ):
+                        return False, "rate_limited"
                     if app_status >= 400 or body_json.get("error"):
-                        return False
+                        return False, "unreachable"
                 except Exception:
                     pass
-            return code == 200 or (200 <= int(code or 0) < 300)
+            if code == 200 or (200 <= int(code or 0) < 300):
+                return True, ""
+            if int(code or 0) == 429:
+                return False, "rate_limited"
+            return False, "unreachable"
     except urllib.error.HTTPError as he:
         code = int(getattr(he, "code", 0) or 0)
         err_url = str(getattr(he, "url", "") or "").lower()
@@ -4249,15 +4260,32 @@ def _upload_sanitized_log_to_drive(
         except Exception:
             pass
         if code == 200:
-            return True
+            return True, ""
         if code in (302, 405) and (
             "googleusercontent.com" in err_url
             or "googleusercontent.com" in loc_hdr
         ):
-            return True
-        return False
+            return True, ""
+        if code == 429:
+            return False, "rate_limited"
+        return False, "unreachable"
     except Exception:
-        return False
+        return False, "unreachable"
+
+
+def _upload_sanitized_log_to_drive(
+    filename, sanitized_text, active_broker, anonymous_id, extra_fields=None
+) -> bool:
+    """Boolean-returning wrapper around `_upload_sanitized_log_to_drive_detailed`
+    so existing background callers can safely test `if ok:`."""
+    ok, _ = _upload_sanitized_log_to_drive_detailed(
+        filename,
+        sanitized_text,
+        active_broker,
+        anonymous_id,
+        extra_fields=extra_fields,
+    )
+    return bool(ok)
 
 
 def _find_most_recent_prior_sanitized_log():
@@ -8786,6 +8814,36 @@ class SchwabAdapter:
         step2_ok = False
         last_http_err = None
 
+        # Step 2 (concurrent) + Step 1: Run 58d server-filtered WORKING GTC sweep in parallel
+        # with the fast 120-hour (5-day, weekend-safe) query so both ~650ms lookups overlap.
+        ord_status_enum = getattr(getattr(cl, "Order", None), "Status", None)
+        working_enum_val = getattr(ord_status_enum, "WORKING", None)
+        s2_box = {"list": None, "code": None, "err": None, "type_err": False}
+        t_s2 = None
+        if working_enum_val is not None:
+            gtc_start = now_utc - timedelta(days=58)
+
+            def _run_s2():
+                try:
+                    r2 = cl.get_orders_for_account(
+                        acct_id,
+                        from_entered_datetime=gtc_start,
+                        to_entered_datetime=now_utc,
+                        status=working_enum_val,
+                    )
+                    s2_box["code"] = getattr(r2, "status_code", None)
+                    if s2_box["code"] == 200:
+                        j2 = r2.json()
+                        if isinstance(j2, list):
+                            s2_box["list"] = j2
+                except TypeError:
+                    s2_box["type_err"] = True
+                except Exception as ex2:
+                    s2_box["err"] = ex2
+
+            t_s2 = threading.Thread(target=_run_s2, daemon=True)
+            t_s2.start()
+
         # Step 1: Fast 120-hour (5-day, weekend-safe) query covering all active statuses & OCO children
         try:
             fast_start = now_utc - timedelta(hours=120)
@@ -8810,33 +8868,7 @@ class SchwabAdapter:
                 f"Schwab get_orders_for_account (120h) exception during cancel: {e1}",
             )
 
-        # Step 2: Thread-bounded 58-day server-filtered WORKING GTC sweep (never mutates shared cl timeout)
-        ord_status_enum = getattr(getattr(cl, "Order", None), "Status", None)
-        working_enum_val = getattr(ord_status_enum, "WORKING", None)
-        if working_enum_val is not None:
-            s2_box = {"list": None, "code": None, "err": None, "type_err": False}
-            gtc_start = now_utc - timedelta(days=58)
-
-            def _run_s2():
-                try:
-                    r2 = cl.get_orders_for_account(
-                        acct_id,
-                        from_entered_datetime=gtc_start,
-                        to_entered_datetime=now_utc,
-                        status=working_enum_val,
-                    )
-                    s2_box["code"] = getattr(r2, "status_code", None)
-                    if s2_box["code"] == 200:
-                        j2 = r2.json()
-                        if isinstance(j2, list):
-                            s2_box["list"] = j2
-                except TypeError:
-                    s2_box["type_err"] = True
-                except Exception as ex2:
-                    s2_box["err"] = ex2
-
-            t_s2 = threading.Thread(target=_run_s2, daemon=True)
-            t_s2.start()
+        if t_s2 is not None:
             t_s2.join(2.2)
             if isinstance(s2_box["list"], list):
                 raw_batches.append(s2_box["list"])
@@ -10616,7 +10648,7 @@ class SchwabAdapter:
         self.invalidate_cached_snapshots()
         return submitted_ok
 
-    def fetch_account_data(self):
+    def fetch_account_data(self, pace_as_verify=False):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         tracking BOTH Equities (1x) and Options (100x)."""
         self.last_snapshot_was_cached = False
@@ -14108,7 +14140,7 @@ class WebullAdapter:
 
         return 0.0, None, None
 
-    def fetch_account_data(self):
+    def fetch_account_data(self, pace_as_verify=False):
         """Returns (adj_eq, is_flat, open_pnl, pos_details, has_options)
         for Webull accounts."""
         self.last_snapshot_was_cached = False
@@ -14129,7 +14161,12 @@ class WebullAdapter:
             return None, True, 0.0, {}, False
 
         try:
-            self._reserve_pos_slot(own_gap=2.10, owner="dl")
+            if pace_as_verify:
+                self._reserve_pos_slot(
+                    own_gap=WEBULL_POS_MIN_INTERVAL_SEC, owner="verify"
+                )
+            else:
+                self._reserve_pos_slot(own_gap=2.10, owner="dl")
             p_res = self._call_get_positions(acct_id=start_acct_id)
             if self.account_id != start_acct_id or broker_reconfig_in_progress:
                 return None, True, 0.0, {}, False
@@ -14989,7 +15026,7 @@ class DemoBrokerAdapter:
                 submitted[sym] = abs_q
             return submitted
 
-    def fetch_account_data(self):
+    def fetch_account_data(self, pace_as_verify=False):
         with self._lock:
             self._settle_expired_halts()
             pos_details = {}
@@ -20286,6 +20323,8 @@ def flatten_equities(
                     "⏳  2. Daytrade Positions: Inspecting open daytrade positions...",
                     False,
                 )
+                _t_f_start = time.monotonic()
+                _t_pk0 = _t_f_start
                 peek_pos = _clean_pos(
                     _call_adapter_open_eq(adapter, cache_empty_ok=True)
                 )
@@ -20294,6 +20333,7 @@ def flatten_equities(
                     if include_options and hasattr(adapter, "get_open_option_positions")
                     else []
                 )
+                peek_ms = (time.monotonic() - _t_pk0) * 1000.0
                 init_preserve_map = {}
                 for item in (peek_pos or []):
                     init_preserve_map[item[0]] = item[1]
@@ -20302,10 +20342,12 @@ def flatten_equities(
                     init_preserve_map[item[0]] = item[1]
                     initial_abs_opt.setdefault(item[0], abs(float(item[1])))
 
+                _t_cn0 = time.monotonic()
                 adapter.cancel_all_working_orders(
                     preserve_market_close_map=init_preserve_map,
                     cancel_options=include_options,
                 )
+                cancel_ms = (time.monotonic() - _t_cn0) * 1000.0
                 _notify_status(
                     "✓  1. Working Orders: Open working orders canceled & cleared",
                     True,
@@ -20313,6 +20355,7 @@ def flatten_equities(
                     False,
                 )
 
+                _t_rf0 = time.monotonic()
                 open_pos = _clean_pos(
                     _call_adapter_open_eq(adapter, cache_empty_ok=True)
                 )
@@ -20325,6 +20368,7 @@ def flatten_equities(
                 )
                 if include_options and open_opt is None and peek_opt is not None:
                     open_opt = peek_opt
+                refetch_ms = (time.monotonic() - _t_rf0) * 1000.0
 
                 for item in (open_pos or []):
                     ever_seen_eq.add(item[0])
@@ -20394,11 +20438,14 @@ def flatten_equities(
                         )
                         return _mark_flatten_flat()
 
+                _t_sb0 = time.monotonic()
+                _did_submit_any = False
                 if open_pos:
                     to_sub_eq = _filter_uncovered_positions(
                         open_pos, submitted_close_eq, is_opt_flag=False
                     )
                     if to_sub_eq:
+                        _did_submit_any = True
                         log_event("FLATTEN", f"Equity positions to liquidate: {to_sub_eq}")
                         syms_str = ", ".join(f"{x[0]} ({x[1]:+g})" for x in to_sub_eq[:4])
                         _notify_status(
@@ -20414,6 +20461,7 @@ def flatten_equities(
                         open_opt, submitted_close_opt, is_opt_flag=True
                     )
                     if to_sub_opt:
+                        _did_submit_any = True
                         log_event(
                             "FLATTEN",
                             f"Option positions to liquidate (BETA): {_fmt_opt_summary(to_sub_opt)}"
@@ -20429,6 +20477,15 @@ def flatten_equities(
                             or {}
                         )
                         submitted_close_opt.update(sub_opt_ok)
+                submit_ms = (time.monotonic() - _t_sb0) * 1000.0
+                if _did_submit_any or cancel_ms >= 250.0:
+                    prep_tot_ms = (time.monotonic() - _t_f_start) * 1000.0
+                    log_event(
+                        "PERF",
+                        f"Flatten order-prep & routing completed in {prep_tot_ms:.0f}ms "
+                        f"(peek={peek_ms:.0f}ms, cancel={cancel_ms:.0f}ms, "
+                        f"refetch={refetch_ms:.0f}ms, submit={submit_ms:.0f}ms).",
+                    )
                 if open_pos is None or (include_options and open_opt is None):
                     log_event(
                         "WARNING",
@@ -25038,6 +25095,7 @@ def evaluate_stop_decisions(
     pre_poll_hwm_profit=None,
     on_before_stop_checks=None,
     suppress_mutations=False,
+    defer_alarm_seeds=False,
 ):
     """Evaluates position transitions, RTH / Extended-Hours tier floors, Open PnL
     Stop, Consecutive Loss Cooldown, Post-Breach Force-Flatten, Cooldown sweeps,
@@ -25591,6 +25649,14 @@ def evaluate_stop_decisions(
                     }
                 )
 
+    def _seed_alarms_for_act(*names):
+        seeds = [str(n) for n in names if n]
+        if not defer_alarm_seeds and seeds:
+            now_seed_ts = time.time()
+            for n_s in seeds:
+                triggered_alarms.setdefault(n_s, now_seed_ts)
+        return seeds
+
     if not rth_now:
         r_pm_max = f"Ext-Hours -${pm_max:,.0f} Breach"
         r_pm_w2 = f"Ext-Hours -${pm_w2:,.0f} Warn 2"
@@ -25623,24 +25689,23 @@ def evaluate_stop_decisions(
                     "reason": r_pm_tr,
                     "has_options": has_options,
                     "ctx": ctx,
+                    "seed_alarms": [],
                 }
             )
         elif not is_locked_down and net_pnl <= -pm_max:
-            triggered_alarms.setdefault(r_pm_w1, time.time())
-            triggered_alarms.setdefault(r_pm_w2, time.time())
             actions.append(
                 {
                     "action": "LOCKDOWN",
                     "reason": r_pm_max,
                     "has_options": has_options,
                     "ctx": ctx,
+                    "seed_alarms": _seed_alarms_for_act(
+                        r_pm_w1 if pm_w1_on else None,
+                        r_pm_w2 if pm_w2_on else None,
+                    ),
                 }
             )
         elif open_flat_on and has_non_grace_open and eff_open_pnl_for_stop <= -open_max:
-            if pm_w2_on and net_pnl <= -pm_w2:
-                triggered_alarms.setdefault(r_pm_w2, time.time())
-            if pm_w1_on and net_pnl <= -pm_w1:
-                triggered_alarms.setdefault(r_pm_w1, time.time())
             r_open = f"Open PnL -${open_max:,.0f} Stop"
             actions.append(
                 {
@@ -25648,13 +25713,25 @@ def evaluate_stop_decisions(
                     "reason": r_open,
                     "has_options": ng_has_opt,
                     "ctx": ctx,
+                    "seed_alarms": _seed_alarms_for_act(
+                        r_pm_w2 if (pm_w2_on and net_pnl <= -pm_w2) else None,
+                        r_pm_w1 if (pm_w1_on and net_pnl <= -pm_w1) else None,
+                    ),
                 }
             )
         elif not is_locked_down and pm_w2_on and net_pnl <= -pm_w2:
-            triggered_alarms.setdefault(r_pm_w1, time.time())
-            actions.append({"action": "ALARM", "reason": r_pm_w2, "ctx": ctx})
+            actions.append(
+                {
+                    "action": "ALARM",
+                    "reason": r_pm_w2,
+                    "ctx": ctx,
+                    "seed_alarms": _seed_alarms_for_act(r_pm_w1 if pm_w1_on else None),
+                }
+            )
         elif not is_locked_down and pm_w1_on and net_pnl <= -pm_w1:
-            actions.append({"action": "ALARM", "reason": r_pm_w1, "ctx": ctx})
+            actions.append(
+                {"action": "ALARM", "reason": r_pm_w1, "ctx": ctx, "seed_alarms": []}
+            )
 
     else:
         if t4_on and max_realized_profit >= t4_trig:
@@ -25676,6 +25753,7 @@ def evaluate_stop_decisions(
                         "reason": msg,
                         "has_options": has_options,
                         "ctx": ctx,
+                        "seed_alarms": [],
                     }
                 )
             elif open_flat_on and has_non_grace_open and eff_open_pnl_for_stop <= -open_max:
@@ -25686,6 +25764,7 @@ def evaluate_stop_decisions(
                         "reason": r_open,
                         "has_options": ng_has_opt,
                         "ctx": ctx,
+                        "seed_alarms": [],
                     }
                 )
 
@@ -25704,11 +25783,10 @@ def evaluate_stop_decisions(
                         "reason": msg,
                         "has_options": has_options,
                         "ctx": ctx,
+                        "seed_alarms": [],
                     }
                 )
             elif open_flat_on and has_non_grace_open and eff_open_pnl_for_stop <= -open_max:
-                if eff_t3_max < 0 and current_eq <= start_equity:
-                    triggered_alarms.setdefault(r_t3, time.time())
                 r_open = f"Open PnL -${open_max:,.0f} Stop"
                 actions.append(
                     {
@@ -25716,6 +25794,9 @@ def evaluate_stop_decisions(
                         "reason": r_open,
                         "has_options": ng_has_opt,
                         "ctx": ctx,
+                        "seed_alarms": _seed_alarms_for_act(
+                            r_t3 if (eff_t3_max < 0 and current_eq <= start_equity) else None
+                        ),
                     }
                 )
             elif (
@@ -25723,7 +25804,9 @@ def evaluate_stop_decisions(
                 and eff_t3_max < 0
                 and current_eq <= start_equity
             ):
-                actions.append({"action": "ALARM", "reason": r_t3, "ctx": ctx})
+                actions.append(
+                    {"action": "ALARM", "reason": r_t3, "ctx": ctx, "seed_alarms": []}
+                )
 
         elif t2_on and max_realized_profit >= t2_trig:
             floor_equity = start_equity + eff_t2_max
@@ -25740,11 +25823,10 @@ def evaluate_stop_decisions(
                         "reason": msg,
                         "has_options": has_options,
                         "ctx": ctx,
+                        "seed_alarms": [],
                     }
                 )
             elif open_flat_on and has_non_grace_open and eff_open_pnl_for_stop <= -open_max:
-                if eff_t2_max < 0 and current_eq <= start_equity:
-                    triggered_alarms.setdefault(r_t2, time.time())
                 r_open = f"Open PnL -${open_max:,.0f} Stop"
                 actions.append(
                     {
@@ -25752,6 +25834,9 @@ def evaluate_stop_decisions(
                         "reason": r_open,
                         "has_options": ng_has_opt,
                         "ctx": ctx,
+                        "seed_alarms": _seed_alarms_for_act(
+                            r_t2 if (eff_t2_max < 0 and current_eq <= start_equity) else None
+                        ),
                     }
                 )
             elif (
@@ -25759,7 +25844,9 @@ def evaluate_stop_decisions(
                 and eff_t2_max < 0
                 and current_eq <= start_equity
             ):
-                actions.append({"action": "ALARM", "reason": r_t2, "ctx": ctx})
+                actions.append(
+                    {"action": "ALARM", "reason": r_t2, "ctx": ctx, "seed_alarms": []}
+                )
 
         else:
             floor_equity = start_equity - t1_max
@@ -25781,13 +25868,10 @@ def evaluate_stop_decisions(
                         "reason": msg,
                         "has_options": has_options,
                         "ctx": ctx,
+                        "seed_alarms": [],
                     }
                 )
             elif open_flat_on and has_non_grace_open and eff_open_pnl_for_stop <= -open_max:
-                if t1_w2_on and current_eq <= (start_equity - t1_w2):
-                    triggered_alarms.setdefault(r_t1_w2, time.time())
-                if t1_w1_on and current_eq <= (start_equity - t1_w1):
-                    triggered_alarms.setdefault(r_t1_w1, time.time())
                 r_open = f"Open PnL -${open_max:,.0f} Stop"
                 actions.append(
                     {
@@ -25795,6 +25879,10 @@ def evaluate_stop_decisions(
                         "reason": r_open,
                         "has_options": ng_has_opt,
                         "ctx": ctx,
+                        "seed_alarms": _seed_alarms_for_act(
+                            r_t1_w2 if (t1_w2_on and current_eq <= (start_equity - t1_w2)) else None,
+                            r_t1_w1 if (t1_w1_on and current_eq <= (start_equity - t1_w1)) else None,
+                        ),
                     }
                 )
             elif (
@@ -25802,9 +25890,13 @@ def evaluate_stop_decisions(
                 and t1_w2_on
                 and current_eq <= (start_equity - t1_w2)
             ):
-                triggered_alarms.setdefault(r_t1_w1, time.time())
                 actions.append(
-                    {"action": "ALARM", "reason": r_t1_w2, "ctx": ctx}
+                    {
+                        "action": "ALARM",
+                        "reason": r_t1_w2,
+                        "ctx": ctx,
+                        "seed_alarms": _seed_alarms_for_act(r_t1_w1 if t1_w1_on else None),
+                    }
                 )
             elif (
                 not is_locked_down
@@ -25812,7 +25904,7 @@ def evaluate_stop_decisions(
                 and current_eq <= (start_equity - t1_w1)
             ):
                 actions.append(
-                    {"action": "ALARM", "reason": r_t1_w1, "ctx": ctx}
+                    {"action": "ALARM", "reason": r_t1_w1, "ctx": ctx, "seed_alarms": []}
                 )
 
     if (
@@ -26703,6 +26795,17 @@ def _paint_poll1_preview_if_valid(
     return True
 
 
+def _call_adapter_fetch_account_data(adapter_obj, pace_as_verify=False):
+    """Calls `adapter_obj.fetch_account_data(pace_as_verify=...)` while cleanly
+    supporting legacy 0-argument mock adapters/lambdas."""
+    if not pace_as_verify:
+        return adapter_obj.fetch_account_data()
+    try:
+        return adapter_obj.fetch_account_data(pace_as_verify=True)
+    except TypeError:
+        return adapter_obj.fetch_account_data()
+
+
 def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global start_equity, max_equity, daily_max_equity, daily_min_equity, last_flat_equity
     global anchor_cash_flow, _last_logged_unanchored_cash_flow
@@ -26741,6 +26844,12 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     _data_loop_wake_event.clear()
     _touch_data_loop_heartbeat()
     _prev_poll_diag = {"open": None, "net": None, "ts": 0.0, "epoch": None}
+    _deferred_breach_carry = {
+        "epoch": -1,
+        "floor": False,
+        "open": False,
+        "warn": False,
+    }
 
     while True:
         _touch_data_loop_heartbeat()
@@ -26927,6 +27036,12 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     recent_loss_timestamps.clear()
                     triggered_alarms.clear()
                     _deferred_alarms.clear()
+                    _deferred_breach_carry = {
+                        "epoch": -1,
+                        "floor": False,
+                        "open": False,
+                        "warn": False,
+                    }
                     _clear_pnl_curve(get_session_key(poll_ad.name, poll_ad.account_id))
                     _uncloseable_fractional_syms.clear()
                     _launch_grace_syms.clear()
@@ -27079,6 +27194,12 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     recent_loss_timestamps.clear()
                     triggered_alarms.clear()
                     _deferred_alarms.clear()
+                    _deferred_breach_carry = {
+                        "epoch": -1,
+                        "floor": False,
+                        "open": False,
+                        "warn": False,
+                    }
                     _clear_pnl_curve(get_session_key(poll_ad.name, poll_ad.account_id))
                     _launch_grace_syms.clear()
                     _reconciled_order_qty.clear()
@@ -27501,31 +27622,121 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 active_warn_floor_now = (
                     max(warn_floors) if warn_floors else None
                 )
-                floor_breach_cand = (
-                    not is_locked_down
-                    and pending_halt_breach is None
-                    and current_eq <= active_floor_now
+                def _eval_breach_state(eq_v, flat_v, pos_map):
+                    ng_opnl = round(
+                        sum(
+                            float(d.get("open_pnl", 0.0) or 0.0)
+                            for k_p, d in pos_map.items()
+                            if k_p not in _launch_grace_syms
+                            and isinstance(d, dict)
+                        ),
+                        2,
+                    )
+                    ng_conf_opnl = round(
+                        sum(
+                            float(
+                                d.get(
+                                    "confirmed_open_pnl", d.get("open_pnl", 0.0)
+                                )
+                                or 0.0
+                            )
+                            for k_p, d in pos_map.items()
+                            if k_p not in _launch_grace_syms
+                            and isinstance(d, dict)
+                        ),
+                        2,
+                    )
+                    tot_opnl = round(
+                        sum(
+                            float(d.get("open_pnl", 0.0) or 0.0)
+                            for d in pos_map.values()
+                            if isinstance(d, dict)
+                        ),
+                        2,
+                    )
+                    tot_conf_opnl = round(
+                        sum(
+                            float(
+                                d.get(
+                                    "confirmed_open_pnl", d.get("open_pnl", 0.0)
+                                )
+                                or 0.0
+                            )
+                            for d in pos_map.values()
+                            if isinstance(d, dict)
+                        ),
+                        2,
+                    )
+                    conf_eq_v = round(eq_v + (tot_conf_opnl - tot_opnl), 2)
+                    has_ng_pos = any(
+                        k_p not in _launch_grace_syms for k_p in pos_map
+                    )
+                    f_cand = bool(
+                        not is_locked_down
+                        and pending_halt_breach is None
+                        and eq_v <= active_floor_now
+                    )
+                    o_cand = bool(
+                        open_flat_on
+                        and pending_halt_breach is None
+                        and not flat_v
+                        and has_ng_pos
+                        and ng_opnl <= -open_max
+                    )
+                    w_cand = bool(
+                        active_warn_floor_now is not None
+                        and pending_halt_breach is None
+                        and eq_v <= active_warn_floor_now
+                    )
+                    bk_f = bool(
+                        f_cand and not flat_v and conf_eq_v <= active_floor_now
+                    )
+                    bk_o = bool(
+                        o_cand and not flat_v and ng_conf_opnl <= -open_max
+                    )
+                    bk_w = bool(
+                        w_cand
+                        and not flat_v
+                        and active_warn_floor_now is not None
+                        and conf_eq_v <= active_warn_floor_now
+                    )
+                    return f_cand, o_cand, w_cand, bk_f, bk_o, bk_w
+
+                (
+                    floor_breach_cand,
+                    open_breach_cand,
+                    warn_breach_cand,
+                    book_confirms_floor,
+                    book_confirms_open,
+                    book_confirms_warn,
+                ) = _eval_breach_state(current_eq, is_flat, pos_details)
+                carry_ok = bool(
+                    not snap_was_cached
+                    and _deferred_breach_carry["epoch"] == poll_epoch
                 )
-                ng_open_pnl_cand = round(
-                    sum(
-                        float(d.get("open_pnl", 0.0) or 0.0)
-                        for k_p, d in pos_details.items()
-                        if k_p not in _launch_grace_syms and isinstance(d, dict)
-                    ),
-                    2,
+                carry_f = bool(
+                    carry_ok
+                    and _deferred_breach_carry["floor"]
+                    and floor_breach_cand
                 )
-                open_breach_cand = (
-                    open_flat_on
-                    and pending_halt_breach is None
-                    and not is_flat
-                    and any(k_p not in _launch_grace_syms for k_p in pos_details)
-                    and ng_open_pnl_cand <= -open_max
+                carry_o = bool(
+                    carry_ok
+                    and _deferred_breach_carry["open"]
+                    and open_breach_cand
                 )
-                warn_breach_cand = (
-                    active_warn_floor_now is not None
-                    and pending_halt_breach is None
-                    and current_eq <= active_warn_floor_now
+                carry_w = bool(
+                    carry_ok
+                    and _deferred_breach_carry["warn"]
+                    and warn_breach_cand
                 )
+                if not snap_was_cached:
+                    _deferred_breach_carry = {
+                        "epoch": -1,
+                        "floor": False,
+                        "open": False,
+                        "warn": False,
+                    }
+
                 if (
                     not snap_was_cached
                     and not first_poll_of_launch
@@ -27535,36 +27746,12 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         or warn_breach_cand
                     )
                 ):
-                    conf_open_pnl = round(
-                        sum(
-                            d.get("confirmed_open_pnl", d.get("open_pnl", 0.0))
-                            for d in pos_details.values()
-                        ),
-                        2
-                    )
-                    conf_eq = round(
-                        current_eq + (conf_open_pnl - open_pnl), 2
-                    )
-                    book_confirms_floor = (
-                        floor_breach_cand
-                        and not is_flat
-                        and conf_eq <= active_floor_now
-                    )
-                    book_confirms_open = (
-                        open_breach_cand
-                        and not is_flat
-                        and conf_open_pnl <= -open_max
-                    )
-                    book_confirms_warn = (
-                        warn_breach_cand
-                        and not is_flat
-                        and active_warn_floor_now is not None
-                        and conf_eq <= active_warn_floor_now
-                    )
-                    qty_just_changed = (
-                        {k: v.get("qty") for k, v in pos_details.items()}
-                        != {k: v.get("qty") for k, v in prev_pos_snapshot.items()}
-                    )
+                    snap1_qty_map = {
+                        k: v.get("qty") for k, v in pos_details.items()
+                    }
+                    qty_just_changed = snap1_qty_map != {
+                        k: v.get("qty") for k, v in prev_pos_snapshot.items()
+                    }
                     prev_poll_sfx = ""
                     if (
                         _prev_poll_diag["epoch"] == poll_epoch
@@ -27581,17 +27768,27 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         f"Open={format_dollar(open_pnl)}, "
                         f"Net={format_dollar(net_pnl)}{prev_poll_sfx}"
                     )
-                    if is_demo_mode_active(poll_ad) or (
+                    need_f = bool(floor_breach_cand and not carry_f)
+                    need_o = bool(open_breach_cand and not carry_o)
+                    need_w = bool(warn_breach_cand and not carry_w)
+                    if not (need_f or need_o or need_w):
+                        if carry_f or carry_o:
+                            log_event(
+                                "GUARDRAIL",
+                                f"Breach confirmed on consecutive live poll after "
+                                f"deferred re-verify ({spike_ctx}).",
+                            )
+                    elif is_demo_mode_active(poll_ad) or (
                         (
-                            book_confirms_floor
-                            or book_confirms_open
-                            or book_confirms_warn
+                            (not need_f or book_confirms_floor)
+                            and (not need_o or book_confirms_open)
+                            and (not need_w or book_confirms_warn)
                         )
                         and not is_flat
                         and not qty_just_changed
                         and not has_options
                     ):
-                        if floor_breach_cand or open_breach_cand:
+                        if need_f or need_o:
                             log_event(
                                 "GUARDRAIL",
                                 f"Breach confirmed immediately by NBBO book & "
@@ -27599,26 +27796,41 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
                     else:
                         wick_delay_s = 0.35 if (qty_just_changed or is_flat) else 0.2
+                        t_w1 = time.monotonic()
                         time.sleep(wick_delay_s)
                         if not _poll_still_valid():
                             continue
                         v_eq, v_flat, v_open, v_pos, v_opt = (
-                            poll_ad.fetch_account_data()
+                            _call_adapter_fetch_account_data(
+                                poll_ad, pace_as_verify=True
+                            )
                         )
+                        pass1_elapsed_s = max(0.0, time.monotonic() - t_w1)
                         v_was_cached = bool(
                             getattr(poll_ad, "last_snapshot_was_cached", False)
                         )
                         if not _poll_still_valid():
                             continue
-                        if v_was_cached:
+                        if v_was_cached or v_eq is None or v_eq <= 0:
                             reverify_deferred_cached = True
+                            _deferred_breach_carry = {
+                                "epoch": poll_epoch,
+                                "floor": bool(floor_breach_cand),
+                                "open": bool(open_breach_cand),
+                                "warn": bool(warn_breach_cand),
+                            }
+                            why_def = (
+                                "cached rate-limit snapshot"
+                                if v_was_cached
+                                else "re-verify fetch failed"
+                            )
                             log_event(
                                 "GUARDRAIL",
-                                f"Deferred breach confirmation (re-verify returned "
-                                f"cached rate-limit snapshot; awaiting next live poll | "
-                                f"Initial: {spike_ctx})."
+                                f"Deferred breach confirmation ({why_def} after "
+                                f"{pass1_elapsed_s:.2f}s; awaiting next live poll | "
+                                f"Initial: {spike_ctx}).",
                             )
-                        elif v_eq is not None and v_eq > 0:
+                        else:
                             current_eq = v_eq
                             is_flat = v_flat
                             current_is_flat = v_flat
@@ -27646,41 +27858,184 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 f"Open={format_dollar(open_pnl)}, "
                                 f"Net={format_dollar(net_pnl)}"
                             )
-                            still_floor = (
-                                not is_locked_down
-                                and current_eq <= active_floor_now
+                            (
+                                still_floor,
+                                still_open,
+                                still_warn,
+                                bk2_f,
+                                bk2_o,
+                                _,
+                            ) = _eval_breach_state(current_eq, is_flat, pos_details)
+                            esc_floor = bool(
+                                still_floor
+                                and not floor_breach_cand
+                                and not carry_f
                             )
-                            still_open = (
-                                open_flat_on
-                                and not is_flat
-                                and open_pnl <= -open_max
+                            esc_open = bool(
+                                still_open
+                                and not still_floor
+                                and not open_breach_cand
+                                and not carry_o
                             )
-                            still_warn = (
-                                active_warn_floor_now is not None
-                                and current_eq <= active_warn_floor_now
-                            )
-                            if (
-                                not still_floor
-                                and not still_open
-                                and not still_warn
-                            ):
-                                wick_no_op = (
-                                    "No flatten triggered."
-                                    if (floor_breach_cand or open_breach_cand)
-                                    else "No warning alarm triggered."
+                            if esc_floor or esc_open:
+                                qty_chg_p2 = (
+                                    {k: v.get("qty") for k, v in pos_details.items()}
+                                    != snap1_qty_map
                                 )
-                                log_event(
-                                    "GUARDRAIL",
-                                    f"Filtered transient single-order wick "
-                                    f"(Spike: {spike_ctx} -> Re-verified {wick_delay_s:g}s later: "
-                                    f"{v_ctx}). {wick_no_op}"
-                                )
-                            elif floor_breach_cand or open_breach_cand:
-                                log_event(
-                                    "GUARDRAIL",
-                                    f"Breach confirmed after {wick_delay_s:g}s anti-wick check "
-                                    f"(Initial: {spike_ctx} -> Verified: {v_ctx})."
-                                )
+                                if is_demo_mode_active(poll_ad) or (
+                                    ((esc_floor and bk2_f) or (esc_open and bk2_o))
+                                    and not is_flat
+                                    and not qty_chg_p2
+                                    and not has_options
+                                ):
+                                    log_event(
+                                        "GUARDRAIL",
+                                        f"Escalated breach confirmed immediately by NBBO book & "
+                                        f"account snapshot (0s extra delay | Initial: {spike_ctx} -> "
+                                        f"Escalated: {v_ctx}).",
+                                    )
+                                else:
+                                    wick_delay_s2 = (
+                                        0.35 if (qty_chg_p2 or is_flat) else 0.2
+                                    )
+                                    t_w2 = time.monotonic()
+                                    time.sleep(wick_delay_s2)
+                                    if not _poll_still_valid():
+                                        continue
+                                    v2_eq, v2_flat, v2_open, v2_pos, v2_opt = (
+                                        _call_adapter_fetch_account_data(
+                                            poll_ad, pace_as_verify=True
+                                        )
+                                    )
+                                    pass2_elapsed_s = max(
+                                        0.0, time.monotonic() - t_w2
+                                    )
+                                    v2_was_cached = bool(
+                                        getattr(
+                                            poll_ad,
+                                            "last_snapshot_was_cached",
+                                            False,
+                                        )
+                                    )
+                                    if not _poll_still_valid():
+                                        continue
+                                    if (
+                                        v2_was_cached
+                                        or v2_eq is None
+                                        or v2_eq <= 0
+                                    ):
+                                        reverify_deferred_cached = True
+                                        _deferred_breach_carry = {
+                                            "epoch": poll_epoch,
+                                            "floor": bool(still_floor),
+                                            "open": bool(still_open),
+                                            "warn": bool(still_warn),
+                                        }
+                                        why_def2 = (
+                                            "cached rate-limit snapshot"
+                                            if v2_was_cached
+                                            else "re-verify fetch failed"
+                                        )
+                                        log_event(
+                                            "GUARDRAIL",
+                                            f"Deferred escalated breach confirmation ({why_def2} "
+                                            f"after {pass2_elapsed_s:.2f}s; awaiting next live poll | "
+                                            f"Initial: {spike_ctx} -> Escalated: {v_ctx}).",
+                                        )
+                                    else:
+                                        current_eq = v2_eq
+                                        is_flat = v2_flat
+                                        current_is_flat = v2_flat
+                                        live_open_pnl = v2_open
+                                        pos_details = v2_pos
+                                        has_options = v2_opt
+                                        current_eq, realized_pnl, open_pnl = (
+                                            _stabilize_mid_fill_realized_and_equity(
+                                                current_eq,
+                                                is_flat,
+                                                live_open_pnl,
+                                                pos_details,
+                                                is_reverify=True,
+                                            )
+                                        )
+                                        net_pnl = round(
+                                            current_eq - start_equity, 2
+                                        )
+                                        max_realized_profit = round(
+                                            max_equity - start_equity, 2
+                                        )
+                                        session_high_pnl = round(
+                                            daily_max_equity - start_equity, 2
+                                        )
+                                        v2_ctx = (
+                                            f"Realized={format_dollar(realized_pnl)}, "
+                                            f"Open={format_dollar(open_pnl)}, "
+                                            f"Net={format_dollar(net_pnl)}"
+                                        )
+                                        (
+                                            s3_floor,
+                                            s3_open,
+                                            s3_warn,
+                                            _,
+                                            _,
+                                            _,
+                                        ) = _eval_breach_state(
+                                            current_eq, is_flat, pos_details
+                                        )
+                                        if (
+                                            not (floor_breach_cand and s3_floor)
+                                            and not (open_breach_cand and s3_open)
+                                            and not (esc_floor and s3_floor)
+                                            and not (esc_open and s3_open)
+                                        ):
+                                            wick_no_op2 = (
+                                                "No warning alarm triggered."
+                                                if not s3_warn
+                                                else "Escalated stop recovered; keeping confirmed warning level."
+                                            )
+                                            log_event(
+                                                "GUARDRAIL",
+                                                f"Filtered transient single-order wick on escalated breach "
+                                                f"(Initial: {spike_ctx} -> Escalated: {v_ctx} -> "
+                                                f"Re-verified {wick_delay_s2:g}s/{pass2_elapsed_s:.2f}s later: "
+                                                f"{v2_ctx}). {wick_no_op2}",
+                                            )
+                                        else:
+                                            log_event(
+                                                "GUARDRAIL",
+                                                f"Escalated breach confirmed after "
+                                                f"{wick_delay_s2:g}s/{pass2_elapsed_s:.2f}s anti-wick check "
+                                                f"(Initial: {spike_ctx} -> Escalated: {v_ctx} -> "
+                                                f"Verified: {v2_ctx}).",
+                                            )
+                            else:
+                                if (
+                                    not still_floor
+                                    and not still_open
+                                    and not still_warn
+                                ):
+                                    wick_no_op = (
+                                        "No flatten triggered."
+                                        if (floor_breach_cand or open_breach_cand)
+                                        else "No warning alarm triggered."
+                                    )
+                                    log_event(
+                                        "GUARDRAIL",
+                                        f"Filtered transient single-order wick "
+                                        f"(Spike: {spike_ctx} -> Re-verified "
+                                        f"{wick_delay_s:g}s/{pass1_elapsed_s:.2f}s later: "
+                                        f"{v_ctx}). {wick_no_op}",
+                                    )
+                                elif (
+                                    (floor_breach_cand and still_floor)
+                                    or (open_breach_cand and still_open)
+                                ):
+                                    log_event(
+                                        "GUARDRAIL",
+                                        f"Breach confirmed after {wick_delay_s:g}s "
+                                        f"({pass1_elapsed_s:.2f}s elapsed) anti-wick check "
+                                        f"(Initial: {spike_ctx} -> Verified: {v_ctx}).",
+                                    )
 
                 if not _poll_still_valid():
                     continue
@@ -27718,6 +28073,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     suppress_mutations=(
                         (not _initial_positions_verified) or snap_was_cached
                     ),
+                    defer_alarm_seeds=True,
                 )
                 if not _poll_still_valid():
                     continue
@@ -27728,6 +28084,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                 session_high_pnl = dec["session_high_pnl"]
                 leash_pct = dec["leash_pct"]
                 ctx = dec["ctx"]
+
+                def _commit_act_seeds(act_obj):
+                    for _sn in act_obj.get("seed_alarms") or ():
+                        if _sn:
+                            triggered_alarms.setdefault(_sn, time.time())
 
                 for act in dec["actions"]:
                     if not _poll_still_valid():
@@ -27811,6 +28172,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
                     elif act_type == "LOCKDOWN":
                         if pending_halt_breach is None and not is_locked_down:
+                            _commit_act_seeds(act)
                             pp_sfx = (
                                 f", PrevPoll(Open={format_dollar(_prev_poll_diag['open'])}, "
                                 f"Net={format_dollar(_prev_poll_diag['net'])}, "
@@ -27832,6 +28194,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             )
                     elif act_type == "OPEN_PNL_FLATTEN":
                         if pending_halt_breach is None:
+                            _commit_act_seeds(act)
                             pp_sfx = (
                                 f", PrevPoll(Open={format_dollar(_prev_poll_diag['open'])}, "
                                 f"Net={format_dollar(_prev_poll_diag['net'])}, "
@@ -27852,6 +28215,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 breach_epoch=poll_epoch,
                             )
                     elif act_type == "ALARM":
+                        _commit_act_seeds(act)
                         trigger_alarm(act["reason"], mute_btn, act["ctx"])
                     elif act_type == "CONSEC_LOSS_COOLDOWN":
                         if not cooldown_active and pending_halt_breach is None:
@@ -32842,7 +33206,7 @@ def show_preflight_window(
                 )
 
             def _worker():
-                ok = _upload_sanitized_log_to_drive(
+                ok, err_kind = _upload_sanitized_log_to_drive_detailed(
                     upload_fname,
                     combined_body,
                     active_b,
@@ -32880,9 +33244,14 @@ def show_preflight_window(
                         except Exception:
                             pass
                     else:
+                        fail_why = (
+                            "daily upload limit reached"
+                            if err_kind == "rate_limited"
+                            else "telemetry endpoint unreachable"
+                        )
                         log_event(
                             "WARN",
-                            f"In-app bug report upload failed; saved local copy at {_mask_user_path(SANITIZED_LOG_PATH)}",
+                            f"In-app bug report upload failed ({fail_why}); saved local copy at {_mask_user_path(SANITIZED_LOG_PATH)}",
                         )
                         try:
                             if (
@@ -32890,7 +33259,11 @@ def show_preflight_window(
                                 and default_status_lbl.winfo_exists()
                             ):
                                 default_status_lbl.config(
-                                    text="⚠️ Bug report upload failed — saved Safe Log locally & copied to clipboard.",
+                                    text=(
+                                        "⚠️ Daily bug-report upload limit reached — saved Safe Log locally & copied to clipboard."
+                                        if err_kind == "rate_limited"
+                                        else "⚠️ Bug report upload failed — saved Safe Log locally & copied to clipboard."
+                                    ),
                                     fg="#f5b041",
                                 )
                         except Exception:
@@ -32902,6 +33275,7 @@ def show_preflight_window(
                         report_mode=True,
                         contact_str=contact_str,
                         included_prior_name=included_prior_name,
+                        err_kind=err_kind,
                     )
 
                 try:
@@ -33042,7 +33416,12 @@ def show_preflight_window(
             pass
 
     def show_telemetry_upload_result_dialog(
-        ok, tester_id, report_mode=False, contact_str="", included_prior_name=""
+        ok,
+        tester_id,
+        report_mode=False,
+        contact_str="",
+        included_prior_name="",
+        err_kind="",
     ):
         hide_all_tooltips()
         parent_win = pf
@@ -33064,6 +33443,7 @@ def show_preflight_window(
             except Exception:
                 pass
         apply_dark_title_bar(dlg)
+        is_rl_err = (not ok) and (err_kind == "rate_limited")
         if report_mode:
             dlg.title(
                 "PnL Enforcer — Bug Report Sent"
@@ -33113,7 +33493,11 @@ def show_preflight_window(
         badge_txt = (
             "🔒 100% BALANCE-REDACTED"
             if ok
-            else "⚠️ CONNECTION UNREACHABLE"
+            else (
+                "⚠️ DAILY UPLOAD LIMIT REACHED"
+                if is_rl_err
+                else "⚠️ CONNECTION UNREACHABLE"
+            )
         )
 
         hdr_row = tk.Frame(dlg, bg="#0d1117")
@@ -33204,8 +33588,13 @@ def show_preflight_window(
                     if included_prior_name
                     else "Safe Log"
                 )
+                first_fail_line = (
+                    "• Daily diagnostic upload limit reached for this Tester ID (resets automatically).\n"
+                    if is_rl_err
+                    else "• Could not reach the diagnostic drive right now (network or firewall blocked).\n"
+                )
                 spans = [
-                    ("• Could not reach the diagnostic drive right now (network or firewall blocked).\n", ("body",)),
+                    (first_fail_line, ("body",)),
                     (f"• Your bug description + {logs_saved_desc} were copied to clipboard and saved to ", ("body",)),
                     (" ~/enforcer_log_sanitized.txt ", ("body", "pill_blue")),
                     (".\n", ("body",)),
@@ -33226,8 +33615,13 @@ def show_preflight_window(
                 (" — thank you for helping improve PnL Enforcer!", ("body",)),
             ]
         else:
+            first_fail_line = (
+                "• Daily diagnostic upload limit reached for this Tester ID (resets automatically).\n"
+                if is_rl_err
+                else "• Could not reach the diagnostic drive right now (network or firewall blocked).\n"
+            )
             spans = [
-                ("• Could not reach the diagnostic drive right now (network or firewall blocked).\n", ("body",)),
+                (first_fail_line, ("body",)),
                 ("• Your trading guardrails and local logs are ", ("body",)),
                 (" 100% unaffected ", ("body", "pill_green")),
                 (".\n", ("body",)),
@@ -33304,7 +33698,7 @@ def show_preflight_window(
                 )
 
             def _worker():
-                ok = _upload_sanitized_log_to_drive(
+                ok, err_kind = _upload_sanitized_log_to_drive_detailed(
                     upload_fname, sanitized_txt, active_b, tester_id
                 )
 
@@ -33337,12 +33731,18 @@ def show_preflight_window(
                                 and default_status_lbl.winfo_exists()
                             ):
                                 default_status_lbl.config(
-                                    text="⚠️ Safe Log upload failed (telemetry endpoint unreachable).",
+                                    text=(
+                                        "⚠️ Daily Safe Log upload limit reached for this Tester ID."
+                                        if err_kind == "rate_limited"
+                                        else "⚠️ Safe Log upload failed (telemetry endpoint unreachable)."
+                                    ),
                                     fg="#f5b041",
                                 )
                         except Exception:
                             pass
-                    show_telemetry_upload_result_dialog(ok, tester_id)
+                    show_telemetry_upload_result_dialog(
+                        ok, tester_id, err_kind=err_kind
+                    )
 
                 try:
                     pf.after(0, _finish)

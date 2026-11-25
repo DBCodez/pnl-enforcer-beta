@@ -4,6 +4,23 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.87] — 2026-11-24
+### ⚡ Quick Summary
+- **Anti-Wick Escalation Protection (`data_loop`, Schwab & Webull):** Closed a loophole where a poll that initially crossed only a Warning Alarm (`Warn 1`/`Warn 2`) or Open PnL Stop and dipped past a stricter threshold (`Open PnL Auto-Flatten` or `Daily Stop`) on the 0.2s verification fetch could fire the escalated flatten/lockout on a single unconfirmed reading. Escalated stops now run one bounded confirmation pass (with `0s` extra delay whenever equity NBBO book quotes already confirm) before touching working orders.
+- **~0.7s Faster Schwab Flatten Preparation (`cancel_all_working_orders`) + Flatten Timing Telemetry:** Runs Schwab's `120h` and `58d WORKING` GTC order queries concurrently during emergency flattens so working orders cancel faster, and adds single-line `[PERF]` sub-step timing breakdowns (`peek`, `cancel`, `refetch`, `submit`) to pinpoint broker API latency.
+- **Clearer Diagnostic Upload Limit Notice (`429`):** When the Safe Log / Bug Report server hits a Tester ID's daily upload cap (`HTTP 429`), the popup now clearly displays **`DAILY UPLOAD LIMIT REACHED`** instead of **`CONNECTION UNREACHABLE`**, while still saving a local copy and clipboard backup.
+
+### 🔍 Detailed Breakdown
+- **Escalation-Safe Anti-Wick Confirmation, Deferred Alarm Seed Preservation & Non-Grace Parity (`_eval_breach_state`, `evaluate_stop_decisions`, `data_loop`, `_call_adapter_fetch_account_data`):**
+  - Unified breach candidate and confirmation math in `_eval_breach_state()` so Snapshot #1, Pass #1, and Pass #2 all evaluate non-grace `open_pnl` (`_launch_grace_syms` excluded) identically.
+  - Added a bounded Pass #2 confirmation whenever Pass #1 newly crosses an escalated destructive stop (`LOCKDOWN` when Snapshot #1 did not breach Daily Floor, or `OPEN_PNL_FLATTEN` when Snapshot #1 only hit a Warning), added explicit fail-safe handling when a re-verify poll returns `None` or cached data (carrying breach state across `_deferred_breach_carry` so consecutive live polls still breach cleanly with zero infinite deferral), moved `WebullAdapter.fetch_account_data(pace_as_verify=True)` onto the faster `1.15s` verify slot (`WEBULL_POS_MIN_INTERVAL_SEC`) during re-verifies, and deferred Warning Alarm `triggered_alarms` seeding (`defer_alarm_seeds=True`) until actions actually execute so deferred polls never silently consume Warning 1/2 sirens.
+- **Concurrent Schwab Cancel Lookups & Flatten `[PERF]` Breakdown (`SchwabAdapter.cancel_all_working_orders`, `flatten_equities`):**
+  - Overlapping Schwab's `120h` and `58d WORKING` order fetches eliminates sequential wait time before canceling resting orders, and `flatten_equities()` now logs `peek_ms`, `cancel_ms`, `refetch_ms`, and `submit_ms` in `[PERF]`.
+- **Rate-Limit Aware Diagnostic Telemetry (`_upload_sanitized_log_to_drive_detailed`, `show_telemetry_upload_result_dialog`):**
+  - Preserves `_upload_sanitized_log_to_drive() -> bool` while returning `(ok, err_kind)` from `_upload_sanitized_log_to_drive_detailed()` so both Bug Reports and manual Safe Log uploads distinguish `"rate_limited"` (`429`) from `"unreachable"`.
+
+---
+
 ## [v0.9.86] — 2026-11-24
 ### ⚡ Quick Summary
 - **Public GitHub Repo as Primary Source (`main` & `beta`):** Switched **`Inspect Source ↗`**, web **`Open Full Changelog ↗`** links, `Launch_Enforcer.bat` fresh-install downloads (now including `enforcer.ico`), and background/manual update checks (`raw.githubusercontent.com`) to use the public **`DBCodez/pnl-enforcer-beta`** GitHub repository first—eliminating redundant Gist REST API lookups while keeping Secret Gists as automatic failover mirrors.
