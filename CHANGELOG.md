@@ -4,6 +4,18 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.87.1] — 2026-11-24
+### ⚡ Quick Summary
+- **Thanksgiving / Black Friday Early-Close UI Polish (`1:00 PM` RTH / `5:00 PM` Extended Hours) & Card 4 Header Fix:** Updated Pre-Flight session greetings, `FLIGHT PLAN` tooltips, Card 3/4/5 session labels, HUD status tooltips, and transition log text to dynamically display **`1:00 PM ET`** RTH / **`5:00 PM ET`** Extended-Hours schedules on NYSE early-close days (including across Midnight ET overnight rollovers) and trimmed Card 4's title to `(Pre & After-Hours)` so it never clips.
+
+### 🔍 Detailed Breakdown
+- **Dynamic Early-Close & Holiday Schedule Copy (`format_preflight_session_greeting`, `build_preflight_card4_subtitle`, `build_preflight_card5_title`, `build_flight_plan_summary`, `refresh_active_rulebook_highlight`, `data_loop`):**
+  - Displays `"⏸ Market Closed (NYSE Holiday)"` on NYSE holidays like Thanksgiving (`2026-11-26`), reflects `1:00 PM Early Close` pre-market/RTH copy and `5:00 PM ET` extended-hours close + `"🌙 Market Closed for Evening"` on early-close dates like Black Friday (`2026-11-27`), dynamically switches `build_flight_plan_summary()` and HUD tooltips between `4:00 PM` and `1:00 PM`, refreshes Card 3/4/5 and idle footer copy automatically across Midnight ET / session boundaries, and logs `"1:00 PM Early-Close Extended-Hours Transition"` in `data_loop`.
+- **Card 4 Pre-Flight Title Fit (`make_card`):**
+  - Shortened Card 4's header to **`▶  4. EXTENDED HOURS RULEBOOK (Pre & After-Hours)`** so `"rs)"` no longer clips before the `STANDBY` / `• ACTIVE NOW` pill.
+
+---
+
 ## [v0.9.87] — 2026-11-24
 ### ⚡ Quick Summary
 - **Anti-Wick Escalation Protection (`data_loop`, Schwab & Webull):** Closed a loophole where a poll that initially crossed only a Warning Alarm (`Warn 1`/`Warn 2`) or Open PnL Stop and dipped past a stricter threshold (`Open PnL Auto-Flatten` or `Daily Stop`) on the 0.2s verification fetch could fire the escalated flatten/lockout on a single unconfirmed reading. Escalated stops now run one bounded confirmation pass (with `0s` extra delay whenever equity NBBO book quotes already confirm) before touching working orders.

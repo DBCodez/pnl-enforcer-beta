@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.87"
+APP_VERSION = "0.9.87.1"
 
 import os
 import sys
@@ -5381,12 +5381,18 @@ def build_flight_plan_summary(fp_state):
     st_ao = bool(st_d.get("alarms_only_mode", False))
     muted = bool(st_d.get("mute_all_audio", False))
     mkt_closed = bool(st_d.get("market_closed_day", False))
+    early_close = bool(st_d.get("early_close_day", False)) and not mkt_closed
+    rth_end_m = 780 if early_close else 960
+    close_short_today = "1:00" if early_close else "4:00"
+    close_ampm_today = "1:00 PM" if early_close else "4:00 PM"
+    ec_hdr_sfx = " · EARLY CLOSE" if early_close else ""
     if "is_rth_now" in st_d:
         rth_live = bool(st_d["is_rth_now"]) and not mkt_closed
     else:
         et_chk = int(_fp_safe_num(st_d.get("et_mins", 600), 600))
-        rth_live = (570 <= et_chk < 960) and not mkt_closed
+        rth_live = (570 <= et_chk < rth_end_m) and not mkt_closed
     et_mins_v = int(_fp_safe_num(st_d.get("et_mins", 600 if rth_live else 500), 600))
+    next_opt_close_short = "1:00" if (early_close and et_mins_v < rth_end_m) else "4:00"
 
     flat_on = (not st_ao) and bool(st_d.get("enable_auto_flatten", False))
     kill_tos_on = (not st_ao) and bool(st_d.get("enable_kill_tos", False))
@@ -5416,7 +5422,7 @@ def build_flight_plan_summary(fp_state):
         w2_mag = abs(_fp_safe_num(st_d.get("t1_warn_2", 1500.0), 1500.0))
         stop_mag = abs(_fp_safe_num(st_d.get("t1_max_loss", 2000.0), 2000.0))
         sess_tag = "RTH"
-        sess_full = "Regular Hours (9:30 AM – 4:00 PM ET)"
+        sess_full = f"Regular Hours (9:30 AM – {close_ampm_today} ET)"
     else:
         w1_on = bool(st_d.get("enable_pm_warn_1", True))
         w2_on = bool(st_d.get("enable_pm_warn_2", True))
@@ -5480,9 +5486,9 @@ def build_flight_plan_summary(fp_state):
             opt_clause = "Options: auto-close RTH (Beta)"
         elif opt_done_armed:
             opt_clause = (
-                "Options: visual now · auto-close 9:30–4:00 ET"
+                f"Options: visual now · auto-close 9:30–{next_opt_close_short} ET"
                 if muted
-                else "Options: alert now · auto-close 9:30–4:00 ET"
+                else f"Options: alert now · auto-close 9:30–{next_opt_close_short} ET"
             )
         else:
             opt_clause = (
@@ -5494,9 +5500,9 @@ def build_flight_plan_summary(fp_state):
         opt_clause = "Options: auto-close RTH (Beta)"
     elif opt_armed:
         opt_clause = (
-            "Options: visual now · auto-close 9:30–4:00 ET"
+            f"Options: visual now · auto-close 9:30–{next_opt_close_short} ET"
             if muted
-            else "Options: alert now · auto-close 9:30–4:00 ET"
+            else f"Options: alert now · auto-close 9:30–{next_opt_close_short} ET"
         )
     elif flat_on and opt_checked and not opt_waived:
         opt_clause = (
@@ -5597,7 +5603,7 @@ def build_flight_plan_summary(fp_state):
         )
     else:
         if rth_live:
-            hdr_base = "FLIGHT PLAN — REGULAR HOURS (9:30 AM – 4:00 PM ET)"
+            hdr_base = f"FLIGHT PLAN — REGULAR HOURS (9:30 AM – {close_ampm_today} ET{ec_hdr_sfx})"
         elif mkt_closed:
             hdr_base = "FLIGHT PLAN — MARKET CLOSED (EXTENDED-HOURS PREVIEW)"
         elif et_mins_v < 570:
@@ -5619,7 +5625,7 @@ def build_flight_plan_summary(fp_state):
 
     stop_detail = stop_clause
     if flat_on and (not rth_live or (et_mins_v < 570)) and (not st_done):
-        stop_detail += " (outside 9:30–4:00 ET, stocks close via marketable limit orders)"
+        stop_detail += f" (outside 9:30–{close_short_today} ET, stocks close via marketable limit orders)"
     tt_lines.append(f"• Daily Stop | {stop_detail}")
 
     opt_val_s = (
@@ -7555,6 +7561,84 @@ def is_after_hours():
 def is_market_hours():
     now_et = get_eastern_now()
     return dt_time(9, 30) <= now_et.time() < get_rth_close_time(now_et)
+
+
+def get_rth_close_minutes(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    return 780 if is_nyse_early_close_day(dt_et) else 960
+
+
+def format_rth_close_short_label(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    return "1:00" if is_nyse_early_close_day(dt_et) else "4:00"
+
+
+def format_rth_close_ampm_label(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    return "1:00 PM" if is_nyse_early_close_day(dt_et) else "4:00 PM"
+
+
+def format_preflight_session_greeting(now_et=None, broker_name=None):
+    """Returns the Pre-Flight bottom-left session greeting, honoring weekends,
+    NYSE full holidays (e.g. Thanksgiving), and NYSE 1:00 PM ET RTH / 5:00 PM ET
+    Extended-Hours early closes (e.g. Black Friday)."""
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    d_str = dt_et.strftime("%Y-%m-%d")
+    if d_str in NYSE_FULL_HOLIDAY_DATES and dt_et.weekday() < 5:
+        return "⏸ Market Closed (NYSE Holiday)"
+    if dt_et.weekday() >= 5:
+        return "⏸ Weekend — Market Closed"
+    et_m = (dt_et.hour * 60) + dt_et.minute
+    early_c = d_str in NYSE_EARLY_CLOSE_DATES
+    rth_end_m = 780 if early_c else 960
+    ext_end_m = 1020 if early_c else 1200
+    if et_m < 570:
+        return (
+            "☀️ Pre-market check-in (1:00 PM Early Close)"
+            if early_c
+            else "☀️ Pre-market check-in"
+        )
+    if et_m < rth_end_m:
+        return (
+            "🟢 Regular Hours active (1:00 PM Early Close)"
+            if early_c
+            else "🟢 Regular Hours active"
+        )
+    if et_m < ext_end_m:
+        return (
+            "🌙 After-Hours active (closes 5:00 PM ET)"
+            if early_c
+            else "🌙 After-Hours active"
+        )
+    return "🌙 Market Closed for Evening"
+
+
+def build_preflight_card4_subtitle(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    if (
+        is_nyse_early_close_day(dt_et)
+        and dt_et.weekday() < 5
+        and (dt_et.strftime("%Y-%m-%d") not in NYSE_FULL_HOLIDAY_DATES)
+    ):
+        return (
+            "Early Close: active before 9:30 AM & after 1:00 PM ET. "
+            "Max Loss / Profit Lock triggers Card 2."
+        )
+    return (
+        "Active before 9:30 AM and after 4:00 PM ET. Hitting your Max Loss "
+        "or Profit Lock triggers Card 2."
+    )
+
+
+def build_preflight_card5_title(now_et=None):
+    dt_et = now_et if now_et is not None else get_eastern_now()
+    if (
+        is_nyse_early_close_day(dt_et)
+        and dt_et.weekday() < 5
+        and (dt_et.strftime("%Y-%m-%d") not in NYSE_FULL_HOLIDAY_DATES)
+    ):
+        return "▶  5. REGULAR HOURS RULEBOOK (9:30 AM – 1:00 PM)"
+    return "▶  5. REGULAR HOURS RULEBOOK (9:30 AM – 4:00 PM)"
 
 
 def is_any_equity_session_open(broker_name=None):
@@ -27326,6 +27410,11 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     flat_desync_streak = 0
                     in_trade_desync_streak = 0
                     pending_scale_out_tol = 0.0
+                    _eh_trans_lbl = (
+                        "1:00 PM Early-Close Extended-Hours Transition"
+                        if is_nyse_early_close_day()
+                        else "4:00 PM Extended-Hours Transition"
+                    )
                     if reset_925:
                         old_hwm = max_equity - start_equity
                         max_equity = max(start_equity, last_flat_equity)
@@ -27358,7 +27447,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         )
                         log_event(
                             "SESSION",
-                            f"4:00 PM Extended-Hours Transition: Rulebook HWM "
+                            f"{_eh_trans_lbl}: Rulebook HWM "
                             f"recalibrated from {format_dollar(old_hwm)} to "
                             f"{format_dollar(new_hwm)} (Session High preserved at "
                             f"{format_dollar(daily_max_equity - start_equity)})."
@@ -27369,7 +27458,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         )
                         log_event(
                             "SESSION",
-                            "4:00 PM Extended-Hours Transition: Switched from RTH "
+                            f"{_eh_trans_lbl}: Switched from RTH "
                             "Rulebook to Extended-Hours Rulebook."
                         )
 
@@ -35925,15 +36014,18 @@ def show_preflight_window(
             anchor="w"
         )
         title_lbl.pack(side="left", fill="x", expand=True)
+        subtitle_lbl = None
         if subtitle:
-            tk.Label(
+            subtitle_lbl = tk.Label(
                 card,
                 text=subtitle,
                 font=("Arial", 9),
                 fg="#8b9bb0",
                 bg="#131922",
                 anchor="w"
-            ).pack(fill="x", pady=(1, 4))
+            )
+            subtitle_lbl.pack(fill="x", pady=(1, 4))
+        card._subtitle_lbl = subtitle_lbl
         tk.Frame(card, bg="#222d3d", height=1).pack(fill="x", pady=(0, 4))
         if return_parts:
             return (
@@ -40643,7 +40735,7 @@ def show_preflight_window(
         audio_short = "🔇 MUTED" if var_mute_all_audio.get() else audio_txt
 
         tier0 = (
-            f"9:30/4:00 Ratchets: {sw_txt} · Swings: {pos_txt} · "
+            f"9:30/{format_rth_close_short_label()} Ratchets: {sw_txt} · Swings: {pos_txt} · "
             f"{audio_txt} · Poll: {p_sec}s · Safe Logs: {log_txt}{wb_sfx}{sim_sfx}"
         )
         tier1 = (
@@ -41446,9 +41538,8 @@ def show_preflight_window(
     # ==========================================================
     c4, c4_halos, c4_bar, c4_title_lbl, c4_badge_pill = make_card(
         right_col,
-        "▶  4. EXTENDED HOURS RULEBOOK (Pre-Market & After-Hours)",
-        "Active before 9:30 AM and after 4:00 PM ET. Hitting your Max Loss "
-        "or Profit Lock triggers Card 2.",
+        "▶  4. EXTENDED HOURS RULEBOOK (Pre & After-Hours)",
+        build_preflight_card4_subtitle(),
         accent="#5dade2",
         bar_color="#10b981",
         return_parts=True
@@ -41576,7 +41667,7 @@ def show_preflight_window(
 
     c5, c5_halos, c5_bar, c5_title_lbl, c5_badge_pill = make_card(
         right_col,
-        "▶  5. REGULAR HOURS RULEBOOK (9:30 AM – 4:00 PM)",
+        build_preflight_card5_title(),
         "Starts at Base Tier 1 and ratchets your stop upward "
         "as realized profit grows. Hitting your stop triggers Card 2.",
         accent="#5dade2",
@@ -41584,6 +41675,29 @@ def show_preflight_window(
         expand=True,
         return_parts=True
     )
+
+    _pf_sched_state = {"sig": None, "date": "", "last_idle_txt": ""}
+
+    def _compute_pf_idle_status(now_et_arg):
+        if is_in_trade_tamper_locked():
+            return (
+                "🔒 In Trade: Risk & Rulebook cards (1, 2, 4, 5) are locked. HUD Columns, Logs & Audio remain editable.",
+                "#fbbf24",
+            )
+        if done_for_today:
+            return (
+                "🔒 Session locked in for today — protected until Midnight ET.",
+                "#34d399",
+            )
+        if is_committed_for_today():
+            return (
+                "🔒 Rulebook committed until Midnight ET — rules set, trade your plan.",
+                "#7dd3fc",
+            )
+        _sg = format_preflight_session_greeting(now_et_arg, var_broker.get())
+        if config.get("user_defaults"):
+            return (f"{_sg} · Custom defaults loaded ✓", "#8b9bb0")
+        return (f"{_sg} — dial in your stops & launch when ready", "#8b9bb0")
 
     def _apply_rulebook_aura(halos, bar_cv, title_w, badge_w, is_active):
         h0, outer_w = halos
@@ -41619,6 +41733,47 @@ def show_preflight_window(
         _apply_rulebook_aura(
             c4_halos, c4_bar, c4_title_lbl, c4_badge_pill, is_active=(not rth_now)
         )
+        try:
+            _now_et_rh = get_eastern_now()
+            _d_rh = _now_et_rh.strftime("%Y-%m-%d")
+            _idle_t_rh, _idle_fg_rh = _compute_pf_idle_status(_now_et_rh)
+            _sig_rh = (
+                _d_rh,
+                is_nyse_early_close_day(_now_et_rh),
+                _idle_t_rh,
+                _idle_fg_rh,
+            )
+            if _sig_rh != _pf_sched_state["sig"]:
+                _date_rolled = bool(
+                    _pf_sched_state["date"] and _pf_sched_state["date"] != _d_rh
+                )
+                c5_title_lbl.config(text=build_preflight_card5_title(_now_et_rh))
+                _c4_sub = getattr(c4, "_subtitle_lbl", None)
+                if _c4_sub is not None:
+                    _c4_sub.config(text=build_preflight_card4_subtitle(_now_et_rh))
+                _refresh_card3_prefs_summary()
+                if (
+                    default_status_lbl is not None
+                    and default_status_lbl.winfo_exists()
+                    and (
+                        _date_rolled
+                        or not _pf_sched_state["last_idle_txt"]
+                        or str(default_status_lbl.cget("text"))
+                        == _pf_sched_state["last_idle_txt"]
+                    )
+                ):
+                    default_status_lbl.config(text=_idle_t_rh, fg=_idle_fg_rh)
+                    _pf_sched_state["last_idle_txt"] = _idle_t_rh
+                _pf_sched_state["sig"] = _sig_rh
+                _pf_sched_state["date"] = _d_rh
+        except Exception as _rh_ex:
+            try:
+                log_event(
+                    "WARN",
+                    f"Pre-Flight schedule label refresh error: {type(_rh_ex).__name__}",
+                )
+            except Exception:
+                pass
         _fp_hooks["schedule"]()
         if not pf_timer_state["closing"]:
             try:
@@ -43634,6 +43789,7 @@ def show_preflight_window(
             "is_rth_now": rth_live_fp,
             "et_mins": et_mins_fp,
             "market_closed_day": mkt_closed_fp,
+            "early_close_day": bool((not mkt_closed_fp) and is_nyse_early_close_day(now_et_fp)),
             "enable_open_flatten": bool(var_open_flat.get()),
             "open_max_loss": dollar_vars["open_max_loss"].get(),
             "enable_open_cooldown": bool(var_open_cd.get()),
@@ -44093,29 +44249,10 @@ def show_preflight_window(
     ver_frame = tk.Frame(ver_outer, bg="#0d1117")
     ver_frame.pack(side="right")
 
-    if is_in_trade_tamper_locked():
-        init_def_txt = "🔒 In Trade: Risk & Rulebook cards (1, 2, 4, 5) are locked. HUD Columns, Logs & Audio remain editable."
-        init_def_fg = "#fbbf24"
-    elif done_for_today:
-        init_def_txt = "🔒 Session locked in for today — protected until Midnight ET."
-        init_def_fg = "#34d399"
-    elif is_committed_for_today():
-        init_def_txt = "🔒 Rulebook committed until Midnight ET — rules set, trade your plan."
-        init_def_fg = "#7dd3fc"
-    else:
-        _et_now = get_eastern_now()
-        _et_mins = (_et_now.hour * 60) + _et_now.minute
-        if _et_mins < 570:
-            _sess_greet = "☀️ Pre-market check-in"
-        elif _et_mins < 960:
-            _sess_greet = "🟢 Regular Hours active"
-        else:
-            _sess_greet = "🌙 After-Hours active"
-        if config.get("user_defaults"):
-            init_def_txt = f"{_sess_greet} · Custom defaults loaded ✓"
-        else:
-            init_def_txt = f"{_sess_greet} — dial in your stops & launch when ready"
-        init_def_fg = "#8b9bb0"
+    _et_init_pf = get_eastern_now()
+    init_def_txt, init_def_fg = _compute_pf_idle_status(_et_init_pf)
+    _pf_sched_state["last_idle_txt"] = init_def_txt
+    _pf_sched_state["date"] = _et_init_pf.strftime("%Y-%m-%d")
     default_status_lbl = tk.Label(
         ver_outer,
         text=init_def_txt,
@@ -48078,7 +48215,8 @@ def attach_hud_mute_tooltip(widget, hud_win):
                 ).pack(fill="x", pady=(4, 0))
 
             r_mode = (
-                "Regular Hours (9:30 AM – 4:00 PM ET)"
+                f"Regular Hours (9:30 AM – {format_rth_close_ampm_label()} ET"
+                + (" · Early Close)" if is_nyse_early_close_day() else ")")
                 if is_rth()
                 else "Extended Hours (Pre-Market & After-Hours)"
             )
