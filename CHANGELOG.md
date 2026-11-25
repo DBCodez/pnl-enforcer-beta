@@ -4,6 +4,26 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.92] — 2026-11-25 (Experimental Beta Channel)
+### ⚡ Quick Summary
+- **Webull Auto-Flatten Reliability Overhaul (`417` Rejections, `PENDING_CANCEL` Settlement, `order_history` Cascade & `403` Quote Cache):** Rejected `4xx` exit orders (like Webull `417`) now retry immediately without false 30s duplicate-order locks, `PENDING_CANCEL` orders wait briefly to settle and isolate only blocked quantities without holding up clean symbols, `order_history` failures degrade gracefully inside a `2.0s` cascade budget, and `HTTP 403` unsubscribed Extended-Hours quote errors pause repeated market-data probes for 30 minutes while keeping `429`/timeout fallback safe.
+- **Pre-Sync Daily Stop Re-Arming & Schwab Order-Cap Safeguard:** Saving Settings before Poll #1 finishes off-session catch-up now safely re-arms Daily Stop once Poll #1 confirms settled equity is safely above the floor (using a short-lived in-memory token), and Schwab order-cancel lookups fail closed against silent `>= 3,000`-row truncation.
+- **Release Channel Switcher, Zero-ID Daily Version Totals & Pre-Flight Card 3 Balance:** Added a 3-checkpoint guarded **`Switch Release Channel...`** flow (`Stable main <-> Experimental beta`) with crash-safe launcher recovery, opt-out Zero-ID `/checkin` counting (`Count My Install in Daily Version Totals`), and tightened Pre-Flight Card 1 / Card 3 / Card 5 vertical alignment to remove Card 3's empty bottom gap.
+
+### 🔍 Detailed Breakdown
+- **Webull & Schwab Definitive Rejection Classifier (`_is_definitive_broker_order_rejection`, `submit_liquidation_batch`, `submit_option_liquidation_batch`):**
+  - Treats definitive `HTTP 4xx` rejections (excluding `408` and `429`, such as Webull `417`) as non-working immediately, clearing `_pending_flatten_cids` and skipping `get_recent_exit_order_coverage()` so rejected flatten orders never create 30s phantom duplicate-order blocks under rate limits.
+- **Webull `sub_ords` Unwrapping, `PENDING_CANCEL` Isolation & Quotes/History Hardening (`_fetch_all_open_orders_webull`, `cancel_all_working_orders`, `poll_pending_cancel_settlement`, `_get_orders_window_cached`, `_run_unified_flatten`, `_get_flatten_timeout_sec`, `data_loop`):**
+  - Unwraps nested `sub_ords` when needed, skips `PENDING_CANCEL`/terminal orders in exit coverage checks, deduplicates OCO sibling quantities via `max` per group ID, submits unblocked symbols immediately, waits up to `0.9s` via `poll_pending_cancel_settlement()` before re-fetching blocked positions, submits uncovered partial balances, and keeps LULD halt exits from firing prematurely while pending cancels remain.
+  - Caches `_market_data_unsubscribed_until` (`30m`) strictly on `HTTP 403` / `MARKET_DATA_NOT_SUBSCRIBED` (cleared on `reconnect_session()`), aligns Webull flatten timeout (`25.0s`) via `_get_flatten_timeout_sec()` while bounding `data_loop()`'s manual-flatten pause to `timeout + 20s` (with `_wake_data_loop()` wakeup), and adds `WEBULL_ORDER_HISTORY_CASCADE_BUDGET_SEC = 2.0`, endpoint preference memory, `last_client_order_id` -> `last_order_id` fallback, and all-or-nothing multi-page pagination in `_get_orders_window_cached()`.
+- **Pre-Sync Lock Re-Arming & Schwab `3,000`-Row Cap Fail-Closed Guard (`_recheck_presync_save_lock_after_sync`, `save_and_launch`, `SCHWAB_ORDERS_DEFAULT_MAX_RESULTS`):**
+  - Introduces an ephemeral, non-persisted `_presync_rearm_token` (`<= 180s` TTL, bound to session key and adapter epoch, cleared on epoch/restore/revert and never minted when Committed for Today) so legitimate off-session catch-up re-arms Pre-Flight saves cleanly while comparing `min(settled_flat_equity, live_equity)` on non-flat launches.
+  - Splits Schwab `120h` vs `58d_WORKING` query `[PERF]` metrics and sets `last_coverage_lookup_failed = True` if either query hits the `3,000`-row cap.
+- **Release Channel Switcher, Zero-ID `/checkin` & Pre-Flight Card Balance (`prompt_release_channel_switch`, `apply_same_version_channel_swap`, `_rewrite_bat_bytes_for_main`, `get_channel_mismatch_status`, `schedule_daily_version_checkin`, `make_card`, `Launch_Enforcer.bat`):**
+  - Adds reversible `main <-> beta` launcher rewriting with `.enforcer_install_record.json` provenance, `.enforcer_boot_pending.json` `bat_swap` startup rollback support, Git-checkout lock safety, opt-out Zero-ID `/checkin` telemetry (`~/.enforcer_checkin_stamp`, 1-day initial grace period), and balanced Card 1/Card 2/Card 3/Card 5 Pre-Flight padding.
+
+---
+
 ## [v0.9.91] — 2026-11-25
 ### ⚡ Quick Summary
 - **Reliable Safe Log Uploads Across All Windows PCs (`ISRG Root X2` / `certifi` SSL Fix + Diagnostics):** Merged Python's `certifi` root bundle into PnL Enforcer's Windows HTTPS trust store so modern Let's Encrypt endpoints (like the Safe Log & Bug Report relay) verify reliably even when `ISRG Root X2` isn't cached in Windows yet, and added clear diagnostic failure codes (`SSL_CERT_20`, `DNS_ERROR`, `HTTP_403`, etc.) in logs and popups.

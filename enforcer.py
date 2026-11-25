@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.91"
+APP_VERSION = "0.9.92"
 
 import os
 import sys
@@ -2514,6 +2514,7 @@ DEFAULT_CONFIG = {
     "options_waiver_sha256": "",
     "seen_layout_tour_version": "",
     "auto_share_sanitized_logs": False,
+    "share_anonymous_version_count": True,
     "show_debug_console": False,
     "check_updates_on_startup": True,
     "start_with_windows": False,
@@ -2761,6 +2762,7 @@ last_breach_trigger_net_pnl = None
 _breach_pin_rt_pending = False
 _breach_pin_retired = False
 _lock_from_presync_save = False
+_presync_rearm_token = None
 done_for_today = False
 committed_for_today = False
 force_reanchor = False
@@ -2787,6 +2789,8 @@ _off_session_peak_reconstructed = False
 _off_session_reconciled = False
 _off_session_pending_boundary = None
 SCHWAB_ORDERS_58D_READ_TIMEOUT_SEC = 12.0
+SCHWAB_ORDERS_DEFAULT_MAX_RESULTS = 3000
+WEBULL_ORDER_HISTORY_CASCADE_BUDGET_SEC = 2.0
 ORDERS_FETCH_LOCK_WAIT_SEC = SCHWAB_ORDERS_58D_READ_TIMEOUT_SEC + 1.0
 ORDERS_WINDOW_FAIL_COOLDOWN_SEC = 2.0
 OFF_SESSION_DEFER_MAX_RETRIES = 5
@@ -2803,6 +2807,9 @@ dry_run_lock_active = False
 breach_visual_sim_active = False
 _pf_prefs_summary_refresh_cb = None
 _manual_flatten_in_flight = False
+_manual_flatten_started_mono = 0.0
+_manual_flatten_target_adapter = None
+_manual_flatten_pause_warned = False
 _manual_flatten_state_lock = threading.Lock()
 PANIC_FLATTEN_HOLD_SEC = 2.0
 _last_real_broker = "SCHWAB"
@@ -2990,13 +2997,14 @@ def _bump_adapter_epoch():
     global _adapter_epoch, _last_fresh_poll_info, _feed_degrade_streak
     global _feed_wake_resync_until_fresh, _last_live_hud_snapshot
     global _pending_postlaunch_auth, pending_baseline_revert, pending_baseline_revert_done_today
-    global _manual_reanchor_pending, _pending_flat_recap
+    global _manual_reanchor_pending, _pending_flat_recap, _presync_rearm_token
     with _postlaunch_auth_lock:
         _pending_postlaunch_auth = None
     pending_baseline_revert = None
     pending_baseline_revert_done_today = False
     _manual_reanchor_pending = False
     _pending_flat_recap = None
+    _presync_rearm_token = None
     with _adapter_epoch_lock:
         _adapter_epoch += 1
         _last_fresh_poll_info = None
@@ -3011,6 +3019,128 @@ def _bump_adapter_epoch():
 
 def get_adapter_epoch():
     return _adapter_epoch
+
+
+def _get_flatten_timeout_sec(adapter):
+    """Returns the broker-appropriate flatten verification timeout in seconds."""
+    return 25.0 if getattr(adapter, "name", "") == "WEBULL" else 15.0
+
+
+def _is_definitive_broker_order_rejection(exc):
+    """Returns True ONLY for definitive broker business rejections (HTTP 4xx
+    excluding 408/429, e.g. Webull HTTP 417), never for timeouts/network/5xx."""
+    if exc is None:
+        return False
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            socket.timeout,
+            ConnectionError,
+            http.client.HTTPException,
+        ),
+    ):
+        return False
+    if (
+        isinstance(exc, OSError)
+        and not hasattr(exc, "http_status")
+        and not hasattr(exc, "get_http_status")
+    ):
+        return False
+    http_st = None
+    get_st_fn = getattr(exc, "get_http_status", None)
+    if callable(get_st_fn):
+        try:
+            http_st = get_st_fn()
+        except Exception:
+            http_st = None
+    if http_st is None:
+        http_st = getattr(exc, "http_status", None)
+    raw_str = str(exc or "")
+    if http_st is None:
+        m_st = re.search(
+            r"(?:HTTP\s+Status:\s*|HTTP(?:/\d(?:\.\d)?)?[\s:=-]+)([1-5]\d{2})\b",
+            raw_str,
+            flags=re.IGNORECASE,
+        )
+        if m_st:
+            try:
+                http_st = int(m_st.group(1))
+            except Exception:
+                http_st = None
+    else:
+        try:
+            http_st = int(http_st)
+        except Exception:
+            http_st = None
+    err_cd = ""
+    get_cd_fn = getattr(exc, "get_error_code", None)
+    if callable(get_cd_fn):
+        try:
+            err_cd = str(get_cd_fn() or "").strip().upper()
+        except Exception:
+            err_cd = ""
+    if not err_cd:
+        err_cd = str(getattr(exc, "error_code", "") or "").strip().upper()
+    low_s = raw_str.lower()
+    if err_cd in ("TIMEOUT", "NETWORK_ERROR", "CONNECTION_ERROR") or (
+        http_st is None
+        and any(
+            tok in low_s
+            for tok in (
+                "timed out",
+                "timeout",
+                "connection reset",
+                "connection aborted",
+                "broken pipe",
+                "eof occurred",
+            )
+        )
+    ):
+        return False
+    if isinstance(http_st, int):
+        return bool(400 <= http_st < 500 and http_st not in (408, 429))
+    if (
+        err_cd.startswith(("OPENAPI_", "ORDER_", "INSUFFICIENT_", "INVALID_"))
+        and "429" not in err_cd
+        and "TOO_MANY" not in err_cd
+    ):
+        return True
+    return False
+
+
+def _is_webull_pending_cancel(code_val=None, exc=None, order_dict=None):
+    """Returns True when a Webull order or cancel response indicates
+    PENDING_CANCEL (e.g. HTTP 417 OPENAPI_ORDER_CAN_NOT_BE_CANCEL_FOR_PENDING_CANCEL)."""
+    if isinstance(order_dict, dict):
+        st = str(
+            order_dict.get("status") or order_dict.get("order_status") or ""
+        ).strip().upper()
+        if st in ("PENDING_CANCEL", "CANCEL_PENDING", "CANCELLING", "CANCELING"):
+            return True
+    parts = [str(code_val or "")]
+    if exc is not None:
+        get_cd_fn = getattr(exc, "get_error_code", None)
+        if callable(get_cd_fn):
+            try:
+                parts.append(str(get_cd_fn() or ""))
+            except Exception:
+                pass
+        parts.append(str(getattr(exc, "error_code", "") or ""))
+        get_msg_fn = getattr(exc, "get_error_msg", None)
+        if callable(get_msg_fn):
+            try:
+                parts.append(str(get_msg_fn() or ""))
+            except Exception:
+                pass
+        parts.append(str(getattr(exc, "error_msg", "") or ""))
+        parts.append(str(exc))
+    blob = " ".join(parts).upper()
+    return (
+        "PENDING_CANCEL" in blob
+        or "CAN_NOT_BE_CANCEL_FOR_PENDING_CANCEL" in blob
+        or "CANCEL_PENDING" in blob
+    )
 
 
 def is_demo_mode_active(adapter=None):
@@ -5397,12 +5527,84 @@ def _get_prev_enforcer_path():
     return os.path.join(SCRIPT_DIR, "enforcer.py.prev")
 
 
+def _get_prev_enforcer_meta_path():
+    return os.path.join(SCRIPT_DIR, "enforcer.py.prev.meta.json")
+
+
+def _get_install_channel_record_path():
+    return os.path.join(SCRIPT_DIR, ".enforcer_install_channel.json")
+
+
 def _get_prev_changelog_path():
     return os.path.join(SCRIPT_DIR, "CHANGELOG.md.prev")
 
 
 def _get_boot_pending_path():
     return os.path.join(SCRIPT_DIR, ".enforcer_boot_pending.json")
+
+
+def _read_json_dict_safe(fpath):
+    try:
+        if os.path.isfile(fpath):
+            with open(fpath, "r", encoding="utf-8") as rf:
+                d = json.load(rf)
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _write_json_dict_atomic(fpath, data_dict):
+    tmp_p = f"{fpath}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_p, "w", encoding="utf-8") as wf:
+            json.dump(data_dict, wf, indent=2)
+            wf.flush()
+            os.fsync(wf.fileno())
+        os.replace(tmp_p, fpath)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp_p):
+                os.remove(tmp_p)
+        except OSError:
+            pass
+        return False
+
+
+def _read_prev_enforcer_meta():
+    return _read_json_dict_safe(_get_prev_enforcer_meta_path())
+
+
+def _write_prev_enforcer_meta(sha_hex, version_str, channel_str):
+    if not sha_hex or channel_str not in ("main", "beta"):
+        return False
+    return _write_json_dict_atomic(
+        _get_prev_enforcer_meta_path(),
+        {
+            "sha256": str(sha_hex),
+            "version": str(version_str or ""),
+            "channel": str(channel_str),
+        },
+    )
+
+
+def _read_install_channel_record():
+    return _read_json_dict_safe(_get_install_channel_record_path())
+
+
+def _write_install_channel_record(version_str, channel_str):
+    if channel_str not in ("main", "beta"):
+        return False
+    return _write_json_dict_atomic(
+        _get_install_channel_record_path(),
+        {
+            "version": str(version_str or ""),
+            "channel": str(channel_str),
+            "updated_at": time.time(),
+        },
+    )
 
 
 def _validate_enforcer_source_bytes(raw_bytes):
@@ -5604,7 +5806,9 @@ def _mark_boot_pending_bat_prompt_suppressed():
 def _restore_prev_files_to_disk():
     """Atomically copies verified enforcer.py.prev -> enforcer.py (and
     CHANGELOG.md.prev -> CHANGELOG.md if present) while keeping .prev intact on
-    disk, and clears .enforcer_boot_pending.json. Returns (ok, prev_ver)."""
+    disk, conditionally restores Launch_Enforcer.bat's release channel ONLY when
+    the verified .prev sidecar SHA-256 (or matching pre-boot crash marker) confirms
+    the backup's channel, and clears .enforcer_boot_pending.json. Returns (ok, prev_ver)."""
     prev_py = _get_prev_enforcer_path()
     if not os.path.isfile(prev_py):
         return False, ""
@@ -5614,6 +5818,11 @@ def _restore_prev_files_to_disk():
         ok_src, prev_ver, _err = _validate_enforcer_source_bytes(prev_bytes)
         if not ok_src:
             return False, ""
+        prev_sha = hashlib.sha256(prev_bytes).hexdigest()
+        bp_path = _get_boot_pending_path()
+        bp_d = _read_json_dict_safe(bp_path)
+        meta_d = _read_prev_enforcer_meta()
+
         target_py = os.path.join(SCRIPT_DIR, "enforcer.py")
         tmp_py = f"{target_py}.{os.getpid()}.rb.tmp"
         with open(tmp_py, "wb") as out_f:
@@ -5636,7 +5845,43 @@ def _restore_prev_files_to_disk():
             except Exception:
                 pass
 
-        bp_path = _get_boot_pending_path()
+        bat_path = os.path.join(SCRIPT_DIR, "Launch_Enforcer.bat")
+        restored_ch = None
+        if (
+            isinstance(meta_d, dict)
+            and meta_d.get("sha256") == prev_sha
+            and meta_d.get("channel") in ("main", "beta")
+        ):
+            restored_ch = meta_d.get("channel")
+        elif (
+            isinstance(bp_d, dict)
+            and isinstance(bp_d.get("bat_swap"), list)
+            and bp_d.get("prev_sha256") == prev_sha
+        ):
+            if os.path.isfile(bat_path):
+                _apply_bat_swap_pairs_on_disk(bat_path, bp_d.get("bat_swap"))
+            if bp_d.get("prev_channel") in ("main", "beta"):
+                restored_ch = bp_d.get("prev_channel")
+
+        if restored_ch in ("main", "beta"):
+            if os.path.isfile(bat_path):
+                try:
+                    with open(bat_path, "rb") as bf_in:
+                        cur_bat_b = bf_in.read()
+                    if _is_valid_launcher_bat_bytes(cur_bat_b):
+                        swapped_b = (
+                            _rewrite_bat_bytes_for_beta(cur_bat_b)
+                            if restored_ch == "beta"
+                            else _rewrite_bat_bytes_for_main(cur_bat_b)
+                        )
+                        if swapped_b != cur_bat_b and _is_valid_launcher_bat_bytes(
+                            swapped_b
+                        ):
+                            _atomic_write_verified_bytes(bat_path, swapped_b)
+                except Exception:
+                    pass
+            _write_install_channel_record(prev_ver, restored_ch)
+
         if os.path.exists(bp_path):
             try:
                 os.remove(bp_path)
@@ -7110,6 +7355,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     global last_flat_equity, anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close, is_locked_down, active_breach_source
     global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
+    global _presync_rearm_token
     global _last_fresh_poll_info, _feed_degrade_streak, _feed_wake_resync_until_fresh
     global done_for_today, committed_for_today
     global win_trades, loss_trades, prev_flat_realized_pnl
@@ -7156,6 +7402,7 @@ def restore_account_session(broker_name, account_id, log_restore=False):
     _breach_pin_rt_pending = False
     _breach_pin_retired = False
     _lock_from_presync_save = False
+    _presync_rearm_token = None
     _last_fresh_poll_info = None
     _feed_degrade_streak = 0
     _feed_wake_resync_until_fresh = False
@@ -9042,6 +9289,11 @@ class SchwabAdapter:
         self._raw_orders_window_cache = {}
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
+        self.last_pending_cancel_syms = set()
+        self.last_pending_cancel_qty = {}
+        self._last_pending_cancel_cids = set()
+        self._market_data_unsubscribed_until = 0.0
+        self._preferred_wb_history_ep = None
         self.last_coverage_lookup_failed = False
         self._last_cov_saw_dead_pend = False
         self.last_positions_fetch_ok = False
@@ -9068,6 +9320,16 @@ class SchwabAdapter:
             self._filled_today_cache = {}
         if not isinstance(getattr(self, "_orders_window_fail_ts", None), dict):
             self._orders_window_fail_ts = {}
+        if not isinstance(getattr(self, "last_pending_cancel_syms", None), set):
+            self.last_pending_cancel_syms = set()
+        if not isinstance(getattr(self, "last_pending_cancel_qty", None), dict):
+            self.last_pending_cancel_qty = {}
+        if not isinstance(getattr(self, "_last_pending_cancel_cids", None), set):
+            self._last_pending_cancel_cids = set()
+        if not hasattr(self, "_market_data_unsubscribed_until"):
+            self._market_data_unsubscribed_until = 0.0
+        if not hasattr(self, "_preferred_wb_history_ep"):
+            self._preferred_wb_history_ep = None
 
     def invalidate_cached_snapshots(self):
         self._ensure_orders_cache_infra()
@@ -9523,6 +9785,13 @@ class SchwabAdapter:
             if not isinstance(orders, list):
                 self.last_coverage_lookup_failed = True
                 return 0.0, 0.0
+            if len(orders) >= SCHWAB_ORDERS_DEFAULT_MAX_RESULTS:
+                self.last_coverage_lookup_failed = True
+                log_event(
+                    "WARN",
+                    f"Schwab exit coverage query hit {len(orders)}-row cap (>= {SCHWAB_ORDERS_DEFAULT_MAX_RESULTS}) — "
+                    f"failing closed against silent order truncation!",
+                )
         except Exception:
             self.last_coverage_lookup_failed = True
             return 0.0, 0.0
@@ -9743,6 +10012,8 @@ class SchwabAdapter:
     ):
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
+        self.last_pending_cancel_syms = set()
+        self.last_pending_cancel_qty = {}
         cl = self.client
         acct_id = self.account_id
         if not cl or not acct_id:
@@ -9756,18 +10027,23 @@ class SchwabAdapter:
         raw_batches = []
         step1_ok = False
         step2_ok = False
+        s1_cnt = 0
+        s1_ms = 0.0
+        s2_cnt = 0
+        s2_ms = 0.0
         last_http_err = None
 
         # Step 2 (concurrent) + Step 1: Run 58d server-filtered WORKING GTC sweep in parallel
         # with the fast 120-hour (5-day, weekend-safe) query so both ~650ms lookups overlap.
         ord_status_enum = getattr(getattr(cl, "Order", None), "Status", None)
         working_enum_val = getattr(ord_status_enum, "WORKING", None)
-        s2_box = {"list": None, "code": None, "err": None, "type_err": False}
+        s2_box = {"list": None, "code": None, "err": None, "type_err": False, "ms": 0.0}
         t_s2 = None
         if working_enum_val is not None:
             gtc_start = now_utc - timedelta(days=58)
 
             def _run_s2():
+                t2_0 = time.monotonic()
                 try:
                     r2 = cl.get_orders_for_account(
                         acct_id,
@@ -9784,11 +10060,14 @@ class SchwabAdapter:
                     s2_box["type_err"] = True
                 except Exception as ex2:
                     s2_box["err"] = ex2
+                finally:
+                    s2_box["ms"] = (time.monotonic() - t2_0) * 1000.0
 
             t_s2 = threading.Thread(target=_run_s2, daemon=True)
             t_s2.start()
 
         # Step 1: Fast 120-hour (5-day, weekend-safe) query covering all active statuses & OCO children
+        t1_0 = time.monotonic()
         try:
             fast_start = now_utc - timedelta(hours=120)
             try:
@@ -9802,6 +10081,7 @@ class SchwabAdapter:
             if getattr(resp1, "status_code", None) == 200:
                 j1 = resp1.json()
                 if isinstance(j1, list):
+                    s1_cnt = len(j1)
                     raw_batches.append(j1)
                     step1_ok = True
             else:
@@ -9811,10 +10091,14 @@ class SchwabAdapter:
                 "ERROR",
                 f"Schwab get_orders_for_account (120h) exception during cancel: {e1}",
             )
+        finally:
+            s1_ms = (time.monotonic() - t1_0) * 1000.0
 
         if t_s2 is not None:
             t_s2.join(2.2)
+            s2_ms = float(s2_box.get("ms", 0.0) or 0.0)
             if isinstance(s2_box["list"], list):
+                s2_cnt = len(s2_box["list"])
                 raw_batches.append(s2_box["list"])
                 step2_ok = True
             elif not s2_box["type_err"]:
@@ -9840,6 +10124,23 @@ class SchwabAdapter:
                         "WARN",
                         f"Schwab 58d WORKING GTC order sweep incomplete ({s2_reason}); proceeding with 120h order set.",
                     )
+
+        if s1_ms >= 250.0 or s2_ms >= 250.0 or (s1_cnt + s2_cnt) >= 200:
+            log_event(
+                "PERF",
+                f"Schwab cancel order-query breakdown: 120h={s1_cnt} row(s) in {s1_ms:.0f}ms | "
+                f"58d_WORKING={s2_cnt} row(s) in {s2_ms:.0f}ms.",
+            )
+        if (
+            s1_cnt >= SCHWAB_ORDERS_DEFAULT_MAX_RESULTS
+            or s2_cnt >= SCHWAB_ORDERS_DEFAULT_MAX_RESULTS
+        ):
+            self.last_coverage_lookup_failed = True
+            log_event(
+                "WARN",
+                f"Schwab order query hit {max(s1_cnt, s2_cnt)}-row cap during cancel "
+                f"(120h={s1_cnt}, 58d_WORKING={s2_cnt}) — failing closed against silent truncation!",
+            )
 
         if not step1_ok and not step2_ok:
             if last_http_err is not None:
@@ -11216,6 +11517,12 @@ class SchwabAdapter:
                         self._pending_flatten_cids.pop(
                             (self.account_id, symbol), None
                         )
+                        r_txt = str(getattr(r, "text", "") or "").strip()
+                        if r_txt:
+                            log_event(
+                                "WARN",
+                                f"Schwab option Buy-to-Close {symbol} rejected (HTTP {r.status_code}): {_clip_log_detail(r_txt, 160)}",
+                            )
                 else:
                     log_event(
                         "ORDER_OUT",
@@ -11243,7 +11550,22 @@ class SchwabAdapter:
                         self._pending_flatten_cids.pop(
                             (self.account_id, symbol), None
                         )
+                        r_txt = str(getattr(r, "text", "") or "").strip()
+                        if r_txt:
+                            log_event(
+                                "WARN",
+                                f"Schwab option Sell-to-Close {symbol} rejected (HTTP {r.status_code}): {_clip_log_detail(r_txt, 160)}",
+                            )
             except Exception as e:
+                if _is_definitive_broker_order_rejection(e):
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
+                    log_event(
+                        "WARN",
+                        f"Schwab option exit order on {symbol} definitively rejected by broker ({e}) — cleared pending order tracker for retry.",
+                    )
+                    continue
                 log_event(
                     "ERROR",
                     f"Schwab option place_order exception ({symbol}): {e}"
@@ -11388,6 +11710,12 @@ class SchwabAdapter:
                             self._pending_flatten_cids.pop(
                                 (self.account_id, symbol), None
                             )
+                            r_txt = str(getattr(r, "text", "") or "").strip()
+                            if r_txt:
+                                log_event(
+                                    "WARN",
+                                    f"Schwab Market Sell {symbol} rejected (HTTP {r.status_code}): {_clip_log_detail(r_txt, 160)}",
+                                )
                             if is_pure_fractional:
                                 mark_uncloseable_fractional_sym(
                                     self.account_id, symbol, f_qty
@@ -11423,6 +11751,12 @@ class SchwabAdapter:
                             self._pending_flatten_cids.pop(
                                 (self.account_id, symbol), None
                             )
+                            r_txt = str(getattr(r, "text", "") or "").strip()
+                            if r_txt:
+                                log_event(
+                                    "WARN",
+                                    f"Schwab Buy-to-Cover {symbol} rejected (HTTP {r.status_code}): {_clip_log_detail(r_txt, 160)}",
+                                )
                             if is_pure_fractional:
                                 mark_uncloseable_fractional_sym(
                                     self.account_id, symbol, f_qty
@@ -11493,6 +11827,12 @@ class SchwabAdapter:
                             self._pending_flatten_cids.pop(
                                 (self.account_id, symbol), None
                             )
+                            r_txt = str(getattr(r, "text", "") or "").strip()
+                            if r_txt:
+                                log_event(
+                                    "WARN",
+                                    f"Schwab EXT Limit Sell {symbol} rejected (HTTP {r.status_code}): {_clip_log_detail(r_txt, 160)}",
+                                )
                     elif f_qty < 0:
                         ask = (
                             q_info.get("askPrice")
@@ -11559,11 +11899,13 @@ class SchwabAdapter:
                             self._pending_flatten_cids.pop(
                                 (self.account_id, symbol), None
                             )
+                            r_txt = str(getattr(r, "text", "") or "").strip()
+                            if r_txt:
+                                log_event(
+                                    "WARN",
+                                    f"Schwab EXT Limit Cover {symbol} rejected (HTTP {r.status_code}): {_clip_log_detail(r_txt, 160)}",
+                                )
             except Exception as e:
-                log_event(
-                    "ERROR",
-                    f"Schwab equity place_order exception ({symbol}): {e}"
-                )
                 if is_pure_fractional:
                     self._pending_flatten_cids.pop(
                         (self.account_id, symbol), None
@@ -11571,7 +11913,24 @@ class SchwabAdapter:
                     mark_uncloseable_fractional_sym(
                         self.account_id, symbol, f_qty
                     )
+                    log_event(
+                        "ERROR",
+                        f"Schwab equity place_order exception ({symbol}): {e}",
+                    )
                     continue
+                if _is_definitive_broker_order_rejection(e):
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
+                    log_event(
+                        "WARN",
+                        f"Schwab exit order on {symbol} definitively rejected by broker ({e}) — cleared pending order tracker for retry.",
+                    )
+                    continue
+                log_event(
+                    "ERROR",
+                    f"Schwab equity place_order exception ({symbol}): {e}"
+                )
                 w_q, f_q = self.get_recent_exit_order_coverage(
                     symbol,
                     is_short=(f_qty < 0),
@@ -12101,6 +12460,11 @@ class WebullAdapter:
         self._raw_orders_window_cache = {}
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
+        self.last_pending_cancel_syms = set()
+        self.last_pending_cancel_qty = {}
+        self._last_pending_cancel_cids = set()
+        self._market_data_unsubscribed_until = 0.0
+        self._preferred_wb_history_ep = None
         self.last_coverage_lookup_failed = False
         self._last_cov_saw_dead_pend = False
         self.last_positions_fetch_ok = False
@@ -12127,6 +12491,16 @@ class WebullAdapter:
             self._filled_today_cache = {}
         if not isinstance(getattr(self, "_orders_window_fail_ts", None), dict):
             self._orders_window_fail_ts = {}
+        if not isinstance(getattr(self, "last_pending_cancel_syms", None), set):
+            self.last_pending_cancel_syms = set()
+        if not isinstance(getattr(self, "last_pending_cancel_qty", None), dict):
+            self.last_pending_cancel_qty = {}
+        if not isinstance(getattr(self, "_last_pending_cancel_cids", None), set):
+            self._last_pending_cancel_cids = set()
+        if not hasattr(self, "_market_data_unsubscribed_until"):
+            self._market_data_unsubscribed_until = 0.0
+        if not hasattr(self, "_preferred_wb_history_ep"):
+            self._preferred_wb_history_ep = None
 
     def invalidate_cached_snapshots(self):
         self._ensure_orders_cache_infra()
@@ -12559,6 +12933,7 @@ class WebullAdapter:
             if not needs_full_reinit:
                 self.api_client._connect_timeout = 3.5
                 self.api_client._read_timeout = 4.5
+                self._market_data_unsubscribed_until = 0.0
                 if not self.api_client.get_token():
                     tok_file = os.path.join(USER_HOME, "conf", "token.txt")
                     saved_tok = _validate_webull_token_file(tok_file)
@@ -12613,6 +12988,7 @@ class WebullAdapter:
                 self._filled_since_cache.clear()
                 self._filled_today_cache.clear()
             self._trade_perm_cache.pop(self.account_id, None)
+            self._market_data_unsubscribed_until = 0.0
             return True
         except Exception as e:
             self.last_error = str(e)
@@ -12680,23 +13056,48 @@ class WebullAdapter:
                     continue
                 sub_ords = item.get("orders")
                 own_cid = item.get("client_order_id") or item.get("order_id")
-                if isinstance(sub_ords, list) and sub_ords and not own_cid:
+                own_sym = str(
+                    item.get("symbol")
+                    or (item.get("ticker") or {}).get("symbol")
+                    or ""
+                ).strip()
+                own_side = str(
+                    item.get("side") or item.get("action") or ""
+                ).strip()
+                has_own_sym_and_side = bool(
+                    (own_sym and own_side) or item.get("legs")
+                )
+                if (
+                    isinstance(sub_ords, list)
+                    and sub_ords
+                    and not has_own_sym_and_side
+                ):
                     wb_gid = (
-                        f"WB_OCO_{item.get('combo_id') or id(item)}"
+                        f"WB_OCO_{item.get('combo_id') or own_cid or id(item)}"
                         if len(sub_ords) > 1
                         else None
                     )
                     for sub_it in sub_ords:
                         if not isinstance(sub_it, dict):
                             continue
+                        sub_cp = dict(sub_it)
+                        if not (
+                            sub_cp.get("client_order_id")
+                            or sub_cp.get("order_id")
+                        ):
+                            if item.get("client_order_id"):
+                                sub_cp["client_order_id"] = item.get(
+                                    "client_order_id"
+                                )
+                            if item.get("order_id"):
+                                sub_cp["order_id"] = item.get("order_id")
                         s_oid = str(
-                            sub_it.get("client_order_id")
-                            or sub_it.get("order_id")
+                            sub_cp.get("client_order_id")
+                            or sub_cp.get("order_id")
                             or id(sub_it)
                         )
                         if s_oid not in seen_ids:
                             seen_ids.add(s_oid)
-                            sub_cp = dict(sub_it)
                             if wb_gid:
                                 sub_cp["_wb_oco_gid"] = wb_gid
                             collected.append(sub_cp)
@@ -12840,9 +13241,28 @@ class WebullAdapter:
                 o_side = str(o.get("side") or o.get("action") or "").upper()
                 if o_side != closing_side:
                     continue
+                o_st = str(
+                    o.get("status") or o.get("order_status") or ""
+                ).upper()
                 cid = str(
                     o.get("client_order_id") or o.get("order_id") or ""
                 ).strip()
+                if o_st in (
+                    "PENDING_CANCEL",
+                    "CANCEL_PENDING",
+                    "CANCELLING",
+                    "CANCELING",
+                    "CANCELED",
+                    "CANCELLED",
+                    "REJECTED",
+                    "EXPIRED",
+                    "FAILED",
+                ) or (
+                    cid
+                    and cid
+                    in (getattr(self, "_last_pending_cancel_cids", None) or set())
+                ):
+                    continue
                 if cid:
                     seen_cids.add(cid)
                 try:
@@ -13065,6 +13485,9 @@ class WebullAdapter:
     ):
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
+        self.last_pending_cancel_syms = set()
+        self.last_pending_cancel_qty = {}
+        self._last_pending_cancel_cids = set()
         preserve_map = (
             dict(preserve_market_close_map)
             if isinstance(preserve_market_close_map, dict)
@@ -13075,8 +13498,12 @@ class WebullAdapter:
             if orders is not None:
                 cancelled_any = False
                 preserved_any = False
+                attempted_any = False
                 wb_cancelled_oco_groups = set()
                 wb_cascade_candidates = []
+                verified_200_closing = []
+                pending_cancel_groups = {}
+                failed_close_groups = {}
                 for o in orders:
                     cid = (
                         o.get("client_order_id")
@@ -13084,6 +13511,7 @@ class WebullAdapter:
                     )
                     if cid:
                         masked_cid = _mask_last4(cid)
+                        cid_str = str(cid).strip()
                         o_itype = str(
                             o.get("instrument_type")
                             or o.get("asset_type")
@@ -13173,16 +13601,24 @@ class WebullAdapter:
                             elif open_q < 0 and o_side == "BUY":
                                 is_closing_dir = True
 
+                        eff_q = (
+                            o_qty
+                            if o_qty > 0
+                            else (
+                                abs(float(preserve_map[o_sym]))
+                                if (o_sym and o_sym in preserve_map)
+                                else 0.0
+                            )
+                        )
+                        wb_gid = o.get("_wb_oco_gid")
+                        grp_key = str(wb_gid or f"SOLO_{cid_str}")
+
                         if (
                             is_closing_dir
                             and is_market_hours()
                             and o_type in ("MARKET", "MKT")
+                            and not _is_webull_pending_cancel(order_dict=o)
                         ):
-                            eff_q = (
-                                o_qty
-                                if o_qty > 0
-                                else abs(float(preserve_map[o_sym]))
-                            )
                             self.last_preserved_close_qty[o_sym] = (
                                 self.last_preserved_close_qty.get(o_sym, 0.0)
                                 + eff_q
@@ -13196,11 +13632,14 @@ class WebullAdapter:
                             )
                             continue
 
+                        attempted_any = True
                         log_event(
                             "FLATTEN", f"Canceling Webull order ID: {masked_cid}"
                         )
                         cancel_ok = False
                         deferred_cascade = False
+                        cancel_code = None
+                        cancel_exc = None
                         try:
                             if hasattr(self.trade_client, "order_v3"):
                                 c_res = (
@@ -13212,52 +13651,88 @@ class WebullAdapter:
                                 c_res = self.trade_client.cancel_order(
                                     self.account_id, cid
                                 )
-                            code = c_resp_code(c_res)
+                            cancel_code = c_resp_code(c_res)
                             log_event(
                                 "FLATTEN",
-                                f"Cancel response {masked_cid}: HTTP {code}"
+                                f"Cancel response {masked_cid}: HTTP {cancel_code}"
                             )
-                            wb_gid = o.get("_wb_oco_gid")
-                            if code in (200, 201, 202, 204, "OK"):
+                            if cancel_code in (200, 201, 202, 204, "OK"):
                                 cancelled_any = True
                                 cancel_ok = True
                                 if wb_gid:
                                     wb_cancelled_oco_groups.add(wb_gid)
+                                if is_closing_dir and o_sym and cid_str:
+                                    verified_200_closing.append(
+                                        (
+                                            cid_str,
+                                            masked_cid,
+                                            o_sym,
+                                            eff_q,
+                                            grp_key,
+                                        )
+                                    )
                             elif (
-                                code in (400, 404, 409, 422)
+                                cancel_code in (400, 404, 409, 422)
                                 and wb_gid
                                 and wb_gid in wb_cancelled_oco_groups
                             ):
                                 deferred_cascade = True
                                 wb_cascade_candidates.append(
                                     (
-                                        str(cid).strip(),
+                                        cid_str,
                                         masked_cid,
                                         o_sym,
                                         is_closing_dir,
                                         o_qty,
+                                        grp_key,
                                     )
                                 )
                         except Exception as ce:
-                            log_event(
-                                "ERROR",
-                                f"Webull cancel_order {masked_cid} exception: {ce}",
-                            )
+                            cancel_exc = ce
+                            if _is_webull_pending_cancel(exc=ce, order_dict=o):
+                                log_event(
+                                    "WARN",
+                                    f"Webull order {masked_cid} is in PENDING_CANCEL state at broker ({ce}) — "
+                                    f"tracking pending-cancel shares without treating as active exit coverage.",
+                                )
+                            else:
+                                log_event(
+                                    "ERROR",
+                                    f"Webull cancel_order {masked_cid} exception: {ce}",
+                                )
                         if not cancel_ok and not deferred_cascade:
-                            if o_sym:
-                                self.last_cancel_failed_syms.add(o_sym)
-                            if is_closing_dir and o_sym:
-                                eff_q = (
-                                    o_qty
-                                    if o_qty > 0
-                                    else abs(float(preserve_map[o_sym]))
-                                )
-                                self.last_preserved_close_qty[o_sym] = (
-                                    self.last_preserved_close_qty.get(
-                                        o_sym, 0.0
+                            if _is_webull_pending_cancel(
+                                code_val=cancel_code,
+                                exc=cancel_exc,
+                                order_dict=o,
+                            ):
+                                if cancel_exc is None:
+                                    log_event(
+                                        "WARN",
+                                        f"Webull order {masked_cid} is in PENDING_CANCEL state at broker — "
+                                        f"tracking pending-cancel shares without treating as active exit coverage.",
                                     )
-                                    + eff_q
-                                )
+                                if cid_str:
+                                    self._last_pending_cancel_cids.add(cid_str)
+                                if o_sym:
+                                    self.last_pending_cancel_syms.add(o_sym)
+                                if is_closing_dir and o_sym:
+                                    g_p = pending_cancel_groups.setdefault(
+                                        o_sym, {}
+                                    )
+                                    g_p[grp_key] = max(
+                                        g_p.get(grp_key, 0.0), eff_q
+                                    )
+                            else:
+                                if o_sym:
+                                    self.last_cancel_failed_syms.add(o_sym)
+                                if is_closing_dir and o_sym:
+                                    g_f = failed_close_groups.setdefault(
+                                        o_sym, {}
+                                    )
+                                    g_f[grp_key] = max(
+                                        g_f.get(grp_key, 0.0), eff_q
+                                    )
                 if wb_cascade_candidates:
                     recheck_open = None
                     try:
@@ -13279,6 +13754,7 @@ class WebullAdapter:
                         c_sym,
                         c_is_cl,
                         c_qty,
+                        c_grp_key,
                     ) in wb_cascade_candidates:
                         if (
                             recheck_open is not None
@@ -13303,20 +13779,189 @@ class WebullAdapter:
                                     if c_qty > 0
                                     else abs(float(preserve_map.get(c_sym, 0.0)))
                                 )
-                                self.last_preserved_close_qty[c_sym] = (
-                                    self.last_preserved_close_qty.get(
-                                        c_sym, 0.0
-                                    )
-                                    + eff_cq
+                                g_cf = failed_close_groups.setdefault(c_sym, {})
+                                g_cf[c_grp_key] = max(
+                                    g_cf.get(c_grp_key, 0.0), eff_cq
                                 )
                 if cancelled_any:
                     time.sleep(0.2)
-                elif not preserved_any:
+                    if verified_200_closing:
+                        try:
+                            post_open = self._fetch_all_open_orders_webull()
+                        except Exception:
+                            post_open = None
+                        if isinstance(post_open, list):
+                            post_map = {
+                                str(
+                                    ro.get("client_order_id")
+                                    or ro.get("order_id")
+                                    or ""
+                                ).strip(): ro
+                                for ro in post_open
+                                if isinstance(ro, dict)
+                            }
+                            for (
+                                v_cid,
+                                v_masked,
+                                v_sym,
+                                v_eff_q,
+                                v_grp,
+                            ) in verified_200_closing:
+                                ro_hit = post_map.get(v_cid)
+                                if ro_hit is None:
+                                    continue
+                                ro_st = str(
+                                    ro_hit.get("status")
+                                    or ro_hit.get("order_status")
+                                    or ""
+                                ).upper()
+                                if ro_st in (
+                                    "FILLED",
+                                    "CANCELED",
+                                    "CANCELLED",
+                                    "REJECTED",
+                                    "EXPIRED",
+                                ):
+                                    continue
+                                self._last_pending_cancel_cids.add(v_cid)
+                                self.last_pending_cancel_syms.add(v_sym)
+                                g_vp = pending_cancel_groups.setdefault(
+                                    v_sym, {}
+                                )
+                                g_vp[v_grp] = max(
+                                    g_vp.get(v_grp, 0.0), v_eff_q
+                                )
+                                log_event(
+                                    "WARN",
+                                    f"Webull closing order {v_masked} ({v_sym}) returned HTTP 200 on cancel but remains pending cancel at exchange.",
+                                )
+                elif not preserved_any and not attempted_any:
                     log_event("FLATTEN", "No working Webull orders to cancel.")
+                for s_f, gm_f in failed_close_groups.items():
+                    tot_f = sum(gm_f.values())
+                    if tot_f > 0:
+                        self.last_preserved_close_qty[s_f] = (
+                            self.last_preserved_close_qty.get(s_f, 0.0) + tot_f
+                        )
+                self.last_pending_cancel_qty = {
+                    s_p: sum(gm_p.values())
+                    for s_p, gm_p in pending_cancel_groups.items()
+                    if sum(gm_p.values()) > 0
+                }
                 return cancelled_any
         except Exception as e:
             log_event("ERROR", f"Webull cancel working orders exception: {e}")
         return False
+
+    def poll_pending_cancel_settlement(
+        self, syms, preserve_map=None, max_wait_s=0.9, interval_s=0.3
+    ):
+        """Short bounded poll waiting for Webull PENDING_CANCEL orders on `syms`
+        to settle before re-fetching positions / submitting uncovered exits."""
+        target_syms = {str(s).strip() for s in (syms or set()) if s}
+        if not target_syms or not self.trade_client or not self.account_id:
+            return True
+        pres = preserve_map if isinstance(preserve_map, dict) else {}
+        t0 = time.monotonic()
+        while (time.monotonic() - t0) < float(max_wait_s):
+            rem_s = float(max_wait_s) - (time.monotonic() - t0)
+            time.sleep(min(float(interval_s), max(0.01, rem_s)))
+            _touch_data_loop_heartbeat()
+            try:
+                open_now = self._fetch_all_open_orders_webull()
+            except Exception:
+                open_now = None
+            if open_now is None:
+                continue
+            rem_groups = {}
+            rem_syms = set()
+            seen_cids = set()
+            for o in open_now:
+                if not isinstance(o, dict):
+                    continue
+                o_st = str(
+                    o.get("status") or o.get("order_status") or ""
+                ).upper()
+                if o_st in (
+                    "FILLED",
+                    "CANCELED",
+                    "CANCELLED",
+                    "REJECTED",
+                    "EXPIRED",
+                    "FAILED",
+                ):
+                    continue
+                cid_s = str(
+                    o.get("client_order_id") or o.get("order_id") or ""
+                ).strip()
+                o_itype = str(
+                    o.get("instrument_type")
+                    or o.get("asset_type")
+                    or "EQUITY"
+                ).upper()
+                o_is_opt = ("OPT" in o_itype) or bool(o.get("legs"))
+                if o_is_opt:
+                    o_meta = self._parse_option_contract_meta(o)
+                    o_sym = o_meta.get("display_sym") or o_meta.get(
+                        "raw_symbol", ""
+                    )
+                else:
+                    o_sym = (
+                        o.get("symbol")
+                        or (o.get("ticker") or {}).get("symbol")
+                        or ""
+                    )
+                o_sym = str(o_sym or "").strip()
+                if o_sym not in target_syms:
+                    continue
+                if cid_s in (getattr(self, "_last_pending_cancel_cids", None) or set()) or _is_webull_pending_cancel(order_dict=o):
+                    if cid_s:
+                        seen_cids.add(cid_s)
+                    rem_syms.add(o_sym)
+                    o_side = str(o.get("side") or o.get("action") or "").upper()
+                    is_cl = False
+                    if o_sym in pres:
+                        pq = float(pres[o_sym])
+                        is_cl = (pq > 0 and o_side == "SELL") or (
+                            pq < 0 and o_side == "BUY"
+                        )
+                    else:
+                        is_cl = True
+                    if is_cl:
+                        try:
+                            oq = float(
+                                o.get("remain_quantity")
+                                or o.get("unfilled_quantity")
+                                or o.get("quantity")
+                                or o.get("total_quantity")
+                                or 0.0
+                            )
+                        except Exception:
+                            oq = 0.0
+                        gk = str(o.get("_wb_oco_gid") or f"SOLO_{cid_s or id(o)}")
+                        gp = rem_groups.setdefault(o_sym, {})
+                        gp[gk] = max(gp.get(gk, 0.0), oq)
+            self._last_pending_cancel_cids = (
+                self._last_pending_cancel_cids & seen_cids
+            )
+            self.last_pending_cancel_syms = (
+                self.last_pending_cancel_syms - target_syms
+            ) | rem_syms
+            new_qty_map = dict(getattr(self, "last_pending_cancel_qty", {}) or {})
+            for s in target_syms:
+                if s in rem_groups and sum(rem_groups[s].values()) > 0:
+                    new_qty_map[s] = sum(rem_groups[s].values())
+                else:
+                    new_qty_map.pop(s, None)
+            self.last_pending_cancel_qty = new_qty_map
+            if not (self.last_pending_cancel_syms & target_syms):
+                el_ms = (time.monotonic() - t0) * 1000.0
+                log_event(
+                    "FLATTEN",
+                    f"Pending Webull cancel(s) on {sorted(target_syms)} settled cleanly in {el_ms:.0f}ms.",
+                )
+                return True
+        return not bool(self.last_pending_cancel_syms & target_syms)
 
     def _get_orders_window_cached(
         self, ttl_sec=8.0, lock_wait_sec=None, respect_fail_cooldown=False
@@ -13431,6 +14076,9 @@ class WebullAdapter:
             wb_seen_ids = set()
             wb_fetch_ok = False
             t0 = time.monotonic()
+            cascade_deadline = t0 + WEBULL_ORDER_HISTORY_CASCADE_BUDGET_SEC
+            last_fail_code = None
+            last_fail_exc = None
 
             def _extract_wb_items(payload):
                 items = (
@@ -13471,167 +14119,356 @@ class WebullAdapter:
                     )
                 return added, next_tok
 
-            def _register_wb_batch(batch_list):
+            def _register_wb_batch(batch_list, dest_list, dest_seen):
                 new_cnt = 0
                 last_cid = None
+                last_oid = None
                 for item_o in batch_list:
-                    cid_v = str(
-                        item_o.get("client_order_id")
-                        or item_o.get("order_id")
-                        or ""
-                    ).strip()
+                    cid_only = str(item_o.get("client_order_id") or "").strip()
+                    oid_only = str(item_o.get("order_id") or "").strip()
+                    cid_v = cid_only or oid_only
+                    if cid_only:
+                        last_cid = cid_only
+                    if oid_only:
+                        last_oid = oid_only
                     if cid_v:
-                        last_cid = (
-                            str(item_o.get("client_order_id") or "").strip()
-                            or last_cid
-                        )
-                        if cid_v in wb_seen_ids:
+                        if cid_v in dest_seen:
                             continue
-                        wb_seen_ids.add(cid_v)
+                        dest_seen.add(cid_v)
                     else:
                         ptr_k = f"PTR_{id(item_o)}"
-                        if ptr_k in wb_seen_ids:
+                        if ptr_k in dest_seen:
                             continue
-                        wb_seen_ids.add(ptr_k)
-                    wb_raw_orders.append(item_o)
+                        dest_seen.add(ptr_k)
+                    dest_list.append(item_o)
                     new_cnt += 1
-                return new_cnt, last_cid
+                return new_cnt, last_cid, last_oid
 
-            if hasattr(tc_before, "order_v3") and hasattr(
-                tc_before.order_v3, "get_order_history"
-            ):
-                last_cid_cursor = None
-                for _ in range(10):
+            def _extract_err_status(code_v=None, exc_v=None):
+                if isinstance(code_v, int):
+                    return code_v
+                if exc_v is None:
+                    return None
+                g_st = getattr(exc_v, "get_http_status", None)
+                st_v = g_st() if callable(g_st) else getattr(exc_v, "http_status", None)
+                if st_v is not None:
                     try:
-                        if last_cid_cursor:
-                            res_h = tc_before.order_v3.get_order_history(
-                                account_id=acct_before,
-                                page_size=100,
-                                start_date=today_str,
-                                end_date=today_str,
-                                last_client_order_id=last_cid_cursor,
-                            )
-                        else:
-                            res_h = tc_before.order_v3.get_order_history(
-                                account_id=acct_before,
-                                page_size=100,
-                                start_date=today_str,
-                                end_date=today_str,
-                            )
-                    except TypeError:
-                        if last_cid_cursor:
-                            break
-                        res_h = tc_before.order_v3.get_order_history(
-                            account_id=acct_before, page_size=100
-                        )
-                    if res_h is None or getattr(res_h, "status_code", None) != 200:
-                        break
-                    wb_fetch_ok = True
-                    b_items, _ = _extract_wb_items(res_h.json())
-                    if not b_items:
-                        break
-                    n_added, next_cid = _register_wb_batch(b_items)
-                    if n_added <= 0 or len(b_items) < 100 or not next_cid:
-                        break
-                    last_cid_cursor = next_cid
-
-            if (
-                not wb_fetch_ok
-                and hasattr(tc_before, "order_v3")
-                and hasattr(tc_before.order_v3, "list_order_history")
-            ):
-                pg_key = None
-                seen_pg = set()
-                for _ in range(10):
-                    if pg_key:
-                        if pg_key in seen_pg:
-                            break
-                        seen_pg.add(pg_key)
-                        res_lh = tc_before.order_v3.list_order_history(
-                            acct_before, pagination_key=pg_key
-                        )
-                    else:
-                        res_lh = tc_before.order_v3.list_order_history(
-                            acct_before
-                        )
-                    if res_lh is None or getattr(res_lh, "status_code", None) != 200:
-                        break
-                    wb_fetch_ok = True
-                    b_items, next_pg = _extract_wb_items(res_lh.json())
-                    if not b_items:
-                        break
-                    n_added, _ = _register_wb_batch(b_items)
-                    if n_added <= 0 or not next_pg:
-                        break
-                    pg_key = str(next_pg)
-
-            if (
-                not wb_fetch_ok
-                and hasattr(tc_before, "order_v2")
-                and hasattr(tc_before.order_v2, "get_order_history")
-            ):
-                last_cid_v2 = None
-                for _ in range(10):
+                        return int(st_v)
+                    except Exception:
+                        pass
+                m_st = re.search(
+                    r"(?:HTTP\s+Status:\s*|HTTP(?:/\d(?:\.\d)?)?[\s:=-]+)([1-5]\d{2})\b",
+                    str(exc_v),
+                    flags=re.IGNORECASE,
+                )
+                if m_st:
                     try:
-                        if last_cid_v2:
-                            res_v2 = tc_before.order_v2.get_order_history(
-                                account_id=acct_before,
-                                page_size=100,
-                                start_date=today_str,
-                                end_date=today_str,
-                                last_client_order_id=last_cid_v2,
-                            )
-                        else:
-                            res_v2 = tc_before.order_v2.get_order_history(
-                                account_id=acct_before,
-                                page_size=100,
-                                start_date=today_str,
-                                end_date=today_str,
-                            )
-                    except TypeError:
-                        if last_cid_v2:
-                            break
-                        res_v2 = tc_before.order_v2.get_order_history(
-                            account_id=acct_before, page_size=100
-                        )
-                    if res_v2 is None or getattr(res_v2, "status_code", None) != 200:
-                        break
-                    wb_fetch_ok = True
-                    b_items, _ = _extract_wb_items(res_v2.json())
-                    if not b_items:
-                        break
-                    n_added, next_cid = _register_wb_batch(b_items)
-                    if n_added <= 0 or len(b_items) < 100 or not next_cid:
-                        break
-                    last_cid_v2 = next_cid
+                        return int(m_st.group(1))
+                    except Exception:
+                        pass
+                return None
 
-            if (
-                not wb_fetch_ok
-                and hasattr(tc_before, "order")
-                and hasattr(tc_before.order, "list_today_orders")
-            ):
-                last_cid_td = None
-                for _ in range(10):
-                    if last_cid_td:
-                        res_td = tc_before.order.list_today_orders(
-                            acct_before,
+            def _should_abort_wb_cascade(code_v=None, exc_v=None, call_dt_s=0.0):
+                st_i = _extract_err_status(code_v, exc_v)
+                low_msg = str(exc_v or code_v or "").lower()
+                if (
+                    st_i == 429
+                    or "429" in low_msg
+                    or "too_many_requests" in low_msg
+                    or "too many requests" in low_msg
+                ):
+                    self._rate_limit_until = max(
+                        self._rate_limit_until, time.time() + 2.5
+                    )
+                    return True
+                if st_i in (401, 403):
+                    return True
+                if isinstance(exc_v, (TimeoutError, socket.timeout)) or any(
+                    tok in low_msg for tok in ("timed out", "timeout")
+                ):
+                    return True
+                if call_dt_s >= 1.5 or time.monotonic() >= cascade_deadline:
+                    return True
+                return False
+
+            def _item_epoch(it_d):
+                raw_t = (
+                    it_d.get("filled_time")
+                    or it_d.get("update_time")
+                    or it_d.get("create_time")
+                    or it_d.get("placed_time")
+                    or it_d.get("transaction_time")
+                )
+                return self._webull_ts_to_epoch(raw_t)
+
+            try:
+                y_i, m_i, d_i = (int(p) for p in str(today_str).split("-"))
+                today_midnight_ep = float(
+                    datetime(y_i, m_i, d_i, 0, 0, 0, tzinfo=timezone.utc).timestamp()
+                ) + (5 * 3600)
+            except Exception:
+                today_midnight_ep = time.time() - 86400.0
+            cutoff_recent_ep = today_midnight_ep - 86400.0
+
+            def _call_get_hist_paged(ep_fn, cursor_cid, cursor_oid, use_dates):
+                if cursor_cid or cursor_oid:
+                    try:
+                        if use_dates:
+                            return ep_fn(
+                                account_id=acct_before,
+                                page_size=100,
+                                start_date=today_str,
+                                end_date=today_str,
+                                last_client_order_id=cursor_cid or cursor_oid,
+                            )
+                        return ep_fn(
+                            account_id=acct_before,
                             page_size=100,
-                            last_client_order_id=last_cid_td,
+                            last_client_order_id=cursor_cid or cursor_oid,
                         )
-                    else:
-                        res_td = tc_before.order.list_today_orders(
-                            acct_before, page_size=100
+                    except TypeError:
+                        return ep_fn(
+                            account_id=acct_before,
+                            page_size=100,
+                            last_order_id=cursor_oid or cursor_cid,
                         )
-                    if res_td is None or getattr(res_td, "status_code", None) != 200:
-                        break
+                try:
+                    if use_dates:
+                        return ep_fn(
+                            account_id=acct_before,
+                            page_size=100,
+                            start_date=today_str,
+                            end_date=today_str,
+                        )
+                    return ep_fn(account_id=acct_before, page_size=100)
+                except TypeError:
+                    return ep_fn(account_id=acct_before, page_size=100)
+
+            cand_eps = ["v3_get", "v3_list", "v2_get", "v1_today"]
+            pref_ep = getattr(self, "_preferred_wb_history_ep", None)
+            if pref_ep in cand_eps:
+                cand_eps = [pref_ep] + [e_n for e_n in cand_eps if e_n != pref_ep]
+
+            for ep_name in cand_eps:
+                if time.monotonic() >= cascade_deadline:
+                    break
+                ep_orders = []
+                ep_seen = set()
+                ep_complete = False
+                ep_code = None
+                ep_exc = None
+                ep_t0 = time.monotonic()
+                try:
+                    if ep_name == "v3_get":
+                        if not (
+                            hasattr(tc_before, "order_v3")
+                            and hasattr(tc_before.order_v3, "get_order_history")
+                        ):
+                            continue
+                        last_cid_c = None
+                        last_oid_c = None
+                        use_dates_flag = True
+                        for _ in range(10):
+                            try:
+                                res_h = _call_get_hist_paged(
+                                    tc_before.order_v3.get_order_history,
+                                    last_cid_c,
+                                    last_oid_c,
+                                    use_dates_flag,
+                                )
+                            except TypeError:
+                                if last_cid_c or last_oid_c:
+                                    break
+                                use_dates_flag = False
+                                res_h = tc_before.order_v3.get_order_history(
+                                    account_id=acct_before, page_size=100
+                                )
+                            st_h = (
+                                getattr(res_h, "status_code", None)
+                                if res_h is not None
+                                else None
+                            )
+                            if st_h != 200:
+                                ep_code = st_h
+                                break
+                            b_items, _ = _extract_wb_items(res_h.json())
+                            if not b_items:
+                                ep_complete = True
+                                break
+                            n_added, next_cid, next_oid = _register_wb_batch(
+                                b_items, ep_orders, ep_seen
+                            )
+                            if (
+                                n_added <= 0
+                                or len(b_items) < 100
+                                or (not next_cid and not next_oid)
+                            ):
+                                ep_complete = True
+                                break
+                            last_cid_c = next_cid
+                            last_oid_c = next_oid
+
+                    elif ep_name == "v3_list":
+                        if not (
+                            hasattr(tc_before, "order_v3")
+                            and hasattr(tc_before.order_v3, "list_order_history")
+                        ):
+                            continue
+                        pg_key = None
+                        seen_pg = set()
+                        for _ in range(10):
+                            if pg_key:
+                                if pg_key in seen_pg:
+                                    ep_complete = True
+                                    break
+                                seen_pg.add(pg_key)
+                                res_lh = tc_before.order_v3.list_order_history(
+                                    acct_before, pagination_key=pg_key
+                                )
+                            else:
+                                res_lh = tc_before.order_v3.list_order_history(
+                                    acct_before
+                                )
+                            st_lh = (
+                                getattr(res_lh, "status_code", None)
+                                if res_lh is not None
+                                else None
+                            )
+                            if st_lh != 200:
+                                ep_code = st_lh
+                                break
+                            b_items, next_pg = _extract_wb_items(res_lh.json())
+                            if not b_items:
+                                ep_complete = True
+                                break
+                            n_added, _, _ = _register_wb_batch(
+                                b_items, ep_orders, ep_seen
+                            )
+                            item_eps = [
+                                _item_epoch(it_x)
+                                for it_x in b_items
+                                if isinstance(it_x, dict)
+                            ]
+                            parsed_eps = [ev for ev in item_eps if ev > 0.0]
+                            all_older = bool(
+                                parsed_eps and max(parsed_eps) < cutoff_recent_ep
+                            )
+                            if n_added <= 0 or not next_pg or all_older:
+                                ep_complete = True
+                                break
+                            pg_key = str(next_pg)
+                        if ep_complete and ep_orders:
+                            filtered_ep = []
+                            for it_f in ep_orders:
+                                ep_v = _item_epoch(it_f)
+                                if ep_v <= 0.0 or ep_v >= cutoff_recent_ep:
+                                    filtered_ep.append(it_f)
+                            ep_orders = filtered_ep
+
+                    elif ep_name == "v2_get":
+                        if not (
+                            hasattr(tc_before, "order_v2")
+                            and hasattr(tc_before.order_v2, "get_order_history")
+                        ):
+                            continue
+                        last_cid_v2 = None
+                        last_oid_v2 = None
+                        use_dates_v2 = True
+                        for _ in range(10):
+                            try:
+                                res_v2 = _call_get_hist_paged(
+                                    tc_before.order_v2.get_order_history,
+                                    last_cid_v2,
+                                    last_oid_v2,
+                                    use_dates_v2,
+                                )
+                            except TypeError:
+                                if last_cid_v2 or last_oid_v2:
+                                    break
+                                use_dates_v2 = False
+                                res_v2 = tc_before.order_v2.get_order_history(
+                                    account_id=acct_before, page_size=100
+                                )
+                            st_v2 = (
+                                getattr(res_v2, "status_code", None)
+                                if res_v2 is not None
+                                else None
+                            )
+                            if st_v2 != 200:
+                                ep_code = st_v2
+                                break
+                            b_items, _ = _extract_wb_items(res_v2.json())
+                            if not b_items:
+                                ep_complete = True
+                                break
+                            n_added, next_cid, next_oid = _register_wb_batch(
+                                b_items, ep_orders, ep_seen
+                            )
+                            if (
+                                n_added <= 0
+                                or len(b_items) < 100
+                                or (not next_cid and not next_oid)
+                            ):
+                                ep_complete = True
+                                break
+                            last_cid_v2 = next_cid
+                            last_oid_v2 = next_oid
+
+                    elif ep_name == "v1_today":
+                        if not (
+                            hasattr(tc_before, "order")
+                            and hasattr(tc_before.order, "list_today_orders")
+                        ):
+                            continue
+                        last_cid_td = None
+                        for _ in range(10):
+                            if last_cid_td:
+                                res_td = tc_before.order.list_today_orders(
+                                    acct_before,
+                                    page_size=100,
+                                    last_client_order_id=last_cid_td,
+                                )
+                            else:
+                                res_td = tc_before.order.list_today_orders(
+                                    acct_before, page_size=100
+                                )
+                            st_td = (
+                                getattr(res_td, "status_code", None)
+                                if res_td is not None
+                                else None
+                            )
+                            if st_td != 200:
+                                ep_code = st_td
+                                break
+                            b_items, _ = _extract_wb_items(res_td.json())
+                            if not b_items:
+                                ep_complete = True
+                                break
+                            n_added, next_cid, _ = _register_wb_batch(
+                                b_items, ep_orders, ep_seen
+                            )
+                            if n_added <= 0 or len(b_items) < 100 or not next_cid:
+                                ep_complete = True
+                                break
+                            last_cid_td = next_cid
+                except Exception as exc_ep:
+                    ep_exc = exc_ep
+                    ep_complete = False
+
+                ep_dt_s = time.monotonic() - ep_t0
+                if ep_complete:
+                    wb_raw_orders = ep_orders
+                    wb_seen_ids = ep_seen
                     wb_fetch_ok = True
-                    b_items, _ = _extract_wb_items(res_td.json())
-                    if not b_items:
-                        break
-                    n_added, next_cid = _register_wb_batch(b_items)
-                    if n_added <= 0 or len(b_items) < 100 or not next_cid:
-                        break
-                    last_cid_td = next_cid
+                    self._preferred_wb_history_ep = ep_name
+                    break
+
+                last_fail_code = ep_code
+                last_fail_exc = ep_exc
+                if _should_abort_wb_cascade(
+                    code_v=ep_code, exc_v=ep_exc, call_dt_s=ep_dt_s
+                ):
+                    break
 
             if not wb_fetch_ok:
                 dt_f_ms = (time.monotonic() - t0) * 1000.0
@@ -13646,9 +14483,18 @@ class WebullAdapter:
                         self._orders_window_fail_ts[
                             (acct_before, gen_before)
                         ] = (time.monotonic(), dt_f_ms)
+                fail_why = (
+                    type(last_fail_exc).__name__
+                    if last_fail_exc is not None
+                    else (
+                        f"HTTP {last_fail_code}"
+                        if last_fail_code is not None
+                        else "non-200/incomplete response"
+                    )
+                )
                 log_event(
                     "WARN",
-                    f"Webull order_history failed in {dt_f_ms:.0f}ms (non-200 response).",
+                    f"Webull order_history failed in {dt_f_ms:.0f}ms ({fail_why}).",
                 )
                 return None
 
@@ -14720,6 +15566,15 @@ class WebullAdapter:
                         (self.account_id, display_sym), None
                     )
             except Exception as e:
+                if _is_definitive_broker_order_rejection(e):
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, display_sym), None
+                    )
+                    log_event(
+                        "WARN",
+                        f"Webull option exit order on {display_sym} definitively rejected by broker ({e}) — cleared pending order tracker for retry.",
+                    )
+                    continue
                 log_event(
                     "ERROR",
                     f"Webull option place_order exception ({display_sym}): {e}"
@@ -14751,7 +15606,11 @@ class WebullAdapter:
         self.invalidate_cached_snapshots()
         use_market = is_market_hours()
         ext_quotes = {}
-        if not use_market and self.data_client is not None:
+        if (
+            not use_market
+            and self.data_client is not None
+            and time.monotonic() >= float(getattr(self, "_market_data_unsubscribed_until", 0.0) or 0.0)
+        ):
             try:
                 syms_to_quote = [
                     str(it[0]).strip()
@@ -14766,7 +15625,8 @@ class WebullAdapter:
                     snap_res = self.data_client.market_data.get_snapshot(
                         syms_to_quote, "US_STOCK", extend_hour_required=True
                     )
-                    if getattr(snap_res, "status_code", None) == 200:
+                    snap_code = getattr(snap_res, "status_code", None)
+                    if snap_code == 200:
                         snap_json = snap_res.json()
                         snap_list = (
                             snap_json
@@ -14779,11 +15639,37 @@ class WebullAdapter:
                             for sq in snap_list:
                                 if isinstance(sq, dict) and sq.get("symbol"):
                                     ext_quotes[str(sq["symbol"]).strip()] = sq
+                    else:
+                        snap_txt = str(getattr(snap_res, "text", "") or "").lower()
+                        if snap_code == 403 or "market_data_not_subscribed" in snap_txt:
+                            self._market_data_unsubscribed_until = time.monotonic() + 1800.0
+                            log_event(
+                                "SESSION",
+                                "Webull Market Data quote add-on not subscribed (HTTP 403) — "
+                                "using live account position prices for Extended-Hours limit exits (re-checking in 30m).",
+                            )
             except Exception as qe:
-                log_event(
-                    "WARN",
-                    f"Webull DataClient snapshot fallback to position price: {qe}",
-                )
+                q_st = getattr(qe, "get_http_status", None)
+                q_code = q_st() if callable(q_st) else getattr(qe, "http_status", None)
+                q_ecd = str(getattr(qe, "error_code", "") or "").upper()
+                q_low = str(qe or "").lower()
+                if (
+                    q_code == 403
+                    or "MARKET_DATA_NOT_SUBSCRIBED" in q_ecd
+                    or "market_data_not_subscribed" in q_low
+                    or "http status: 403" in q_low
+                ):
+                    self._market_data_unsubscribed_until = time.monotonic() + 1800.0
+                    log_event(
+                        "SESSION",
+                        "Webull Market Data quote add-on not subscribed (HTTP 403) — "
+                        "using live account position prices for Extended-Hours limit exits (re-checking in 30m).",
+                    )
+                else:
+                    log_event(
+                        "WARN",
+                        f"Webull DataClient snapshot fallback to position price: {qe}",
+                    )
 
         for item in open_positions:
             symbol = str(item[0]).strip()
@@ -14965,12 +15851,17 @@ class WebullAdapter:
                     self._pending_flatten_cids.pop(
                         (self.account_id, symbol), None
                     )
+                    r_txt_w = str(getattr(r, "text", "") or "").strip()
+                    if r_txt_w:
+                        log_event(
+                            "WARN",
+                            f"Webull {side} {symbol} rejected (HTTP {code}): {_clip_log_detail(r_txt_w, 160)}",
+                        )
                     if is_pure_fractional:
                         mark_uncloseable_fractional_sym(
                             self.account_id, symbol, f_qty
                         )
             except Exception as e:
-                log_event("ERROR", f"Webull place_order exception: {e}")
                 if is_pure_fractional:
                     self._pending_flatten_cids.pop(
                         (self.account_id, symbol), None
@@ -14978,7 +15869,18 @@ class WebullAdapter:
                     mark_uncloseable_fractional_sym(
                         self.account_id, symbol, f_qty
                     )
+                    log_event("ERROR", f"Webull place_order exception: {e}")
                     continue
+                if _is_definitive_broker_order_rejection(e):
+                    self._pending_flatten_cids.pop(
+                        (self.account_id, symbol), None
+                    )
+                    log_event(
+                        "WARN",
+                        f"Webull exit order on {symbol} definitively rejected by broker ({e}) — cleared pending order tracker for retry.",
+                    )
+                    continue
+                log_event("ERROR", f"Webull place_order exception: {e}")
                 w_q, f_q = self.get_recent_exit_order_coverage(
                     symbol,
                     is_short=(f_qty < 0),
@@ -15540,6 +16442,8 @@ class DemoBrokerAdapter:
         self._last_snapshot_epoch = {}
         self.last_preserved_close_qty = {}
         self.last_cancel_failed_syms = set()
+        self.last_pending_cancel_syms = set()
+        self.last_pending_cancel_qty = {}
         self.last_coverage_lookup_failed = False
         self._last_cov_saw_dead_pend = False
         self.last_positions_fetch_ok = True
@@ -15857,6 +16761,8 @@ class DemoBrokerAdapter:
             self._settle_expired_halts()
             self.last_preserved_close_qty = {}
             self.last_cancel_failed_syms = set()
+            self.last_pending_cancel_syms = set()
+            self.last_pending_cancel_qty = {}
             preserve_map = preserve_market_close_map or {}
             kept = []
             for wo in self._working_orders:
@@ -21090,6 +21996,7 @@ def flatten_equities(
                 _clear_launch_grace_state()
             try:
                 setattr(adapter, "_last_flatten_halted_with_working_exit", False)
+                setattr(adapter, "_last_flatten_blocked_by_pending_cancel", False)
                 setattr(adapter, "_last_flatten_outcome", "OPEN")
                 setattr(adapter, "_post_flatten_opt_verify", None)
             except Exception:
@@ -21157,6 +22064,9 @@ def flatten_equities(
                 failed_cancels = (
                     getattr(adapter, "last_cancel_failed_syms", set()) or set()
                 )
+                pend_cancel_qty_map = (
+                    getattr(adapter, "last_pending_cancel_qty", {}) or {}
+                )
                 uncovered = []
                 for item in pos_list:
                     sym = item[0]
@@ -21180,6 +22090,7 @@ def flatten_equities(
                         )
                         submitted_map[sym] = max(sub_q, abs_q)
                         continue
+                    cand_item = item
                     if (
                         sub_q > 0
                         and hasattr(adapter, "get_recent_exit_order_coverage")
@@ -21222,11 +22133,31 @@ def flatten_equities(
                                 f"Partial exit coverage on {sym} (init={init_q:g}, open={abs_q:g}, filled={f_q:g}, working={w_q:g}) "
                                 f"— submitting uncovered remainder ({rem_signed_q:+g}).",
                             )
-                            uncovered.append(
-                                (sym, rem_signed_q) + tuple(item[2:])
+                            cand_item = (sym, rem_signed_q) + tuple(item[2:])
+                    blocked_q = float(pend_cancel_qty_map.get(sym, 0.0) or 0.0)
+                    if blocked_q > 1e-6:
+                        cand_abs = abs(float(cand_item[1]))
+                        sendable_abs = max(0.0, cand_abs - blocked_q)
+                        if sendable_abs <= 1e-6:
+                            log_event(
+                                "WARN",
+                                f"Exit order for {sym} ({qty:+g}) held by {blocked_q:g} share(s) "
+                                f"in broker PENDING_CANCEL state — waiting for cancel to settle.",
                             )
                             continue
-                    uncovered.append(item)
+                        if sendable_abs < (cand_abs - 1e-6):
+                            send_signed = (
+                                sendable_abs if qty > 0 else -sendable_abs
+                            )
+                            if float(send_signed).is_integer():
+                                send_signed = int(round(send_signed))
+                            log_event(
+                                "FLATTEN",
+                                f"Partial PENDING_CANCEL on {sym} (need={cand_abs:g}, pending_cancel={blocked_q:g}) "
+                                f"— submitting unblocked {send_signed:+g} immediately.",
+                            )
+                            cand_item = (sym, send_signed) + tuple(item[2:])
+                    uncovered.append(cand_item)
                 return uncovered
 
             def _clean_pos(p_list):
@@ -21410,43 +22341,173 @@ def flatten_equities(
 
                 _t_sb0 = time.monotonic()
                 _did_submit_any = False
-                if open_pos:
-                    to_sub_eq = _filter_uncovered_positions(
-                        open_pos, submitted_close_eq, is_opt_flag=False
-                    )
-                    if to_sub_eq:
-                        _did_submit_any = True
-                        log_event("FLATTEN", f"Equity positions to liquidate: {to_sub_eq}")
-                        syms_str = ", ".join(f"{x[0]} ({x[1]:+g})" for x in to_sub_eq[:4])
-                        _notify_status(
-                            "✓  1. Working Orders: Open working orders canceled & cleared",
-                            True,
-                            f"⏳  2. Daytrade Positions: Submitting exit order(s) for {syms_str}...",
-                            False,
+
+                def _submit_eq_and_opt(eq_items, opt_items):
+                    did_s = False
+                    if eq_items:
+                        to_sub_eq = _filter_uncovered_positions(
+                            eq_items, submitted_close_eq, is_opt_flag=False
                         )
-                        sub_ok = adapter.submit_liquidation_batch(to_sub_eq) or {}
-                        submitted_close_eq.update(sub_ok)
-                if include_options and open_opt:
-                    to_sub_opt = _filter_uncovered_positions(
-                        open_opt, submitted_close_opt, is_opt_flag=True
+                        if to_sub_eq:
+                            did_s = True
+                            log_event(
+                                "FLATTEN",
+                                f"Equity positions to liquidate: {to_sub_eq}",
+                            )
+                            syms_str = ", ".join(
+                                f"{x[0]} ({x[1]:+g})" for x in to_sub_eq[:4]
+                            )
+                            _notify_status(
+                                "✓  1. Working Orders: Open working orders canceled & cleared",
+                                True,
+                                f"⏳  2. Daytrade Positions: Submitting exit order(s) for {syms_str}...",
+                                False,
+                            )
+                            sub_ok = (
+                                adapter.submit_liquidation_batch(to_sub_eq)
+                                or {}
+                            )
+                            submitted_close_eq.update(sub_ok)
+                    if include_options and opt_items:
+                        to_sub_opt = _filter_uncovered_positions(
+                            opt_items, submitted_close_opt, is_opt_flag=True
+                        )
+                        if to_sub_opt:
+                            did_s = True
+                            log_event(
+                                "FLATTEN",
+                                f"Option positions to liquidate (BETA): {_fmt_opt_summary(to_sub_opt)}",
+                            )
+                            _notify_status(
+                                "✓  1. Working Orders: Open working orders canceled & cleared",
+                                True,
+                                f"⏳  2. Daytrade Positions: Submitting option exit order(s) ({len(to_sub_opt)} leg(s))...",
+                                False,
+                            )
+                            sub_opt_ok = (
+                                adapter.submit_option_liquidation_batch(
+                                    to_sub_opt
+                                )
+                                or {}
+                            )
+                            submitted_close_opt.update(sub_opt_ok)
+                    return did_s
+
+                pend_syms_init = set(
+                    getattr(adapter, "last_pending_cancel_syms", set()) or set()
+                )
+                blocking_pend_init = pend_syms_init & (
+                    {x[0] for x in (open_pos or [])}
+                    | (
+                        {x[0] for x in (open_opt or [])}
+                        if include_options
+                        else set()
                     )
-                    if to_sub_opt:
+                )
+                if blocking_pend_init:
+                    clean_eq_init = [
+                        x
+                        for x in (open_pos or [])
+                        if x[0] not in blocking_pend_init
+                    ]
+                    clean_opt_init = [
+                        x
+                        for x in (open_opt or [])
+                        if x[0] not in blocking_pend_init
+                    ]
+                    if _submit_eq_and_opt(clean_eq_init, clean_opt_init):
                         _did_submit_any = True
+                    if hasattr(adapter, "poll_pending_cancel_settlement"):
+                        adapter.poll_pending_cancel_settlement(
+                            blocking_pend_init,
+                            preserve_map=init_preserve_map,
+                            max_wait_s=0.9,
+                            interval_s=0.3,
+                        )
+                    post_eq = _clean_pos(
+                        _call_adapter_open_eq(
+                            adapter, allow_stale_cache=False, pace_for_verify=True
+                        )
+                    )
+                    if post_eq is not None:
+                        open_pos = post_eq
+                    post_opt = _clean_pos(
+                        _call_adapter_open_opt(
+                            adapter,
+                            allow_stale_cache=False,
+                            pace_for_verify=True,
+                            reuse_paired_eq_read=True,
+                        )
+                        if include_options
+                        and hasattr(adapter, "get_open_option_positions")
+                        else []
+                    )
+                    if include_options and post_opt is not None:
+                        open_opt = post_opt
+                    for item in (open_pos or []):
+                        ever_seen_eq.add(item[0])
+                        initial_abs_eq[item[0]] = max(
+                            float(initial_abs_eq.get(item[0], 0.0)),
+                            abs(float(item[1])),
+                        )
+                    for item in (open_opt or []):
+                        ever_seen_opt.add(item[0])
+                        initial_abs_opt[item[0]] = max(
+                            float(initial_abs_opt.get(item[0], 0.0)),
+                            abs(float(item[1])),
+                        )
+                    if (
+                        open_pos is not None
+                        and len(open_pos) == 0
+                        and (
+                            not include_options
+                            or (open_opt is not None and len(open_opt) == 0)
+                        )
+                    ):
                         log_event(
                             "FLATTEN",
-                            f"Option positions to liquidate (BETA): {_fmt_opt_summary(to_sub_opt)}"
+                            "Pending-cancel settlement check shows 0 open positions (#1/3). "
+                            "Running 0.8s settlement triple-confirm (Checks #2/3 & #3/3)...",
                         )
-                        _notify_status(
-                            "✓  1. Working Orders: Open working orders canceled & cleared",
-                            True,
-                            f"⏳  2. Daytrade Positions: Submitting option exit order(s) ({len(to_sub_opt)} leg(s))...",
-                            False,
-                        )
-                        sub_opt_ok = (
-                            adapter.submit_option_liquidation_batch(to_sub_opt)
-                            or {}
-                        )
-                        submitted_close_opt.update(sub_opt_ok)
+                        triple_post_ok = True
+                        for _chk_idx in (2, 3):
+                            time.sleep(_triple_sleep_s)
+                            open_pos = _clean_pos(
+                                _call_adapter_open_eq(
+                                    adapter,
+                                    allow_stale_cache=False,
+                                    pace_for_verify=True,
+                                )
+                            )
+                            open_opt = _clean_pos(
+                                _call_adapter_open_opt(
+                                    adapter,
+                                    allow_stale_cache=False,
+                                    pace_for_verify=True,
+                                    reuse_paired_eq_read=True,
+                                )
+                                if include_options
+                                and hasattr(adapter, "get_open_option_positions")
+                                else []
+                            )
+                            if not (
+                                open_pos is not None
+                                and len(open_pos) == 0
+                                and (
+                                    not include_options
+                                    or (
+                                        open_opt is not None
+                                        and len(open_opt) == 0
+                                    )
+                                )
+                            ):
+                                triple_post_ok = False
+                                break
+                        if triple_post_ok:
+                            return _mark_flatten_flat()
+
+                if _submit_eq_and_opt(open_pos, open_opt):
+                    _did_submit_any = True
                 submit_ms = (time.monotonic() - _t_sb0) * 1000.0
                 if _did_submit_any or cancel_ms >= 250.0:
                     prep_tot_ms = (time.monotonic() - _t_f_start) * 1000.0
@@ -21537,9 +22598,7 @@ def flatten_equities(
                 if include_options
                 else "Polling broker API to verify 0 open equity shares..."
             )
-            max_wait_s = (
-                25.0 if getattr(adapter, "name", "") == "WEBULL" else 15.0
-            )
+            max_wait_s = _get_flatten_timeout_sec(adapter)
             start_wait = time.time()
             polls = 0
             last_live_verify_open_count = None
@@ -21733,7 +22792,15 @@ def flatten_equities(
                     )
                     break
 
-                if should_exec and polls % 2 == 0:
+                _curr_pend_syms = set(
+                    getattr(adapter, "last_pending_cancel_syms", set()) or set()
+                )
+                _curr_open_syms = {x[0] for x in (rem_pos or [])} | (
+                    {x[0] for x in (rem_opt or [])} if include_options else set()
+                )
+                if should_exec and (
+                    polls % 2 == 0 or bool(_curr_pend_syms & _curr_open_syms)
+                ):
                     log_event(
                         "FLATTEN",
                         "Positions still open after 4s — inspecting working orders & sweeping uncovered shares..."
@@ -21867,6 +22934,22 @@ def flatten_equities(
                         and not uncovered_opt
                         and polls >= 4
                         and (rem_pos or (include_options and rem_opt))
+                        and not (
+                            set(
+                                getattr(
+                                    adapter, "last_pending_cancel_syms", set()
+                                )
+                                or set()
+                            )
+                            & (
+                                {x[0] for x in (rem_pos or [])}
+                                | (
+                                    {x[0] for x in (rem_opt or [])}
+                                    if include_options
+                                    else set()
+                                )
+                            )
+                        )
                     ):
                         try:
                             setattr(
@@ -22016,11 +23099,29 @@ def flatten_equities(
                     f"(broker API rate-limited/unreachable — position state unverified)!"
                 )
             else:
+                pend_timeout_syms = sorted(
+                    set(getattr(adapter, "last_pending_cancel_syms", set()) or set())
+                    & ({x[0] for x in rem_final_eq} | {x[0] for x in rem_final_opt})
+                )
+                if pend_timeout_syms:
+                    try:
+                        setattr(
+                            adapter,
+                            "_last_flatten_blocked_by_pending_cancel",
+                            True,
+                        )
+                    except Exception:
+                        pass
+                pend_sfx = (
+                    f" (order(s) stuck in PENDING_CANCEL / auction freeze on {pend_timeout_syms} — verify at broker!)"
+                    if pend_timeout_syms
+                    else ""
+                )
                 log_event(
                     "CRITICAL",
-                    f"Flatten {int(max_wait_s)}s timeout reached! Positions (Equities/Options) still open!"
+                    f"Flatten {int(max_wait_s)}s timeout reached! Positions (Equities/Options) still open!{pend_sfx}"
                     if include_options
-                    else f"Equity flatten {int(max_wait_s)}s timeout reached! Shares still open!"
+                    else f"Equity flatten {int(max_wait_s)}s timeout reached! Shares still open!{pend_sfx}"
                 )
             return False
 
@@ -22088,7 +23189,8 @@ def trigger_manual_panic_flatten(
     (and options if Options Auto-Flatten + Waiver are armed during RTH).
     Runs on a background daemon thread when run_async=True so the Tkinter UI
     never freezes."""
-    global _manual_flatten_in_flight
+    global _manual_flatten_in_flight, _manual_flatten_started_mono
+    global _manual_flatten_target_adapter, _manual_flatten_pause_warned
     target_adapter = adapter if adapter is not None else active_adapter
     if target_adapter is None:
         if callable(on_done_cb):
@@ -22108,10 +23210,14 @@ def trigger_manual_panic_flatten(
                     pass
             return False
         _manual_flatten_in_flight = True
+        _manual_flatten_started_mono = time.monotonic()
+        _manual_flatten_target_adapter = target_adapter
+        _manual_flatten_pause_warned = False
         _clear_launch_grace_state()
 
     def _worker():
-        global _manual_flatten_in_flight
+        global _manual_flatten_in_flight, _manual_flatten_started_mono
+        global _manual_flatten_target_adapter, _manual_flatten_pause_warned
         ok = False
         panic_status = "INCOMPLETE"
         try:
@@ -22193,10 +23299,30 @@ def trigger_manual_panic_flatten(
                         )
             else:
                 panic_status = "INCOMPLETE"
-                log_event(
-                    "CRITICAL",
-                    "Manual Emergency Flatten did not confirm 100% flat within 15s!",
-                )
+                to_sec = int(_get_flatten_timeout_sec(target_adapter))
+                if getattr(
+                    target_adapter,
+                    "_last_flatten_halted_with_working_exit",
+                    False,
+                ):
+                    log_event(
+                        "FLATTEN",
+                        "Manual Emergency Flatten ended sweep early: remaining position(s) have working exit order(s) queued (likely LULD halt).",
+                    )
+                elif getattr(
+                    target_adapter,
+                    "_last_flatten_blocked_by_pending_cancel",
+                    False,
+                ):
+                    log_event(
+                        "CRITICAL",
+                        f"Manual Emergency Flatten did not confirm 100% flat within {to_sec}s (order(s) stuck in PENDING_CANCEL / auction freeze)!",
+                    )
+                else:
+                    log_event(
+                        "CRITICAL",
+                        f"Manual Emergency Flatten did not confirm 100% flat within {to_sec}s!",
+                    )
                 if ui_button is not None:
                     trigger_alarm(
                         "MANUAL FLATTEN INCOMPLETE — CHECK POSITIONS!",
@@ -22215,6 +23341,13 @@ def trigger_manual_panic_flatten(
                 pass
             with _manual_flatten_state_lock:
                 _manual_flatten_in_flight = False
+                _manual_flatten_started_mono = 0.0
+                _manual_flatten_target_adapter = None
+                _manual_flatten_pause_warned = False
+            try:
+                _wake_data_loop()
+            except Exception:
+                pass
             if callable(on_done_cb):
                 try:
                     on_done_cb(ok)
@@ -22222,7 +23355,24 @@ def trigger_manual_panic_flatten(
                     pass
 
     if run_async:
-        threading.Thread(target=_worker, daemon=True).start()
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as th_exc:
+            with _manual_flatten_state_lock:
+                _manual_flatten_in_flight = False
+                _manual_flatten_started_mono = 0.0
+                _manual_flatten_target_adapter = None
+                _manual_flatten_pause_warned = False
+            log_event(
+                "ERROR",
+                f"Failed to start Manual Emergency Flatten thread: {th_exc}",
+            )
+            if callable(on_done_cb):
+                try:
+                    on_done_cb(False)
+                except Exception:
+                    pass
+            return False
         return True
     _worker()
     return True
@@ -25584,16 +26734,61 @@ def _reconcile_off_session_flat_delta(eq_now, is_fl_now):
     return _reconcile_off_session_activity(eq_now, True, 0.0, {})
 
 
-def _recheck_presync_save_lock_after_sync(settled_flat_eq):
+def _recheck_presync_save_lock_after_sync(
+    settled_flat_eq, live_eq_now=None, is_flat_now=True
+):
     """If Settings saved while Pre-Flight background sync was still pending and
-    newly engaged `is_locked_down` against stale pre-sync equity, re-evaluates
-    once after Poll #1 finishes off-session catch-up."""
+    locked against stale pre-sync state/pin, re-evaluates once after Poll #1
+    finishes off-session catch-up."""
     global is_locked_down, active_breach_source, last_breach_trigger_net_pnl
     global _breach_pin_rt_pending, _breach_pin_retired, daily_breach_settings_prompted
-    global _lock_from_presync_save
-    if not _lock_from_presync_save:
+    global _lock_from_presync_save, _presync_rearm_token
+    rearm_tok = _presync_rearm_token
+    _presync_rearm_token = None
+    if _lock_from_presync_save:
+        _lock_from_presync_save = False
+        if (
+            not is_locked_down
+            or is_committed_for_today()
+            or start_equity is None
+            or settled_flat_eq is None
+        ):
+            return False
+        fl_eq, _, _, tier_short, _, _ = describe_active_floor(config)
+        if fl_eq is not None and float(settled_flat_eq) > float(fl_eq):
+            is_locked_down = False
+            active_breach_source = ""
+            last_breach_trigger_net_pnl = None
+            _breach_pin_rt_pending = False
+            _breach_pin_retired = False
+            daily_breach_settings_prompted = False
+            save_session_state()
+            log_event(
+                "SESSION",
+                f"Pre-sync Daily Stop lock cleared after Poll #1 off-session catch-up "
+                f"({format_dollar(round(float(settled_flat_eq) - float(fl_eq), 2))} buffer above "
+                f"{format_dollar(round(float(fl_eq) - float(start_equity), 2))} [{tier_short}]).",
+            )
+            return True
         return False
-    _lock_from_presync_save = False
+
+    if not (isinstance(rearm_tok, tuple) and len(rearm_tok) == 4):
+        return False
+    tok_skey, tok_epoch, tok_mono, tok_pinless_widened = rearm_tok
+    if active_adapter is None or is_demo_mode_active(active_adapter):
+        return False
+    cur_skey = get_session_key(
+        getattr(active_adapter, "name", ""),
+        getattr(active_adapter, "account_id", ""),
+    )
+    if (
+        not cur_skey
+        or cur_skey != tok_skey
+        or int(get_adapter_epoch()) != int(tok_epoch)
+        or (time.monotonic() - float(tok_mono)) < 0.0
+        or (time.monotonic() - float(tok_mono)) > 180.0
+    ):
+        return False
     if (
         not is_locked_down
         or is_committed_for_today()
@@ -25602,19 +26797,41 @@ def _recheck_presync_save_lock_after_sync(settled_flat_eq):
     ):
         return False
     fl_eq, _, _, tier_short, _, _ = describe_active_floor(config)
-    if fl_eq is not None and float(settled_flat_eq) > float(fl_eq):
+    if fl_eq is None:
+        return False
+    base_eq = (
+        min(float(settled_flat_eq), float(live_eq_now))
+        if (not is_flat_now and live_eq_now is not None)
+        else float(settled_flat_eq)
+    )
+    eff_eq = (
+        min(
+            base_eq,
+            round(float(start_equity) + float(last_breach_trigger_net_pnl), 2),
+        )
+        if last_breach_trigger_net_pnl is not None
+        else base_eq
+    )
+    pinless_blocks = bool(
+        last_breach_trigger_net_pnl is None
+        and not _breach_pin_retired
+        and not bool(tok_pinless_widened)
+    )
+    if eff_eq > float(fl_eq) and not pinless_blocks:
         is_locked_down = False
         active_breach_source = ""
         last_breach_trigger_net_pnl = None
         _breach_pin_rt_pending = False
         _breach_pin_retired = False
+        _lock_from_presync_save = False
         daily_breach_settings_prompted = False
         save_session_state()
         log_event(
             "SESSION",
-            f"Pre-sync Daily Stop lock cleared after Poll #1 off-session catch-up "
-            f"({format_dollar(round(float(settled_flat_eq) - float(fl_eq), 2))} buffer above "
-            f"{format_dollar(round(float(fl_eq) - float(start_equity), 2))} [{tier_short}]).",
+            f"Daily Stop RE-ARMED at "
+            f"{format_dollar(round(float(fl_eq) - float(start_equity), 2))} "
+            f"[{tier_short}] "
+            f"({format_dollar(round(eff_eq - float(fl_eq), 2))} buffer to stop; verified after Poll #1 off-session catch-up).",
         )
         return True
     return False
@@ -25674,7 +26891,9 @@ def _stabilize_mid_fill_realized_and_equity(
                         and isinstance(_off_session_pending_boundary, dict)
                     ):
                         _off_session_pending_boundary["live_advanced"] = True
-            _recheck_presync_save_lock_after_sync(current_eq)
+            _recheck_presync_save_lock_after_sync(
+                current_eq, live_eq_now=current_eq, is_flat_now=True
+            )
             last_flat_equity = current_eq
             if current_eq > max_equity:
                 max_equity = current_eq
@@ -25705,7 +26924,9 @@ def _stabilize_mid_fill_realized_and_equity(
                     _off_session_pending_boundary["live_advanced"] = True
             realized_pnl = _round_cents((current_eq - start_equity) - open_pnl)
             last_flat_equity = _round_cents(start_equity + realized_pnl)
-            _recheck_presync_save_lock_after_sync(last_flat_equity)
+            _recheck_presync_save_lock_after_sync(
+                last_flat_equity, live_eq_now=current_eq, is_flat_now=False
+            )
             prev_flat_realized_pnl = realized_pnl
         settled_realized_pnl = realized_pnl
         flat_desync_streak = 0
@@ -27630,7 +28851,7 @@ def _apply_pending_baseline_revert(
     global last_flat_equity, anchor_cash_flow, _last_logged_unanchored_cash_flow
     global has_reset_at_open, has_reset_at_close, is_locked_down, active_breach_source
     global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired
-    global _lock_from_presync_save, done_for_today, daily_breach_settings_prompted
+    global _lock_from_presync_save, _presync_rearm_token, done_for_today, daily_breach_settings_prompted
     global win_trades, loss_trades, prev_flat_realized_pnl, settled_realized_pnl
     global flat_desync_streak, in_trade_desync_streak, pending_scale_out_tol
     global current_upside_tier, first_poll_of_launch, _baseline_archive, _manual_reanchor_pending
@@ -27778,6 +28999,7 @@ def _apply_pending_baseline_revert(
     _breach_pin_rt_pending = False
     _breach_pin_retired = False
     _lock_from_presync_save = False
+    _presync_rearm_token = None
     daily_breach_settings_prompted = False
     flat_desync_streak = 0
     in_trade_desync_streak = 0
@@ -27891,6 +29113,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global _off_session_pending_boundary
     global _reconciled_through_epoch, _reconciled_order_qty, _off_session_peak_reconstructed
     global _last_live_hud_snapshot, _pending_flat_recap
+    global _manual_flatten_pause_warned
 
     consecutive_api_failures = 0
     consecutive_loop_exceptions = 0
@@ -27926,6 +29149,34 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
 
             if active_adapter is None or broker_reconfig_in_progress:
                 time.sleep(0.5)
+                continue
+
+            _pause_for_manual_flatten = False
+            with _manual_flatten_state_lock:
+                if (
+                    _manual_flatten_in_flight
+                    and not first_poll_of_launch
+                    and _manual_flatten_target_adapter is active_adapter
+                ):
+                    _flt_bound_s = _get_flatten_timeout_sec(active_adapter) + 20.0
+                    _flt_age_s = max(
+                        0.0,
+                        time.monotonic()
+                        - float(_manual_flatten_started_mono or 0.0),
+                    )
+                    if _flt_age_s < _flt_bound_s:
+                        _pause_for_manual_flatten = True
+                    elif not _manual_flatten_pause_warned:
+                        _manual_flatten_pause_warned = True
+                        log_event(
+                            "WARN",
+                            f"Manual flatten background thread exceeded {_flt_bound_s:.0f}s "
+                            f"safety pause bound — resuming live HUD polling immediately.",
+                        )
+            if _pause_for_manual_flatten:
+                if _data_loop_wake_event.wait(timeout=0.25):
+                    _data_loop_wake_event.clear()
+                _touch_data_loop_heartbeat()
                 continue
 
             poll_ad = None
@@ -30734,6 +31985,8 @@ def show_preflight_window(
     else:
         _init_win_boot = bool(config.get("start_with_windows", False))
         _init_win_boot_dis = False
+    if _read_version_checkin_stamp().get("opt_out") is True:
+        config["share_anonymous_version_count"] = False
     _prefs_trace_state = {
         "suppress_user_toggle": False,
         "debug": bool(
@@ -30741,6 +31994,7 @@ def show_preflight_window(
             or ("--console" in sys.argv)
         ),
         "updates": bool(config.get("check_updates_on_startup", True)),
+        "version_count": _is_version_checkin_enabled(config),
         "mute": bool(config.get("mute_all_audio", False)),
         "start_win": _init_win_boot,
         "win_disabled": _init_win_boot_dis,
@@ -30867,6 +32121,20 @@ def show_preflight_window(
         save_config(config)
 
     var_check_updates_on_startup.trace_add("write", _on_toggle_check_updates)
+    var_share_version_count = tk.BooleanVar(
+        value=_prefs_trace_state["version_count"]
+    )
+
+    def _on_toggle_share_version_count(*_):
+        vc_now = bool(var_share_version_count.get())
+        if vc_now == _prefs_trace_state["version_count"]:
+            return
+        _prefs_trace_state["version_count"] = vc_now
+        _set_version_checkin_sticky_opt_out(not vc_now)
+        config["share_anonymous_version_count"] = vc_now
+        save_config(config)
+
+    var_share_version_count.trace_add("write", _on_toggle_share_version_count)
     var_mute_all_audio = tk.BooleanVar(value=_prefs_trace_state["mute"])
 
     def _on_toggle_mute_all_audio(*_):
@@ -36080,6 +37348,17 @@ def show_preflight_window(
             )
             if bool(var_check_updates_on_startup.get()) != target_upd:
                 var_check_updates_on_startup.set(target_upd)
+            target_vcnt = bool(
+                src.get(
+                    "share_anonymous_version_count",
+                    DEFAULT_CONFIG["share_anonymous_version_count"],
+                )
+                and _is_version_checkin_enabled(config)
+            )
+            _prefs_trace_state["version_count"] = target_vcnt
+            if bool(var_share_version_count.get()) != target_vcnt:
+                var_share_version_count.set(target_vcnt)
+            config["share_anonymous_version_count"] = target_vcnt
             target_mute = bool(
                 src.get(
                     "mute_all_audio",
@@ -36229,6 +37508,9 @@ def show_preflight_window(
                 "reset_at_925": bool(var_reset925.get()),
                 "ignore_preexisting_positions": bool(var_ignore_preexisting.get()),
                 "auto_share_sanitized_logs": bool(var_auto_share_logs.get()),
+                "share_anonymous_version_count": bool(
+                    var_share_version_count.get()
+                ),
                 "show_debug_console": bool(var_debug_console.get()),
                 "check_updates_on_startup": bool(
                     var_check_updates_on_startup.get()
@@ -36279,6 +37561,7 @@ def show_preflight_window(
         global force_reanchor, _manual_reanchor_pending, is_locked_down, active_breach_source
         global _pending_reanchor_curve_seed, pending_baseline_revert, pending_baseline_revert_done_today
         global last_breach_trigger_net_pnl, _breach_pin_rt_pending, _breach_pin_retired, _lock_from_presync_save
+        global _presync_rearm_token
         global current_is_flat, active_adapter, _launch_fee_drift_checked, _launch_live_sync_deferred
         global active_preflight_close_fn, active_preflight_win
         global daily_breach_settings_prompted, breach_visual_sim_active
@@ -36335,6 +37618,9 @@ def show_preflight_window(
             new_cfg["enable_upside_chime"] = bool(var_upside_chime.get())
             new_cfg["auto_share_sanitized_logs"] = bool(
                 var_auto_share_logs.get()
+            )
+            new_cfg["share_anonymous_version_count"] = bool(
+                var_share_version_count.get()
             )
             new_cfg["show_debug_console"] = bool(var_debug_console.get())
             new_cfg["check_updates_on_startup"] = bool(
@@ -36530,6 +37816,9 @@ def show_preflight_window(
             )
             new_cfg["auto_share_sanitized_logs"] = bool(
                 var_auto_share_logs.get()
+            )
+            new_cfg["share_anonymous_version_count"] = bool(
+                var_share_version_count.get()
             )
             new_cfg["show_debug_console"] = bool(var_debug_console.get())
             new_cfg["check_updates_on_startup"] = bool(
@@ -36834,6 +38123,19 @@ def show_preflight_window(
                     _lock_from_presync_save = bool(
                         presync_save and (not was_ld or _lock_from_presync_save)
                     )
+                    pinless_floor_widened = bool(
+                        old_floor is None
+                        or (new_floor is not None and new_floor < (old_floor - 0.005))
+                    )
+                    if presync_save and was_ld:
+                        _presync_rearm_token = (
+                            str(s_key or ""),
+                            int(get_adapter_epoch()),
+                            float(time.monotonic()),
+                            bool(pinless_floor_widened),
+                        )
+                    else:
+                        _presync_rearm_token = None
                     shown_net_chk = (
                         last_breach_trigger_net_pnl
                         if (
@@ -36889,6 +38191,7 @@ def show_preflight_window(
                     _breach_pin_rt_pending = False
                     _breach_pin_retired = False
                     _lock_from_presync_save = False
+                    _presync_rearm_token = None
                     if parent is not None:
                         _launch_grace_syms.clear()
                     daily_breach_settings_prompted = False
@@ -37029,7 +38332,8 @@ def show_preflight_window(
         accent="#5dade2",
         bar_color=None,
         expand=False,
-        return_parts=False
+        return_parts=False,
+        card_pady=8
     ):
         core_c = bar_color or accent
         halo0 = tk.Frame(
@@ -37052,7 +38356,7 @@ def show_preflight_window(
         )
         accent_bar.pack(side="left", fill="y")
         card = tk.Frame(
-            outer, bg="#131922", padx=14, pady=8
+            outer, bg="#131922", padx=14, pady=card_pady
         )
         card.pack(side="left", fill="both", expand=True)
         hdr_row = tk.Frame(card, bg="#131922")
@@ -37244,7 +38548,8 @@ def show_preflight_window(
         "▶  1. TRADE & TILT STOPS (Intraday Penalty Box)",
         "Stops single-trade blowups and rapid loss streaks without ending your trading day.",
         accent="#5dade2",
-        bar_color="#38bdf8"
+        bar_color="#38bdf8",
+        card_pady=11
     )
     c1_tamper_lbl = tk.Label(
         c1._hdr_row,
@@ -38602,7 +39907,8 @@ def show_preflight_window(
         "▶  2. DAILY STOP ACTIONS (Max Loss & Profit Lock)",
         "Fires when Net PnL hits your active Max Loss or Profit Lock in Rulebook 4 or 5.",
         accent="#f5b041",
-        bar_color="#fbbf24"
+        bar_color="#fbbf24",
+        card_pady=11
     )
     c2_tamper_lbl = tk.Label(
         c2._hdr_row,
@@ -39008,7 +40314,7 @@ def show_preflight_window(
         c3_outer, core_color=c3_core, card_bg="#131922", glow_on=True
     )
     c3_bar.pack(side="left", fill="y")
-    c3 = tk.Frame(c3_outer, bg="#131922", padx=14, pady=11)
+    c3 = tk.Frame(c3_outer, bg="#131922", padx=14, pady=13)
     c3.pack(side="left", fill="both", expand=True)
     c3_hdr_row = tk.Frame(c3, bg="#131922")
     c3_hdr_row.pack(fill="x")
@@ -40021,9 +41327,9 @@ def show_preflight_window(
     var_reanchor.trace_add("write", _on_var_reanchor_changed)
 
     base_sub_lbl = tk.Frame(c3, bg="#131922", height=38)
-    base_sub_lbl.pack(fill="x", pady=(2, 6))
+    base_sub_lbl.pack(fill="x", pady=(5, 8))
     base_sub_lbl.pack_propagate(False)
-    tk.Frame(c3, bg="#222d3d", height=1).pack(fill="x", pady=(0, 6))
+    tk.Frame(c3, bg="#222d3d", height=1).pack(fill="x", pady=(0, 8))
     refresh_baseline_preview()
 
     prepos_tip = (
@@ -42158,6 +43464,28 @@ def show_preflight_window(
             "  updates manually via 'Inspect Source ↗'."
         )
 
+        r_ver_cnt = tk.Frame(sec3, bg="#131922")
+        r_ver_cnt.pack(fill="x", pady=(6, 0))
+        cb_ver_cnt = make_glass_checkbutton(
+            r_ver_cnt,
+            text="Count My Install in Daily Version Totals (Zero-ID)",
+            variable=var_share_version_count,
+            font=("Arial", 10, "bold"),
+            fg="#94a3b8",
+            bg="#131922",
+            anchor="w",
+        )
+        cb_ver_cnt.pack(side="left")
+        _ver_cnt_ch = "beta" if _is_beta_channel_build() else "main"
+        attach_tooltip(
+            cb_ver_cnt,
+            "Daily Active Version Totals (Zero-ID · Enabled by Default):\n"
+            f"• Sends ONLY {{\"version\":\"{APP_VERSION}\",\"channel\":\"{_ver_cnt_ch}\"}} once per ET day\n"
+            "  starting the day after your first launch (1-day initial grace period).\n"
+            "• No ID sent, no account data, nothing per-request stored — increments a single aggregate counter.\n"
+            "• Uncheck anytime to opt out persistently across future updates and Default resets."
+        )
+
         _wb_dlg_st = read_windows_startup_status()
         if _wb_dlg_st.get("ok") and not _wb_dlg_st.get("sandboxed"):
             _prefs_trace_state["win_disabled"] = bool(
@@ -42217,6 +43545,160 @@ def show_preflight_window(
             "win_disabled", False
         ):
             lbl_win_boot_warn.pack(fill="x", padx=(22, 0), pady=(2, 0))
+
+        r_rel_ch = tk.Frame(sec3, bg="#131922")
+        r_rel_ch.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            r_rel_ch,
+            text="Release Channel:",
+            font=("Arial", 10, "bold"),
+            fg="#97a7b9",
+            bg="#131922",
+            anchor="w",
+        ).pack(side="left", padx=(0, 8))
+
+        lbl_rel_ch_badge = tk.Label(
+            r_rel_ch,
+            text="",
+            font=("Arial", 9, "bold"),
+            padx=8,
+            pady=2,
+        )
+        lbl_rel_ch_badge.pack(side="left", padx=(0, 8))
+
+        btn_fix_ch_mismatch = make_stadium_button(
+            r_rel_ch,
+            text="Align Launcher",
+            font=("Arial", 8, "bold"),
+            fill_color="#2b1b08",
+            border_color="#f59e0b",
+            hover_fill="#3b260c",
+            hover_border="#fbbf24",
+            fg="#fde68a",
+            hover_fg="#ffffff",
+            canvas_bg="#131922",
+            width=112,
+            height=26,
+            auto_width=False,
+        )
+
+        btn_switch_channel = make_stadium_button(
+            r_rel_ch,
+            text="Switch Release Channel...",
+            font=("Arial", 9, "bold"),
+            fill_color="#141820",
+            border_color="#2e3746",
+            hover_border="#38bdf8",
+            fg="#7dd3fc",
+            hover_fg="#ffffff",
+            canvas_bg="#131922",
+            width=192,
+            height=28,
+            auto_width=False,
+        )
+        btn_switch_channel.pack(side="right")
+
+        lbl_rel_ch_note = tk.Label(
+            sec3,
+            text="",
+            font=("Arial", 8, "bold"),
+            fg="#94a3b8",
+            bg="#131922",
+            anchor="w",
+        )
+
+        def _refresh_release_channel_row():
+            is_git_repo = _is_git_repo_checkout()
+            is_beta_ch = _is_beta_channel_build()
+            has_mm, mm_rec, mm_bat = get_channel_mismatch_status()
+            if is_beta_ch:
+                lbl_rel_ch_badge.config(
+                    text="Experimental (beta)",
+                    fg="#7dd3fc",
+                    bg="#1a2636",
+                )
+            else:
+                lbl_rel_ch_badge.config(
+                    text="Stable (main)",
+                    fg="#cbd5e1",
+                    bg="#1a2636",
+                )
+            if has_mm:
+                if not btn_fix_ch_mismatch.winfo_manager():
+                    btn_fix_ch_mismatch.pack(side="left", padx=(0, 8))
+                lbl_rel_ch_note.config(
+                    text=f"⚠️ Installed build came from {mm_rec}, while launcher points to {mm_bat}. Click 'Align Launcher' to match them.",
+                    fg="#fbbf24",
+                )
+                if not lbl_rel_ch_note.winfo_manager():
+                    lbl_rel_ch_note.pack(fill="x", pady=(4, 0))
+                btn_fix_ch_mismatch.config(
+                    command=lambda r_ch=mm_rec: _on_align_channel_mismatch(r_ch)
+                )
+            else:
+                if btn_fix_ch_mismatch.winfo_manager():
+                    btn_fix_ch_mismatch.pack_forget()
+                if is_git_repo:
+                    lbl_rel_ch_note.config(
+                        text="Developer Git checkout detected — use 'git checkout' to switch branches.",
+                        fg="#64748b",
+                    )
+                    if not lbl_rel_ch_note.winfo_manager():
+                        lbl_rel_ch_note.pack(fill="x", pady=(4, 0))
+                elif lbl_rel_ch_note.winfo_manager():
+                    lbl_rel_ch_note.pack_forget()
+
+            btn_switch_channel.config(
+                text=(
+                    "Switch Back to Stable..."
+                    if is_beta_ch
+                    else "Switch to Beta..."
+                ),
+                state=("disabled" if is_git_repo else "normal"),
+            )
+
+        def _on_align_channel_mismatch(target_rec_ch):
+            hide_all_tooltips()
+            ok_sw, _c, msg_sw = _check_version_switch_guardrails(
+                from_live_hud=(parent is not None),
+                action_label="Channel switch",
+                log_block=True,
+            )
+            if not ok_sw:
+                messagebox.showwarning("Channel Switch Locked", msg_sw, parent=dlg)
+                return
+            ok_ap, err_ap = apply_same_version_channel_swap(target_rec_ch)
+            if ok_ap:
+                _refresh_release_channel_row()
+                messagebox.showinfo(
+                    "Launcher Channel Aligned",
+                    f"Launch_Enforcer.bat now matches your installed {target_rec_ch} build (v{APP_VERSION}).",
+                    parent=dlg,
+                )
+            else:
+                messagebox.showerror(
+                    "Channel Align Failed",
+                    err_ap or "Could not update Launch_Enforcer.bat.",
+                    parent=dlg,
+                )
+
+        btn_switch_channel.config(
+            command=lambda: prompt_release_channel_switch(
+                parent_pf=dlg,
+                from_live_hud=(parent is not None),
+                cancel_pf_fn=_cancel_pf_timers,
+                extra_close_win=pf,
+                on_swapped_in_place=_refresh_release_channel_row,
+            )
+        )
+        _refresh_release_channel_row()
+        attach_tooltip(
+            btn_switch_channel,
+            "Release Channel Switcher (Stable main <-> Experimental beta):\n"
+            "• Preview the target channel's Changelog and GitHub diff before anything is modified.\n"
+            "• Blocked automatically while the HUD is running, while a position is open, or during lockouts.\n"
+            "• Keeps 100% of your saved settings, API keys, and today's session baseline intact.",
+        )
 
         lbl_poll_err = tk.Label(
             sec3,
@@ -42374,7 +43856,7 @@ def show_preflight_window(
     prefs_row_h = max(19, int(lbl_prefs_summary.winfo_reqheight()))
     lbl_prefs_summary.config(text="")
     prefs_summary_frame.config(height=prefs_row_h)
-    prefs_summary_frame.pack(fill="x", pady=(0, 4))
+    prefs_summary_frame.pack(fill="x", pady=(0, 8))
     prefs_summary_frame.pack_propagate(False)
     lbl_prefs_summary.pack(fill="both", expand=True)
     lbl_prefs_summary.bind(
@@ -42501,7 +43983,7 @@ def show_preflight_window(
     )
 
     r_c3_actions = tk.Frame(c3, bg="#131922")
-    r_c3_actions.pack(fill="x", pady=(4, 0))
+    r_c3_actions.pack(fill="x", pady=(6, 2))
     btn_review_ignored = make_stadium_button(
         r_c3_actions,
         text="Positions (0)",
@@ -43222,7 +44704,7 @@ def show_preflight_window(
         "Open Preferences & Audio Settings:\n"
         "• Session Behavior: Reset Profit Ratchets at 9:30 AM & 4:00 PM Switch & Swing Filter\n"
         "• Audio & Voice Cues: Silent Mode (Mute All), Voice Cues, Upside Chime & Sound/Dry-Run Tester\n"
-        "• System & Telemetry: API Poll Interval (s), Debug Terminal, Startup Update Check, Windows Startup & Safe Logs"
+        "• System & Telemetry: API Poll Interval (s), Debug Terminal, Startup Update Check, Version Totals, Windows Startup, Release Channel & Safe Logs"
     )
 
     # ==========================================================
@@ -43667,7 +45149,7 @@ def show_preflight_window(
             _rp_scr_h = 1080
         rp_ls = max(12, int(rp_hdr_font.metrics("linespace")))
         rp_box_h = (
-            max(96, rp_ls * 6 + 12)
+            max(80, rp_ls * 5 + 8)
             if _rp_scr_h >= 860
             else max(52, rp_ls * 3 + 12)
         )
@@ -47358,6 +48840,7 @@ def show_preflight_window(
         _clear_boot_pending_marker()
         if _IS_MAIN_PROCESS:
             start_background_update_check(pf, cancel_pf_fn=_cancel_pf_timers)
+            schedule_daily_version_checkin(pf)
 
         if _pf_initial_shown.get("needs_bg_sync") or getattr(
             active_adapter, "_fast_auth_deferred", False
@@ -52248,6 +53731,7 @@ CHANGELOG_WEB_URL = f"{GITHUB_REPO_WEB_URL}/blob/main/CHANGELOG.md"
 BETA_CHANGELOG_WEB_URL = f"{GITHUB_REPO_WEB_URL}/blob/beta/CHANGELOG.md"
 SOURCE_DIFF_WEB_URL = GITHUB_REPO_WEB_URL
 BETA_SOURCE_DIFF_WEB_URL = f"{GITHUB_REPO_WEB_URL}/tree/beta"
+CHANNEL_COMPARE_WEB_URL = f"{GITHUB_REPO_WEB_URL}/compare/main...beta"
 GIST_DOC_RAW_URLS = {
     "CHANGELOG.md": (
         f"https://gist.githubusercontent.com/DBCodez/"
@@ -52274,10 +53758,82 @@ def _is_bat_beta_channel_text(bat_txt):
 
 
 def _rewrite_bat_bytes_for_beta(raw_bytes):
-    txt = bytes(raw_bytes).decode("utf-8", errors="replace")
-    txt = txt.replace(GITHUB_RAW_BASE, BETA_GITHUB_RAW_BASE)
-    txt = txt.replace(MAIN_GIST_BUNDLE_ID, BETA_GIST_BUNDLE_ID)
-    return txt.encode("utf-8")
+    out_b = bytes(raw_bytes)
+    out_b = out_b.replace(
+        GITHUB_RAW_BASE.encode("utf-8"), BETA_GITHUB_RAW_BASE.encode("utf-8")
+    )
+    out_b = out_b.replace(
+        MAIN_GIST_BUNDLE_ID.encode("utf-8"), BETA_GIST_BUNDLE_ID.encode("utf-8")
+    )
+    if len(out_b) != len(raw_bytes):
+        raise ValueError("Beta channel launcher byte swap length mismatch.")
+    return out_b
+
+
+def _rewrite_bat_bytes_for_main(raw_bytes):
+    out_b = bytes(raw_bytes)
+    out_b = out_b.replace(
+        BETA_GITHUB_RAW_BASE.encode("utf-8"), GITHUB_RAW_BASE.encode("utf-8")
+    )
+    out_b = out_b.replace(
+        BETA_GIST_BUNDLE_ID.encode("utf-8"), MAIN_GIST_BUNDLE_ID.encode("utf-8")
+    )
+    if len(out_b) != len(raw_bytes):
+        raise ValueError("Main channel launcher byte swap length mismatch.")
+    return out_b
+
+
+def _build_bat_channel_swap_pairs(from_ch, to_ch):
+    if from_ch == "beta" and to_ch == "main":
+        return [
+            [BETA_GITHUB_RAW_BASE, GITHUB_RAW_BASE],
+            [BETA_GIST_BUNDLE_ID, MAIN_GIST_BUNDLE_ID],
+        ]
+    if from_ch == "main" and to_ch == "beta":
+        return [
+            [GITHUB_RAW_BASE, BETA_GITHUB_RAW_BASE],
+            [MAIN_GIST_BUNDLE_ID, BETA_GIST_BUNDLE_ID],
+        ]
+    return []
+
+
+def _apply_bat_swap_pairs_to_bytes(raw_bytes, swap_pairs):
+    out_b = bytes(raw_bytes)
+    if not isinstance(swap_pairs, list):
+        return out_b
+    for pair in swap_pairs:
+        if (
+            not isinstance(pair, (list, tuple))
+            or len(pair) != 2
+            or not isinstance(pair[0], str)
+            or not isinstance(pair[1], str)
+        ):
+            continue
+        a_b = pair[0].encode("utf-8")
+        b_b = pair[1].encode("utf-8")
+        if len(a_b) > 0 and len(a_b) == len(b_b):
+            out_b = out_b.replace(a_b, b_b)
+    if len(out_b) != len(raw_bytes):
+        return bytes(raw_bytes)
+    return out_b
+
+
+def _apply_bat_swap_pairs_on_disk(bat_path, swap_pairs):
+    if not os.path.isfile(bat_path) or not isinstance(swap_pairs, list):
+        return False
+    try:
+        with open(bat_path, "rb") as rf:
+            cur_b = rf.read()
+        if not _is_valid_launcher_bat_bytes(cur_b):
+            return False
+        new_b = _apply_bat_swap_pairs_to_bytes(cur_b, swap_pairs)
+        if len(new_b) != len(cur_b) or not _is_valid_launcher_bat_bytes(new_b):
+            return False
+        if new_b == cur_b:
+            return True
+        return _atomic_write_verified_bytes(bat_path, new_b)
+    except Exception:
+        return False
 
 
 def _is_beta_channel_build():
@@ -52307,24 +53863,26 @@ def _is_beta_channel_build():
     return False
 
 
-def get_changelog_web_url():
-    """Returns the Beta branch GitHub Changelog URL when running on the beta
-    branch/channel, or the main branch GitHub Changelog URL on stable builds."""
-    return (
-        BETA_CHANGELOG_WEB_URL
-        if _is_beta_channel_build()
-        else CHANGELOG_WEB_URL
+def get_changelog_web_url(channel=None):
+    """Returns the Beta branch GitHub Changelog URL when running on (or
+    previewing) the beta branch/channel, or the main branch URL on stable."""
+    is_beta = (
+        (channel == "beta")
+        if channel in ("main", "beta")
+        else _is_beta_channel_build()
     )
+    return BETA_CHANGELOG_WEB_URL if is_beta else CHANGELOG_WEB_URL
 
 
-def get_source_diff_web_url():
-    """Returns the public GitHub repository URL for the active channel so
-    traders can inspect full source code, release tags, and commit history."""
-    return (
-        BETA_SOURCE_DIFF_WEB_URL
-        if _is_beta_channel_build()
-        else SOURCE_DIFF_WEB_URL
+def get_source_diff_web_url(channel=None):
+    """Returns the public GitHub repository URL for the active (or previewed)
+    channel so traders can inspect full source code, tags, and commit history."""
+    is_beta = (
+        (channel == "beta")
+        if channel in ("main", "beta")
+        else _is_beta_channel_build()
     )
+    return BETA_SOURCE_DIFF_WEB_URL if is_beta else SOURCE_DIFF_WEB_URL
 
 
 def _parse_version_tuple(v_str):
@@ -52332,11 +53890,15 @@ def _parse_version_tuple(v_str):
     return tuple(nums) if nums else (0,)
 
 
-def _fetch_remote_doc_bytes(doc_name, ts=None):
+def _fetch_remote_doc_bytes(doc_name, ts=None, channel=None):
     import urllib.request
     if ts is None:
         ts = int(time.time())
-    is_beta = _is_beta_channel_build()
+    is_beta = (
+        (channel == "beta")
+        if channel in ("main", "beta")
+        else _is_beta_channel_build()
+    )
     if is_beta:
         doc_urls = [
             f"{BETA_GITHUB_RAW_BASE}{doc_name}?t={ts}",
@@ -52374,8 +53936,12 @@ def _fetch_remote_doc_bytes(doc_name, ts=None):
                     b"[" not in doc_bytes or b"<html" in doc_bytes[:512].lower()
                 ):
                     continue
-                if is_beta and doc_name == "Launch_Enforcer.bat":
-                    doc_bytes = _rewrite_bat_bytes_for_beta(doc_bytes)
+                if doc_name == "Launch_Enforcer.bat":
+                    doc_bytes = (
+                        _rewrite_bat_bytes_for_beta(doc_bytes)
+                        if is_beta
+                        else _rewrite_bat_bytes_for_main(doc_bytes)
+                    )
                 return doc_bytes
         except Exception:
             continue
@@ -54014,8 +55580,10 @@ ENFORCER_TIDY_KNOWN_FILES = (
     "README.md",
     "LICENSE.txt",
     "enforcer.py.prev",
+    "enforcer.py.prev.meta.json",
     "CHANGELOG.md.prev",
     ".enforcer_boot_pending.json",
+    ".enforcer_install_channel.json",
 )
 
 
@@ -54243,6 +55811,16 @@ def _is_verified_enforcer_app_file(fpath, fname=None):
                 raw_bp = f.read(16384).decode("utf-8")
             obj = json.loads(raw_bp)
             return isinstance(obj, dict) and ("target_version" in obj)
+        if base == "enforcer.py.prev.meta.json":
+            with open(fpath, "rb") as f:
+                raw_pm = f.read(16384).decode("utf-8")
+            obj = json.loads(raw_pm)
+            return isinstance(obj, dict) and ("sha256" in obj) and ("channel" in obj)
+        if base == ".enforcer_install_channel.json":
+            with open(fpath, "rb") as f:
+                raw_ic = f.read(16384).decode("utf-8")
+            obj = json.loads(raw_ic)
+            return isinstance(obj, dict) and (obj.get("channel") in ("main", "beta"))
     except Exception:
         return False
     return False
@@ -54694,7 +56272,9 @@ def relocate_desktop_install(
                 "README.md",
                 "LICENSE.txt",
                 "enforcer.py.prev",
+                "enforcer.py.prev.meta.json",
                 "CHANGELOG.md.prev",
+                ".enforcer_install_channel.json",
             ):
                 src_opt_p = os.path.join(eff_src, opt_name)
                 dst_opt_p = os.path.join(target_dir, opt_name)
@@ -54734,6 +56314,28 @@ def relocate_desktop_install(
                             dst_prev_p, dst_py_bytes
                         ):
                             rotated_dst_prev = True
+                            dst_meta_p = os.path.join(
+                                target_dir, "enforcer.py.prev.meta.json"
+                            )
+                            dst_ch_Guess = "main"
+                            if os.path.isfile(dst_bat_path):
+                                try:
+                                    with open(dst_bat_path, "rb") as dbf_m:
+                                        if _is_bat_beta_channel_text(
+                                            dbf_m.read().decode("utf-8", errors="replace")
+                                        ):
+                                            dst_ch_Guess = "beta"
+                                except OSError:
+                                    pass
+                            _write_json_dict_atomic(
+                                dst_meta_p,
+                                {
+                                    "sha256": hashlib.sha256(dst_py_bytes).hexdigest(),
+                                    "version": str(dst_ver),
+                                    "channel": dst_ch_Guess,
+                                },
+                            )
+                            verified_dest_files.add("enforcer.py.prev.meta.json")
 
             if not _atomic_write_verified_bytes(dst_py_path, src_py_bytes):
                 return (
@@ -54757,10 +56359,12 @@ def relocate_desktop_install(
                 "LICENSE.txt",
                 "enforcer.ico",
                 "enforcer.py.prev",
+                "enforcer.py.prev.meta.json",
                 "CHANGELOG.md.prev",
+                ".enforcer_install_channel.json",
             ):
-                if opt_name == "enforcer.py.prev" and rotated_dst_prev:
-                    verified_dest_files.add("enforcer.py.prev")
+                if opt_name in ("enforcer.py.prev", "enforcer.py.prev.meta.json") and rotated_dst_prev:
+                    verified_dest_files.add(opt_name)
                     continue
                 src_opt_p = os.path.join(eff_src, opt_name)
                 if not (
@@ -54854,7 +56458,9 @@ def relocate_desktop_install(
             "CHANGELOG.md",
             "CHANGELOG.md.prev",
             "enforcer.py.prev",
+            "enforcer.py.prev.meta.json",
             ".enforcer_boot_pending.json",
+            ".enforcer_install_channel.json",
             "Launch_Enforcer.bat",
             "enforcer.py",
             "enforcer.ico",
@@ -55479,8 +57085,175 @@ def show_release_notes_dialog(
 
 
 UPDATE_CHECK_STAMP_PATH = os.path.join(USER_HOME, ".enforcer_update_check_ts")
+VERSION_CHECKIN_ENDPOINT = "https://pnl-enforcer-logs.dbcodez-logs.workers.dev/checkin"
+VERSION_CHECKIN_STAMP_PATH = os.path.join(USER_HOME, ".enforcer_checkin_stamp")
+VERSION_CHECKIN_FAIL_COOLDOWN_SEC = 3600.0
+_version_checkin_lock = threading.RLock()
+_version_checkin_attempted_this_proc = False
+_version_checkin_transport_override = None
+_version_checkin_allow_sandbox = False
 _SINGLE_INSTANCE_MUTEX_HANDLE = None
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\PnLEnforcerBeta_SingleInstance_Mutex"
+
+
+def _read_version_checkin_stamp():
+    with _version_checkin_lock:
+        try:
+            if os.path.isfile(VERSION_CHECKIN_STAMP_PATH):
+                with open(VERSION_CHECKIN_STAMP_PATH, "r", encoding="utf-8") as sf:
+                    data = json.load(sf)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
+def _write_version_checkin_stamp(stamp_dict):
+    with _version_checkin_lock:
+        if not isinstance(stamp_dict, dict):
+            return False
+        return _write_json_dict_atomic(VERSION_CHECKIN_STAMP_PATH, dict(stamp_dict))
+
+
+def _set_version_checkin_sticky_opt_out(opt_out_bool):
+    with _version_checkin_lock:
+        st = _read_version_checkin_stamp()
+        st["opt_out"] = bool(opt_out_bool)
+        return _write_version_checkin_stamp(st)
+
+
+def _is_version_checkin_enabled(cfg=None):
+    st = _read_version_checkin_stamp()
+    if st.get("opt_out") is True:
+        return False
+    c_src = cfg if isinstance(cfg, dict) else (config if isinstance(config, dict) else {})
+    return bool(c_src.get("share_anonymous_version_count", True))
+
+
+def _build_version_checkin_payload(channel_override=None):
+    ch = (
+        channel_override
+        if channel_override in ("main", "beta")
+        else ("beta" if _is_beta_channel_build() else "main")
+    )
+    return {"version": str(APP_VERSION), "channel": ch}
+
+
+def _run_daily_version_checkin_once(now_ts=None, today_et=None):
+    """Performs at most one daily Zero-ID check-in per ET calendar day after a
+    1-day initial grace period. Never sends an ID, never reads or writes
+    enforcer_config.json (`save_config`), and never blocks or raises on failure."""
+    global _version_checkin_attempted_this_proc
+    import urllib.error
+    import urllib.request
+
+    with _version_checkin_lock:
+        if ("--check-update" in sys.argv) or ("--preview-update-dialog" in sys.argv):
+            return "DISABLED_ENV"
+        if not _version_checkin_allow_sandbox and (
+            _is_git_repo_checkout() or _is_sandboxed_temp_home()
+        ):
+            return "DISABLED_ENV"
+        if not _is_version_checkin_enabled():
+            return "OPT_OUT"
+        if _version_checkin_attempted_this_proc:
+            return "PROC_ONCE"
+
+        eff_today = str(today_et or get_today_str())
+        eff_now = float(time.time() if now_ts is None else now_ts)
+        st = _read_version_checkin_stamp()
+        first_seen = str(st.get("first_seen_date") or "").strip()
+        if not first_seen:
+            st["first_seen_date"] = eff_today
+            _write_version_checkin_stamp(st)
+            _version_checkin_attempted_this_proc = True
+            return "GRACE_DAY"
+        if first_seen == eff_today:
+            _version_checkin_attempted_this_proc = True
+            return "GRACE_DAY"
+        if str(st.get("last_sent_date") or "").strip() == eff_today:
+            _version_checkin_attempted_this_proc = True
+            return "ALREADY_SENT"
+
+        last_att = 0.0
+        try:
+            last_att = float(st.get("last_attempt_ts", 0.0) or 0.0)
+        except Exception:
+            last_att = 0.0
+        if last_att > 0.0 and (eff_now - last_att) < VERSION_CHECKIN_FAIL_COOLDOWN_SEC:
+            _version_checkin_attempted_this_proc = True
+            return "THROTTLED"
+
+        _version_checkin_attempted_this_proc = True
+        st["last_attempt_ts"] = eff_now
+        _write_version_checkin_stamp(st)
+        payload = _build_version_checkin_payload()
+
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if len(body) > 128:
+        return "PAYLOAD_TOO_LARGE"
+
+    req = urllib.request.Request(
+        VERSION_CHECKIN_ENDPOINT,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": f"PnL-Enforcer-Checkin/{APP_VERSION}",
+            "Cache-Control": "no-store",
+        },
+        method="POST",
+    )
+    try:
+        if callable(_version_checkin_transport_override):
+            resp_ctx = _version_checkin_transport_override(req, 4.0)
+        else:
+            resp_ctx = _urlopen_https(req, timeout=4.0)
+        with resp_ctx as resp:
+            status = int(getattr(resp, "status", None) or resp.getcode() or 204)
+        if 200 <= status < 300:
+            with _version_checkin_lock:
+                st2 = _read_version_checkin_stamp()
+                st2["last_sent_date"] = eff_today
+                _write_version_checkin_stamp(st2)
+            return "SENT"
+        return "RETRY_LATER"
+    except urllib.error.HTTPError as he:
+        if 400 <= he.code < 500 and he.code != 429:
+            with _version_checkin_lock:
+                st2 = _read_version_checkin_stamp()
+                st2["last_sent_date"] = eff_today
+                _write_version_checkin_stamp(st2)
+            return f"REJECTED_{he.code}"
+        return "RETRY_LATER"
+    except Exception:
+        return "RETRY_LATER"
+
+
+def schedule_daily_version_checkin(parent_pf):
+    """Schedules the non-blocking Zero-ID daily check-in ~5 seconds after
+    Pre-Flight opens so startup latency and network calls are never impacted."""
+    if parent_pf is None:
+        return
+    if ("--check-update" in sys.argv) or ("--preview-update-dialog" in sys.argv):
+        return
+    if not _version_checkin_allow_sandbox and (
+        _is_git_repo_checkout() or _is_sandboxed_temp_home()
+    ):
+        return
+
+    def _kick():
+        try:
+            threading.Thread(
+                target=_run_daily_version_checkin_once, daemon=True
+            ).start()
+        except Exception:
+            pass
+
+    try:
+        parent_pf.after(5000, _kick)
+    except Exception:
+        pass
 
 
 def _is_another_instance_running():
@@ -55556,13 +57329,16 @@ def _ensure_single_instance_or_exit():
         pass
 
 
-def _fetch_available_update_payload(skip_if_recent=False):
-    """Checks GitHub / Gist for a newer APP_VERSION off the UI thread.
-    Returns (best_ver, best_bytes, cl_bytes, cl_text, ts) if a newer version
-    exists, or None if up to date / offline."""
+def _fetch_available_update_payload(
+    skip_if_recent=False, channel=None, allow_downgrade=False
+):
+    """Checks GitHub / Gist for a newer APP_VERSION (or target release channel
+    payload when `channel`/`allow_downgrade` are specified) off the UI thread.
+    Returns (best_ver, best_bytes, cl_bytes, cl_text, ts) or None."""
     try:
         now_ts = time.time()
-        if skip_if_recent and os.path.exists(UPDATE_CHECK_STAMP_PATH):
+        use_stamp = (channel is None) and (not allow_downgrade)
+        if use_stamp and skip_if_recent and os.path.exists(UPDATE_CHECK_STAMP_PATH):
             try:
                 with open(UPDATE_CHECK_STAMP_PATH, "r", encoding="utf-8") as sf:
                     last_chk = float(sf.read().strip() or "0")
@@ -55570,15 +57346,21 @@ def _fetch_available_update_payload(skip_if_recent=False):
                     return None
             except Exception:
                 pass
-        try:
-            with open(UPDATE_CHECK_STAMP_PATH, "w", encoding="utf-8") as sf:
-                sf.write(f"{now_ts:.3f}")
-        except Exception:
-            pass
+        if use_stamp:
+            try:
+                with open(UPDATE_CHECK_STAMP_PATH, "w", encoding="utf-8") as sf:
+                    sf.write(f"{now_ts:.3f}")
+            except Exception:
+                pass
 
         import urllib.request
         ts = int(now_ts)
-        is_beta = _is_beta_channel_build()
+        target_ch = (
+            channel
+            if channel in ("main", "beta")
+            else ("beta" if _is_beta_channel_build() else "main")
+        )
+        is_beta = (target_ch == "beta")
         active_enforcer_raw = (
             BETA_GIST_ENFORCER_RAW_URL if is_beta else GIST_ENFORCER_RAW_URL
         )
@@ -55611,9 +57393,9 @@ def _fetch_available_update_payload(skip_if_recent=False):
                     if not m_rem or not m_rem.group(1).strip():
                         continue
                     v_cand = m_rem.group(1).strip()
-                    if _parse_version_tuple(v_cand) <= _parse_version_tuple(
-                        APP_VERSION
-                    ):
+                    if (not allow_downgrade) and _parse_version_tuple(
+                        v_cand
+                    ) <= _parse_version_tuple(APP_VERSION):
                         best_ver = v_cand
                         break
                     rem_bytes = head_bytes + resp.read()
@@ -55629,7 +57411,11 @@ def _fetch_available_update_payload(skip_if_recent=False):
                 continue
 
         if (not _desktop_tidy_in_progress) and (not os.path.exists(ICON_PATH)):
-            ico_bytes = _fetch_remote_doc_bytes("enforcer.ico", ts=ts)
+            ico_bytes = (
+                _fetch_remote_doc_bytes("enforcer.ico", ts=ts, channel=target_ch)
+                if channel in ("main", "beta")
+                else _fetch_remote_doc_bytes("enforcer.ico", ts=ts)
+            )
             if ico_bytes and not _desktop_tidy_in_progress:
                 tmp_ico = f"{ICON_PATH}.{os.getpid()}.tmp"
                 try:
@@ -55650,15 +57436,22 @@ def _fetch_available_update_payload(skip_if_recent=False):
             print(f"Version check: v{APP_VERSION} (Offline / skipped)")
             return None
 
-        if _parse_version_tuple(best_ver) <= _parse_version_tuple(APP_VERSION):
+        if (not allow_downgrade) and _parse_version_tuple(
+            best_ver
+        ) <= _parse_version_tuple(APP_VERSION):
             print(f"Version check: v{APP_VERSION} (Up to date)")
             return None
 
         if not best_bytes:
             return None
 
-        print(f"New update available: v{APP_VERSION} -> v{best_ver}")
-        cl_bytes = _fetch_remote_doc_bytes("CHANGELOG.md", ts=ts)
+        if not allow_downgrade:
+            print(f"New update available: v{APP_VERSION} -> v{best_ver}")
+        cl_bytes = (
+            _fetch_remote_doc_bytes("CHANGELOG.md", ts=ts, channel=target_ch)
+            if channel in ("main", "beta")
+            else _fetch_remote_doc_bytes("CHANGELOG.md", ts=ts)
+        )
         cl_text = (
             cl_bytes.decode("utf-8", errors="replace") if cl_bytes else ""
         )
@@ -55668,21 +57461,73 @@ def _fetch_available_update_payload(skip_if_recent=False):
         return None
 
 
-def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
+def _install_update_payload(
+    best_ver,
+    best_bytes,
+    cl_bytes,
+    ts,
+    channel=None,
+    clear_skip_pin=False,
+    prefetched_bat_bytes=None,
+):
     """Validates best_bytes, backs up the current working enforcer.py / CHANGELOG.md
-    to .prev (unless an unconfirmed boot_pending stamp is still active), records
-    .enforcer_boot_pending.json for crash-safe startup recovery, writes the new
-    update files atomically to SCRIPT_DIR, and returns target_py."""
+    to .prev with SHA-256 + channel sidecar, derives/verifies Launch_Enforcer.bat
+    for target channel before any disk write, records .enforcer_boot_pending.json
+    (including bat_swap pairs), writes the files atomically in safe order, and
+    returns target_py."""
     ok_new, parsed_new_v, new_err = _validate_enforcer_source_bytes(best_bytes)
     if not ok_new:
         raise ValueError(f"Refusing to install invalid update payload: {new_err}")
 
+    prev_ch = "beta" if _is_beta_channel_build() else "main"
+    target_ch = channel if channel in ("main", "beta") else prev_ch
+    is_channel_switch = (target_ch != prev_ch)
+    in_console_bat = ("--check-update" in sys.argv) or ("--console" in sys.argv)
+
     script_dir = SCRIPT_DIR
     target_py = os.path.join(script_dir, "enforcer.py")
     target_cl = os.path.join(script_dir, "CHANGELOG.md")
+    target_bat = os.path.join(script_dir, "Launch_Enforcer.bat")
     prev_py = _get_prev_enforcer_path()
     prev_cl = _get_prev_changelog_path()
     bp_path = _get_boot_pending_path()
+
+    # Prepare channel-switched launcher bytes BEFORE touching any file on disk.
+    switch_bat_bytes = None
+    if is_channel_switch:
+        base_bat_b = None
+        if os.path.isfile(target_bat):
+            try:
+                with open(target_bat, "rb") as bf_r:
+                    cand_local_bat = bf_r.read()
+                if _is_valid_launcher_bat_bytes(cand_local_bat):
+                    base_bat_b = cand_local_bat
+            except Exception:
+                base_bat_b = None
+        if (
+            not in_console_bat
+            and prefetched_bat_bytes
+            and _is_valid_launcher_bat_bytes(prefetched_bat_bytes)
+        ):
+            base_bat_b = bytes(prefetched_bat_bytes)
+        if not base_bat_b:
+            raise ValueError(
+                "Missing valid Launch_Enforcer.bat needed for channel switch."
+            )
+        switch_bat_bytes = (
+            _rewrite_bat_bytes_for_beta(base_bat_b)
+            if target_ch == "beta"
+            else _rewrite_bat_bytes_for_main(base_bat_b)
+        )
+        if not _is_valid_launcher_bat_bytes(switch_bat_bytes):
+            raise ValueError("Channel-switched Launch_Enforcer.bat failed validation.")
+        is_target_beta_txt = _is_bat_beta_channel_text(
+            switch_bat_bytes.decode("utf-8", errors="replace")
+        )
+        if is_target_beta_txt != (target_ch == "beta"):
+            raise ValueError(
+                f"Launcher channel assertion failed for target '{target_ch}'."
+            )
 
     # Only overwrite .prev if the current script booted cleanly (no stale
     # boot_pending marker) OR no .prev backup exists yet, so a broken update
@@ -55690,6 +57535,7 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
     can_rotate_prev = (not os.path.exists(bp_path)) or (not os.path.isfile(prev_py))
     saved_prev_ver = ""
     wrote_new_prev = False
+    prev_sha_hex = ""
     if can_rotate_prev and os.path.isfile(target_py):
         try:
             with open(target_py, "rb") as cur_f:
@@ -55704,6 +57550,8 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
                 os.replace(tmp_prev, prev_py)
                 saved_prev_ver = cur_ver
                 wrote_new_prev = True
+                prev_sha_hex = hashlib.sha256(cur_bytes).hexdigest()
+                _write_prev_enforcer_meta(prev_sha_hex, cur_ver, prev_ch)
                 if os.path.isfile(target_cl):
                     try:
                         with open(target_cl, "rb") as cur_cl_f:
@@ -55718,6 +57566,13 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
         except Exception:
             pass
 
+    if not prev_sha_hex and os.path.isfile(prev_py):
+        try:
+            with open(prev_py, "rb") as pf_s:
+                prev_sha_hex = hashlib.sha256(pf_s.read()).hexdigest()
+        except Exception:
+            prev_sha_hex = ""
+
     existing_prev_ver = ""
     if not saved_prev_ver:
         rb_existing = get_rollback_backup_info()
@@ -55728,8 +57583,13 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
         bp_payload = {
             "target_version": str(best_ver),
             "prev_version": str(saved_prev_ver),
+            "target_channel": target_ch,
+            "prev_channel": prev_ch,
+            "prev_sha256": prev_sha_hex,
             "installed_at": time.time(),
         }
+        if is_channel_switch:
+            bp_payload["bat_swap"] = _build_bat_channel_swap_pairs(target_ch, prev_ch)
         tmp_bp = f"{bp_path}.{os.getpid()}.tmp"
         with open(tmp_bp, "w", encoding="utf-8") as bpf:
             json.dump(bp_payload, bpf, indent=2)
@@ -55738,6 +57598,12 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
         os.replace(tmp_bp, bp_path)
     except Exception:
         pass
+
+    # Write Launch_Enforcer.bat BEFORE enforcer.py when switching channels so
+    # an interruption after writing the launcher cannot orphan it behind an old target.
+    if is_channel_switch and switch_bat_bytes is not None:
+        if not _atomic_write_verified_bytes(target_bat, switch_bat_bytes):
+            raise IOError("Failed to write channel-switched Launch_Enforcer.bat.")
 
     tmp_py = f"{target_py}.{os.getpid()}.tmp"
     with open(tmp_py, "wb") as f:
@@ -55755,17 +57621,20 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
         except Exception:
             pass
 
-    # When invoked from Launch_Enforcer.bat --console (--check-update), cmd.exe
-    # is still executing Launch_Enforcer.bat and will resume at its prior byte
-    # offset on return; skip rewriting Launch_Enforcer.bat in that mode so cmd
-    # never lands mid-line (normal GUI updates rewrite Launch_Enforcer.bat safely).
+    # When invoked under --check-update or --console, cmd.exe may resume at its
+    # byte offset inside Launch_Enforcer.bat; avoid variable-length remote bat writes
+    # there, and skip re-fetching bat if switch_bat_bytes was already written above.
     doc_list = (
         ("README.md", "LICENSE.txt", "enforcer.ico")
-        if "--check-update" in sys.argv
+        if (in_console_bat or is_channel_switch)
         else ("Launch_Enforcer.bat", "README.md", "LICENSE.txt", "enforcer.ico")
     )
     for doc_name in doc_list:
-        doc_bytes = _fetch_remote_doc_bytes(doc_name, ts=ts)
+        doc_bytes = (
+            _fetch_remote_doc_bytes(doc_name, ts=ts, channel=target_ch)
+            if channel in ("main", "beta")
+            else _fetch_remote_doc_bytes(doc_name, ts=ts)
+        )
         if doc_bytes:
             if doc_name == "Launch_Enforcer.bat" and not _is_valid_launcher_bat_bytes(
                 doc_bytes
@@ -55784,9 +57653,12 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
             except Exception:
                 pass
 
+    _write_install_channel_record(parsed_new_v or str(best_ver), target_ch)
+
     skipped_prev = _peek_saved_skipped_update_version()
-    if skipped_prev and _parse_version_tuple(best_ver) >= _parse_version_tuple(
+    if clear_skip_pin or (
         skipped_prev
+        and _parse_version_tuple(best_ver) >= _parse_version_tuple(skipped_prev)
     ):
         _record_skipped_update_version_on_disk("")
 
@@ -55798,10 +57670,518 @@ def _install_update_payload(best_ver, best_bytes, cl_bytes, ts):
         bk_note = "fresh install — no prior script to back up"
     log_event(
         "SESSION",
-        f"Installed update v{APP_VERSION} -> v{best_ver} ({bk_note}).",
+        f"Installed update v{APP_VERSION} -> v{best_ver} ({bk_note}, channel={target_ch}).",
     )
     print(f"[SUCCESS] Updated to PnL Enforcer v{best_ver} ({bk_note}).\n")
     return target_py
+
+
+def get_channel_mismatch_status():
+    """Returns (has_mismatch, record_channel, launcher_channel) when
+    .enforcer_install_channel.json records a different channel for the running
+    APP_VERSION than Launch_Enforcer.bat on disk (never auto-flips)."""
+    if _is_git_repo_checkout():
+        return False, "", ""
+    rec = _read_install_channel_record()
+    rec_ch = str(rec.get("channel") or "").strip().lower()
+    rec_ver = str(rec.get("version") or "").strip()
+    if rec_ch not in ("main", "beta") or rec_ver != str(APP_VERSION):
+        return False, "", ""
+    bat_ch = "beta" if _is_beta_channel_build() else "main"
+    return (rec_ch != bat_ch), rec_ch, bat_ch
+
+
+def apply_same_version_channel_swap(target_ch):
+    """Performs an in-place equal-length raw-byte channel swap on
+    Launch_Enforcer.bat when both channels already carry APP_VERSION."""
+    if target_ch not in ("main", "beta"):
+        return False, f"Invalid channel '{target_ch}'."
+    if _is_git_repo_checkout():
+        return False, "Blocked inside a developer Git checkout."
+    bat_path = os.path.join(SCRIPT_DIR, "Launch_Enforcer.bat")
+    if not os.path.isfile(bat_path):
+        return False, "Launch_Enforcer.bat was not found in this folder."
+    try:
+        with open(bat_path, "rb") as rf:
+            cur_b = rf.read()
+        if not _is_valid_launcher_bat_bytes(cur_b):
+            return False, "Launch_Enforcer.bat failed validation."
+        new_b = (
+            _rewrite_bat_bytes_for_beta(cur_b)
+            if target_ch == "beta"
+            else _rewrite_bat_bytes_for_main(cur_b)
+        )
+        if not _is_valid_launcher_bat_bytes(new_b):
+            return False, "Converted Launch_Enforcer.bat failed validation."
+        is_target_beta = _is_bat_beta_channel_text(
+            new_b.decode("utf-8", errors="replace")
+        )
+        if is_target_beta != (target_ch == "beta"):
+            return False, f"Channel verification failed for '{target_ch}'."
+        if not _atomic_write_verified_bytes(bat_path, new_b):
+            return False, "Could not atomically update Launch_Enforcer.bat."
+        _write_install_channel_record(APP_VERSION, target_ch)
+        _record_skipped_update_version_on_disk("")
+        log_event(
+            "CONFIG",
+            f"Switched release channel launcher to {target_ch} (v{APP_VERSION} matches both channels — no reinstall required).",
+        )
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def show_channel_switch_preview_dialog(
+    curr_ver,
+    target_ver,
+    target_ch,
+    changelog_md="",
+    legacy_main_blocked=False,
+    parent=None,
+):
+    """Displays the dark-glass Release Channel preview modal with Changelog,
+    Compare main...beta link, and legacy-target gate before any files change."""
+    decision = {"switch": False}
+    is_to_beta = (target_ch == "beta")
+    ch_title = "Experimental (beta)" if is_to_beta else "Stable (main)"
+    is_same_ver = (str(target_ver) == str(curr_ver))
+    is_standalone = parent is None
+    if not is_standalone:
+        hide_all_tooltips()
+    win = tk.Tk() if is_standalone else tk.Toplevel(parent)
+    win.withdraw()
+    if not is_standalone:
+        win.transient(parent)
+    if os.path.exists(ICON_PATH):
+        try:
+            win.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+    apply_dark_title_bar(win)
+    win.title(f"PnL Enforcer — Switch Release Channel to {ch_title}")
+    win.config(bg="#0d1117", padx=24, pady=18)
+    win.resizable(True, True)
+    win.minsize(780, 500)
+    win.attributes("-topmost", True)
+
+    m_left, m_top, m_right, m_bottom = get_monitor_work_area(
+        widget=(parent if parent is not None else win)
+    )
+    mw = max(800, m_right - m_left)
+    mh = max(600, m_bottom - m_top)
+    w = min(1040, max(780, mw - 80))
+    h = min(690, max(500, mh - 80))
+
+    hdr_row = tk.Frame(win, bg="#0d1117")
+    hdr_row.pack(fill="x")
+    tk.Label(
+        hdr_row,
+        text=(
+            f"🔄 CHANNEL SWITCH PREVIEW:  v{curr_ver}  ➔  {ch_title} v{target_ver}"
+            if not is_same_ver
+            else f"🔄 ALIGN RELEASE CHANNEL:  Switch to {ch_title} (v{target_ver})"
+        ),
+        font=("Arial", 12, "bold"),
+        fg="#7dd3fc" if is_to_beta else "#34d399",
+        bg="#0d1117",
+        anchor="w",
+    ).pack(side="left")
+
+    make_stadium_button(
+        hdr_row,
+        text="Open Full Changelog ↗",
+        font=("Arial", 9, "bold"),
+        fill_color="#132235",
+        border_color="#2b6cb0",
+        hover_fill="#1c3452",
+        hover_border="#63b3ed",
+        fg="#e0f2fe",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=30,
+        pad_x=18,
+        command=lambda: webbrowser.open(get_changelog_web_url(channel=target_ch)),
+    ).pack(side="right")
+
+    make_stadium_button(
+        hdr_row,
+        text="Inspect Source ↗",
+        font=("Arial", 9, "bold"),
+        fill_color="#161f2c",
+        border_color="#475569",
+        hover_fill="#1f2c3f",
+        hover_border="#94a3b8",
+        fg="#cbd5e1",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=30,
+        pad_x=18,
+        command=lambda: webbrowser.open(get_source_diff_web_url(channel=target_ch)),
+    ).pack(side="right", padx=(0, 8))
+
+    make_stadium_button(
+        hdr_row,
+        text="Compare main...beta ↗",
+        font=("Arial", 9, "bold"),
+        fill_color="#161f2c",
+        border_color="#475569",
+        hover_fill="#1f2c3f",
+        hover_border="#94a3b8",
+        fg="#7dd3fc",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=30,
+        pad_x=18,
+        command=lambda: webbrowser.open(CHANNEL_COMPARE_WEB_URL),
+    ).pack(side="right", padx=(0, 8))
+
+    sub_txt = (
+        "Your saved Pre-Flight settings, daily account baselines, and broker API tokens stay 100% intact. "
+        "Switch back anytime while flat using 'Switch Back to Stable...' or '📜 Logs ▾ -> ↺ Revert to Previous Version'."
+        if not legacy_main_blocked
+        else "Stable gets in-app channel switching in its next release — use '📜 Logs ▾ -> ↺ Revert to Previous Version' if you need to step back right now."
+    )
+    tk.Label(
+        win,
+        text=sub_txt,
+        font=("Arial", 9, "bold"),
+        fg="#fbbf24" if legacy_main_blocked else "#94a3b8",
+        bg="#0d1117",
+        justify="left",
+        wraplength=980,
+        anchor="w",
+    ).pack(fill="x", pady=(6, 10))
+
+    btn_bar = tk.Frame(win, bg="#0d1117", pady=12)
+    btn_bar.pack(fill="x", side="bottom")
+
+    def _on_cancel():
+        decision["switch"] = False
+        win.destroy()
+
+    def _on_confirm():
+        if legacy_main_blocked:
+            return
+        decision["switch"] = True
+        win.destroy()
+
+    make_stadium_button(
+        btn_bar,
+        text=f"Cancel (Stay Where I Am)",
+        font=("Arial", 10, "bold"),
+        fill_color="#181e26",
+        border_color="#4a5568",
+        hover_fill="#232c38",
+        hover_border="#718096",
+        fg="#d1d5db",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=34,
+        pad_x=24,
+        command=_on_cancel,
+    ).pack(side="left")
+
+    confirm_lbl = (
+        f"✓ Align Launcher to {ch_title}"
+        if is_same_ver
+        else (
+            f"🔄 Switch to {ch_title} v{target_ver} & Relaunch >>"
+            if not legacy_main_blocked
+            else "Stable Gets Switcher Next Release"
+        )
+    )
+    btn_conf = make_stadium_button(
+        btn_bar,
+        text=confirm_lbl,
+        font=("Arial", 10, "bold"),
+        fill_color="#13283d" if not legacy_main_blocked else "#181e26",
+        fill_top_color="#1a3652" if not legacy_main_blocked else "#181e26",
+        border_color="#38bdf8" if not legacy_main_blocked else "#475569",
+        hover_fill="#163049",
+        hover_fill_top="#1e3e5d",
+        hover_border="#7dd3fc",
+        fg="#e0f2fe" if not legacy_main_blocked else "#64748b",
+        hover_fg="#ffffff",
+        canvas_bg="#0d1117",
+        height=36,
+        pad_x=28,
+        command=_on_confirm,
+    )
+    if legacy_main_blocked:
+        btn_conf.config(state="disabled")
+    btn_conf.pack(side="right")
+
+    card_outer = tk.Frame(
+        win,
+        bg="#131922",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#243040",
+    )
+    card_outer.pack(fill="both", expand=True)
+    NeonBarCanvas(
+        card_outer,
+        core_color="#38bdf8" if is_to_beta else "#10b981",
+        card_bg="#131922",
+        glow_on=True,
+    ).pack(side="left", fill="y")
+    card = tk.Frame(card_outer, bg="#131922", padx=12, pady=10)
+    card.pack(side="left", fill="both", expand=True)
+
+    tk.Label(
+        card,
+        text=f"▶ WHAT'S ON {ch_title.upper()} (v{target_ver}):",
+        font=("Arial", 9, "bold"),
+        fg="#38bdf8",
+        bg="#131922",
+        anchor="w",
+    ).pack(fill="x", pady=(0, 6))
+
+    nav_holder = tk.Frame(card, bg="#131922")
+    nav_holder.pack(fill="x")
+
+    txt_frame = tk.Frame(
+        card,
+        bg="#151d28",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#263548",
+    )
+    txt_frame.pack(fill="both", expand=True)
+    sb = tk.Scrollbar(txt_frame)
+    sb.pack(side="right", fill="y")
+    txt_box = tk.Text(
+        txt_frame,
+        height=12,
+        bg="#151d28",
+        fg="#dce4ee",
+        font=("Arial", 10, "bold"),
+        wrap="word",
+        bd=0,
+        padx=10,
+        pady=8,
+        yscrollcommand=sb.set,
+    )
+    txt_box.pack(side="left", fill="both", expand=True)
+    sb.config(command=txt_box.yview)
+
+    disp_cl = (changelog_md or "").strip() or (
+        f"PnL Enforcer {ch_title} v{target_ver} is ready.\n\n"
+        "Click 'Open Full Changelog ↗' or 'Compare main...beta ↗' above to inspect changes."
+    )
+    nav_ctrl = _insert_formatted_changelog(txt_box, disp_cl)
+    if len(nav_ctrl.get("versions", [])) > 1:
+        _build_changelog_nav_bar(nav_holder, txt_box, nav_ctrl)
+    txt_box.see("1.0")
+    txt_box.config(state="disabled")
+
+    prev_grab_win = None
+    if not is_standalone:
+        try:
+            prev_grab_win = parent.grab_current()
+        except Exception:
+            prev_grab_win = None
+    win.protocol("WM_DELETE_WINDOW", _on_cancel)
+    center_dialog_over_parent(win, parent=parent, width=w, height=h)
+    if not is_standalone:
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+    win.lift()
+    win.focus_force()
+    if is_standalone:
+        win.mainloop()
+    else:
+        parent.wait_window(win)
+        if prev_grab_win is not None:
+            try:
+                if prev_grab_win.winfo_exists():
+                    prev_grab_win.grab_set()
+            except Exception:
+                pass
+    return decision["switch"]
+
+
+def prompt_release_channel_switch(
+    parent_pf=None,
+    from_live_hud=False,
+    cancel_pf_fn=None,
+    extra_close_win=None,
+    on_swapped_in_place=None,
+):
+    """Full 3-checkpoint guarded workflow to preview and switch between
+    Stable (main) and Experimental (beta) release channels."""
+    global _manual_update_chk_busy
+    hide_all_tooltips()
+    if _manual_update_chk_busy or _desktop_tidy_in_progress:
+        return False
+    if _is_git_repo_checkout():
+        messagebox.showinfo(
+            "Developer Git Checkout",
+            "You are running inside a Git clone (.git folder present).\n\nUse 'git checkout main' / 'git checkout beta' to switch branches.",
+            parent=parent_pf,
+        )
+        return False
+    if _is_another_instance_running():
+        messagebox.showwarning(
+            "Another Instance Running",
+            "Close any second running instance of PnL Enforcer before switching release channels.",
+            parent=parent_pf,
+        )
+        return False
+
+    # Checkpoint 1: On click
+    ok_sw, _c1, msg1 = _check_version_switch_guardrails(
+        from_live_hud=from_live_hud,
+        action_label="Channel switch",
+        log_block=True,
+    )
+    if not ok_sw:
+        messagebox.showwarning("Channel Switch Locked", msg1, parent=parent_pf)
+        return False
+
+    target_ch = "main" if _is_beta_channel_build() else "beta"
+    _manual_update_chk_busy = True
+    if parent_pf is not None:
+        try:
+            parent_pf.config(cursor="watch")
+        except Exception:
+            pass
+
+    def _bg_fetch():
+        global _manual_update_chk_busy
+        payload = _fetch_available_update_payload(
+            skip_if_recent=False, channel=target_ch, allow_downgrade=True
+        )
+        prefetched_bat = None
+        if payload is not None and ("--console" not in sys.argv) and ("--check-update" not in sys.argv):
+            prefetched_bat = _fetch_remote_doc_bytes(
+                "Launch_Enforcer.bat", ts=payload[4], channel=target_ch
+            )
+
+        def _finish_on_ui():
+            global _manual_update_chk_busy
+            _manual_update_chk_busy = False
+            if parent_pf is not None:
+                try:
+                    if not parent_pf.winfo_exists():
+                        return
+                    parent_pf.config(cursor="")
+                except Exception:
+                    return
+            if payload is None:
+                messagebox.showwarning(
+                    "Channel Check Unavailable",
+                    f"Could not download the {target_ch} channel manifest from GitHub right now.\n\n"
+                    "If you need to step back while offline, use '📜 Logs ▾ -> ↺ Revert to Previous Version'.",
+                    parent=parent_pf,
+                )
+                return
+
+            best_ver, best_bytes, cl_bytes, cl_text, ts = payload
+            # Checkpoint 2: After fetch
+            ok_re, _c2, msg2 = _check_version_switch_guardrails(
+                from_live_hud=from_live_hud,
+                action_label="Channel switch",
+                log_block=True,
+            )
+            if not ok_re:
+                messagebox.showwarning("Channel Switch Locked", msg2, parent=parent_pf)
+                return
+
+            legacy_blocked = (
+                target_ch == "main"
+                and b"def _rewrite_bat_bytes_for_main" not in best_bytes
+            )
+            if not show_channel_switch_preview_dialog(
+                APP_VERSION,
+                best_ver,
+                target_ch,
+                changelog_md=cl_text,
+                legacy_main_blocked=legacy_blocked,
+                parent=parent_pf,
+            ):
+                return
+
+            if legacy_blocked or _desktop_tidy_in_progress or _is_another_instance_running():
+                return
+
+            # Checkpoint 3: After modal confirm, immediately before first disk write
+            ok_fin, _c3, msg3 = _check_version_switch_guardrails(
+                from_live_hud=from_live_hud,
+                action_label="Channel switch",
+                log_block=True,
+            )
+            if not ok_fin:
+                messagebox.showwarning("Channel Switch Locked", msg3, parent=parent_pf)
+                return
+
+            if str(best_ver) == str(APP_VERSION):
+                ok_ap, err_ap = apply_same_version_channel_swap(target_ch)
+                if ok_ap:
+                    if callable(on_swapped_in_place):
+                        try:
+                            on_swapped_in_place()
+                        except Exception:
+                            pass
+                    messagebox.showinfo(
+                        "Release Channel Updated",
+                        f"Switched Launch_Enforcer.bat to the {target_ch} channel.\n\n"
+                        f"Both channels are currently on v{APP_VERSION}, so no reinstall or relaunch is needed.",
+                        parent=parent_pf,
+                    )
+                else:
+                    messagebox.showerror(
+                        "Channel Switch Failed",
+                        err_ap or "Could not update Launch_Enforcer.bat.",
+                        parent=parent_pf,
+                    )
+                return
+
+            try:
+                target_py = _install_update_payload(
+                    best_ver,
+                    best_bytes,
+                    cl_bytes,
+                    ts,
+                    channel=target_ch,
+                    clear_skip_pin=True,
+                    prefetched_bat_bytes=prefetched_bat,
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    "Channel Switch Failed",
+                    f"Could not switch to {target_ch} v{best_ver}: {exc}",
+                    parent=parent_pf,
+                )
+                return
+
+            if callable(cancel_pf_fn):
+                try:
+                    cancel_pf_fn()
+                except Exception:
+                    pass
+            for w_obj in (parent_pf, extra_close_win):
+                if w_obj is not None:
+                    try:
+                        if w_obj.winfo_exists():
+                            w_obj.destroy()
+                    except Exception:
+                        pass
+            _release_single_instance_mutex()
+            _spawn_updated_enforcer(target_py)
+
+        if parent_pf is not None:
+            try:
+                parent_pf.after(10, _finish_on_ui)
+                return
+            except Exception:
+                pass
+        _manual_update_chk_busy = False
+
+    threading.Thread(target=_bg_fetch, daemon=True).start()
+    return True
 
 
 def _is_git_repo_checkout(script_dir=None):
