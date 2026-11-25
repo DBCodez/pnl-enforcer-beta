@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.90"
+APP_VERSION = "0.9.91"
 
 import os
 import sys
@@ -25,7 +25,15 @@ import tempfile
 import builtins
 import webbrowser
 import threading
+import ssl
+import socket
+import http.client
+import urllib.error
+import urllib.parse
+import urllib.request
 import tkinter as tk
+
+_ORIG_STDLIB_URLOPEN = urllib.request.urlopen
 from tkinter import messagebox
 import tkinter.font as tkfont
 import winsound
@@ -4117,16 +4125,24 @@ def sanitize_log_for_export(raw_log_text):
     lines = str(raw_log_text or "").splitlines()
     out_lines = []
     inserted_notice = False
+    notice_line = (
+        f"[SANITIZED EXPORT ({SANITIZED_LOG_FORMAT_REV}): Total account balances, user paths, "
+        "and full order IDs redacted for safe sharing]"
+    )
 
     for line in lines:
         s = _redact_balance_figures(_scrub_log_line(line))
         out_lines.append(s)
         if not inserted_notice and s.startswith("==="):
-            out_lines.append(
-                f"[SANITIZED EXPORT ({SANITIZED_LOG_FORMAT_REV}): Total account balances, user paths, "
-                "and full order IDs redacted for safe sharing]"
-            )
+            out_lines.append(notice_line)
             inserted_notice = True
+
+    if not any("ENFORCER SESSION LOG" in ln for ln in out_lines):
+        hdr = f"=== ENFORCER SESSION LOG | v{APP_VERSION} | DATE: {get_today_str()} ==="
+        if inserted_notice:
+            out_lines.insert(0, hdr)
+        else:
+            out_lines = [hdr, notice_line] + out_lines
 
     return "\n".join(out_lines) + "\n"
 
@@ -4205,8 +4221,150 @@ def _sync_sanitized_log_archive():
 
 _telemetry_auto_upload_in_flight = False
 
+_https_ssl_ctx_lock = threading.Lock()
+_https_ssl_ctx_cached = None
+_https_ssl_ctx_built = False
+_TESTER_ID_RE = re.compile(r"^[a-f0-9]{6,8}$")
+_PEM_CERT_BLOCK_RE = re.compile(
+    r"-----BEGIN CERTIFICATE-----[\x20-\x7e\r\n]+?-----END CERTIFICATE-----"
+)
+UPLOAD_PAYLOAD_MAX_BYTES = 2_400_000
 
-def _cap_sanitized_log_for_upload(sanitized_text, max_chars=2_200_000):
+
+def _get_https_ssl_context():
+    """Lazily builds and caches an SSLContext combining the Windows OS trust
+    store with certifi's CA bundle (so modern ECDSA roots like Let's Encrypt
+    ISRG Root X2 verify cleanly even when missing from the Windows cache)."""
+    global _https_ssl_ctx_cached, _https_ssl_ctx_built
+    if _https_ssl_ctx_built:
+        return _https_ssl_ctx_cached
+    log_kind = None
+    log_msg = ""
+    with _https_ssl_ctx_lock:
+        if _https_ssl_ctx_built:
+            return _https_ssl_ctx_cached
+        ctx = ssl.create_default_context()
+        try:
+            pre_ca = int((ctx.cert_store_stats() or {}).get("x509_ca", 0) or 0)
+        except Exception:
+            pre_ca = 0
+        try:
+            import certifi
+
+            ca_path = str(certifi.where() or "")
+        except Exception:
+            ca_path = ""
+        if not ca_path or not os.path.isfile(ca_path):
+            _https_ssl_ctx_cached = ctx
+            _https_ssl_ctx_built = True
+            log_kind = "WARN"
+            log_msg = "HTTPS certifi root merge skipped (no_certifi); using OS store only."
+        else:
+            merged_ok = False
+            post_ca = pre_ca
+            try:
+                ctx.load_verify_locations(cafile=ca_path)
+                try:
+                    post_ca = int((ctx.cert_store_stats() or {}).get("x509_ca", 0) or 0)
+                except Exception:
+                    post_ca = pre_ca
+                if post_ca > pre_ca:
+                    merged_ok = True
+            except Exception:
+                pass
+            if not merged_ok:
+                try:
+                    with open(ca_path, "r", encoding="utf-8", errors="ignore") as cf:
+                        pem_txt = cf.read()
+                    blocks = _PEM_CERT_BLOCK_RE.findall(pem_txt)
+                    if blocks:
+                        ctx.load_verify_locations(cadata="\n".join(blocks))
+                        try:
+                            post_ca = int(
+                                (ctx.cert_store_stats() or {}).get("x509_ca", 0) or 0
+                            )
+                        except Exception:
+                            post_ca = pre_ca
+                        if post_ca > pre_ca:
+                            merged_ok = True
+                except Exception:
+                    pass
+            _https_ssl_ctx_cached = ctx
+            _https_ssl_ctx_built = True
+            if merged_ok:
+                log_kind = "SESSION"
+                log_msg = f"HTTPS SSL trust store initialized (OS + certifi: {post_ca} CAs)."
+            else:
+                log_kind = "WARN"
+                log_msg = "HTTPS certifi root merge failed (load_failed); falling back to OS store."
+    if log_kind and log_msg:
+        try:
+            log_event(log_kind, log_msg)
+        except Exception:
+            pass
+    return _https_ssl_ctx_cached
+
+
+def _urlopen_https(req, timeout=10):
+    """Calls urllib.request.urlopen with the OS+certifi merged SSLContext when
+    running against stdlib urlopen, while preserving 2-arg mock compatibility."""
+    cur_fn = urllib.request.urlopen
+    if cur_fn is not _ORIG_STDLIB_URLOPEN:
+        return cur_fn(req, timeout=timeout)
+    ctx = _get_https_ssl_context()
+    if ctx is not None:
+        return cur_fn(req, timeout=timeout, context=ctx)
+    return cur_fn(req, timeout=timeout)
+
+
+def _ensure_valid_anonymous_tester_id(cfg=None, persist=True):
+    """Normalizes (strip+lowercase) or generates a valid 6-8 hex anonymous
+    Tester ID under _config_io_lock so Worker validation never rejects it."""
+    with _config_io_lock:
+        target_cfg = cfg if isinstance(cfg, dict) else config
+        raw_val = str(target_cfg.get("anonymous_tester_id", "") or "").strip().lower()
+        changed = False
+        if _TESTER_ID_RE.fullmatch(raw_val):
+            clean_id = raw_val
+            if target_cfg.get("anonymous_tester_id") != clean_id:
+                target_cfg["anonymous_tester_id"] = clean_id
+                changed = True
+        else:
+            clean_id = uuid.uuid4().hex[:6]
+            target_cfg["anonymous_tester_id"] = clean_id
+            changed = True
+        if (
+            changed
+            and persist
+            and not _config_load_corrupt
+            and target_cfg is config
+        ):
+            save_config(target_cfg)
+        return clean_id
+
+
+def _classify_urlopen_exception(ex):
+    """Maps non-HTTPError urlopen exceptions to a closed diagnostic code."""
+    reason = ex.reason if isinstance(ex, urllib.error.URLError) else ex
+    if reason is None:
+        reason = ex
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        vc = getattr(reason, "verify_code", None)
+        if isinstance(vc, int) and not isinstance(vc, bool):
+            return f"ssl_cert_{vc}"
+        return "ssl_cert"
+    if isinstance(reason, ssl.SSLError):
+        return "ssl_err"
+    if isinstance(reason, socket.gaierror):
+        return "dns_error"
+    if isinstance(reason, TimeoutError):
+        return "timeout"
+    if isinstance(reason, (OSError, http.client.HTTPException)):
+        return "conn_error"
+    return "client_err"
+
+
+def _cap_sanitized_log_for_upload(sanitized_text, max_chars=1_900_000):
     """Caps uploaded sanitized logs at max_chars while preserving the session
     header, startup config, and most recent trading/error lines."""
     txt = str(sanitized_text or "")
@@ -4218,31 +4376,39 @@ def _cap_sanitized_log_for_upload(sanitized_text, max_chars=2_200_000):
     return txt[:head_len] + notice + txt[-tail_len:]
 
 
-def _upload_sanitized_log_to_drive_detailed(
+def _upload_sanitized_log_to_drive_diag(
     filename, sanitized_text, active_broker, anonymous_id, extra_fields=None
 ):
     """Uploads a balance-redacted session log (or bug report + log) to the Google
-    Apps Script / Cloudflare relay webhook and returns `(ok: bool, err_kind: str)`
-    where `err_kind` is `''`, `'rate_limited'`, or `'unreachable'`. Inspects the
-    JSON response body so application-level errors (e.g., {"status": 413/429}) are
-    never mistaken for HTTP 200 success."""
-    import urllib.error
-    import urllib.request
-
+    Apps Script / Cloudflare relay webhook and returns
+    `(ok: bool, err_kind: str, diag_code: str)` where `err_kind` is `''`,
+    `'rate_limited'`, or `'unreachable'` and `diag_code` is a closed safe code."""
     try:
-        safe_content = _cap_sanitized_log_for_upload(sanitized_text)
-        payload_dict = {
-            "filename": str(filename),
-            "version": APP_VERSION,
-            "broker": str(active_broker or "SCHWAB"),
-            "tester_id": str(anonymous_id or ""),
-            "content": safe_content,
-        }
-        if isinstance(extra_fields, dict):
-            for ek, ev in extra_fields.items():
-                if ek not in payload_dict and ev is not None:
-                    payload_dict[ek] = ev
-        payload_bytes = json.dumps(payload_dict).encode("utf-8")
+        clean_tid = str(anonymous_id or "").strip().lower()
+        cur_max_chars = 1_900_000
+        payload_bytes = b""
+        for _trim_pass in range(4):
+            safe_content = _cap_sanitized_log_for_upload(
+                sanitized_text, max_chars=cur_max_chars
+            )
+            payload_dict = {
+                "filename": str(filename),
+                "version": APP_VERSION,
+                "broker": str(active_broker or "SCHWAB"),
+                "tester_id": clean_tid,
+                "content": safe_content,
+            }
+            if isinstance(extra_fields, dict):
+                for ek, ev in extra_fields.items():
+                    if ek not in payload_dict and ev is not None:
+                        payload_dict[ek] = ev
+            payload_bytes = json.dumps(payload_dict, ensure_ascii=False).encode(
+                "utf-8", errors="replace"
+            )
+            if len(payload_bytes) <= UPLOAD_PAYLOAD_MAX_BYTES:
+                break
+            over_b = len(payload_bytes) - UPLOAD_PAYLOAD_MAX_BYTES
+            cur_max_chars = max(4096, cur_max_chars - over_b - 1024)
         req = urllib.request.Request(
             BETA_TELEMETRY_WEBHOOK_URL,
             data=payload_bytes,
@@ -4252,31 +4418,48 @@ def _upload_sanitized_log_to_drive_detailed(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _urlopen_https(req, timeout=30) as resp:
             code = getattr(resp, "status", None) or resp.getcode()
             body_raw = ""
             try:
                 body_raw = resp.read().decode("utf-8", errors="replace").strip()
             except Exception:
                 pass
+            body_low = body_raw[:256].lstrip().lower()
+            if body_low.startswith(("<!doctype", "<html")):
+                return False, "unreachable", "html_block"
             if body_raw.startswith("{"):
                 try:
                     body_json = json.loads(body_raw)
-                    app_status = int(body_json.get("status", 200) or 200)
-                    err_msg = str(body_json.get("message", "") or body_json.get("error", "")).lower()
+                except Exception:
+                    body_json = None
+                if isinstance(body_json, dict):
+                    raw_st = body_json.get("status", 200)
+                    try:
+                        app_status = int(200 if raw_st is None else raw_st)
+                    except (TypeError, ValueError):
+                        return False, "unreachable", "app_err"
+                    err_msg = str(
+                        body_json.get("message", "") or body_json.get("error", "")
+                    ).lower()
                     if app_status == 429 or (
                         app_status >= 400 and ("limit" in err_msg or "rate" in err_msg)
                     ):
-                        return False, "rate_limited"
+                        return False, "rate_limited", "rate_limited"
                     if app_status >= 400 or body_json.get("error"):
-                        return False, "unreachable"
-                except Exception:
-                    pass
+                        clamped = max(100, min(599, app_status)) if app_status >= 100 else 0
+                        return (
+                            False,
+                            "unreachable",
+                            f"app_{clamped}" if clamped else "app_err",
+                        )
             if code == 200 or (200 <= int(code or 0) < 300):
-                return True, ""
-            if int(code or 0) == 429:
-                return False, "rate_limited"
-            return False, "unreachable"
+                return True, "", ""
+            c_int = int(code or 0)
+            if c_int == 429:
+                return False, "rate_limited", "rate_limited"
+            clamped_c = max(100, min(599, c_int)) if c_int >= 100 else 0
+            return False, "unreachable", f"http_{clamped_c}" if clamped_c else "http_err"
     except urllib.error.HTTPError as he:
         code = int(getattr(he, "code", 0) or 0)
         err_url = str(getattr(he, "url", "") or "").lower()
@@ -4287,25 +4470,40 @@ def _upload_sanitized_log_to_drive_detailed(
         except Exception:
             pass
         if code == 200:
-            return True, ""
+            return True, "", ""
         if code in (302, 405) and (
             "googleusercontent.com" in err_url
             or "googleusercontent.com" in loc_hdr
         ):
-            return True, ""
+            return True, "", ""
         if code == 429:
-            return False, "rate_limited"
-        return False, "unreachable"
-    except Exception:
-        return False, "unreachable"
+            return False, "rate_limited", "rate_limited"
+        clamped = max(100, min(599, code)) if code >= 100 else 0
+        return False, "unreachable", f"http_{clamped}" if clamped else "http_err"
+    except Exception as ex:
+        return False, "unreachable", _classify_urlopen_exception(ex)
+
+
+def _upload_sanitized_log_to_drive_detailed(
+    filename, sanitized_text, active_broker, anonymous_id, extra_fields=None
+):
+    """2-tuple `(ok, err_kind)` wrapper preserving backwards compatibility."""
+    ok, err_kind, _diag = _upload_sanitized_log_to_drive_diag(
+        filename,
+        sanitized_text,
+        active_broker,
+        anonymous_id,
+        extra_fields=extra_fields,
+    )
+    return bool(ok), str(err_kind or "")
 
 
 def _upload_sanitized_log_to_drive(
     filename, sanitized_text, active_broker, anonymous_id, extra_fields=None
 ) -> bool:
-    """Boolean-returning wrapper around `_upload_sanitized_log_to_drive_detailed`
+    """Boolean-returning wrapper around `_upload_sanitized_log_to_drive_diag`
     so existing background callers can safely test `if ok:`."""
-    ok, _ = _upload_sanitized_log_to_drive_detailed(
+    ok, _, _ = _upload_sanitized_log_to_drive_diag(
         filename,
         sanitized_text,
         active_broker,
@@ -4320,7 +4518,8 @@ def _upload_sanitized_log_to_drive(
 # ==========================================
 MOBILE_PUSH_MAX_QUEUE = 48
 MOBILE_PUSH_STALE_SEC = 120.0
-MOBILE_PUSH_HTTP_TIMEOUT_SEC = 2.5
+MOBILE_PUSH_HTTP_TIMEOUT_SEC = 5.0
+MOBILE_PUSH_RETRY_DELAY_SEC = 0.75
 MOBILE_NTFY_MIN_TOPIC_LEN = 10
 MOBILE_PUSH_429_COOLDOWN_SEC = 90.0
 
@@ -4457,13 +4656,64 @@ def _snapshot_mobile_push_cfg(cfg=None):
     }
 
 
+def _format_mobile_push_exc_detail(ex):
+    """Formats a closed-vocabulary exception detail without ever exposing raw
+    reason strings, hostnames, paths, or secrets."""
+    top_cls = type(ex).__name__
+    if isinstance(ex, urllib.error.URLError):
+        reason = getattr(ex, "reason", None)
+        if reason is not None and not isinstance(reason, str):
+            r_cls = type(reason).__name__
+            err_no = getattr(reason, "winerror", None)
+            if err_no is None:
+                err_no = getattr(reason, "errno", None)
+            if isinstance(err_no, int) and not isinstance(err_no, bool):
+                return f"{top_cls} ({r_cls} {err_no})"
+            return f"{top_cls} ({r_cls})"
+    err_no = getattr(ex, "winerror", None)
+    if err_no is None:
+        err_no = getattr(ex, "errno", None)
+    if isinstance(err_no, int) and not isinstance(err_no, bool):
+        return f"{top_cls} ({err_no})"
+    return top_cls
+
+
+def _parse_pushover_400_detail(he):
+    """Maps Pushover HTTP 400 JSON bodies to a closed, secret-free hint."""
+    try:
+        raw_b = he.read(512)
+        obj = json.loads(raw_b.decode("utf-8", errors="replace"))
+        if isinstance(obj, dict):
+            errs = " ".join(str(x) for x in (obj.get("errors") or ())).lower()
+            has_bad = ("invalid" in errs) or ("not valid" in errs)
+            if "token" in errs and has_bad:
+                return "HTTP 400 (App Token invalid)"
+            if "user" in errs and has_bad:
+                return "HTTP 400 (User Key invalid)"
+    except Exception:
+        pass
+    return "HTTP 400"
+
+
+def _is_mobile_push_permanent_failure(detail):
+    """Deny-list classifier: permanent errors are never retried."""
+    s = str(detail or "")
+    if (
+        s.startswith("HTTP 3")
+        or s.startswith("HTTP 4")
+        or s.startswith("missing ")
+        or s.startswith("fallback:")
+    ):
+        return True
+    for tok in ("ValueError", "InvalidURL", "UnicodeError"):
+        if tok in s:
+            return True
+    return False
+
+
 def _send_mobile_push_http(snap_cfg, title, body, prio_rank=1):
     """Synchronously dispatches one 1-way push notification via the selected
     provider. Returns `(ok: bool, detail: str)` without ever logging secrets."""
-    import urllib.error
-    import urllib.parse
-    import urllib.request
-
     if callable(_mobile_push_transport_override):
         return _mobile_push_transport_override(
             snap_cfg.get("provider", "ntfy"),
@@ -4501,13 +4751,16 @@ def _send_mobile_push_http(snap_cfg, title, body, prio_rank=1):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=MOBILE_PUSH_HTTP_TIMEOUT_SEC) as r:
+            with _urlopen_https(req, timeout=MOBILE_PUSH_HTTP_TIMEOUT_SEC) as r:
                 st = int(getattr(r, "status", None) or r.getcode() or 0)
                 return (200 <= st < 300), f"HTTP {st}"
         except urllib.error.HTTPError as he:
-            return False, f"HTTP {int(getattr(he, 'code', 0) or 0)}"
+            code = int(getattr(he, "code", 0) or 0)
+            if code == 400:
+                return False, _parse_pushover_400_detail(he)
+            return False, f"HTTP {code}"
         except Exception as ex:
-            return False, type(ex).__name__
+            return False, _format_mobile_push_exc_detail(ex)
 
     # Default: ntfy UTF-8 JSON publish to root server URL (avoids non-Latin-1 Title header crashes)
     base_url = snap_cfg.get("server", "")
@@ -4534,7 +4787,7 @@ def _send_mobile_push_http(snap_cfg, title, body, prio_rank=1):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=MOBILE_PUSH_HTTP_TIMEOUT_SEC) as r:
+        with _urlopen_https(req, timeout=MOBILE_PUSH_HTTP_TIMEOUT_SEC) as r:
             st = int(getattr(r, "status", None) or r.getcode() or 0)
             return (200 <= st < 300), f"HTTP {st}"
     except urllib.error.HTTPError as he:
@@ -4553,16 +4806,16 @@ def _send_mobile_push_http(snap_cfg, title, body, prio_rank=1):
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req2, timeout=MOBILE_PUSH_HTTP_TIMEOUT_SEC) as r2:
+                with _urlopen_https(req2, timeout=MOBILE_PUSH_HTTP_TIMEOUT_SEC) as r2:
                     st2 = int(getattr(r2, "status", None) or r2.getcode() or 0)
                     return (200 <= st2 < 300), f"HTTP {st2}"
             except urllib.error.HTTPError as he2:
-                return False, f"HTTP {int(getattr(he2, 'code', 0) or 0)}"
+                return False, f"fallback: HTTP {int(getattr(he2, 'code', 0) or 0)}"
             except Exception as ex2:
-                return False, type(ex2).__name__
+                return False, f"fallback: {_format_mobile_push_exc_detail(ex2)}"
         return False, f"HTTP {code}"
     except Exception as ex:
-        return False, type(ex).__name__
+        return False, _format_mobile_push_exc_detail(ex)
 
 
 def _mobile_push_worker_loop():
@@ -4581,10 +4834,47 @@ def _mobile_push_worker_loop():
                 if _is_mobile_push_429_held(snap_cfg, prio_rank, cat_key):
                     continue
             ok, detail = _send_mobile_push_http(snap_cfg, title, body, prio_rank=prio_rank)
+            retried = False
+            if (
+                not ok
+                and not str(detail).startswith("HTTP 429")
+                and not _is_mobile_push_permanent_failure(detail)
+                and (int(prio_rank) == 0 or _mobile_push_queue.empty())
+                and (
+                    int(prio_rank) == 0
+                    or (time.monotonic() - float(enqueued_mono)) <= MOBILE_PUSH_STALE_SEC
+                )
+            ):
+                delay_s = max(0.0, float(MOBILE_PUSH_RETRY_DELAY_SEC or 0.0))
+                if delay_s > 0.0:
+                    time.sleep(delay_s)
+                can_retry = True
+                if (
+                    int(prio_rank) >= 1
+                    and (time.monotonic() - float(enqueued_mono)) > MOBILE_PUSH_STALE_SEC
+                ):
+                    can_retry = False
+                else:
+                    with _mobile_push_lock:
+                        if _is_mobile_push_429_held(snap_cfg, prio_rank, cat_key):
+                            can_retry = False
+                if can_retry and (int(prio_rank) == 0 or _mobile_push_queue.empty()):
+                    first_detail = detail
+                    retried = True
+                    ok, detail = _send_mobile_push_http(
+                        snap_cfg, title, body, prio_rank=prio_rank
+                    )
+                    if ok:
+                        prov_lbl_ok = str(snap_cfg.get("provider", "ntfy") or "ntfy")
+                        log_event(
+                            "SESSION",
+                            f"Mobile push ({prov_lbl_ok}) delivered on retry "
+                            f"(first attempt: {first_detail}).",
+                        )
             if not ok:
                 prov_lbl_w = str(snap_cfg.get("provider", "ntfy") or "ntfy")
                 srv_lbl_w = str(snap_cfg.get("server", "") or "")
-                if detail == "HTTP 429":
+                if str(detail).startswith("HTTP 429"):
                     with _mobile_push_lock:
                         now_429 = time.monotonic()
                         hold_k = (prov_lbl_w, srv_lbl_w)
@@ -4607,9 +4897,10 @@ def _mobile_push_worker_loop():
                             f"recaps/warnings for {int(MOBILE_PUSH_429_COOLDOWN_SEC)}s so URGENT stop alerts keep priority.",
                         )
                 else:
+                    retry_sfx = " after 1 retry" if retried else ""
                     log_event(
                         "WARN",
-                        f"Mobile push ({prov_lbl_w}) failed: {detail}.",
+                        f"Mobile push ({prov_lbl_w}) failed{retry_sfx}: {detail}.",
                     )
         except Exception as ex:
             try:
@@ -4741,7 +5032,7 @@ def flush_mobile_push_queue(timeout_s=2.0):
     return bool(_mobile_push_idle_event.wait(timeout=max(0.0, float(timeout_s or 0.0))))
 
 
-atexit.register(lambda: flush_mobile_push_queue(2.0))
+atexit.register(lambda: flush_mobile_push_queue(3.5))
 
 
 def send_mobile_push_test_sync(cfg_override=None):
@@ -4877,27 +5168,30 @@ def _maybe_upload_prior_day_sanitized_log():
         if not san_text.strip():
             return
 
-        tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
-        if not tester_id:
-            tester_id = uuid.uuid4().hex[:6]
-            config["anonymous_tester_id"] = tester_id
-            save_config(config)
+        tester_id = _ensure_valid_anonymous_tester_id(config, persist=True)
         active_b = str(config.get("active_broker", "SCHWAB") or "SCHWAB")
         _telemetry_auto_upload_in_flight = True
 
         def _bg_upload():
             global _telemetry_auto_upload_in_flight
             try:
-                ok = _upload_sanitized_log_to_drive(
+                ok, err_kind, diag_code = _upload_sanitized_log_to_drive_diag(
                     fname, san_text, active_b, tester_id
                 )
                 if ok:
-                    config["last_uploaded_sanitized_log"] = fname
-                    save_config(config)
+                    with _config_io_lock:
+                        config["last_uploaded_sanitized_log"] = fname
+                        save_config(config)
                     log_event(
                         "TELEMETRY",
                         f"Auto-shared prior-day sanitized log "
                         f"({fname}, Tester ID: {tester_id})",
+                    )
+                else:
+                    log_event(
+                        "WARN",
+                        f"Prior-day Safe Log auto-share could not complete "
+                        f"({err_kind or 'unreachable'}: {diag_code or 'unknown'}).",
                     )
             except Exception:
                 pass
@@ -4932,7 +5226,7 @@ def init_daily_log():
         try:
             with open(LOG_PATH, "r", encoding="utf-8") as f:
                 first_line = f.readline()
-                if today_str in first_line:
+                if ("ENFORCER SESSION LOG" in first_line) and (today_str in first_line):
                     needs_wipe = False
         except Exception:
             needs_wipe = True
@@ -6531,22 +6825,42 @@ def compute_sparkline_scale(
     pts, stop_pnl, session_high_pnl, breach_active=False
 ):
     """Computes `(y_min, y_max, stop_in_window)` for `PnL CURVE`.
-    Returns `stop_in_window=False` (Anti-Pancake bottom pin) when `stop_pnl`
-    sits far below the intraday curve so morning price action is not squashed."""
-    vals = [0.0] + [float(v) for v in (pts or ())]
+    Always frames active breaches and profit-lock stops (`stop_pnl >= 0`), and
+    returns `stop_in_window=False` (Anti-Pancake bottom pin) for negative loss
+    stops until drawdown uses >= 50% of the stop budget or naturally enters
+    the pinned frame."""
+    clean_pts = []
+    for v in pts or ():
+        try:
+            fv = float(v)
+            if math.isfinite(fv):
+                clean_pts.append(fv)
+        except Exception:
+            continue
+    vals = [0.0] + clean_pts
     if session_high_pnl is not None:
-        vals.append(max(0.0, float(session_high_pnl)))
+        try:
+            hi_f = float(session_high_pnl)
+            if math.isfinite(hi_f):
+                vals.append(max(0.0, hi_f))
+        except Exception:
+            pass
     c_min = min(vals)
     c_max = max(vals)
     raw_span = max(25.0, c_max - c_min)
-    stop_f = float(stop_pnl if stop_pnl is not None else -1500.0)
-    stop_in_window = bool(
-        breach_active
-        or (
-            (stop_f >= (c_min - 1.5 * raw_span))
-            and (stop_f <= (c_max + 0.5 * raw_span))
+    try:
+        stop_f = float(stop_pnl if stop_pnl is not None else -1500.0)
+        if not math.isfinite(stop_f):
+            stop_f = -1500.0
+    except Exception:
+        stop_f = -1500.0
+    if breach_active or stop_f >= 0.0:
+        stop_in_window = True
+    else:
+        stop_in_window = bool(
+            (stop_f >= (c_min - 0.16 * raw_span))
+            or (c_min <= 0.50 * stop_f)
         )
-    )
     if stop_in_window:
         lo = min(c_min, stop_f)
         hi = max(c_max, stop_f)
@@ -7256,11 +7570,7 @@ def load_config(log_restore=False):
             except Exception as e:
                 print(f"Could not apply saved config fields: {e}")
 
-        tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
-        if not tester_id:
-            config["anonymous_tester_id"] = uuid.uuid4().hex[:6]
-            if not _config_load_corrupt:
-                save_config(config)
+        _ensure_valid_anonymous_tester_id(config, persist=(not _config_load_corrupt))
 
         today_str = get_today_str()
         c_broker = str(config.get("committed_broker", "") or "").upper()
@@ -33573,11 +33883,7 @@ def show_preflight_window(
         if not pf.winfo_exists():
             return
 
-        tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
-        if not tester_id:
-            tester_id = uuid.uuid4().hex[:6]
-            config["anonymous_tester_id"] = tester_id
-            save_config(config)
+        tester_id = _ensure_valid_anonymous_tester_id(config, persist=True)
         active_b = str(
             var_broker.get() or config.get("active_broker", "SCHWAB") or "SCHWAB"
         )
@@ -34024,7 +34330,7 @@ def show_preflight_window(
                 )
 
             def _worker():
-                ok, err_kind = _upload_sanitized_log_to_drive_detailed(
+                ok, err_kind, diag_code = _upload_sanitized_log_to_drive_diag(
                     upload_fname,
                     combined_body,
                     active_b,
@@ -34065,7 +34371,7 @@ def show_preflight_window(
                         fail_why = (
                             "daily upload limit reached"
                             if err_kind == "rate_limited"
-                            else "telemetry endpoint unreachable"
+                            else f"telemetry upload failed ({diag_code or 'unreachable'})"
                         )
                         log_event(
                             "WARN",
@@ -34094,6 +34400,7 @@ def show_preflight_window(
                         contact_str=contact_str,
                         included_prior_name=included_prior_name,
                         err_kind=err_kind,
+                        diag_code=diag_code,
                     )
 
                 try:
@@ -34240,6 +34547,7 @@ def show_preflight_window(
         contact_str="",
         included_prior_name="",
         err_kind="",
+        diag_code="",
     ):
         hide_all_tooltips()
         parent_win = pf
@@ -34262,6 +34570,10 @@ def show_preflight_window(
                 pass
         apply_dark_title_bar(dlg)
         is_rl_err = (not ok) and (err_kind == "rate_limited")
+        d_code_low = str(diag_code or "").strip().lower()
+        is_rejected_err = (not ok) and (not is_rl_err) and (
+            d_code_low.startswith(("http_", "app_")) or d_code_low == "html_block"
+        )
         if report_mode:
             dlg.title(
                 "PnL Enforcer — Bug Report Sent"
@@ -34314,7 +34626,11 @@ def show_preflight_window(
             else (
                 "⚠️ DAILY UPLOAD LIMIT REACHED"
                 if is_rl_err
-                else "⚠️ CONNECTION UNREACHABLE"
+                else (
+                    "⚠️ UPLOAD REJECTED"
+                    if is_rejected_err
+                    else "⚠️ CONNECTION UNREACHABLE"
+                )
             )
         )
 
@@ -34377,6 +34693,34 @@ def show_preflight_window(
         txt_box.tag_configure(
             "pill_amber", font=("Arial", 10, "bold"), foreground="#fde68a", background="#3b2106"
         )
+
+        def _build_fail_bullet_spans():
+            if is_rl_err:
+                return [
+                    ("• Daily diagnostic upload limit reached for this Tester ID (resets automatically).\n", ("body",))
+                ]
+            if d_code_low.startswith("ssl_"):
+                lead = "• Secure SSL/TLS verification failed before reaching the upload drive "
+            elif d_code_low == "dns_error":
+                lead = "• DNS lookup for the upload host was blocked or failed on this network "
+            elif d_code_low == "html_block":
+                lead = "• Network or firewall returned an HTML block/captive page instead of the upload API "
+            elif is_rejected_err:
+                lead = "• Diagnostic server rejected the upload payload "
+            elif d_code_low == "timeout":
+                lead = "• Upload request timed out waiting for the diagnostic server "
+            elif d_code_low == "client_err":
+                lead = "• Local upload preparation hit an unexpected client error "
+            else:
+                lead = "• Could not reach the diagnostic drive right now (network or firewall blocked) "
+            if d_code_low:
+                return [
+                    (lead, ("body",)),
+                    (f" {d_code_low.upper()} ", ("body", "pill_blue")),
+                    (".\n", ("body",)),
+                ]
+            return [(lead.rstrip() + ".\n", ("body",))]
+
         if report_mode:
             if ok:
                 c_note = (
@@ -34406,13 +34750,7 @@ def show_preflight_window(
                     if included_prior_name
                     else "Safe Log"
                 )
-                first_fail_line = (
-                    "• Daily diagnostic upload limit reached for this Tester ID (resets automatically).\n"
-                    if is_rl_err
-                    else "• Could not reach the diagnostic drive right now (network or firewall blocked).\n"
-                )
-                spans = [
-                    (first_fail_line, ("body",)),
+                spans = _build_fail_bullet_spans() + [
                     (f"• Your bug description + {logs_saved_desc} were copied to clipboard and saved to ", ("body",)),
                     (" ~/enforcer_log_sanitized.txt ", ("body", "pill_blue")),
                     (".\n", ("body",)),
@@ -34433,13 +34771,7 @@ def show_preflight_window(
                 (" — thank you for helping improve PnL Enforcer!", ("body",)),
             ]
         else:
-            first_fail_line = (
-                "• Daily diagnostic upload limit reached for this Tester ID (resets automatically).\n"
-                if is_rl_err
-                else "• Could not reach the diagnostic drive right now (network or firewall blocked).\n"
-            )
-            spans = [
-                (first_fail_line, ("body",)),
+            spans = _build_fail_bullet_spans() + [
                 ("• Your trading guardrails and local logs are ", ("body",)),
                 (" 100% unaffected ", ("body", "pill_green")),
                 (".\n", ("body",)),
@@ -34491,11 +34823,7 @@ def show_preflight_window(
             with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
                 raw_txt = f.read()
             sanitized_txt = sanitize_log_for_export(raw_txt)
-            tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
-            if not tester_id:
-                tester_id = uuid.uuid4().hex[:6]
-                config["anonymous_tester_id"] = tester_id
-                save_config(config)
+            tester_id = _ensure_valid_anonymous_tester_id(config, persist=True)
             active_b = str(
                 var_broker.get() or config.get("active_broker", "SCHWAB")
             )
@@ -34516,7 +34844,7 @@ def show_preflight_window(
                 )
 
             def _worker():
-                ok, err_kind = _upload_sanitized_log_to_drive_detailed(
+                ok, err_kind, diag_code = _upload_sanitized_log_to_drive_diag(
                     upload_fname, sanitized_txt, active_b, tester_id
                 )
 
@@ -34543,6 +34871,10 @@ def show_preflight_window(
                         except Exception:
                             pass
                     else:
+                        log_event(
+                            "WARN",
+                            f"Manual Safe Log upload failed ({err_kind or 'unreachable'}: {diag_code or 'unknown'}).",
+                        )
                         try:
                             if (
                                 default_status_lbl is not None
@@ -34559,7 +34891,7 @@ def show_preflight_window(
                         except Exception:
                             pass
                     show_telemetry_upload_result_dialog(
-                        ok, tester_id, err_kind=err_kind
+                        ok, tester_id, err_kind=err_kind, diag_code=diag_code
                     )
 
                 try:
@@ -34578,11 +34910,7 @@ def show_preflight_window(
 
     def show_auto_share_consent_dialog():
         hide_all_tooltips()
-        tester_id = str(config.get("anonymous_tester_id", "") or "").strip()
-        if not tester_id:
-            tester_id = uuid.uuid4().hex[:6]
-            config["anonymous_tester_id"] = tester_id
-            save_config(config)
+        tester_id = _ensure_valid_anonymous_tester_id(config, persist=True)
 
         decision = {"ok": False}
         active_parent = _prefs_modal_refs.get("dlg")
@@ -48257,9 +48585,64 @@ def _format_sparkline_tooltip():
     )
 
 
+_sparkline_err_logged = False
+
+
+def _build_sparkline_runs(pts):
+    """Splits a sequence of PnL checkpoints into contiguous same-sign runs
+    `[(sign, [(x_idx_float, y_val_float), ...]), ...]` (`sign` in `+1, -1, 0`),
+    interpolating exact `$0` crossings (`t = v0 / (v0 - v1)`) and preserving
+    the `0.005` epsilon rule for points touching zero."""
+    clean = []
+    for p in pts or ():
+        try:
+            fv = float(p)
+            if math.isfinite(fv):
+                clean.append(fv)
+        except Exception:
+            continue
+    if len(clean) < 2:
+        return []
+
+    def _sign_of(v):
+        if v > 0.005:
+            return 1
+        if v < -0.005:
+            return -1
+        return 0
+
+    runs = []
+    for j in range(1, len(clean)):
+        v0 = clean[j - 1]
+        v1 = clean[j]
+        s0 = _sign_of(v0)
+        s1 = _sign_of(v1)
+        segs = []
+        if s0 != 0 and s1 != 0 and s0 != s1:
+            t_cross = v0 / (v0 - v1)
+            x_cross = (j - 1) + t_cross
+            segs.append((s0, (float(j - 1), v0), (x_cross, 0.0)))
+            segs.append((s1, (x_cross, 0.0), (float(j), v1)))
+        else:
+            ref_v = v0 if (abs(v1) <= 0.005 and abs(v0) > 0.005) else v1
+            segs.append((_sign_of(ref_v), (float(j - 1), v0), (float(j), v1)))
+        for s_seg, p_start, p_end in segs:
+            if (
+                runs
+                and runs[-1][0] == s_seg
+                and abs(runs[-1][1][-1][0] - p_start[0]) <= 1e-9
+                and abs(runs[-1][1][-1][1] - p_start[1]) <= 1e-9
+            ):
+                runs[-1][1].append(p_end)
+            else:
+                runs.append((s_seg, [p_start, p_end]))
+    return runs
+
+
 def _redraw_hud_sparkline_canvas(event=None):
     """Draws the HUD `PnL CURVE` column using `_hud_last_spark_snap` only
     (never touches `_pnl_curve_lock`)."""
+    global _sparkline_err_logged
     if hud_sparkline_canvas is None:
         return
     try:
@@ -48283,8 +48666,17 @@ def _redraw_hud_sparkline_canvas(event=None):
             )
             return
 
-        pts = list(snap.get("pts") or ())
+        pts = []
+        for raw_p in snap.get("pts") or ():
+            try:
+                fp = float(raw_p)
+                if math.isfinite(fp):
+                    pts.append(fp)
+            except Exception:
+                continue
         net_v = float(snap.get("net_pnl", 0.0))
+        if not math.isfinite(net_v):
+            net_v = 0.0
         if not pts:
             pts = [net_v]
         stop_v = float(snap.get("stop_pnl", -1500.0))
@@ -48309,9 +48701,57 @@ def _redraw_hud_sparkline_canvas(event=None):
                 return pad_x + plot_w
             return pad_x + (float(idx_p) / float(len(pts) - 1)) * plot_w
 
-        # 1. $0 breakeven reference line
-        if y_min <= 0.0 <= y_max:
-            y0_px = _y_px(0.0)
+        y0_px = _y_px(0.0)
+        y0_fill = max(float(pad_t), min(float(pad_t + plot_h), y0_px))
+        yst_px = _y_px(stop_v) if stop_in_win else None
+
+        def _spark_pt_col(val):
+            if neutral_v:
+                return "#94a3b8"
+            fv = float(val)
+            if fv > 0.005:
+                return "#4ade80"
+            if fv < -0.005:
+                return "#f87171"
+            return "#94a3b8"
+
+        def _sign_col(sign_i):
+            if neutral_v:
+                return "#94a3b8"
+            if sign_i > 0:
+                return "#4ade80"
+            if sign_i < 0:
+                return "#f87171"
+            return "#94a3b8"
+
+        # 0. Subtle background-blended area fills under/over $0 (behind ref lines)
+        runs = _build_sparkline_runs(pts) if len(pts) > 1 else []
+        if runs and not neutral_v:
+            try:
+                bg_hex = str(hud_sparkline_canvas.cget("bg") or "#262a2e")
+            except Exception:
+                bg_hex = "#262a2e"
+            fill_pos = _blend_hex(bg_hex, "#22c55e", 0.16)
+            fill_neg = _blend_hex(bg_hex, "#ef4444", 0.16)
+            for s_run, run_pts in runs:
+                if s_run == 0 or len(run_pts) < 2:
+                    continue
+                px_pts = [(_x_px(rx), _y_px(ry)) for rx, ry in run_pts]
+                max_dy = max(abs(py - y0_fill) for _px, py in px_pts)
+                if max_dy < 1.0:
+                    continue
+                poly_coords = [px_pts[0][0], y0_fill]
+                for px_v, py_v in px_pts:
+                    poly_coords.extend((px_v, py_v))
+                poly_coords.extend((px_pts[-1][0], y0_fill))
+                hud_sparkline_canvas.create_polygon(
+                    *poly_coords,
+                    fill=(fill_pos if s_run > 0 else fill_neg),
+                    outline="",
+                )
+
+        # 1. $0 breakeven reference line (skipped when colliding with Stop == $0)
+        if y_min <= 0.0 <= y_max and (yst_px is None or abs(yst_px - y0_px) >= 1.5):
             hud_sparkline_canvas.create_line(
                 pad_x, y0_px, w - pad_x, y0_px, fill="#475569", dash=(2, 3)
             )
@@ -48328,9 +48768,8 @@ def _redraw_hud_sparkline_canvas(event=None):
                 dash=(2, 2),
             )
 
-        # 3. Stop indicator (true scale or Anti-Pancake bottom pin)
+        # 3. Stop indicator last among ref lines (true scale or Anti-Pancake bottom pin)
         if stop_in_win:
-            yst_px = _y_px(stop_v)
             st_col = (
                 "#64748b"
                 if neutral_v
@@ -48350,17 +48789,7 @@ def _redraw_hud_sparkline_canvas(event=None):
                 tx - 3, ypin - 4, tx + 3, ypin - 4, tx, ypin, fill=pin_col, outline=""
             )
 
-        # 4. Net PnL polyline & 5. Live tip dot
-        def _spark_pt_col(val):
-            if neutral_v:
-                return "#94a3b8"
-            fv = float(val)
-            if fv > 0.005:
-                return "#4ade80"
-            if fv < -0.005:
-                return "#f87171"
-            return "#94a3b8"
-
+        # 4. Net PnL polyline (batched per run, neutral as single slate line) & High marker
         if len(pts) == 1:
             yv = _y_px(pts[0])
             c_seg = _spark_pt_col(pts[0])
@@ -48368,18 +48797,25 @@ def _redraw_hud_sparkline_canvas(event=None):
                 pad_x, yv, w - pad_x, yv, fill=c_seg, width=2
             )
         else:
-            for j in range(1, len(pts)):
-                p0, p1 = pts[j - 1], pts[j]
-                ref_v = p0 if (abs(p1) <= 0.005 and abs(p0) > 0.005) else p1
-                c_seg = _spark_pt_col(ref_v)
+            if neutral_v:
+                all_coords = []
+                for idx_n, val_n in enumerate(pts):
+                    all_coords.extend((_x_px(idx_n), _y_px(val_n)))
                 hud_sparkline_canvas.create_line(
-                    _x_px(j - 1),
-                    _y_px(p0),
-                    _x_px(j),
-                    _y_px(p1),
-                    fill=c_seg,
-                    width=2,
+                    *all_coords, fill="#94a3b8", width=2, joinstyle="round"
                 )
+            else:
+                for s_run, run_pts in runs:
+                    line_coords = []
+                    for rx, ry in run_pts:
+                        line_coords.extend((_x_px(rx), _y_px(ry)))
+                    if len(line_coords) >= 4:
+                        hud_sparkline_canvas.create_line(
+                            *line_coords,
+                            fill=_sign_col(s_run),
+                            width=2,
+                            joinstyle="round",
+                        )
             hi_idx = max(range(len(pts)), key=lambda idx_m: pts[idx_m])
             if pts[hi_idx] > 0.0 and not neutral_v:
                 px_m, py_m = _x_px(hi_idx), _y_px(pts[hi_idx])
@@ -48397,8 +48833,13 @@ def _redraw_hud_sparkline_canvas(event=None):
         hud_sparkline_canvas.create_oval(
             lx - 2.5, ly - 2.5, lx + 2.5, ly + 2.5, fill=tip_c, outline=""
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        if not _sparkline_err_logged:
+            _sparkline_err_logged = True
+            try:
+                log_event("TK_ERR", f"Sparkline redraw error: {type(exc).__name__}: {exc}")
+            except Exception:
+                pass
 
 
 def _redraw_hud_leash_canvas(event=None):
@@ -51917,7 +52358,7 @@ def _fetch_remote_doc_bytes(doc_name, ts=None):
                     "Cache-Control": "no-cache",
                 },
             )
-            with urllib.request.urlopen(d_req, timeout=3) as d_resp:
+            with _urlopen_https(d_req, timeout=3) as d_resp:
                 doc_bytes = d_resp.read()
             if doc_bytes:
                 if doc_name == "Launch_Enforcer.bat" and not _is_valid_launcher_bat_bytes(
@@ -55160,7 +55601,7 @@ def _fetch_available_update_payload(skip_if_recent=False):
                         "Cache-Control": "no-cache",
                     },
                 )
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                with _urlopen_https(req, timeout=8) as resp:
                     head_bytes = resp.read(4096)
                     head_txt = head_bytes.decode("utf-8", errors="replace")
                     m_rem = re.search(

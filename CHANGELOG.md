@@ -4,6 +4,23 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.91] — 2026-11-25
+### ⚡ Quick Summary
+- **Reliable Safe Log Uploads Across All Windows PCs (`ISRG Root X2` / `certifi` SSL Fix + Diagnostics):** Merged Python's `certifi` root bundle into PnL Enforcer's Windows HTTPS trust store so modern Let's Encrypt endpoints (like the Safe Log & Bug Report relay) verify reliably even when `ISRG Root X2` isn't cached in Windows yet, and added clear diagnostic failure codes (`SSL_CERT_20`, `DNS_ERROR`, `HTTP_403`, etc.) in logs and popups.
+- **Smarter `PnL CURVE` Sparkline Scaling & Shaded `$0` Fills:** Fixed the Anti-Pancake scale rule so upward gains no longer pull distant negative Daily Stops into frame and squash intraday price action, added subtle green/red area shading with exact `$0` zero-crossing splits, and skipped overlapping `$0`/Stop dashes.
+- **Promoted `🔔 Mobile Push Alerts (BETA)` + Resilient Delivery (`ntfy` & `Pushover`):** Graduated experimental 1-way Mobile Push Alerts (`ntfy` & `Pushover`) to `main` with a `5.0s` HTTP timeout, 1 smart inline retry on transient failures (never delaying `URGENT` stop alerts; duplicate delivery possible after read timeouts or `5xx`), closed-vocabulary error logs, and clearer Pushover `HTTP 400` token/key hints.
+
+### 🔍 Detailed Breakdown
+- **OS + `certifi` HTTPS Trust Store & Telemetry Hardening (`_get_https_ssl_context`, `_urlopen_https`, `_ensure_valid_anonymous_tester_id`, `_upload_sanitized_log_to_drive_diag`, `sanitize_log_for_export`, `show_telemetry_upload_result_dialog`):**
+  - Lazily builds and caches an `SSLContext` combining Windows' native trust store with `certifi.where()` (with a PEM-block `cadata=` fallback and `x509_ca` count verification logged once cleanly), routing Safe Log uploads, Bug Reports, Mobile Push requests, and GitHub/Gist update checks through `_urlopen_https()`.
+  - Normalizes and validates `anonymous_tester_id` (`^[a-f0-9]{6,8}$`) under `_config_io_lock`, guarantees `ENFORCER SESSION LOG` headers in `init_daily_log()` / `sanitize_log_for_export()`, enforces a character-trimmed `2.4 MB` UTF-8 JSON payload cap (`UPLOAD_PAYLOAD_MAX_BYTES`), rejects HTML captive-portal `HTTP 200` pages (`html_block`), fixes a background `save_config()` lock race in `_maybe_upload_prior_day_sanitized_log()`, and surfaces closed-vocabulary `diag_code` pills + `⚠️ UPLOAD REJECTED` badges in `show_telemetry_upload_result_dialog()`.
+- **HUD `PnL CURVE` Sparkline Scaling & Run-Batched Rendering (`compute_sparkline_scale`, `_build_sparkline_runs`, `_redraw_hud_sparkline_canvas`):**
+  - Keeps `breach_active` and profit-lock stops (`stop_pnl >= 0`) in true scale while pinning negative loss stops until drawdown reaches `>= 50%` of the stop budget (`c_min <= 0.50 * stop_f`) or enters the pinned frame (`stop_f >= c_min - 0.16 * raw_span`), filters non-finite points, batches `$0`-interpolated runs into `joinstyle="round"` polylines and background-blended `16%` area fills, suppresses `< 1px` fill speckles and colliding `$0`/Stop dashes, and adds one-shot `[TK_ERR]` logging.
+- **Mobile Push Hardening (`MOBILE_PUSH_HTTP_TIMEOUT_SEC`, `MOBILE_PUSH_RETRY_DELAY_SEC`, `_send_mobile_push_http`, `_mobile_push_worker_loop`, `atexit`):**
+  - Raised `MOBILE_PUSH_HTTP_TIMEOUT_SEC` from `2.5s` to `5.0s` (and `atexit` flush to `3.5s`), added 1 inline `0.75s` retry on transient errors only when `prio_rank == 0` or the queue is empty (never retrying `HTTP 3xx/4xx`, `429`, or `404/405` fallback hops; noting that a retry after a read timeout or `5xx` can deliver a duplicate), added closed-vocabulary `_format_mobile_push_exc_detail()` error logging, and mapped Pushover `HTTP 400` bodies to `"HTTP 400 (App Token invalid)"` / `"HTTP 400 (User Key invalid)"`.
+
+---
+
 ## [v0.9.90] — 2026-11-24 (Experimental Beta Channel)
 ### ⚡ Quick Summary
 - **Merged `v0.9.87.1` Holiday/Early-Close & Card 4 UI Fixes + Tightened `ntfy` Topic & Rate-Limit Protection (`🔔 Mobile Push Alerts (BETA)`):** Merged Thanksgiving/Black Friday `1:00 PM` RTH / `5:00 PM` Extended-Hours schedule labels and Card 4 `(Pre & After-Hours)` fit from `main`, raised the `ntfy` Secret Topic minimum length to `10` characters, and added a `90s` `HTTP 429` cooldown for non-urgent recaps/warnings while keeping `URGENT` stop and connection alerts unblocked.
