@@ -4,7 +4,7 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
-## [v0.9.92] — 2026-11-25 (Experimental Beta Channel)
+## [v0.9.92] — 2026-11-25
 ### ⚡ Quick Summary
 - **Webull Auto-Flatten Reliability Overhaul (`417` Rejections, `PENDING_CANCEL` Settlement, `order_history` Cascade & `403` Quote Cache):** Rejected `4xx` exit orders (like Webull `417`) now retry immediately without false 30s duplicate-order locks, `PENDING_CANCEL` orders wait briefly to settle and isolate only blocked quantities without holding up clean symbols, `order_history` failures degrade gracefully inside a `2.0s` cascade budget, and `HTTP 403` unsubscribed Extended-Hours quote errors pause repeated market-data probes for 30 minutes while keeping `429`/timeout fallback safe.
 - **Pre-Sync Daily Stop Re-Arming & Schwab Order-Cap Safeguard:** Saving Settings before Poll #1 finishes off-session catch-up now safely re-arms Daily Stop once Poll #1 confirms settled equity is safely above the floor (using a short-lived in-memory token), and Schwab order-cancel lookups fail closed against silent `>= 3,000`-row truncation.
