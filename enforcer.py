@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.87"
+APP_VERSION = "0.9.88"
 
 import os
 import sys
@@ -18,6 +18,10 @@ import json
 import hashlib
 import ctypes
 import time
+import atexit
+import queue
+import secrets
+import tempfile
 import builtins
 import webbrowser
 import threading
@@ -2506,6 +2510,17 @@ DEFAULT_CONFIG = {
     "check_updates_on_startup": True,
     "start_with_windows": False,
     "desktop_tidy_dismissed": False,
+    "enable_mobile_push": False,
+    "mobile_push_provider": "ntfy",
+    "mobile_ntfy_server": "https://ntfy.sh",
+    "mobile_ntfy_topic": "",
+    "mobile_pushover_user": "",
+    "mobile_pushover_token": "",
+    "mobile_push_stops": True,
+    "mobile_push_warnings": True,
+    "mobile_push_flat_recap": True,
+    "mobile_push_connection": True,
+    "mobile_push_armed_checkin": False,
     "skipped_update_version": "",
     "last_uploaded_sanitized_log": "",
     "anonymous_tester_id": "",
@@ -2967,12 +2982,13 @@ def _bump_adapter_epoch():
     global _adapter_epoch, _last_fresh_poll_info, _feed_degrade_streak
     global _feed_wake_resync_until_fresh, _last_live_hud_snapshot
     global _pending_postlaunch_auth, pending_baseline_revert, pending_baseline_revert_done_today
-    global _manual_reanchor_pending
+    global _manual_reanchor_pending, _pending_flat_recap
     with _postlaunch_auth_lock:
         _pending_postlaunch_auth = None
     pending_baseline_revert = None
     pending_baseline_revert_done_today = False
     _manual_reanchor_pending = False
+    _pending_flat_recap = None
     with _adapter_epoch_lock:
         _adapter_epoch += 1
         _last_fresh_poll_info = None
@@ -3990,6 +4006,17 @@ def _scrub_log_line(message):
         cur_ad_id = str(getattr(active_adapter, "account_id", "") or "").strip()
         if len(cur_ad_id) > 4 and cur_ad_id != DemoBrokerAdapter.DEMO_ACCOUNT_ID:
             msg = msg.replace(cur_ad_id, _mask_last4(cur_ad_id))
+        for m_sec_k in (
+            "mobile_ntfy_topic",
+            "mobile_pushover_user",
+            "mobile_pushover_token",
+        ):
+            m_sec_v = str(config.get(m_sec_k) or "").strip()
+            if len(m_sec_v) >= 8:
+                msg = msg.replace(m_sec_v, "[REDACTED]")
+        m_srv_v = str(config.get("mobile_ntfy_server") or "").strip().rstrip("/")
+        if m_srv_v and m_srv_v.lower() != "https://ntfy.sh" and len(m_srv_v) >= 8:
+            msg = msg.replace(m_srv_v, "[REDACTED]")
     except Exception:
         pass
 
@@ -4286,6 +4313,411 @@ def _upload_sanitized_log_to_drive(
         extra_fields=extra_fields,
     )
     return bool(ok)
+
+
+# ==========================================
+# OPTIONAL 1-WAY MOBILE PUSH ALERTS (BETA)
+# ==========================================
+MOBILE_PUSH_MAX_QUEUE = 48
+MOBILE_PUSH_STALE_SEC = 120.0
+MOBILE_PUSH_HTTP_TIMEOUT_SEC = 2.5
+
+_mobile_push_lock = threading.Lock()
+_mobile_push_queue = queue.PriorityQueue(maxsize=MOBILE_PUSH_MAX_QUEUE)
+_mobile_push_seq = 0
+_mobile_push_worker_started = False
+_mobile_push_in_flight = 0
+_mobile_push_idle_event = threading.Event()
+_mobile_push_idle_event.set()
+_mobile_push_dedup_ts = {}
+_mobile_push_transport_override = None
+_mobile_push_allow_sandbox_net = False
+_pending_flat_recap = None
+
+
+def _is_sandboxed_temp_home():
+    try:
+        uh = os.path.normcase(os.path.abspath(USER_HOME))
+        td = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+        return bool(uh and td and uh.startswith(td))
+    except Exception:
+        return False
+
+
+def generate_mobile_ntfy_topic():
+    """Generates a high-entropy private ntfy topic string for 1-click setup."""
+    raw = secrets.token_urlsafe(12).replace("_", "-").lower()
+    return f"enf-{raw[:16]}"
+
+
+def _normalize_mobile_ntfy_server(url_val):
+    s = str(url_val or "https://ntfy.sh").strip().rstrip("/")
+    if not s:
+        return "https://ntfy.sh"
+    if not (s.lower().startswith("https://") or s.lower().startswith("http://")):
+        return ""
+    return s
+
+
+def is_mobile_push_configured(cfg=None):
+    """Returns True when experimental Mobile Push Alerts are enabled and valid
+    credentials for the selected provider are configured."""
+    c = cfg if isinstance(cfg, dict) else config
+    if not bool(c.get("enable_mobile_push", False)):
+        return False
+    prov = str(c.get("mobile_push_provider", "ntfy") or "ntfy").strip().lower()
+    if prov == "pushover":
+        u_key = str(c.get("mobile_pushover_user", "") or "").strip()
+        a_tok = str(c.get("mobile_pushover_token", "") or "").strip()
+        return bool(len(u_key) >= 10 and len(a_tok) >= 10)
+    srv = _normalize_mobile_ntfy_server(c.get("mobile_ntfy_server", "https://ntfy.sh"))
+    topic = str(c.get("mobile_ntfy_topic", "") or "").strip()
+    return bool(srv and len(topic) >= 4)
+
+
+def _snapshot_mobile_push_cfg(cfg=None):
+    c = cfg if isinstance(cfg, dict) else config
+    prov = str(c.get("mobile_push_provider", "ntfy") or "ntfy").strip().lower()
+    if prov not in ("ntfy", "pushover"):
+        prov = "ntfy"
+    return {
+        "provider": prov,
+        "server": _normalize_mobile_ntfy_server(
+            c.get("mobile_ntfy_server", "https://ntfy.sh")
+        ),
+        "topic": str(c.get("mobile_ntfy_topic", "") or "").strip(),
+        "user": str(c.get("mobile_pushover_user", "") or "").strip(),
+        "token": str(c.get("mobile_pushover_token", "") or "").strip(),
+    }
+
+
+def _send_mobile_push_http(snap_cfg, title, body, prio_rank=1):
+    """Synchronously dispatches one 1-way push notification via the selected
+    provider. Returns `(ok: bool, detail: str)` without ever logging secrets."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    if callable(_mobile_push_transport_override):
+        return _mobile_push_transport_override(
+            snap_cfg.get("provider", "ntfy"),
+            dict(snap_cfg),
+            str(title),
+            str(body),
+            int(prio_rank),
+        )
+    if _is_sandboxed_temp_home() and not _mobile_push_allow_sandbox_net:
+        return True, "sandbox_skipped"
+
+    prov = snap_cfg.get("provider", "ntfy")
+    if prov == "pushover":
+        u_key = snap_cfg.get("user", "")
+        a_tok = snap_cfg.get("token", "")
+        if not u_key or not a_tok:
+            return False, "missing Pushover User Key or App Token"
+        po_prio = "1" if int(prio_rank) == 0 else "0"
+        form_bytes = urllib.parse.urlencode(
+            {
+                "token": a_tok,
+                "user": u_key,
+                "title": str(title)[:250],
+                "message": str(body)[:1024],
+                "priority": po_prio,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.pushover.net/1/messages.json",
+            data=form_bytes,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": f"PnL-Enforcer/{APP_VERSION}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=MOBILE_PUSH_HTTP_TIMEOUT_SEC) as r:
+                st = int(getattr(r, "status", None) or r.getcode() or 0)
+                return (200 <= st < 300), f"HTTP {st}"
+        except urllib.error.HTTPError as he:
+            return False, f"HTTP {int(getattr(he, 'code', 0) or 0)}"
+        except Exception as ex:
+            return False, type(ex).__name__
+
+    # Default: ntfy UTF-8 JSON publish to root server URL (avoids non-Latin-1 Title header crashes)
+    base_url = snap_cfg.get("server", "")
+    topic = snap_cfg.get("topic", "")
+    if not base_url or not topic:
+        return False, "missing ntfy server URL or topic"
+    ntfy_prio = 5 if int(prio_rank) == 0 else (4 if int(prio_rank) == 1 else 3)
+    payload_bytes = json.dumps(
+        {
+            "topic": topic,
+            "title": str(title)[:200],
+            "message": str(body)[:1500],
+            "priority": ntfy_prio,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        base_url,
+        data=payload_bytes,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": f"PnL-Enforcer/{APP_VERSION}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=MOBILE_PUSH_HTTP_TIMEOUT_SEC) as r:
+            st = int(getattr(r, "status", None) or r.getcode() or 0)
+            return (200 <= st < 300), f"HTTP {st}"
+    except urllib.error.HTTPError as he:
+        code = int(getattr(he, "code", 0) or 0)
+        if code in (404, 405):
+            # Fallback for custom reverse proxies expecting POST /<topic> with UTF-8 plain text body
+            topic_url = f"{base_url}/{urllib.parse.quote(topic, safe='')}"
+            plain_bytes = f"{title}\n\n{body}".encode("utf-8")
+            req2 = urllib.request.Request(
+                topic_url,
+                data=plain_bytes,
+                headers={
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "User-Agent": f"PnL-Enforcer/{APP_VERSION}",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req2, timeout=MOBILE_PUSH_HTTP_TIMEOUT_SEC) as r2:
+                    st2 = int(getattr(r2, "status", None) or r2.getcode() or 0)
+                    return (200 <= st2 < 300), f"HTTP {st2}"
+            except urllib.error.HTTPError as he2:
+                return False, f"HTTP {int(getattr(he2, 'code', 0) or 0)}"
+            except Exception as ex2:
+                return False, type(ex2).__name__
+        return False, f"HTTP {code}"
+    except Exception as ex:
+        return False, type(ex).__name__
+
+
+def _mobile_push_worker_loop():
+    global _mobile_push_in_flight
+    while True:
+        item = _mobile_push_queue.get()
+        try:
+            prio_rank, _seq, enqueued_mono, snap_cfg, title, body = item
+            if (
+                int(prio_rank) >= 1
+                and (time.monotonic() - float(enqueued_mono)) > MOBILE_PUSH_STALE_SEC
+            ):
+                continue
+            ok, detail = _send_mobile_push_http(snap_cfg, title, body, prio_rank=prio_rank)
+            if not ok:
+                log_event(
+                    "WARN",
+                    f"Mobile push ({snap_cfg.get('provider', 'ntfy')}) failed: {detail}.",
+                )
+        except Exception as ex:
+            try:
+                log_event("WARN", f"Mobile push worker error: {type(ex).__name__}.")
+            except Exception:
+                pass
+        finally:
+            with _mobile_push_lock:
+                _mobile_push_in_flight = max(0, _mobile_push_in_flight - 1)
+                if _mobile_push_in_flight == 0 and _mobile_push_queue.empty():
+                    _mobile_push_idle_event.set()
+            _mobile_push_queue.task_done()
+
+
+def _ensure_mobile_push_worker_started():
+    global _mobile_push_worker_started
+    if not _mobile_push_worker_started:
+        _mobile_push_worker_started = True
+        threading.Thread(target=_mobile_push_worker_loop, daemon=True).start()
+
+
+def enqueue_mobile_push(
+    category_key,
+    title,
+    body,
+    prio_rank=1,
+    dedup_key="",
+    cooldown_s=8.0,
+    force_demo_test=False,
+    cfg=None,
+):
+    """Queues an asynchronous 1-way mobile push alert without ever blocking
+    the calling thread. High-priority (`prio_rank == 0`) stop/manual-exit alerts
+    always preempt queued lower-priority items and are never dropped on full."""
+    global _mobile_push_seq, _mobile_push_in_flight
+    c = cfg if isinstance(cfg, dict) else config
+    if not force_demo_test and is_demo_mode_active():
+        return False
+    if not is_mobile_push_configured(c):
+        return False
+    if category_key != "test" and not bool(c.get(category_key, True)):
+        return False
+
+    snap_cfg = _snapshot_mobile_push_cfg(c)
+    ts_str = datetime.now().strftime("%H:%M:%S")
+    stamped_body = f"[{ts_str}] {str(body or '').strip()}"
+    now_m = time.monotonic()
+
+    with _mobile_push_lock:
+        if dedup_key:
+            last_t = float(_mobile_push_dedup_ts.get(dedup_key, 0.0) or 0.0)
+            if last_t > 0.0 and (now_m - last_t) < float(cooldown_s):
+                return False
+            if len(_mobile_push_dedup_ts) > 256:
+                _mobile_push_dedup_ts.clear()
+            _mobile_push_dedup_ts[dedup_key] = now_m
+
+        _ensure_mobile_push_worker_started()
+        _mobile_push_seq += 1
+        pkt = (int(prio_rank), _mobile_push_seq, now_m, snap_cfg, str(title), stamped_body)
+        try:
+            _mobile_push_queue.put_nowait(pkt)
+            _mobile_push_in_flight += 1
+            _mobile_push_idle_event.clear()
+            return True
+        except queue.Full:
+            if int(prio_rank) != 0:
+                return False
+            # Evict one lowest-priority (highest prio_rank >= 1) item so URGENT alerts never drop
+            kept = []
+            while True:
+                try:
+                    kept.append(_mobile_push_queue.get_nowait())
+                    _mobile_push_queue.task_done()
+                except queue.Empty:
+                    break
+            orig_q_count = len(kept)
+            drop_idx = None
+            worst_rank = 0
+            for idx_k, k_it in enumerate(kept):
+                if int(k_it[0]) >= worst_rank and int(k_it[0]) >= 1:
+                    worst_rank = int(k_it[0])
+                    drop_idx = idx_k
+            if drop_idx is None:
+                # All queued items are already URGENT; drop oldest URGENT to keep freshest alert
+                if kept:
+                    kept.pop(0)
+            else:
+                kept.pop(drop_idx)
+            re_added = 0
+            for k_it in kept:
+                try:
+                    _mobile_push_queue.put_nowait(k_it)
+                    re_added += 1
+                except queue.Full:
+                    break
+            try:
+                _mobile_push_queue.put_nowait(pkt)
+                re_added += 1
+                _mobile_push_in_flight = max(
+                    0, _mobile_push_in_flight + (re_added - orig_q_count)
+                )
+                _mobile_push_idle_event.clear()
+                return True
+            except queue.Full:
+                _mobile_push_in_flight = max(
+                    0, _mobile_push_in_flight + (re_added - orig_q_count)
+                )
+                return False
+
+
+def flush_mobile_push_queue(timeout_s=2.0):
+    """Waits up to `timeout_s` seconds for queued mobile push notifications to
+    finish sending (safe to call redundantly before lockouts and on app exit)."""
+    if not _mobile_push_worker_started:
+        return True
+    if _mobile_push_queue.empty() and _mobile_push_idle_event.is_set():
+        return True
+    return bool(_mobile_push_idle_event.wait(timeout=max(0.0, float(timeout_s or 0.0))))
+
+
+atexit.register(lambda: flush_mobile_push_queue(2.0))
+
+
+def send_mobile_push_test_sync(cfg_override=None):
+    """Synchronously sends one Test notification using the active/draft Mobile
+    Push settings and returns `(ok: bool, status_msg: str)`."""
+    c = cfg_override if isinstance(cfg_override, dict) else config
+    tmp_c = dict(c)
+    tmp_c["enable_mobile_push"] = True
+    if not is_mobile_push_configured(tmp_c):
+        prov = str(tmp_c.get("mobile_push_provider", "ntfy") or "ntfy").lower()
+        return (
+            False,
+            "Enter both Pushover User Key & App Token first."
+            if prov == "pushover"
+            else "Enter (or Generate) a private ntfy Topic Name (>= 4 chars) first.",
+        )
+    snap_cfg = _snapshot_mobile_push_cfg(tmp_c)
+    ts_str = datetime.now().strftime("%H:%M:%S")
+    ok, detail = _send_mobile_push_http(
+        snap_cfg,
+        "📱 PnL Enforcer Test Alert (BETA)",
+        f"[{ts_str}] 1-way mobile alerts are connected ({snap_cfg['provider']}). Silence never guarantees your account is safe.",
+        prio_rank=2,
+    )
+    if ok:
+        return True, f"✓ Test alert sent cleanly ({detail})."
+    return False, f"⚠️ Test alert failed ({detail}) — check topic/keys or internet."
+
+
+def _format_mobile_flat_recap_tail(alarms_only_now, terminate_pnl_lvl, dist_to_term):
+    if is_locked_down or done_for_today:
+        return "🔒 LOCKED FOR DAY"
+    if alarms_only_now:
+        return "👀 Alarms-Only Mode"
+    room_v = round(max(0.0, float(dist_to_term)), 2)
+    return f"Room to {format_dollar(terminate_pnl_lvl)} Stop: ${room_v:,.2f}"
+
+
+def _maybe_dispatch_pending_flat_recap(
+    is_flat_now,
+    poll_epoch,
+    realized_pnl_now,
+    net_pnl_now,
+    terminate_pnl_lvl,
+    dist_to_term,
+    alarms_only_now,
+    cfg=None,
+):
+    """Waits 1 subsequent fresh flat poll after a position closes flat so
+    realized cash/PnL settles cleanly before composing the mobile push recap."""
+    global _pending_flat_recap
+    pend = _pending_flat_recap
+    if not isinstance(pend, dict):
+        return False
+    if int(pend.get("epoch", -1)) != int(poll_epoch):
+        _pending_flat_recap = None
+        return False
+    if not is_flat_now:
+        _pending_flat_recap = None
+        return False
+    if not pend.get("armed_next_poll", False):
+        pend["armed_next_poll"] = True
+        return False
+
+    _pending_flat_recap = None
+    trade_delta = _round_cents(float(realized_pnl_now) - float(pend.get("prev_realized", 0.0)))
+    syms = ", ".join(pend.get("syms") or []) or "Trade"
+    tail = _format_mobile_flat_recap_tail(alarms_only_now, terminate_pnl_lvl, dist_to_term)
+    title = f"🔔 Closed Flat: {syms} ({format_dollar(trade_delta)})"
+    body = (
+        f"Day Net: {format_dollar(net_pnl_now)} | W:{int(win_trades)} L:{int(loss_trades)} | {tail}"
+    )
+    return enqueue_mobile_push(
+        "mobile_push_flat_recap",
+        title,
+        body,
+        prio_rank=2,
+        dedup_key=f"flat_recap_{poll_epoch}_{round(float(pend.get('ts', 0.0)), 2)}",
+        cooldown_s=5.0,
+        cfg=cfg,
+    )
 
 
 def _find_most_recent_prior_sanitized_log():
@@ -5745,6 +6177,11 @@ def format_config_summary(cfg):
         else "OFF"
     )
 
+    push_str = (
+        f"ON({str(cfg.get('mobile_push_provider', 'ntfy')).lower()},BETA)"
+        if is_mobile_push_configured(cfg)
+        else "OFF"
+    )
     return (
         f"Broker={broker} | Cols={len(get_active_hud_columns(cfg))} | "
         f"Poll={cfg.get('poll_interval')}s | "
@@ -5760,6 +6197,7 @@ def format_config_summary(cfg):
         f"SilentMode={'ON' if cfg.get('mute_all_audio', False) else 'OFF'} | "
         f"Voice={'ON' if cfg.get('enable_voice_cues', True) else 'OFF'} | "
         f"UpChime={'ON' if cfg.get('enable_upside_chime', True) else 'OFF'} | "
+        f"Push={push_str} | "
         f"ResetSwitch={'ON' if cfg.get('reset_at_925', True) else 'OFF'} | "
         f"IgnorePrePos={'ON' if cfg.get('ignore_preexisting_positions', True) else 'OFF'} | "
         f"EH_Max=-${cfg.get('pm_max_loss', 0):,.0f} | "
@@ -17598,6 +18036,31 @@ def trigger_alarm(reason, ui_button, context_str="", force_repeat=False):
     hum_ui = _humanize_alarm_reason(reason, for_tts=False)
     disp_sfx = f" [{hum_ui}]" if hum_ui and hum_ui != str(reason).strip() else ""
     log_event("ALARM", f"Triggered: {reason}{disp_sfx}{extra}")
+    if (
+        not is_disc
+        and "INTERNAL POLL ERROR" not in r_up
+        and not any(
+            k in r_up
+            for k in (
+                "UNFILLED:",
+                "HALT/UNFILLED:",
+                "CHECK OPTIONS MANUALLY",
+                "CLOSE OPTIONS MANUALLY",
+                "MANUAL OPTIONS EXIT",
+                "POST-LOCK FLATTEN FAILED",
+                "FORCE-FLATTEN UNFILLED",
+                "OPTIONS MARKET CLOSED",
+            )
+        )
+    ):
+        enqueue_mobile_push(
+            "mobile_push_warnings",
+            f"⚠️ {hum_ui or reason}",
+            f"{reason}{extra}",
+            prio_rank=1,
+            dedup_key=f"alarm_{reason}",
+            cooldown_s=ALARM_COOLDOWN_SEC,
+        )
     btn_txt = format_alarm_button_text(reason)
     if ui_button is not None:
         try:
@@ -19869,6 +20332,7 @@ def start_cooldown_lock(
                 f"(Workstation kept unlocked in Demo Mode).",
             )
         else:
+            flush_mobile_push_queue(timeout_s=1.0)
             try:
                 ctypes.windll.user32.LockWorkStation()
             except Exception:
@@ -22036,6 +22500,34 @@ def _enter_halt_breach_watch(
             f"in broker queue; suppressing repeat flatten loops and deferring "
             f"OS Lock ({'ON: ' + str(lock_m_hb) + 'm' if lock_en_hb else 'OFF'}) / App Kill until 100% flat.",
         )
+    _halt_dedup_k = f"halt_{eff_type}_{'|'.join(sorted(watched.keys()))}"
+    if halted_with_working_exit:
+        enqueue_mobile_push(
+            "mobile_push_stops",
+            f"⏸️ HALT WATCH — Exit Queued ({syms_label})",
+            f"{eff_reason} | {eff_ctx}",
+            prio_rank=0,
+            dedup_key=_halt_dedup_k,
+            cooldown_s=60.0,
+        )
+    elif has_options or eff_manual_opt:
+        enqueue_mobile_push(
+            "mobile_push_stops",
+            f"🚨 ACTION NEEDED — CLOSE OPTIONS MANUALLY ({syms_label})",
+            f"{eff_reason} | {eff_ctx}",
+            prio_rank=0,
+            dedup_key=_halt_dedup_k,
+            cooldown_s=60.0,
+        )
+    else:
+        enqueue_mobile_push(
+            "mobile_push_stops",
+            f"🚨 ACTION NEEDED — POSITION NOT FLAT ({syms_label})",
+            f"{eff_reason} | {eff_ctx}",
+            prio_rank=0,
+            dedup_key=_halt_dedup_k,
+            cooldown_s=60.0,
+        )
     if halted_with_working_exit:
         alarm_active = False
         if lock_en_hb and lock_m_hb > 0:
@@ -22725,6 +23217,14 @@ def trigger_open_pnl_flatten(
 
     cd_mins = float(config.get("open_cooldown_mins", 1.0))
 
+    enqueue_mobile_push(
+        "mobile_push_stops",
+        f"🛑 {reason} — Flattening",
+        context_str or "Auto-flatten initiated.",
+        prio_rank=0,
+        dedup_key=f"open_stop_{eff_epoch}",
+        cooldown_s=5.0,
+    )
     log_event(
         "GUARDRAIL",
         f"OPEN PnL AUTO-FLATTEN {'(EQUITIES + OPTIONS BETA) ' if opt_exec_now else ''}INITIATED: "
@@ -22887,6 +23387,14 @@ def trigger_consec_loss_cooldown(
 
     cd_mins = float(config.get("open_cooldown_mins", 1.0))
 
+    enqueue_mobile_push(
+        "mobile_push_stops",
+        f"🛑 Tilt Streak Cooldown — Flattening",
+        f"{reason} | {context_str}" if context_str else reason,
+        prio_rank=0,
+        dedup_key=f"consec_stop_{eff_epoch}",
+        cooldown_s=5.0,
+    )
     log_event(
         "GUARDRAIL",
         f"CONSECUTIVE LOSS COOLDOWN TRIGGERED: {reason} | {context_str}"
@@ -23096,16 +23604,33 @@ def trigger_lockdown(
             f"Daily floor breached ({reason}), but {mode_desc} "
             f"(Observation Mode — Siren Only)."
         )
+        enqueue_mobile_push(
+            "mobile_push_stops",
+            f"🚨 DAILY STOP BREACHED (Observation Only)",
+            f"{reason} | {context_str}" if context_str else reason,
+            prio_rank=0,
+            dedup_key=f"daily_obs_{eff_epoch}",
+            cooldown_s=30.0,
+        )
         return
-
-    log_event(
-        "LOCKDOWN",
-        f"DAILY TERMINATION BREACHED: {reason} | {context_str}"
-    )
 
     rth_now = is_market_hours()
     opt_exec_now = bool(opt_armed and rth_now)
     dl_mins = float(config.get("daily_lock_mins", 15.0))
+
+    if not (has_options and not opt_exec_now and _prev_snapshot_has_no_equities()):
+        enqueue_mobile_push(
+            "mobile_push_stops",
+            "🔒 DAILY STOP BREACHED — Flattening & Locking",
+            f"{reason} | {context_str}" if context_str else reason,
+            prio_rank=0,
+            dedup_key=f"daily_lock_{eff_epoch}",
+            cooldown_s=15.0,
+        )
+    log_event(
+        "LOCKDOWN",
+        f"DAILY TERMINATION BREACHED: {reason} | {context_str}"
+    )
 
     all_flat = flatten_equities(
         adapter,
@@ -23351,6 +23876,7 @@ def trigger_lockdown(
                         "[DEMO] Simulated one-shot Windows OS Lock (Workstation kept unlocked in Demo Mode).",
                     )
                 else:
+                    flush_mobile_push_queue(timeout_s=1.0)
                     try:
                         ctypes.windll.user32.LockWorkStation()
                     except Exception:
@@ -23492,7 +24018,7 @@ def log_position_transitions(
 ):
     global prev_pos_snapshot, prev_flat_realized_pnl
     global _last_round_trip_close_ts, _pending_subpoll_consec_reason
-    global _breach_pin_rt_pending
+    global _breach_pin_rt_pending, _pending_flat_recap
     pending_sub = _pending_subpoll_consec_reason
     _pending_subpoll_consec_reason = None
     curr_sig_map = {
@@ -23509,6 +24035,7 @@ def log_position_transitions(
 
     all_syms = sorted(set(curr_sig_map.keys()) | set(prev_sig_map.keys()))
     changes = []
+    closed_syms = []
     completed_round_trip = False
     for sym in all_syms:
         old_q, old_avg = prev_sig_map.get(sym, (0, 0.0))
@@ -23522,6 +24049,7 @@ def log_position_transitions(
                 )
             else:
                 changes.append(f"{sym}: {old_q:+g} -> 0 (CLOSED FLAT)")
+                closed_syms.append(sym)
                 completed_round_trip = True
         elif new_q != 0 and abs(new_avg - old_avg) >= 0.0001:
             info = pos_details[sym]
@@ -23530,6 +24058,7 @@ def log_position_transitions(
                 f"(Re-entry Avg: ${old_avg:.4f} -> ${info['avg']:.4f}, "
                 f"Last: ${info['last']:.4f})"
             )
+            closed_syms.append(sym)
             completed_round_trip = True
 
     if not changes:
@@ -23538,16 +24067,29 @@ def log_position_transitions(
     consec_trigger_reason = None
     streak_note = ""
     if completed_round_trip:
+        prev_realized_before = float(prev_flat_realized_pnl or 0.0)
         delta = _round_cents(realized_pnl - prev_flat_realized_pnl)
         streak_note, consec_trigger_reason = _classify_round_trip_delta(delta)
         _last_round_trip_close_ts = time.time()
         prev_flat_realized_pnl = realized_pnl
+        if len(curr_sig_map) == 0 and not first_poll_of_launch:
+            _pending_flat_recap = {
+                "syms": list(closed_syms),
+                "prev_realized": prev_realized_before,
+                "epoch": get_adapter_epoch(),
+                "armed_next_poll": False,
+                "ts": _last_round_trip_close_ts,
+            }
+        else:
+            _pending_flat_recap = None
         if _breach_pin_rt_pending:
             if len(curr_sig_map) == 0:
                 _breach_pin_rt_pending = False
         elif is_locked_down and last_breach_trigger_net_pnl is not None:
             _retire_stale_breach_trigger_pin("live round-trip")
         save_session_state()
+    elif len(curr_sig_map) > 0:
+        _pending_flat_recap = None
 
     prev_pos_snapshot = pos_details.copy()
     change_str = ", ".join(changes)
@@ -26431,6 +26973,15 @@ def _handle_disconnect_recovery(recovered_attempts, was_alerted, mute_btn, now_m
                     0,
                     lambda: apply_idle_button_config(mute_btn),
                 )
+        if not _is_disconnect_audio_suppressed():
+            enqueue_mobile_push(
+                "mobile_push_connection",
+                "✅ Broker Reconnected",
+                f"Broker API connection restored after {recovered_attempts} attempt(s).",
+                prio_rank=2,
+                dedup_key="conn_recov",
+                cooldown_s=20.0,
+            )
     else:
         log_event(
             "SESSION",
@@ -26833,7 +27384,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
     global _launch_fee_drift_checked, _launch_live_sync_deferred, _off_session_reconciled
     global _off_session_pending_boundary
     global _reconciled_through_epoch, _reconciled_order_qty, _off_session_peak_reconstructed
-    global _last_live_hud_snapshot
+    global _last_live_hud_snapshot, _pending_flat_recap
 
     consecutive_api_failures = 0
     consecutive_loop_exceptions = 0
@@ -27036,6 +27587,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     recent_loss_timestamps.clear()
                     triggered_alarms.clear()
                     _deferred_alarms.clear()
+                    _pending_flat_recap = None
                     _deferred_breach_carry = {
                         "epoch": -1,
                         "floor": False,
@@ -27194,6 +27746,7 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     recent_loss_timestamps.clear()
                     triggered_alarms.clear()
                     _deferred_alarms.clear()
+                    _pending_flat_recap = None
                     _deferred_breach_carry = {
                         "epoch": -1,
                         "floor": False,
@@ -28101,6 +28654,14 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     ):
                         continue
                     if act_type == "COOLDOWN_FLATTEN":
+                        enqueue_mobile_push(
+                            "mobile_push_stops",
+                            f"🛑 Cooldown Sweep — Flattening ({', '.join(act['symbols'][:3])})",
+                            act["ctx"],
+                            prio_rank=0,
+                            dedup_key=f"cd_flat_{poll_epoch}",
+                            cooldown_s=15.0,
+                        )
                         log_event(
                             "GUARDRAIL",
                             f"Position detected in main poll while Cooldown Lock is active "
@@ -28129,6 +28690,19 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                     elif act_type == "COOLDOWN_STRAGGLER_ALERT":
                         _sound_lock_straggler_alert_burst()
                     elif act_type == "POST_BREACH_FLATTEN":
+                        _pb_syms_lbl = ", ".join(act["symbols"][:3])
+                        enqueue_mobile_push(
+                            "mobile_push_stops",
+                            (
+                                f"🛑 Done Today Force-Flatten ({_pb_syms_lbl})"
+                                if _is_done_today_display_active()
+                                else f"🛑 Breach Lock Force-Flatten ({_pb_syms_lbl})"
+                            ),
+                            act["ctx"],
+                            prio_rank=0,
+                            dedup_key=f"pb_flat_{poll_epoch}",
+                            cooldown_s=15.0,
+                        )
                         if _is_done_today_display_active():
                             log_event(
                                 "GUARDRAIL",
@@ -28247,6 +28821,14 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                         trigger_upside_tier_glow(
                             mute_btn, act["banner_txt"], act["log_txt"]
                         )
+                        enqueue_mobile_push(
+                            "mobile_push_warnings",
+                            "✨ Profit Ratchet Raised",
+                            act["log_txt"],
+                            prio_rank=2,
+                            dedup_key=f"ratchet_{poll_epoch}_{act['banner_txt']}",
+                            cooldown_s=30.0,
+                        )
                     elif act_type == "NON_BREACH_HALT_NOTICE":
                         h_lbl = ", ".join(act["symbols"])
                         log_event(
@@ -28274,6 +28856,22 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                                 0,
                                 lambda: apply_idle_button_config(mute_btn),
                             )
+
+                if (
+                    not snap_was_cached
+                    and not reverify_deferred_cached
+                    and not is_demo_mode_active(poll_ad)
+                ):
+                    _maybe_dispatch_pending_flat_recap(
+                        is_flat_now=is_flat,
+                        poll_epoch=poll_epoch,
+                        realized_pnl_now=realized_pnl,
+                        net_pnl_now=net_pnl,
+                        terminate_pnl_lvl=terminate_pnl_level,
+                        dist_to_term=distance_to_terminate,
+                        alarms_only_now=alarms_only,
+                        cfg=config,
+                    )
 
                 hud_breach_active = bool(
                     is_locked_down or breach_visual_sim_active
@@ -28324,6 +28922,14 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             "PERF",
                             f"HUD Poll #1 live sync completed in {total_p1_ms:.0f}ms "
                             f"(account_fetch={acct_fetch_ms:.0f}ms).",
+                        )
+                        enqueue_mobile_push(
+                            "mobile_push_armed_checkin",
+                            f"🛡️ Enforcer Armed ({poll_broker})",
+                            f"Live monitoring active | Daily Stop: {format_dollar(terminate_pnl_level)} | OpenStop={'ON' if open_flat_on else 'OFF'}",
+                            prio_rank=2,
+                            dedup_key=f"armed_{poll_epoch}",
+                            cooldown_s=3600.0,
                         )
                 if not _poll_still_valid():
                     continue
@@ -28536,6 +29142,15 @@ def data_loop(ui_labels, mute_btn, settings_btn, close_btn, root):
                             _evaluate_disconnect_flap_start(
                                 is_tok_exp, is_hard_keys, v_msg
                             )
+                            if not _is_disconnect_audio_suppressed():
+                                enqueue_mobile_push(
+                                    "mobile_push_connection",
+                                    f"📡 Broker Connection Lost ({poll_ad.name})",
+                                    f"{r_msg} | {_clip_log_detail(raw_err, 110)}",
+                                    prio_rank=1,
+                                    dedup_key="conn_drop",
+                                    cooldown_s=20.0,
+                                )
                             trigger_alarm(
                                 r_msg,
                                 mute_btn,
@@ -29202,6 +29817,8 @@ def show_preflight_window(
 
     _prefs_modal_refs = {
         "dlg": None,
+        "mobile_dlg": None,
+        "btn_mobile_push": None,
         "cb_reset925": None,
         "cb_ignore_prepos": None,
         "lbl_session_lock": None,
@@ -40301,6 +40918,503 @@ def show_preflight_window(
             "Preview the Post-Breach Return-to-Settings popup window without triggering a real breach.",
         )
 
+        # Compact experimental row tucked quietly inside Audio & Alerts
+        r_mob_push = tk.Frame(sec2, bg="#131922")
+        r_mob_push.pack(fill="x", pady=(6, 0))
+        tk.Label(
+            r_mob_push,
+            text="Remote Phone:",
+            font=("Arial", 9, "bold"),
+            fg="#97a7b9",
+            bg="#131922",
+            anchor="w",
+        ).pack(side="left", padx=(0, 8))
+
+        def _fmt_mobile_btn_txt():
+            if is_mobile_push_configured(config):
+                pv = str(config.get("mobile_push_provider", "ntfy") or "ntfy").lower()
+                return f"📱 Mobile Push Alerts (BETA): ON ({pv})"
+            return "📱 Mobile Push Alerts (BETA): OFF"
+
+        btn_mobile_push = make_stadium_button(
+            r_mob_push,
+            text=_fmt_mobile_btn_txt(),
+            font=("Arial", 9, "bold"),
+            fill_color="#102a20" if is_mobile_push_configured(config) else "#141820",
+            fill_top_color="#163a2c" if is_mobile_push_configured(config) else "#1c212b",
+            border_color="#1f6e4c" if is_mobile_push_configured(config) else "#2e3746",
+            hover_fill="#15392b" if is_mobile_push_configured(config) else "#181e28",
+            hover_fill_top="#1c4a38" if is_mobile_push_configured(config) else "#232a36",
+            hover_border="#34d399" if is_mobile_push_configured(config) else "#38bdf8",
+            fg="#bbf7d0" if is_mobile_push_configured(config) else "#cbd5e1",
+            canvas_bg="#131922",
+            width=268,
+            height=26,
+            pad_x=14,
+            auto_width=False,
+        )
+        btn_mobile_push.pack(side="left", padx=(0, 8))
+        _prefs_modal_refs["btn_mobile_push"] = btn_mobile_push
+
+        def _refresh_mobile_push_btn():
+            try:
+                if not btn_mobile_push.winfo_exists():
+                    return
+                is_on = is_mobile_push_configured(config)
+                btn_mobile_push.config(
+                    text=_fmt_mobile_btn_txt(),
+                    fill_color="#102a20" if is_on else "#141820",
+                    fill_top_color="#163a2c" if is_on else "#1c212b",
+                    border_color="#1f6e4c" if is_on else "#2e3746",
+                    hover_fill="#15392b" if is_on else "#181e28",
+                    hover_fill_top="#1c4a38" if is_on else "#232a36",
+                    hover_border="#34d399" if is_on else "#38bdf8",
+                    fg="#bbf7d0" if is_on else "#cbd5e1",
+                )
+            except Exception:
+                pass
+
+        def _open_mobile_alerts_dialog():
+            hide_all_tooltips()
+            existing_m = _prefs_modal_refs.get("mobile_dlg")
+            try:
+                if existing_m is not None and existing_m.winfo_exists():
+                    existing_m.lift()
+                    existing_m.focus_force()
+                    return
+            except Exception:
+                pass
+
+            mdlg = tk.Toplevel(dlg)
+            mdlg.withdraw()
+            if os.path.exists(ICON_PATH):
+                try:
+                    mdlg.iconbitmap(ICON_PATH)
+                except Exception:
+                    pass
+            apply_dark_title_bar(mdlg)
+            mdlg.title("PnL Enforcer — Mobile Push Alerts (Experimental BETA)")
+            mdlg.config(bg="#0d1117", padx=22, pady=18)
+            mdlg.resizable(False, False)
+            mdlg.transient(dlg)
+            mdlg.attributes("-topmost", True)
+            _prefs_modal_refs["mobile_dlg"] = mdlg
+
+            m_hdr = tk.Frame(mdlg, bg="#0d1117")
+            m_hdr.pack(fill="x", pady=(0, 4))
+            tk.Label(
+                m_hdr,
+                text="▶  📱 1-WAY MOBILE PUSH ALERTS",
+                font=("Arial", 11, "bold"),
+                fg="#7dd3fc",
+                bg="#0d1117",
+                anchor="w",
+            ).pack(side="left")
+            tk.Label(
+                m_hdr,
+                text="🧪 EXPERIMENTAL BETA",
+                font=("Arial", 8, "bold"),
+                fg="#fde68a",
+                bg="#3b2106",
+                padx=8,
+                pady=3,
+            ).pack(side="right", padx=(12, 0))
+
+            tk.Label(
+                mdlg,
+                text="1-way status convenience for when Enforcer guards your home PC while you step away — silence never guarantees your account is safe.",
+                font=("Arial", 8, "bold"),
+                fg="#94a3b8",
+                bg="#0d1117",
+                anchor="w",
+            ).pack(fill="x", pady=(0, 10))
+
+            var_m_en = tk.BooleanVar(value=bool(config.get("enable_mobile_push", False)))
+            var_m_prov = tk.StringVar(
+                value=str(config.get("mobile_push_provider", "ntfy") or "ntfy").lower()
+            )
+            var_m_srv = tk.StringVar(
+                value=str(config.get("mobile_ntfy_server", "https://ntfy.sh") or "https://ntfy.sh")
+            )
+            var_m_top = tk.StringVar(value=str(config.get("mobile_ntfy_topic", "") or ""))
+            var_m_pu = tk.StringVar(value=str(config.get("mobile_pushover_user", "") or ""))
+            var_m_pt = tk.StringVar(value=str(config.get("mobile_pushover_token", "") or ""))
+            var_m_stops = tk.BooleanVar(value=bool(config.get("mobile_push_stops", True)))
+            var_m_flat = tk.BooleanVar(value=bool(config.get("mobile_push_flat_recap", True)))
+            var_m_warn = tk.BooleanVar(value=bool(config.get("mobile_push_warnings", True)))
+            var_m_conn = tk.BooleanVar(value=bool(config.get("mobile_push_connection", True)))
+            var_m_arm = tk.BooleanVar(value=bool(config.get("mobile_push_armed_checkin", False)))
+
+            m_card = tk.Frame(
+                mdlg,
+                bg="#131922",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground="#243040",
+            )
+            m_card.pack(fill="x", pady=(0, 10))
+            NeonBarCanvas(
+                m_card, core_color="#38bdf8", card_bg="#131922", glow_on=True
+            ).pack(side="left", fill="y")
+            m_body = tk.Frame(m_card, bg="#131922", padx=16, pady=12)
+            m_body.pack(side="left", fill="both", expand=True)
+
+            make_glass_checkbutton(
+                m_body,
+                text="Enable 1-Way Mobile Push Alerts (BETA · Zero account balances ever sent)",
+                variable=var_m_en,
+                font=("Arial", 10, "bold"),
+                fg="#e2e8f0",
+                bg="#131922",
+                accent_hex="#0d6e4e",
+                check_hex="#34d399",
+                anchor="w",
+            ).pack(fill="x", pady=(0, 8))
+
+            r_prov = tk.Frame(m_body, bg="#131922")
+            r_prov.pack(fill="x", pady=(0, 8))
+            tk.Label(
+                r_prov,
+                text="Service:",
+                font=("Arial", 9, "bold"),
+                fg="#94a3b8",
+                bg="#131922",
+            ).pack(side="left", padx=(0, 8))
+
+            btn_prov_ntfy = make_stadium_button(
+                r_prov,
+                text="ntfy (Free · Zero Signup)",
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                border_color="#2e3746",
+                fg="#cbd5e1",
+                canvas_bg="#131922",
+                width=182,
+                height=26,
+                auto_width=False,
+            )
+            btn_prov_ntfy.pack(side="left", padx=(0, 6))
+
+            btn_prov_po = make_stadium_button(
+                r_prov,
+                text="Pushover (User + App Key)",
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                border_color="#2e3746",
+                fg="#cbd5e1",
+                canvas_bg="#131922",
+                width=192,
+                height=26,
+                auto_width=False,
+            )
+            btn_prov_po.pack(side="left")
+
+            cred_box = tk.Frame(m_body, bg="#131922")
+            cred_box.pack(fill="x", pady=(2, 8))
+
+            # ntfy fields
+            f_ntfy = tk.Frame(cred_box, bg="#131922")
+            r_nt1 = tk.Frame(f_ntfy, bg="#131922")
+            r_nt1.pack(fill="x", pady=(0, 5))
+            tk.Label(
+                r_nt1,
+                text="Secret Topic:",
+                font=("Arial", 9, "bold"),
+                fg="#cbd5e1",
+                bg="#131922",
+                width=12,
+                anchor="w",
+            ).pack(side="left")
+            ent_top = make_entry(r_nt1, var_m_top, width=26)
+            ent_top.pack(side="left", padx=(0, 6))
+            make_stadium_button(
+                r_nt1,
+                text="🎲 Generate",
+                font=("Arial", 8, "bold"),
+                fill_color="#1a2636",
+                border_color="#38bdf8",
+                fg="#bae6fd",
+                canvas_bg="#131922",
+                width=98,
+                height=24,
+                auto_width=False,
+                command=lambda: var_m_top.set(generate_mobile_ntfy_topic()),
+            ).pack(side="left")
+            r_nt2 = tk.Frame(f_ntfy, bg="#131922")
+            r_nt2.pack(fill="x")
+            tk.Label(
+                r_nt2,
+                text="Server URL:",
+                font=("Arial", 9, "bold"),
+                fg="#94a3b8",
+                bg="#131922",
+                width=12,
+                anchor="w",
+            ).pack(side="left")
+            make_entry(r_nt2, var_m_srv, width=26).pack(side="left", padx=(0, 8))
+            tk.Label(
+                r_nt2,
+                text="Install free ntfy app & subscribe to your Secret Topic.",
+                font=("Arial", 8),
+                fg="#7f8ea3",
+                bg="#131922",
+            ).pack(side="left")
+
+            # Pushover fields
+            f_po = tk.Frame(cred_box, bg="#131922")
+            r_po1 = tk.Frame(f_po, bg="#131922")
+            r_po1.pack(fill="x", pady=(0, 5))
+            tk.Label(
+                r_po1,
+                text="User Key:",
+                font=("Arial", 9, "bold"),
+                fg="#cbd5e1",
+                bg="#131922",
+                width=12,
+                anchor="w",
+            ).pack(side="left")
+            ent_po_user = make_entry(r_po1, var_m_pu, width=34)
+            ent_po_user.config(show="*")
+            ent_po_user.pack(side="left")
+            r_po2 = tk.Frame(f_po, bg="#131922")
+            r_po2.pack(fill="x")
+            tk.Label(
+                r_po2,
+                text="App Token:",
+                font=("Arial", 9, "bold"),
+                fg="#cbd5e1",
+                bg="#131922",
+                width=12,
+                anchor="w",
+            ).pack(side="left")
+            ent_po_tok = make_entry(r_po2, var_m_pt, width=34)
+            ent_po_tok.config(show="*")
+            ent_po_tok.pack(side="left", padx=(0, 8))
+            tk.Label(
+                r_po2,
+                text="Create personal app token at pushover.net",
+                font=("Arial", 8),
+                fg="#7f8ea3",
+                bg="#131922",
+            ).pack(side="left")
+
+            def _sync_provider_ui(new_prov=None):
+                if new_prov in ("ntfy", "pushover"):
+                    var_m_prov.set(new_prov)
+                pv_now = var_m_prov.get()
+                if pv_now == "pushover":
+                    f_ntfy.pack_forget()
+                    f_po.pack(fill="x")
+                    btn_prov_ntfy.config(fill_color="#141820", border_color="#2e3746", fg="#94a3b8")
+                    btn_prov_po.config(fill_color="#102336", border_color="#38bdf8", fg="#e0f2fe")
+                else:
+                    f_po.pack_forget()
+                    f_ntfy.pack(fill="x")
+                    btn_prov_ntfy.config(fill_color="#102336", border_color="#38bdf8", fg="#e0f2fe")
+                    btn_prov_po.config(fill_color="#141820", border_color="#2e3746", fg="#94a3b8")
+
+            btn_prov_ntfy.config(command=lambda: _sync_provider_ui("ntfy"))
+            btn_prov_po.config(command=lambda: _sync_provider_ui("pushover"))
+            _sync_provider_ui()
+
+            tk.Frame(m_body, bg="#222d3d", height=1).pack(fill="x", pady=(4, 8))
+            tk.Label(
+                m_body,
+                text="EVENT TRIGGERS (Transitions Only — Never Spams Every Poll):",
+                font=("Arial", 8, "bold"),
+                fg="#7dd3fc",
+                bg="#131922",
+                anchor="w",
+            ).pack(fill="x", pady=(0, 4))
+
+            for v_chk, c_lbl in (
+                (var_m_stops, "Stops, Flattens, Lockouts & Urgent Manual-Exit Alerts"),
+                (var_m_flat, "Trade Closed Flat Recap (Realized PnL, Day Net & Remaining Room to Stop)"),
+                (var_m_warn, "Warning Sirens (Warn 1 / Warn 2) & Upside Profit Ratchets"),
+                (var_m_conn, "Broker Connection Lost / Reconnected Alerts"),
+                (var_m_arm, "Session Armed Check-In Once at HUD Launch (Proof of Life)"),
+            ):
+                make_glass_checkbutton(
+                    m_body,
+                    text=c_lbl,
+                    variable=v_chk,
+                    font=("Arial", 9, "bold"),
+                    fg="#cbd5e1",
+                    bg="#131922",
+                    anchor="w",
+                ).pack(fill="x", pady=1)
+
+            lbl_m_status = tk.Label(
+                mdlg,
+                text="",
+                font=("Arial", 9, "bold"),
+                fg="#94a3b8",
+                bg="#0d1117",
+                anchor="w",
+            )
+            lbl_m_status.pack(fill="x", pady=(0, 8))
+
+            def _build_draft_mobile_cfg():
+                d_cfg = json.loads(json.dumps(config))
+                d_cfg["enable_mobile_push"] = bool(var_m_en.get())
+                d_cfg["mobile_push_provider"] = (
+                    "pushover" if var_m_prov.get() == "pushover" else "ntfy"
+                )
+                d_cfg["mobile_ntfy_server"] = (
+                    str(var_m_srv.get() or "https://ntfy.sh").strip() or "https://ntfy.sh"
+                )
+                d_cfg["mobile_ntfy_topic"] = str(var_m_top.get() or "").strip()
+                d_cfg["mobile_pushover_user"] = str(var_m_pu.get() or "").strip()
+                d_cfg["mobile_pushover_token"] = str(var_m_pt.get() or "").strip()
+                d_cfg["mobile_push_stops"] = bool(var_m_stops.get())
+                d_cfg["mobile_push_flat_recap"] = bool(var_m_flat.get())
+                d_cfg["mobile_push_warnings"] = bool(var_m_warn.get())
+                d_cfg["mobile_push_connection"] = bool(var_m_conn.get())
+                d_cfg["mobile_push_armed_checkin"] = bool(var_m_arm.get())
+                return d_cfg
+
+            def _on_test_mobile_push():
+                draft = _build_draft_mobile_cfg()
+                lbl_m_status.config(text="⏳ Sending test alert to your phone...", fg="#7dd3fc")
+                btn_m_test.config(state="disabled")
+
+                def _w_test():
+                    ok_t, msg_t = send_mobile_push_test_sync(cfg_override=draft)
+
+                    def _done_test():
+                        try:
+                            if mdlg.winfo_exists():
+                                btn_m_test.config(state="normal")
+                                lbl_m_status.config(
+                                    text=msg_t,
+                                    fg="#6ee7b7" if ok_t else "#fbbf24",
+                                )
+                        except Exception:
+                            pass
+
+                    try:
+                        mdlg.after(0, _done_test)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_w_test, daemon=True).start()
+
+            def _close_mdlg(_ev=None):
+                _prefs_modal_refs["mobile_dlg"] = None
+                _restore_pf_modal_focus(mdlg)
+
+            def _save_mdlg():
+                draft = _build_draft_mobile_cfg()
+                if draft["enable_mobile_push"] and not is_mobile_push_configured(draft):
+                    lbl_m_status.config(
+                        text=(
+                            "⚠️ Enter a valid Pushover User Key & App Token (or uncheck Enable)."
+                            if draft["mobile_push_provider"] == "pushover"
+                            else "⚠️ Enter/Generate an ntfy Secret Topic (>= 4 chars) & valid http(s) URL."
+                        ),
+                        fg="#fbbf24",
+                    )
+                    return
+                for mk in (
+                    "enable_mobile_push",
+                    "mobile_push_provider",
+                    "mobile_ntfy_server",
+                    "mobile_ntfy_topic",
+                    "mobile_pushover_user",
+                    "mobile_pushover_token",
+                    "mobile_push_stops",
+                    "mobile_push_warnings",
+                    "mobile_push_flat_recap",
+                    "mobile_push_connection",
+                    "mobile_push_armed_checkin",
+                ):
+                    config[mk] = draft[mk]
+                save_config(config)
+                prov_lbl = draft["mobile_push_provider"]
+                log_event(
+                    "CONFIG",
+                    f"Updated Mobile Push Alerts (BETA): {'ON (' + prov_lbl + ')' if is_mobile_push_configured(config) else 'OFF'}",
+                )
+                _refresh_mobile_push_btn()
+                _close_mdlg()
+
+            mdlg.protocol("WM_DELETE_WINDOW", _close_mdlg)
+            mdlg.bind("<Escape>", _close_mdlg)
+
+            r_m_btns = tk.Frame(mdlg, bg="#0d1117")
+            r_m_btns.pack(fill="x")
+            btn_m_test = make_stadium_button(
+                r_m_btns,
+                text="🔔 Send Test Push",
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                border_color="#2e3746",
+                hover_border="#38bdf8",
+                fg="#7dd3fc",
+                canvas_bg="#0d1117",
+                width=148,
+                height=32,
+                auto_width=False,
+                command=_on_test_mobile_push,
+            )
+            btn_m_test.pack(side="left")
+
+            make_stadium_button(
+                r_m_btns,
+                text="Save Mobile Settings ✓",
+                font=("Arial", 9, "bold"),
+                fill_color="#0d3b20",
+                fill_top_color="#14532d",
+                border_color="#10b981",
+                hover_fill="#114b29",
+                hover_fill_top="#196638",
+                hover_border="#34d399",
+                fg="#ffffff",
+                canvas_bg="#0d1117",
+                width=182,
+                height=32,
+                auto_width=False,
+                command=_save_mdlg,
+            ).pack(side="right")
+
+            make_stadium_button(
+                r_m_btns,
+                text="Cancel",
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                border_color="#475569",
+                fg="#cbd5e1",
+                canvas_bg="#0d1117",
+                width=92,
+                height=32,
+                auto_width=False,
+                command=_close_mdlg,
+            ).pack(side="right", padx=(0, 8))
+
+            center_dialog_over_parent(mdlg, parent=dlg)
+            mdlg.grab_set()
+            mdlg.focus_set()
+            dlg.wait_window(mdlg)
+
+        btn_mobile_push.config(command=_open_mobile_alerts_dialog)
+        tk.Label(
+            r_mob_push,
+            text="🧪 EXPERIMENTAL BETA",
+            font=("Arial", 8, "bold"),
+            fg="#fde68a",
+            bg="#2b1b08",
+            padx=7,
+            pady=2,
+        ).pack(side="left")
+        attach_tooltip(
+            btn_mobile_push,
+            "1-Way Mobile Push Alerts (Experimental BETA — OFF by default):\n"
+            "• Receive push notifications on your phone via ntfy (free, zero signup) or Pushover.\n"
+            "• Sends event alerts only (Stops/Flattens, Urgent Manual-Exit notices, Trade-Closed-Flat recaps\n"
+            "  with remaining room to Daily Stop, Warnings, and Disconnects) with zero account balances.\n"
+            "• Editable anytime and preserved separately from Risk Presets.",
+        )
+
         # Section 3: System & Telemetry
         sec3, _sec3_hdr = _make_prefs_section("SYSTEM & TELEMETRY", "#5dade2")
         r_poll = tk.Frame(sec3, bg="#131922")
@@ -40468,6 +41582,18 @@ def show_preflight_window(
             if _prefs_cleaned["done"]:
                 return
             _prefs_cleaned["done"] = True
+            mob_d = _prefs_modal_refs.get("mobile_dlg")
+            if mob_d is not None:
+                _prefs_modal_refs["mobile_dlg"] = None
+                try:
+                    mob_d.grab_release()
+                except Exception:
+                    pass
+                try:
+                    if mob_d.winfo_exists():
+                        mob_d.destroy()
+                except Exception:
+                    pass
             if restore_invalid_poll:
                 raw_p = str(var_poll.get()).strip()
                 try:
@@ -49921,6 +51047,7 @@ def start_gui():
             pass
         alarm_active = False
         log_event("SESSION", "User closed Enforcer via HUD X button.")
+        flush_mobile_push_queue(timeout_s=1.5)
         root.destroy()
         sys.exit(0)
 

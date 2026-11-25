@@ -4,6 +4,19 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.88] — 2026-11-24 (Experimental Beta Channel)
+### ⚡ Quick Summary
+- **Optional 1-Way Mobile Push Alerts (`🧪 EXPERIMENTAL BETA` — `⚙ Preferences & Audio...`):** Added an opt-in, completely tucked-away **`📱 Mobile Push Alerts (BETA)`** configuration panel inside `Preferences & Audio` supporting **`ntfy`** (free iOS/Android app, zero signup, 1-click private topic generator) and **`Pushover`** (personal User Key + App Token) for traders monitoring a home workstation remotely.
+
+### 🔍 Detailed Breakdown
+- **1-Way Priority Async Push Engine & Privacy Protection (`enqueue_mobile_push`, `flush_mobile_push_queue`, `_send_mobile_push_http`, `_scrub_log_line`, `format_config_summary`):**
+  - Uses a bounded priority queue (`MOBILE_PUSH_MAX_QUEUE = 48`) so `URGENT` stop/flatten and manual-exit alerts preempt lower-priority items (never dropped on full, stale `>= 120s` low-priority items dropped cleanly, bounded `2.0s` exit/pre-lock flush via `atexit`, `close_app`, and `LockWorkStation`).
+  - Publishes UTF-8 JSON to `ntfy` root endpoints (emoji-safe, with `/<topic>` fallback) and Pushover (`priority=1` for stops/manual-exit, `0` otherwise), sends zero total account equity/balances, and scrubs configured secrets (`>= 8` chars) & custom server URLs from `enforcer_log.txt` while keeping mobile settings editable anytime and preserved separately from Risk Presets.
+- **Event Hooks (`_enter_halt_breach_watch`, `trigger_open_pnl_flatten`, `trigger_consec_loss_cooldown`, `trigger_lockdown`, `trigger_alarm`, `trigger_upside_tier_glow`, `_maybe_dispatch_pending_flat_recap`, `_handle_disconnect_recovery`, `data_loop`):**
+  - Sends `URGENT` pushes on Stops/Flattens/Lockouts and Urgent Manual-Exit notices (sending only the manual-exit alert when Options Auto-Flatten is OFF or outside RTH), deduplicates Warning Alarm pushes via `trigger_alarm()`, composes a 1-poll settled **Trade Closed Flat Recap** (`TradePnL`, `Day Net`, `W/L`, and exact remaining `Room to Stop` or `LOCKED FOR DAY` / `Alarms-Only Mode`), reports Disconnect/Reconnect transitions (honoring flap-storm quiet mode), offers an optional session-armed check-in, and stays inactive in Demo Simulator mode (outside manual `🔔 Send Test Push`).
+
+---
+
 ## [v0.9.87] — 2026-11-24
 ### ⚡ Quick Summary
 - **Anti-Wick Escalation Protection (`data_loop`, Schwab & Webull):** Closed a loophole where a poll that initially crossed only a Warning Alarm (`Warn 1`/`Warn 2`) or Open PnL Stop and dipped past a stricter threshold (`Open PnL Auto-Flatten` or `Daily Stop`) on the 0.2s verification fetch could fire the escalated flatten/lockout on a single unconfirmed reading. Escalated stops now run one bounded confirmation pass (with `0s` extra delay whenever equity NBBO book quotes already confirm) before touching working orders.
