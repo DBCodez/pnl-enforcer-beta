@@ -5,7 +5,7 @@ Not financial advice; no guarantee of loss prevention; not affiliated with Schwa
 See LICENSE.txt for full terms, limitation of liability, and indemnification.
 """
 
-APP_VERSION = "0.9.88"
+APP_VERSION = "0.9.89"
 
 import os
 import sys
@@ -4357,6 +4357,38 @@ def _normalize_mobile_ntfy_server(url_val):
     if not (s.lower().startswith("https://") or s.lower().startswith("http://")):
         return ""
     return s
+
+
+def _should_mask_mobile_server_url(url_val):
+    """Returns True when `url_val` is a non-empty custom server URL (anything
+    other than the public default `https://ntfy.sh`) that should be masked while
+    secrets are hidden."""
+    s = str(url_val or "").strip().rstrip("/")
+    if not s:
+        return False
+    return s.lower() != "https://ntfy.sh"
+
+
+def _make_mobile_text_entry(parent_w, var_s, width_chars, secret=False):
+    """Builds a plain alphanumeric `tk.Entry` for Mobile Push topics/keys/URLs
+    (avoiding Pre-Flight's numeric-only `make_entry` validator)."""
+    return tk.Entry(
+        parent_w,
+        textvariable=var_s,
+        font=("Consolas", 10, "bold"),
+        width=width_chars,
+        bg="#132333",
+        fg="#e6eef8",
+        disabledbackground="#11161e",
+        disabledforeground="#475569",
+        insertbackground="#f1f5f9",
+        justify="left",
+        show="*" if secret else "",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#2e526e",
+        highlightcolor="#38bdf8",
+    )
 
 
 def is_mobile_push_configured(cfg=None):
@@ -40933,8 +40965,8 @@ def show_preflight_window(
         def _fmt_mobile_btn_txt():
             if is_mobile_push_configured(config):
                 pv = str(config.get("mobile_push_provider", "ntfy") or "ntfy").lower()
-                return f"📱 Mobile Push Alerts (BETA): ON ({pv})"
-            return "📱 Mobile Push Alerts (BETA): OFF"
+                return f"🔔 Mobile Push Alerts (BETA): ON ({pv})"
+            return "🔔 Mobile Push Alerts (BETA): OFF"
 
         btn_mobile_push = make_stadium_button(
             r_mob_push,
@@ -41004,7 +41036,7 @@ def show_preflight_window(
             m_hdr.pack(fill="x", pady=(0, 4))
             tk.Label(
                 m_hdr,
-                text="▶  📱 1-WAY MOBILE PUSH ALERTS",
+                text="▶  1-WAY MOBILE PUSH ALERTS",
                 font=("Arial", 11, "bold"),
                 fg="#7dd3fc",
                 bg="#0d1117",
@@ -41112,6 +41144,8 @@ def show_preflight_window(
             cred_box = tk.Frame(m_body, bg="#131922")
             cred_box.pack(fill="x", pady=(2, 8))
 
+            secrets_vis = {"shown": False}
+
             # ntfy fields
             f_ntfy = tk.Frame(cred_box, bg="#131922")
             r_nt1 = tk.Frame(f_ntfy, bg="#131922")
@@ -41125,9 +41159,9 @@ def show_preflight_window(
                 width=12,
                 anchor="w",
             ).pack(side="left")
-            ent_top = make_entry(r_nt1, var_m_top, width=26)
-            ent_top.pack(side="left", padx=(0, 6))
-            make_stadium_button(
+            ent_top = _make_mobile_text_entry(r_nt1, var_m_top, 26, secret=True)
+            ent_top.pack(side="left", padx=(0, 6), ipady=2)
+            btn_gen_ntfy = make_stadium_button(
                 r_nt1,
                 text="🎲 Generate",
                 font=("Arial", 8, "bold"),
@@ -41138,8 +41172,25 @@ def show_preflight_window(
                 width=98,
                 height=24,
                 auto_width=False,
-                command=lambda: var_m_top.set(generate_mobile_ntfy_topic()),
-            ).pack(side="left")
+            )
+            btn_gen_ntfy.pack(side="left", padx=(0, 6))
+            btn_eye_ntfy = make_stadium_button(
+                r_nt1,
+                text="👁 Show",
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#38bdf8",
+                fg="#cbd5e1",
+                canvas_bg="#131922",
+                width=86,
+                height=24,
+                auto_width=False,
+            )
+            btn_eye_ntfy.pack(side="left")
             r_nt2 = tk.Frame(f_ntfy, bg="#131922")
             r_nt2.pack(fill="x")
             tk.Label(
@@ -41151,7 +41202,13 @@ def show_preflight_window(
                 width=12,
                 anchor="w",
             ).pack(side="left")
-            make_entry(r_nt2, var_m_srv, width=26).pack(side="left", padx=(0, 8))
+            ent_srv = _make_mobile_text_entry(
+                r_nt2,
+                var_m_srv,
+                26,
+                secret=_should_mask_mobile_server_url(var_m_srv.get()),
+            )
+            ent_srv.pack(side="left", padx=(0, 8), ipady=2)
             tk.Label(
                 r_nt2,
                 text="Install free ntfy app & subscribe to your Secret Topic.",
@@ -41173,9 +41230,25 @@ def show_preflight_window(
                 width=12,
                 anchor="w",
             ).pack(side="left")
-            ent_po_user = make_entry(r_po1, var_m_pu, width=34)
-            ent_po_user.config(show="*")
-            ent_po_user.pack(side="left")
+            ent_po_user = _make_mobile_text_entry(r_po1, var_m_pu, 34, secret=True)
+            ent_po_user.pack(side="left", padx=(0, 6), ipady=2)
+            btn_eye_po = make_stadium_button(
+                r_po1,
+                text="👁 Show",
+                font=("Arial", 9, "bold"),
+                fill_color="#141820",
+                fill_top_color="#1c212b",
+                border_color="#2e3746",
+                hover_fill="#181e28",
+                hover_fill_top="#232a36",
+                hover_border="#38bdf8",
+                fg="#cbd5e1",
+                canvas_bg="#131922",
+                width=86,
+                height=24,
+                auto_width=False,
+            )
+            btn_eye_po.pack(side="left")
             r_po2 = tk.Frame(f_po, bg="#131922")
             r_po2.pack(fill="x")
             tk.Label(
@@ -41187,9 +41260,8 @@ def show_preflight_window(
                 width=12,
                 anchor="w",
             ).pack(side="left")
-            ent_po_tok = make_entry(r_po2, var_m_pt, width=34)
-            ent_po_tok.config(show="*")
-            ent_po_tok.pack(side="left", padx=(0, 8))
+            ent_po_tok = _make_mobile_text_entry(r_po2, var_m_pt, 34, secret=True)
+            ent_po_tok.pack(side="left", padx=(0, 8), ipady=2)
             tk.Label(
                 r_po2,
                 text="Create personal app token at pushover.net",
@@ -41197,6 +41269,57 @@ def show_preflight_window(
                 fg="#7f8ea3",
                 bg="#131922",
             ).pack(side="left")
+
+            def _apply_secret_visibility():
+                shown_now = bool(secrets_vis["shown"])
+                mask_ch = "" if shown_now else "*"
+                srv_mask_ch = (
+                    ""
+                    if (shown_now or not _should_mask_mobile_server_url(var_m_srv.get()))
+                    else "*"
+                )
+                ent_top.config(show=mask_ch)
+                ent_po_user.config(show=mask_ch)
+                ent_po_tok.config(show=mask_ch)
+                ent_srv.config(show=srv_mask_ch)
+                for b_eye in (btn_eye_ntfy, btn_eye_po):
+                    if shown_now:
+                        b_eye.config(
+                            text="👁 Hide",
+                            fill_color="#102a3a",
+                            fill_top_color="#173a4f",
+                            border_color="#38bdf8",
+                            hover_fill="#143448",
+                            hover_fill_top="#1c4760",
+                            hover_border="#7dd3fc",
+                            fg="#e0f2fe",
+                        )
+                    else:
+                        b_eye.config(
+                            text="👁 Show",
+                            fill_color="#141820",
+                            fill_top_color="#1c212b",
+                            border_color="#2e3746",
+                            hover_fill="#181e28",
+                            hover_fill_top="#232a36",
+                            hover_border="#38bdf8",
+                            fg="#cbd5e1",
+                        )
+
+            def _toggle_secret_visibility():
+                secrets_vis["shown"] = not bool(secrets_vis["shown"])
+                _apply_secret_visibility()
+
+            btn_eye_ntfy.config(command=_toggle_secret_visibility)
+            btn_eye_po.config(command=_toggle_secret_visibility)
+            attach_tooltip(
+                btn_eye_ntfy,
+                "Show or hide your private topic / keys (opens hidden by default so screenshots stay private).",
+            )
+            attach_tooltip(
+                btn_eye_po,
+                "Show or hide your private topic / keys (opens hidden by default so screenshots stay private).",
+            )
 
             def _sync_provider_ui(new_prov=None):
                 if new_prov in ("ntfy", "pushover"):
@@ -41253,6 +41376,27 @@ def show_preflight_window(
                 anchor="w",
             )
             lbl_m_status.pack(fill="x", pady=(0, 8))
+
+            def _on_generate_ntfy_topic():
+                had_saved = bool(str(config.get("mobile_ntfy_topic") or "").strip())
+                var_m_top.set(generate_mobile_ntfy_topic())
+                _apply_secret_visibility()
+                if had_saved:
+                    msg_gen = (
+                        "✓ New topic generated — click '👁 Show' to re-subscribe in ntfy, then Save."
+                        if not secrets_vis["shown"]
+                        else "✓ New topic generated — re-subscribe to this topic in ntfy, then Save."
+                    )
+                else:
+                    msg_gen = (
+                        "✓ New Secret Topic generated — click '👁 Show' to view it for your ntfy app."
+                        if not secrets_vis["shown"]
+                        else "✓ New Secret Topic generated — subscribe to it in your ntfy app."
+                    )
+                lbl_m_status.config(text=msg_gen, fg="#7dd3fc")
+
+            btn_gen_ntfy.config(command=_on_generate_ntfy_topic)
+            _apply_secret_visibility()
 
             def _build_draft_mobile_cfg():
                 d_cfg = json.loads(json.dumps(config))

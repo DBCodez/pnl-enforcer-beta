@@ -4,6 +4,18 @@ All notable updates, guardrail improvements, and broker adapter fixes are docume
 
 ---
 
+## [v0.9.89] — 2026-11-24 (Experimental Beta Channel)
+### ⚡ Quick Summary
+- **Screenshot-Safe Privacy Eye Toggle & Alphanumeric Input Fix (`🔔 Mobile Push Alerts (BETA)`):** Mobile Push fields now open pre-masked (`*`) by default with synchronized **`👁 Show` / `👁 Hide`** toggles across `ntfy` and `Pushover`, fixed alphanumeric typing/pasting on all 4 Mobile Push fields, and cleaned up blank-rendering Tkinter phone glyphs.
+
+### 🔍 Detailed Breakdown
+- **Pre-Masked Secrets, Custom Server Masking & Eye Toggle (`_open_mobile_alerts_dialog`, `_should_mask_mobile_server_url`, `_on_generate_ntfy_topic`):**
+  - Masks `Secret Topic`, Pushover `User Key` / `App Token`, and any non-default custom `Server URL` (`!= https://ntfy.sh`) automatically upon opening while leaving public `https://ntfy.sh` readable, adds synchronized **`👁 Show` / `👁 Hide`** stadium buttons on both tabs, and keeps generated topics masked until revealed (with clear re-subscribe reminders when rotating a saved topic).
+- **Alphanumeric Entry Fix & Win11 Glyph Polish (`_make_mobile_text_entry`, `_fmt_mobile_btn_txt`):**
+  - Replaced Pre-Flight's numeric-only `make_entry` validator inside `_open_mobile_alerts_dialog` with `_make_mobile_text_entry()` so 30+ character alphanumeric Pushover keys, custom URLs, and manual topics type and paste cleanly, and swapped blank-rendering `📱` Tkinter labels to `🔔 Mobile Push Alerts (BETA)` and `▶  1-WAY MOBILE PUSH ALERTS`.
+
+---
+
 ## [v0.9.88] — 2026-11-24 (Experimental Beta Channel)
 ### ⚡ Quick Summary
 - **Optional 1-Way Mobile Push Alerts (`🧪 EXPERIMENTAL BETA` — `⚙ Preferences & Audio...`):** Added an opt-in, completely tucked-away **`📱 Mobile Push Alerts (BETA)`** configuration panel inside `Preferences & Audio` supporting **`ntfy`** (free iOS/Android app, zero signup, 1-click private topic generator) and **`Pushover`** (personal User Key + App Token) for traders monitoring a home workstation remotely.
